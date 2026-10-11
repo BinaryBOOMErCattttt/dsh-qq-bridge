@@ -1,0 +1,32 @@
+[Unit]
+Description=DeepSeek Harness — QQ bot (profile: qqbot)
+Documentation=file://~/Projects/qqbot/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/qqbot
+
+# DeepSeek credential.
+#
+# Preferred: store it ONCE through the Models page of the 3081 Web UI. That
+# writes %h/.dsh/.credentials.yaml, which every profile reads, and this unit
+# then needs no environment at all.
+#
+# Fallback: put `DEEPSEEK_API_KEY=sk-...` in %h/.config/qqbot.env. The leading
+# `-` makes the file optional, so the unit still starts when it is absent.
+#
+# NOTE: the Harness scrubs sensitive variables (scrubbedParentEnv) from every
+# child it spawns, so this variable will not be visible inside bash tool calls
+# even though the Harness process itself can read it. That is expected.
+EnvironmentFile=-%h/.config/qqbot.env
+
+ExecStart=%h/.npm-global/bin/dsh --profile qqbot --port 3081 --no-open
+
+# The bot is useless when it is not connected, so always come back.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

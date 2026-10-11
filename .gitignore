@@ -1,0 +1,15 @@
+# 运行时数据：会话缓存、下载的漫画、临时媒体文件
+data/
+.qq-jm/
+.qq-media/
+
+# 依赖与虚拟环境（node_modules 是指向全局安装目录的软链）
+node_modules
+.venv/
+
+# 本地编译产物
+/hello
+
+# 日志与临时文件
+*.log
+*.tmp

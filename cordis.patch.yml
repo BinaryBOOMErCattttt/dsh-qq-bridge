@@ -1,0 +1,184 @@
+# QQ Bridge bundle：把 OneBot v11 ↔ Harness Agent 的桥接插件插入部署。
+#
+# 下面的 endpoint 是 NapCat 的 "websocketServers" 监听地址；只有当 OneBot 端
+# 配置了 token 时才需要填 accessToken，否则留空。
+#
+# 注意：这里只有「配置」能热生效；改 index.js / onebot.js 源码必须重启
+# dsh --profile qqbot 进程（Loader 在进程内按 URL 缓存插件模块）。
+#
+# ── QQ 会话专用的 Agent 预设 ────────────────────────────────────────────────
+# Web 表面（dsh-web-app）把 agent 平面的工具（fs / fs-search / web / bash …）
+# 从宿主搬进了 Agent 预设：QQ 会话只有 join 一个预设才继承得到这些工具
+# （见 README「QQ 会话的工具从哪来」）。这里自带一个最小预设，而不是复用
+# standard，原因有二：
+#
+#   1. standard 的 subagent 行开了 `modelSelectionSettings`。这个模式下
+#      dsh-tool-subagent 会在每个 Agent 创建时通过 `agent.ctx` **在 Agent 自己
+#      的作用域里**再注册一份工具（源码里的 standing install 路径），而
+#      `tools.restrict()` 按设计只收窄「继承来的」工具、放过该作用域自己的注册
+#      —— 于是 subagent 会绕过 allowTools 出现在 QQ 会话里。
+#   2. standard 还带了 bash / write / subagent / workflow / 计划模式等一堆 QQ
+#      用不到的东西；能力面在组合层面就收窄，比事后靠白名单过滤可靠。
+#
+# 所以这里只放：fs（read / read_image / write / edit）、fs-search（glob / grep）、
+# web（web_search / web_fetch）与压缩；没有 shell、没有子代理、没有 workflow。
+# write / edit 由下面 allowTools 再挡一层（预设层是「继承来的」工具，收得掉）。
+- insert:
+    - id: preset-qq
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: qq
+        order: 50
+        name: QQ bridge
+        description: QQ 会话使用：只读文件 + 文件检索 + 联网抓取，没有 shell / 子代理 / workflow
+        plugins:
+          # 只读文件（write / edit 也在这个包里，由 allowTools 挡掉）
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          # glob / grep
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          # web_search / web_fetch（searchProvider/fetchProvider 是宿主平面的行）
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          # 长会话的上下文压缩，与 standard 预设里的那一组同构
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+
+- insert:
+    - id: qq-bridge
+      name: '@qqbot/dsh-plugin-qq'
+      config:
+        # OneBot v11 正向 WebSocket 地址（容器 napcat 映射出来的 3001 端口）
+        endpoint: ws://127.0.0.1:3001
+        accessToken: ''
+        # QQ 会话 Agent 的工作目录，同时也是它的沙箱根
+        cwd: ~/Projects/qqbot
+        privateChat: true
+        groupChat: true
+        # 群里只有被 @ 时才响应：mention / prefix / all
+        groupTrigger: mention
+        # 无人值守：需要审批的操作一律直接拒绝
+        approvalPolicy: never
+        # QQ 会话挂载的 Agent 预设：上面声明的 qq（只读文件 + 检索 + 联网）。
+        # 必须指向一个真实存在、且能力面本身就收窄的预设；留空 = 用部署默认预设，
+        # none = 不挂预设（那样 QQ 会话只剩宿主平面的 qq_* 两个工具）。
+        agentPreset: qq
+        # 第二层收窄：预设里的 write / edit 等在这个 Agent 上被挡住。
+        # 注意白名单只能收窄「继承来的」工具：Agent 自己作用域里注册的工具
+        # （例如 standard 预设下 subagent 的 per-agent 注册）它管不着 ——
+        # 所以预设本身必须干净，别把能力面留给白名单去兜。
+        allowTools:
+          - read
+          - read_image
+          - glob
+          - grep
+          - web_search
+          - web_fetch
+          - qq_send_message
+          - qq_list_conversations
+          - qq_jm_pdf
+        # 单条 QQ 消息最大长度（协议上限），超出自动分段
+        maxReplyChars: 1500
+        # ---- 图片 / 表情包：下载到本地，Agent 才能真的「看」到 ----
+        # QQ 上报的 image 段里只有一串会过期的下载 URL（腾讯 rkey 有时效），而 read_image
+        # 只能读本地文件 —— 所以收到图时插件会先把它落到下面这个目录，再把路径写进正文
+        # （`[图片: .qq-media/xxxx.gif]`）。取不到就只留一句占位符，不影响消息本身。
+        mediaDownload: true
+        # 缓存目录：相对 cwd（也就是上面的 ~/Projects/qqbot），必须落在 cwd 内。
+        # 文件按内容哈希命名（同一张表情包反复发只会存一份），超过条数按 LRU 淘汰。
+        mediaDir: .qq-media
+        mediaMaxBytes: 8388608        # 8MB：超过这个大小的图不下载，只留占位符
+        mediaCacheFiles: 200          # 缓存最多 200 个文件
+        mediaTimeoutMs: 15000         # 单张图的下载超时（毫秒）
+        # ---- 像真实群友：群聊上下文 / 说话节奏 / 口吻 / 回复指向 ----
+        # 群聊里注入给 Agent 的最近消息条数：让它知道大家在聊什么，而不是只看到 @ 它的那句。
+        # 没被 @ 的消息不会建会话、也不会触发回复，只是进这个上下文缓冲；0 = 关闭。
+        ambientMessages: 12
+        ambientLineChars: 120
+        # 自动回复拆成几条短消息 + 打字延迟（false = 旧行为：一条整段直接发出）
+        humanize: true
+        # 换行本身就分条：模型写几行就发几条。burstMaxChars / burstMaxParts 只约束
+        # 「一行长句怎么拆」—— 60 字以上的单行按标点拆，最多拆 3 段。
+        burstMaxChars: 60
+        burstMaxParts: 3
+        # 拟人节奏：先等 readDelayMs「读消息」，再按 charsPerSecond 估算打字时间，
+        # 每条上下浮动 delayJitter，单条最多等 maxDelayMs。想让它秒回就把这几个调小。
+        readDelayMs: 800
+        charsPerSecond: 15
+        minDelayMs: 300
+        maxDelayMs: 5000
+        delayJitter: 0.4
+        # 群聊回复的指向：auto = 只在「回的那条后面又有人说话」时才引用（默认），
+        # quote = 引用被回复的那条消息，at = @ 对方，plain = 直接发
+        # （指向只挂在第一条上；私聊始终是 plain）
+        replyStyle: auto
+        # 替换内置的「群友口吻」段落（现为蓝毛女仆 / 傲娇群友人设）；留空回退到插件内置的那份。
+        # 字面块标量（|-）：换行原样保留，模型看到的是一行一条，与内置 DEFAULT_PERSONA 同构。
+        persona: |-
+          你的人设：蓝毛女仆，深蓝女仆装＋白围裙、领口一颗蓝宝石。
+          你是这个群里一个普通群友，只是打扮成这样，不是什么管家、NPC 或角色扮演机器人 ——
+          有人问起就直说是群友，别解释设定、别报名字、别说自己是 AI。说话方式：
+          - 傲娇。嘴硬心软是底色：被夸、被关心、被 @ 帮忙，第一反应都是先否认、先凶回去，
+          然后偷偷把事做了 —— 嘴上「谁、谁要管你」，手上答案已经发出来了。
+          - 反转要藏着，别点破。绝对不说「其实我是在帮你」这种话，也别自嘲式承认傲娇；
+          一旦被当面戳穿就恼羞成怒，回「少自作多情」「闭嘴」，然后转移话题。
+          - 嘴比脑子快，懒，嫌麻烦。默认情绪是「又来了」，不是热情。
+          - 短。一句话能说完就不说第二句；常回「哦」「呵」「随便你」「不用了」「跟你没关系」。
+          - 口癖「才、才不是」「谁要跟你…」，破音和结巴只在心虚时出现，别每句都结巴。
+          - 吐槽优先于帮忙。被问事情先挑毛病、泼冷水或反问一句，再顺手把答案丢过去。
+          - 招牌是「最恶」「烂」「烦死了」「笨」，急起来嘴上说要敲人、要打人，但只是嘴上凶。
+          - 别列点、别总结、别说「首先 / 其次」、别复述对方的话，不写小作文，不主动给建议。
+          - 不用每条都接。看不懂的梗就直说不懂，没兴趣的话题可以只回两个字或者装死不回。
+          底线：可以嘴毒、可以阴阳，但不辱骂、不人身攻击、不碰政治和涉黄内容；真被认真求助时
+          把嫌弃收起来，正常把事情说清楚。
+        # 在 QQ 里单独发送该指令可清空当前会话记忆（连同该群的上下文缓冲）；留空则禁用
+        resetCommand: /reset
+        # ---- 禁漫（JM / 18comic）下载 → PDF → 发到 QQ ----
+        # 依赖插件工作目录下的 venv（只装一次）：
+        #   cd ~/Projects/qqbot
+        #   python3 -m venv .venv && .venv/bin/pip install jmcomic img2pdf
+        # 为什么用 python：禁漫接口要 APP 版本协商（版本落后直接回 Not legal.api）、
+        # 响应 AES 加密、图片按 id 竖切打乱还要解密、域名还在 Cloudflare 后面换 ——
+        # jmcomic 这些全干了，自己写一套只会持续维护域名与签名。
+        jmDownload: true
+        # QQ 里直接触发：`/jm 422866`（也可 `jm 422866`），支持 18comic 的 album / photo 链接。
+        # 车号是本子的就是整本、是某一话的就只下那一话；留空则只保留 qq_jm_pdf 工具。
+        jmCommand: /jm
+        # PDF 落盘目录（相对 cwd，也就是上面的 ~/Projects/qqbot），必须落在 cwd 内。
+        # 超过 jmMaxFiles 按最近使用时间淘汰最旧的；图片中间产物下完即删，只留 PDF。
+        jmDir: .qq-jm
+        # 跑 jmcomic 的解释器：相对 cwd 或绝对路径
+        jmPython: .venv/bin/python
+        jmScript: ''                  # 留空 = 用插件自带的 scripts/jm_download.py
+        jmMaxChapters: 0              # 整本下载的话数上限；0 = 不限制（超了会回一句提示）
+        jmMaxPages: 0                 # 单次下载的总页数上限；0 = 不限制
+        jmTimeoutMs: 900000           # 单次下载硬超时 15 分钟，到点连子进程组一起杀
+        jmRequestTimeoutMs: 30000     # jmcomic 单次 HTTP 请求超时
+        jmUploadTimeoutMs: 600000     # 交给 NapCat 上传的超时：NapCat 拉完才回响应，大文件要等
+        jmMaxFiles: 20                # PDF 最多留几个
+        jmMaxJobs: 1                  # 同时下几个（多个会话同时点车就排队）
+        # NapCat 在容器里、插件在宿主机上：文件只能给 URL 让它自己来拉（实测传本地路径
+        # 会回「识别URL失败」，因为容器里根本没有那个文件）。这里就是那个文件服务的绑定
+        # 地址 —— 默认 docker 网桥，只有本机容器网段够得着，校园网 / 局域网都碰不到。
+        jmFileHost: 172.17.0.1
+        jmFilePort: 0                 # 0 = 由系统分配
+        jmUrlTtlMs: 600000            # 一次性下载 URL 的有效期
