@@ -161,6 +161,29 @@ export function mentions(message, selfId) {
 }
 
 /**
+ * 找出「这条消息在回复哪一条」：`reply` 段的下标与它指向的 message_id。
+ *
+ * `reply` 段里只有 id —— OneBot v11 不带被引用消息的任何内容（没有正文、没有
+ * `url`/`file`），所以想看见被引用的那条（尤其是里面的图），必须另外调 `get_msg`；
+ * 下标则用来在渲染正文时把 `[回复]` 这个占位符换成真正的引用前缀。
+ * 一条消息里理论上只该有一个 `reply` 段，取第一个即可。
+ *
+ * @param message - OneBot 的 `message` 字段（消息段数组；CQ 码字符串会得到 undefined）。
+ * @returns `{ id, index }`；没有引用段时 undefined。
+ */
+export function findReply(message) {
+  if (!Array.isArray(message)) return undefined;
+  for (const [index, segment] of message.entries()) {
+    if (segment?.type !== 'reply') continue;
+    const raw = segment?.data?.id;
+    if (raw === undefined || raw === null) continue;
+    const id = String(raw).trim();
+    if (id.length > 0) return { id, index };
+  }
+  return undefined;
+}
+
+/**
  * 在自然边界处把长文本切成 OneBot 能接受的多段。
  * 优先在换行处切；换行位置太靠前（不足半段）就退而求其次在空格处切；
  * 都没有就硬切在 limit 处。切完两端的空白会被裁掉。
@@ -253,6 +276,51 @@ export function splitBurst(text, maxChars = 60, maxParts = 3) {
     if (rest.length > 0) parts.push(rest);
     return parts.filter((part) => part.length > 0);
   });
+}
+
+/**
+ * 回复正文里的「表情包标记」：`[[图片: .qq-stickers/笑死.gif]]`。
+ *
+ * 为什么要有这个东西：工具调用发生在整轮回复**之前**，而且工具是 Agent 的显式动作，
+ * 没法表达「这句话之后跟一张表情」这种顺序；更要紧的是「只发表情、一个字都不说」
+ * 在纯文本回复里根本表达不出来（模型总得写点什么）。把表情写成正文里的一行，
+ * 顺序就跟着行序走，整条回复只有这一行时自然就是一条文字都不发。
+ *
+ * 关键字给几种写法是刻意的：模型十有八九会按提示词里的 `[[图片: …]]` 写，但也可能
+ * 顺手写成「表情包 / 表情 / sticker」。多认几个的成本只是正则，写错一个字的成本是
+ * 把一行方括号原样糊到群里。
+ */
+const STICKER_MARKER = /\[\[\s*(?:图片|图片表情|表情包|表情|贴图|sticker|image|img)\s*[:：]\s*([^\]\n]*?)\s*\]\]/gi;
+
+/**
+ * 把一条回复正文切成「要一条条发出去的东西」：文字段与表情包段，按原文顺序。
+ *
+ * 标记可以出现在任何位置（不要求独占一行）：标记之间的文字原样留着，交给调用方
+ * 按换行/长度继续拆。载荷是空的标记（`[[图片:]]`）不算数，当普通文字留下 ——
+ * 与其静默吞掉一行，不如让这个错别字露出来。
+ *
+ * @param text - 模型给出的完整回复。
+ * @returns `{ kind: 'text', text }` 与 `{ kind: 'image', source, raw }` 组成的数组；
+ *   全空白时为空数组。`source` 是标记里那个路径或链接；`raw` 是标记原文，
+ *   供调用方在「不能发图」时把它当普通文字发出去。
+ */
+export function splitStickerLines(text) {
+  const body = String(text ?? '');
+  const pieces = [];
+  const pushText = (value) => {
+    const trimmed = value.trim();
+    if (trimmed.length > 0) pieces.push({ kind: 'text', text: trimmed });
+  };
+  let cursor = 0;
+  for (const match of body.matchAll(STICKER_MARKER)) {
+    const source = String(match[1] ?? '').trim();
+    if (source.length === 0) continue;
+    pushText(body.slice(cursor, match.index));
+    pieces.push({ kind: 'image', source, raw: match[0] });
+    cursor = match.index + match[0].length;
+  }
+  pushText(body.slice(cursor));
+  return pieces;
 }
 
 /**

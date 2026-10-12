@@ -15,11 +15,13 @@ import { existsSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import yaml from 'js-yaml';
 import { Config, apply } from '../index.js';
-import { collectMedia, mediaLabel, mediaPlaceholder, messageToText, splitBurst, typingDelayMs } from '../onebot.js';
+import { collectMedia, mediaLabel, mediaPlaceholder, messageToText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
+import { imageSegment, loadOutgoingImage } from '../image.js';
 
 /** 测试用机器人自己的 QQ 号。 */
 const SELF_ID = 100000000;
@@ -60,9 +62,10 @@ async function startImageServer(body = TINY_PNG, { status = 200, contentType = '
 /**
  * 起一个最小 OneBot v11 服务端，并记录收到的每一次 API 调用。
  * @param options.getImage - `get_image` 的桩响应（不传则像多数实现一样报「不支持」）。
+ * @param options.getMsg - `get_msg` 的桩响应：`(params) => 消息对象`（不传则报「不支持」）。
  * @param options.uploadFails - 给出时，`upload_*_file` 一律失败（用来验证「文件发不出去」的降级）。
  */
-async function startFakeOneBot({ getImage, uploadFails } = {}) {
+async function startFakeOneBot({ getImage, getMsg, uploadFails } = {}) {
   const calls = [];
   // 端口 0 = 让系统分配空闲端口，避免与真实 NapCat（3001）或并行测试冲突。
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
@@ -97,6 +100,10 @@ async function startFakeOneBot({ getImage, uploadFails } = {}) {
     if (frame.action === 'get_image') {
       if (getImage === undefined) throw new Error('get_image is not supported by this fake');
       return await getImage(frame.params);
+    }
+    if (frame.action === 'get_msg') {
+      if (getMsg === undefined) throw new Error('get_msg is not supported by this fake');
+      return await getMsg(frame.params);
     }
     // 文件上传：默认成功（返回一个 file_id），需要验证降级时由 uploadFails 强制失败。
     if (frame.action === 'upload_private_file' || frame.action === 'upload_group_file') {
@@ -348,6 +355,24 @@ function privateMessageWithImage(url, { text = '你看这个', summary = '[动�
   };
 }
 
+/**
+ * 造一条「引用了某条消息」的私聊事件。
+ * OneBot v11 的 `reply` 段里只有被引用消息的 message_id —— 图与正文都不在里面，
+ * 这正是要额外走一趟 `get_msg` 的原因。
+ */
+function privateMessageWithReply(text, quotedId) {
+  return {
+    post_type: 'message',
+    message_type: 'private',
+    user_id: 100000002,
+    sender: { nickname: 'iroha' },
+    message: [
+      { type: 'reply', data: { id: quotedId } },
+      { type: 'text', data: { text } },
+    ],
+  };
+}
+
 /** 造一条群聊入站事件；`messageId` 用于验证引用回复。 */
 function groupMessage(segments, { userId = 100000003, name = 'tomori', card = 'kaguya', messageId = 7000 } = {}) {
   return {
@@ -465,7 +490,8 @@ async function boot(config = {}, hostOptions = {}, onebotOptions = {}) {
   const host = makeHost({ sessionsRoot, ...hostOptions });
   // 用 Config() 过一遍真实 schema，测试里传的配置因此也顺带验证了默认值合并。
   // 延迟一律压到 0：拟人节奏不该让测试多等几秒，需要验证时序的用例自己覆盖。
-  apply(host.ctx, Config({ endpoint: onebot.endpoint, cwd: '/tmp', readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, ...config }));
+  // 攒批窗口同理：默认关掉，要验证「几个人同时 @ 只回一轮」的用例自己给一个小窗口。
+  apply(host.ctx, Config({ endpoint: onebot.endpoint, cwd: '/tmp', readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, batchWindowMs: 0, ...config }));
   host.list.start();
   // 等到 get_login_info 发出，说明 socket 已就绪、selfId 即将可用。
   await until(() => onebot.calls.some((call) => call.action === 'get_login_info'), 'the plugin to identify itself');
@@ -584,6 +610,147 @@ test('a group message only reaches the Agent when the bot is mentioned', async (
   } finally {
     await onebot.close();
   }
+});
+
+// 用例：群里几个人几乎同时 @ 机器人 —— 攒成一条 user message，只回一轮。
+test('mentions that land together become one turn instead of one reply each', async () => {
+  const { onebot, host } = await boot({ batchWindowMs: 150, batchMaxWaitMs: 400 });
+  try {
+    onebot.push(mention('你俩在吗', { userId: 100000003, name: 'tomori', card: 'kaguya', messageId: 7001 }));
+    onebot.push(mention('帮我看看这个', { userId: 3333333333, name: 'iroha', card: 'iroha', messageId: 7002 }));
+    onebot.push(mention('我也想问', { userId: 4444444444, name: 'mutsumi', card: 'mutsumi', messageId: 7003 }));
+
+    const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+    await until(() => agent.inbox.length > 0, 'the batched message to reach the Agent');
+    // 三句话 = 一条消息 = 一次 followup = 一轮 = 一条回复。
+    assert.equal(agent.inbox.length, 1);
+    const text = agent.inbox[0].content[0].text;
+    assert.ok(text.includes('kaguya: 你俩在吗'), text);
+    assert.ok(text.includes('iroha: 帮我看看这个'), text);
+    assert.ok(text.includes('mutsumi: 我也想问'), text);
+
+    // 提示词里说的是「几个人一起在跟你说话」，而不是只报最后一个。
+    const prompt = promptText(host, 'qq-bridge:channel');
+    assert.ok(prompt.includes('kaguya（QQ 100000003）'), prompt);
+    assert.ok(prompt.includes('mutsumi（QQ 4444444444）'), prompt);
+
+    completeTurn(host, agent, '都在呢', 1);
+    const sent = await until(() => sentTexts(onebot)[0], 'the single reply');
+    assert.equal(sent, '都在呢');
+    // 再等一会儿：三个人不该被分别答复一遍。
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(sentTexts(onebot), ['都在呢']);
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：同一个人连发几句也只回一轮，而且指向他最后那条。
+test('a run of messages from one person is one turn that quotes the last of them', async () => {
+  const { onebot, host } = await boot({ batchWindowMs: 150, batchMaxWaitMs: 400, replyStyle: 'quote' });
+  try {
+    onebot.push(mention('在吗', { messageId: 7101 }));
+    onebot.push(mention('帮我看看这个报错', { messageId: 7102 }));
+
+    const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+    await until(() => agent.inbox.length > 0, 'the batched message to reach the Agent');
+    assert.equal(agent.inbox.length, 1);
+    assert.ok(agent.inbox[0].content[0].text.includes('连着发的'), agent.inbox[0].content[0].text);
+
+    completeTurn(host, agent, '嗯', 1);
+    const sent = await until(() => onebot.calls.find((call) => call.action === 'send_group_msg'), 'the reply');
+    assert.deepEqual(sent.params.message, [
+      { type: 'reply', data: { id: '7102' } },
+      { type: 'text', data: { text: '嗯' } },
+    ]);
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：一批里有好几个人时，回复不指向其中任何一个人 —— 引用谁都像是在单独回他。
+test('a batch from several people is not pinned to any one of them', async () => {
+  const { onebot, host } = await boot({ batchWindowMs: 150, batchMaxWaitMs: 400, replyStyle: 'quote' });
+  try {
+    onebot.push(mention('在吗', { userId: 100000003, messageId: 7201 }));
+    onebot.push(mention('帮我看看这个', { userId: 3333333333, name: 'iroha', card: 'iroha', messageId: 7202 }));
+
+    const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+    await until(() => agent.inbox.length > 0, 'the batched message to reach the Agent');
+    completeTurn(host, agent, '都在呢', 1);
+    const sent = await until(() => onebot.calls.find((call) => call.action === 'send_group_msg'), 'the reply');
+    assert.equal(sent.params.message, '都在呢');
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：batchWindowMs: 0 回到「来一条回一条」。
+test('batchWindowMs: 0 goes back to one turn per message', async () => {
+  const { onebot, host } = await boot({ batchWindowMs: 0 });
+  try {
+    onebot.push(mention('第一句', { messageId: 7301 }));
+    onebot.push(mention('第二句', { messageId: 7302 }));
+    const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+    await until(() => agent.inbox.length === 2, 'both messages to reach the Agent separately');
+    assert.equal(agent.inbox[0].content[0].text, '第一句');
+    assert.equal(agent.inbox[1].content[0].text, '第二句');
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：群里一直有人 @ 也不能让机器人永远不吭声 —— 一批的等待以第一条为起点卡上限。
+test('the batch wait is capped even while people keep talking', async () => {
+  const { onebot, host } = await boot({ batchWindowMs: 300, batchMaxWaitMs: 600 });
+  let chatter;
+  try {
+    const started = Date.now();
+    // 不 await：一边不停地有人说话，一边看它会不会按上限把这一批发出去。
+    // 没有上限的话，要等最后一句之后再过一整个窗口才轮到机器人开口（≈ 1500ms）。
+    chatter = (async () => {
+      for (let i = 0; i < 12; i += 1) {
+        onebot.push(mention(`第 ${i} 句`, { messageId: 7400 + i }));
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
+    })();
+    const agent = await until(() => host.list.created[0], 'the capped batch to flush', 3000);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 1000, `the batch should flush at the cap (~600ms), took ${elapsed}ms`);
+    await until(() => agent.inbox.length > 0, 'the batched messages to reach the Agent');
+    assert.ok(agent.inbox.length < 12, `the batch must not wait for the chatter to stop (${agent.inbox.length} messages)`);
+  } finally {
+    await chatter?.catch(() => {});
+    await onebot.close();
+  }
+});
+
+// 用例：/reset 之前攒着的那批话要先投出去 —— 它们是清空前说的，不能被一起忘掉。
+test('the reset command delivers a pending batch before it wipes the conversation', async () => {
+  const { onebot, host } = await boot({ batchWindowMs: 200, batchMaxWaitMs: 400 });
+  try {
+    onebot.push(privateMessage('你好'));
+    onebot.push(privateMessage('/reset'));
+    const confirmation = await until(
+      () => onebot.calls.find((call) => call.action === 'send_private_msg' && call.params.message.includes('已清空')),
+      'the reset confirmation to reach QQ',
+    );
+    assert.equal(confirmation.params.user_id, '100000002');
+    // 攒着的那条消息在清空之前投了出去，Agent 随后才被销毁。
+    const first = host.list.created[0];
+    assert.ok(first, 'the pending batch should reach the Agent before the reset');
+    assert.equal(first.inbox[0].content[0].text, '你好');
+    await until(() => host.list.disposed.includes(first.id), 'the Agent to be disposed');
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：攒批窗口的默认值是可以直接用的「人味」节奏，也可以关掉。
+test('the batch window defaults to a human beat and can be turned off', () => {
+  assert.equal(Config({}).batchWindowMs, 1200);
+  assert.equal(Config({}).batchMaxWaitMs, 5000);
+  assert.equal(Config({ batchWindowMs: 0 }).batchWindowMs, 0);
 });
 
 // 用例三：白名单、未开启的渠道、以及消息发送者是机器人自己 —— 都应被丢弃。
@@ -839,8 +1006,8 @@ test('the bundled patch declares the narrowed preset the plugin mounts', async (
   for (const name of forbidden) assert.ok(!names.includes(name), `${name} must not be in the QQ preset`);
 
   // 白名单只能收窄、不能授予：每个放开的工具名都要能在这个预设里找到出处。
-  // 本插件的三个工具是**宿主平面**的全局工具（不在预设里），所以直接算作出处。
-  const provided = new Set(['qq_send_message', 'qq_list_conversations', 'qq_jm_pdf']);
+  // 本插件的四个工具是**宿主平面**的全局工具（不在预设里），所以直接算作出处。
+  const provided = new Set(['qq_send_message', 'qq_send_image', 'qq_list_conversations', 'qq_jm_pdf']);
   if (names.includes('@deepseek-ai/dsh-tool-fs')) for (const name of ['read', 'read_image', 'write', 'edit']) provided.add(name);
   if (names.includes('@deepseek-ai/dsh-tool-fs-search')) for (const name of ['glob', 'grep']) provided.add(name);
   if (names.includes('@deepseek-ai/dsh-tool-web')) for (const name of ['web_search', 'web_fetch']) provided.add(name);
@@ -992,7 +1159,9 @@ test('ambientMessages: 0 disables the group context', async () => {
     await until(() => host.list.created[0], 'the group Agent');
     const text = promptText(host, 'qq-bridge:channel');
     assert.ok(!text.includes('晚上吃啥'));
-    assert.ok(!text.includes('群里最近的消息'));
+    // 环境块的表头（「群里最近的消息（旧 → 新；…）」）不该出现。注意别只匹配
+    // 「群里最近的消息」这几个字 —— 图片那一条静态说明里也会提到它。
+    assert.ok(!text.includes('群里最近的消息（旧 → 新'), text);
   } finally {
     await onebot.close();
   }
@@ -1226,7 +1395,7 @@ test('media segments are collected and rendered with their local path', () => {
   assert.deepEqual(collectMedia([{ type: 'text', data: { text: 'hi' } }]), []);
   assert.deepEqual(collectMedia('[CQ:image,file=x.png]'), []);
 
-  // 没有映射时就是朴素占位符 —— 群聊环境上下文走的就是这条路（不为闲聊下载）。
+  // 没有映射时就是朴素占位符 —— 媒体还没落盘、下载失败、或 mediaDownload / ambientMedia 关掉时。
   assert.equal(messageToText(message, SELF_ID), '[图片(动画表情)]看这个[表情包(猫猫)][表情]');
   // 有映射时整段被替换成本地路径，模型才知道该 read_image 哪个文件。
   const media = new Map([[1, mediaPlaceholder({ kind: 'image', label: '动画表情' }, '.qq-media/ab.gif')]]);
@@ -1314,29 +1483,145 @@ test('the media cache dedupes by content and evicts the oldest files', async () 
   await rm(mediaRoot, { recursive: true, force: true });
 });
 
-// 用例二十四：群聊环境上下文里的图不下载（没人会去读），只留一句占位符。
-test('images in group chatter become placeholders without any download', async () => {
+// 用例二十四：群聊环境上下文里的图默认也落盘（「刚才那张表情包」@ 它时它真的看得见）；
+// ambientMedia: false 退回成「不为闲聊花带宽和磁盘」的老行为。
+test('images in group chatter are downloaded unless ambientMedia is off', async () => {
   const images = await startImageServer(TINY_PNG);
   const mediaRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
   const { onebot, host } = await boot({ cwd: mediaRoot, mediaDir: 'media' });
   try {
-    // 没被 @ 的群消息：只记进环境缓冲。
+    // 没被 @ 的群消息：只记进环境缓冲，但图会异步落盘。
     onebot.push(groupMessage([{ type: 'image', data: { summary: '[动画表情]', file: 'A.png', url: images.url() } }], { messageId: 21 }));
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    assert.equal(images.hits.length, 0, 'ambient images must not be downloaded');
+    await until(() => images.hits.length === 1, 'the ambient image to be downloaded');
     assert.equal(host.list.created.length, 0);
 
-    // 随后被 @：上下文里那张图应该只是一句占位符，不带任何路径。
+    // 随后被 @：上下文里那条已经改写成带路径的版本，模型可以 read_image。
     onebot.push(mention('这啥', { messageId: 22 }));
     await until(() => host.list.created[0], 'the group Agent');
-    const prompt = promptText(host, 'qq-bridge:channel');
-    assert.ok(prompt.includes('[图片(动画表情)]'), prompt);
-    assert.ok(!prompt.includes('media/'), prompt);
-    assert.equal(images.hits.length, 0);
+    const prompt = await until(
+      () => (/kaguya: \[图片\(动画表情\): (media\/[0-9a-f]{32}\.png)\]/.exec(promptText(host, 'qq-bridge:channel')) ?? undefined),
+      'the ambient line to carry the local path',
+    );
+    // 落盘的确实是原字节。
+    assert.deepEqual(await readFile(join(mediaRoot, prompt[1])), TINY_PNG);
   } finally {
     await onebot.close();
     await images.close();
     await rm(mediaRoot, { recursive: true, force: true });
+  }
+
+  // 关掉开关：一条请求都不发，上下文里只有朴素占位符。
+  const quietImages = await startImageServer(TINY_PNG);
+  const quietRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
+  const quiet = await boot({ cwd: quietRoot, mediaDir: 'media', ambientMedia: false });
+  try {
+    quiet.onebot.push(groupMessage([{ type: 'image', data: { summary: '[动画表情]', file: 'A.png', url: quietImages.url() } }], { messageId: 21 }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(quietImages.hits.length, 0, 'ambient images must not be downloaded when ambientMedia is off');
+    quiet.onebot.push(mention('这啥', { messageId: 22 }));
+    await until(() => quiet.host.list.created[0], 'the group Agent');
+    const prompt = promptText(quiet.host, 'qq-bridge:channel');
+    assert.ok(prompt.includes('[图片(动画表情)]'), prompt);
+    // 只断言「没有真的落盘路径」：提示词里作为例子提到 `.qq-media/…` 是另一回事。
+    assert.ok(!/media\/[0-9a-f]{32}\./.test(prompt), prompt);
+    assert.equal(quietImages.hits.length, 0);
+  } finally {
+    await quiet.onebot.close();
+    await quietImages.close();
+    await rm(quietRoot, { recursive: true, force: true });
+  }
+});
+
+// 用例二十四之二：被引用的那条消息会被 get_msg 取回来 —— 引用一张表情包再 @ 它，图能落盘；
+// 引用纯文本时原文直接进正文；实现不支持 get_msg 时安静降级成 `[回复]`。
+test('a quoted message is fetched so quoted images become readable', async () => {
+  const images = await startImageServer(TINY_PNG);
+  const mediaRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
+  const asked = [];
+  const { onebot, host } = await boot({ cwd: mediaRoot, mediaDir: 'media' }, {}, {
+    getMsg: async (params) => {
+      asked.push(params.message_id);
+      return {
+        message_id: params.message_id,
+        sender: { card: 'kaguya', nickname: 'tomori', user_id: 100000003 },
+        message: [{ type: 'image', data: { summary: '[动画表情]', file: 'A.png', url: images.url() } }],
+      };
+    },
+  });
+  try {
+    // 「引用某条消息 + @bot 这啥」：图不在本条消息里，只在被引用的那条里。
+    onebot.push(groupMessage([
+      { type: 'reply', data: { id: '7001' } },
+      { type: 'at', data: { qq: SELF_ID, name: '小助手' } },
+      { type: 'text', data: { text: '这啥表情' } },
+    ], { messageId: 7002 }));
+    await until(() => host.list.created[0]?.inbox.length === 1, 'the quoting message to be delivered');
+    const body = host.list.created[0].inbox[0].content[0].text;
+    // message_id 按整数传给 get_msg（NapCat 的形状），引用前缀里带的是可 read_image 的路径。
+    assert.deepEqual(asked, [7001]);
+    const match = /^（引用 kaguya: \[图片\(动画表情\): (media\/[0-9a-f]{32}\.png)\]）\n这啥表情$/.exec(body);
+    assert.ok(match, body);
+    assert.deepEqual(await readFile(join(mediaRoot, match[1])), TINY_PNG);
+    // 提示词要交代「（引用 某某: …）」是什么，否则模型会把它读成对方原话的一部分。
+    assert.ok(promptText(host, 'qq-bridge:channel').includes('（引用 某某: …）'));
+  } finally {
+    await onebot.close();
+    await images.close();
+    await rm(mediaRoot, { recursive: true, force: true });
+  }
+
+  // 引用纯文本：原文进正文，不需要任何媒体。
+  const textRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
+  const quotedText = await boot({ cwd: textRoot, mediaDir: 'media' }, {}, {
+    getMsg: async () => ({ sender: { card: 'iroha' }, message: [{ type: 'text', data: { text: '你看这个 https://example.com/a' } }] }),
+  });
+  try {
+    quotedText.onebot.push(privateMessageWithReply('在吗', '6650'));
+    await until(() => quotedText.host.list.created[0]?.inbox.length === 1, 'the quoting private message to be delivered');
+    assert.equal(
+      quotedText.host.list.created[0].inbox[0].content[0].text,
+      '（引用 iroha: 你看这个 https://example.com/a）\n在吗',
+    );
+  } finally {
+    await quotedText.onebot.close();
+    await rm(textRoot, { recursive: true, force: true });
+  }
+
+  // 实现不支持 get_msg：只记一条 warn，正文照常投递，引用退化成 `[回复]`。
+  const bareRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
+  const bare = await boot({ cwd: bareRoot, mediaDir: 'media' });
+  try {
+    bare.onebot.push(privateMessageWithReply('在吗', '6650'));
+    await until(() => bare.host.list.created[0]?.inbox.length === 1, 'the message to be delivered');
+    assert.equal(bare.host.list.created[0].inbox[0].content[0].text, '[回复]在吗');
+    assert.ok(
+      bare.host.list.warnings.some((line) => line.includes('could not fetch message 6650')),
+      bare.host.list.warnings.join('\n'),
+    );
+  } finally {
+    await bare.onebot.close();
+    await rm(bareRoot, { recursive: true, force: true });
+  }
+});
+
+// 用例二十四之三：quoteMedia: false 回到老行为 —— 引用段就是一句 `[回复]`，一次 get_msg 都不发。
+test('quoteMedia: false leaves the reply segment as a bare placeholder', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'qq-media-'));
+  const asked = [];
+  const { onebot, host } = await boot({ cwd: root, mediaDir: 'media', quoteMedia: false }, {}, {
+    getMsg: async (params) => {
+      asked.push(params.message_id);
+      return { message: [{ type: 'text', data: { text: '不该被取回来' } }] };
+    },
+  });
+  try {
+    onebot.push(privateMessageWithReply('在吗', '6650'));
+    await until(() => host.list.created[0]?.inbox.length === 1, 'the message to be delivered');
+    assert.equal(host.list.created[0].inbox[0].content[0].text, '[回复]在吗');
+    assert.deepEqual(asked, []);
+  } finally {
+    await onebot.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -1421,6 +1706,303 @@ test('a media directory outside cwd disables the cache', async () => {
   const outcome = await store.resolve({ kind: 'image', url: 'http://127.0.0.1:1/x.png' });
   assert.equal(outcome.path, undefined);
   await rm(mediaRoot, { recursive: true, force: true });
+});
+
+// ---- 表情包 / 发图：工作目录里的图 → QQ --------------------------------------
+// 上面的媒体用例是入站（QQ 的图 → 本地文件），这一组是出站（本地文件/URL → QQ）。
+// 传输走 OneBot image 段的 `base64://`（NapCat 在容器里，本地路径它读不到），
+// 所以这里真正要钉住的是：发出去的确实是一个 image 段，且 base64 解出来是原字节。
+
+/**
+ * 起一个「有表情包」的插件实例：cwd 是新临时目录，里面放一张真 PNG 与一个假图片。
+ * @param config - 插件配置（覆盖默认的 cwd）。
+ */
+async function bootImages(config = {}, hostOptions = {}, onebotOptions = {}) {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-image-'));
+  await mkdir(join(cwd, '.qq-stickers'), { recursive: true });
+  await writeFile(join(cwd, '.qq-stickers', '笑死.png'), TINY_PNG);
+  await writeFile(join(cwd, 'notes.txt'), 'definitely not an image');
+  const booted = await boot({ cwd, ...config }, hostOptions, onebotOptions);
+  return { ...booted, cwd };
+}
+
+test('loadOutgoingImage reads paths inside cwd and URLs, and refuses everything else', async () => {
+  const images = await startImageServer(TINY_PNG);
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-image-'));
+  try {
+    await mkdir(join(cwd, '.qq-stickers'), { recursive: true });
+    await writeFile(join(cwd, '.qq-stickers', '笑死.png'), TINY_PNG);
+    await writeFile(join(cwd, 'notes.txt'), 'definitely not an image');
+
+    const local = await loadOutgoingImage({ source: '.qq-stickers/笑死.png', cwd });
+    assert.equal(local.format, 'png');
+    assert.deepEqual(local.bytes, TINY_PNG);
+    assert.equal(local.label, '.qq-stickers/笑死.png');
+
+    // `file://` 也认，但同样受「必须在工作目录里」的约束。
+    const viaFileUrl = await loadOutgoingImage({ source: pathToFileURL(join(cwd, '.qq-stickers', '笑死.png')).href, cwd });
+    assert.deepEqual(viaFileUrl.bytes, TINY_PNG);
+    assert.equal(viaFileUrl.label, '.qq-stickers/笑死.png');
+
+    // URL：插件自己先下下来（顺便校验格式），而不是把链接原样丢给 NapCat。
+    const url = images.url('/meme.png');
+    const remote = await loadOutgoingImage({ source: url, cwd });
+    assert.equal(remote.format, 'png');
+    assert.deepEqual(remote.bytes, TINY_PNG);
+    assert.equal(remote.label, url);
+    assert.equal(images.hits.length, 1);
+
+    await assert.rejects(() => loadOutgoingImage({ source: '   ', cwd }), /no image given/);
+    await assert.rejects(() => loadOutgoingImage({ source: 'notes.txt', cwd }), /not a PNG\/JPEG\/WebP\/GIF/);
+    await assert.rejects(() => loadOutgoingImage({ source: 'no-such-file.png', cwd }), /not a local file/);
+    await assert.rejects(() => loadOutgoingImage({ source: '../outside.png', cwd }), /inside the working directory/);
+    await assert.rejects(() => loadOutgoingImage({ source: pathToFileURL('/etc/hostname').href, cwd }), /inside the working directory/);
+    await assert.rejects(() => loadOutgoingImage({ source: 'ftp://example.com/a.png', cwd }), /unsupported image source/);
+    await assert.rejects(() => loadOutgoingImage({ source: 'http://127.0.0.1:1/x.png', cwd, timeoutMs: 800 }), /could not download/);
+    await assert.rejects(() => loadOutgoingImage({ source: '.qq-stickers/笑死.png', cwd, maxBytes: 10 }), /larger than 10 bytes/);
+
+    // 段形状：base64 放在 file 里（NapCat 的发送侧按 [url, file, path] 取第一个有值的字段）。
+    const segment = imageSegment(TINY_PNG);
+    assert.equal(segment.type, 'image');
+    assert.match(segment.data.file, /^base64:\/\//);
+    assert.deepEqual(Buffer.from(segment.data.file.slice('base64://'.length), 'base64'), TINY_PNG);
+  } finally {
+    await images.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('qq_send_image sends a sticker to the QQ conversation the calling Agent belongs to', async () => {
+  const { onebot, host } = await bootImages();
+  onebot.push(privateMessage('在吗'));
+  const agent = await until(() => host.list.created[0], 'the conversation Agent');
+
+  const tool = host.tools.get('qq_send_image');
+  assert.ok(tool, 'qq_send_image should be registered');
+  const value = await tool.execute({ image: '.qq-stickers/笑死.png' }, { agent });
+
+  assert.equal(value.target_type, 'private');
+  assert.equal(value.target_id, '100000002');
+  assert.equal(value.format, 'png');
+  assert.equal(value.bytes, TINY_PNG.length);
+  const sent = onebot.calls.find((call) => call.action === 'send_private_msg' && Array.isArray(call.params.message));
+  assert.ok(sent, 'an image message must reach QQ');
+  assert.equal(sent.params.user_id, '100000002');
+  assert.equal(sent.params.message.length, 1);
+  assert.equal(sent.params.message[0].type, 'image');
+  assert.deepEqual(Buffer.from(sent.params.message[0].data.file.replace('base64://', ''), 'base64'), TINY_PNG);
+});
+
+test('qq_send_image can send back a picture the conversation already downloaded', async () => {
+  const images = await startImageServer(TINY_PNG);
+  const { onebot, host } = await bootImages({ mediaDir: 'media' });
+  try {
+    // 「对方发了张表情包」→ 正文里给出落盘路径 → 模型把那张原样发回去。
+    onebot.push(privateMessageWithImage(images.url(), { text: '你看这个' }));
+    const agent = await until(() => host.list.created[0], 'the conversation Agent');
+    // 入队与建 Agent 之间隔着一次下载，所以正文要等它真的进了收件箱。
+    const body = await until(() => agent.inbox[0]?.content[0]?.text, 'the message body to reach the Agent');
+    const path = /\[图片\(动画表情\): ([^\]]+)\]/.exec(body)?.[1];
+    assert.ok(path, body);
+
+    const value = await host.tools.get('qq_send_image').execute({ image: path }, { agent });
+    assert.equal(value.source, path);
+    assert.equal(value.bytes, TINY_PNG.length);
+    const sent = onebot.calls.find((call) => call.action === 'send_private_msg' && Array.isArray(call.params.message));
+    assert.equal(sent.params.message[0].type, 'image');
+  } finally {
+    await onebot.close();
+    await images.close();
+  }
+});
+
+test('qq_send_image needs a target outside a QQ conversation and can post to a group', async () => {
+  const { onebot, host } = await bootImages();
+  const tool = host.tools.get('qq_send_image');
+
+  await assert.rejects(() => tool.execute({ image: '.qq-stickers/笑死.png' }, {}), /target_type and target_id/);
+  const value = await tool.execute({ image: '.qq-stickers/笑死.png', target_type: 'group', target_id: '100000001' }, {});
+  assert.equal(value.target_type, 'group');
+  assert.equal(value.target_id, '100000001');
+  const sent = onebot.calls.find((call) => call.action === 'send_group_msg');
+  assert.equal(sent.params.group_id, '100000001');
+  assert.equal(sent.params.message[0].type, 'image');
+});
+
+test('qq_send_image refuses non-images, oversized files, and paths outside cwd', async () => {
+  const { onebot, host } = await bootImages({ imageMaxBytes: 32 });
+  onebot.push(privateMessage('在吗'));
+  await until(() => host.list.created[0], 'the conversation Agent');
+  const tool = host.tools.get('qq_send_image');
+  const target = { target_type: 'private', target_id: '100000002' };
+
+  await assert.rejects(() => tool.execute({ image: 'notes.txt', ...target }, {}), /not a PNG\/JPEG\/WebP\/GIF/);
+  await assert.rejects(() => tool.execute({ image: '.qq-stickers/笑死.png', ...target }, {}), /larger than 32 bytes/);
+  await assert.rejects(() => tool.execute({ image: '../../etc/hostname', ...target }, {}), /inside the working directory/);
+  // 一张都没发出去：校验全部发生在发消息之前。
+  assert.equal(onebot.calls.some((call) => call.action === 'send_private_msg'), false);
+
+  const off = await bootImages({ imageSend: false });
+  off.onebot.push(privateMessage('在吗'));
+  await until(() => off.host.list.created[0], 'the second Agent');
+  await assert.rejects(() => off.host.tools.get('qq_send_image').execute({ image: '.qq-stickers/笑死.png' }, {}), /imageSend/);
+});
+
+test('the channel prompt offers qq_send_image and lists the sticker pack', async () => {
+  const on = await bootImages();
+  on.onebot.push(privateMessage('在吗'));
+  await until(() => on.host.list.created[0], 'the first Agent');
+  const prompt = promptText(on.host, 'qq-bridge:channel');
+  assert.match(prompt, /qq_send_image/);
+  assert.match(prompt, /\.qq-stickers\/笑死\.png/);
+
+  // 白名单挡掉这个工具时，提示词里一个字都不能再提它。
+  const off = await bootImages(
+    { allowTools: ['read'] },
+    { knownTools: ['qq_send_message', 'qq_send_image', 'qq_list_conversations', 'qq_jm_pdf', 'read'] },
+  );
+  off.onebot.push(privateMessage('在吗'));
+  await until(() => off.host.list.created[0], 'the second Agent');
+  const hidden = promptText(off.host, 'qq-bridge:channel');
+  assert.doesNotMatch(hidden, /qq_send_image/);
+  assert.doesNotMatch(hidden, /笑死\.png/);
+});
+
+test('a sticker directory outside cwd is not advertised', async () => {
+  const { onebot, host } = await bootImages({ stickerDir: '../stickers' });
+  onebot.push(privateMessage('在吗'));
+  await until(() => host.list.created[0], 'the Agent');
+  assert.ok(host.list.warnings.some((line) => line.includes('outside cwd')), host.list.warnings.join('|'));
+  const prompt = promptText(host, 'qq-bridge:channel');
+  // 工具照样在（发工作目录里的图不受影响），但那个读不到的目录不该被列出来。
+  assert.match(prompt, /qq_send_image/);
+  assert.doesNotMatch(prompt, /stickers\//);
+});
+
+// ---- 只发表情：回复正文里的 `[[图片: …]]` 标记 ---------------------------------
+// 工具调用发生在整轮文字之前，而且「一个字都不说」用工具表达不出来（模型总得写点什么）。
+// 所以表情写成正文里的一处标记：位置跟着正文走，整条回复只有这一处时就是一条文字都不发。
+
+test('splitStickerLines turns sticker markers into image pieces and keeps the text order', () => {
+  assert.deepEqual(splitStickerLines(''), []);
+  assert.deepEqual(splitStickerLines('  \n '), []);
+  assert.deepEqual(splitStickerLines('[[图片: a.png]]'), [{ kind: 'image', source: 'a.png', raw: '[[图片: a.png]]' }]);
+  // 关键字写法与全角冒号、空格都认
+  assert.deepEqual(splitStickerLines('[[ 表情包 ： b.gif ]]'), [{ kind: 'image', source: 'b.gif', raw: '[[ 表情包 ： b.gif ]]' }]);
+  // 混在正文里也认，顺序不变
+  assert.deepEqual(splitStickerLines('你好\n[[图片: a.png]]\n再见'), [
+    { kind: 'text', text: '你好' },
+    { kind: 'image', source: 'a.png', raw: '[[图片: a.png]]' },
+    { kind: 'text', text: '再见' },
+  ]);
+  // 认不出来的方括号一律当普通文字：宁可在群里露出这行字，也不要静默吞掉。
+  assert.deepEqual(splitStickerLines('[[图片: ]]'), [{ kind: 'text', text: '[[图片: ]]' }]);
+  assert.deepEqual(splitStickerLines('[[音频: a.mp3]]'), [{ kind: 'text', text: '[[音频: a.mp3]]' }]);
+});
+
+test('a reply that is only a sticker marker sends one image and no text at all', async () => {
+  // humanize 不该影响这件事：拆条拆的是文字，表情本来就只有一条。
+  for (const humanize of [true, false]) {
+    const { onebot, host } = await bootImages({ humanize });
+    onebot.push(privateMessage('在吗'));
+    const agent = await until(() => host.list.created[0], 'the Agent');
+
+    completeTurn(host, agent, '[[图片: .qq-stickers/笑死.png]]');
+    const sent = await until(
+      () => onebot.calls.find((call) => call.action === 'send_private_msg' && Array.isArray(call.params.message)),
+      'the sticker to reach QQ',
+    );
+    assert.equal(sent.params.user_id, '100000002');
+    assert.equal(sent.params.message.length, 1);
+    assert.equal(sent.params.message[0].type, 'image');
+    assert.deepEqual(Buffer.from(sent.params.message[0].data.file.replace('base64://', ''), 'base64'), TINY_PNG);
+    // 一条文字都没有：整轮只发了这一条。
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(onebot.calls.filter((call) => call.action === 'send_private_msg').length, 1);
+    await onebot.close();
+  }
+});
+
+test('a sticker written as a bare file name is found in the sticker directory', async () => {
+  // 提示词里给的是 `.qq-stickers/笑死.png`，但模型很可能只写 `笑死` 或 `笑死.png`。
+  // 落空的话群里只会看到一句「表情包没发出去」，所以裸文件名先在表情包目录里找。
+  for (const source of ['笑死', '笑死.png', '.qq-stickers/笑死.png']) {
+    const { onebot, host } = await bootImages();
+    onebot.push(privateMessage('在吗'));
+    const agent = await until(() => host.list.created[0], 'the Agent');
+
+    completeTurn(host, agent, `[[图片: ${source}]]`);
+    const sent = await until(
+      () => onebot.calls.find((call) => call.action === 'send_private_msg' && Array.isArray(call.params.message)),
+      `the sticker written as ${source} to reach QQ`,
+    );
+    assert.equal(sent.params.message[0].type, 'image');
+    assert.equal(onebot.calls.filter((call) => call.action === 'send_private_msg' && typeof call.params.message === 'string').length, 0);
+    // 工具那边同一套解析。
+    const viaTool = await host.tools.get('qq_send_image').execute({ image: source }, { agent });
+    assert.equal(viaTool.source, '.qq-stickers/笑死.png');
+    await onebot.close();
+  }
+});
+
+test('a sticker marker inside a reply keeps its place between the text parts', async () => {
+  const { onebot, host } = await bootImages();
+  onebot.push(privateMessage('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+
+  completeTurn(host, agent, '先说我一句\n[[图片: .qq-stickers/笑死.png]]\n再补一句');
+  const calls = await until(() => {
+    const sent = onebot.calls.filter((call) => call.action === 'send_private_msg');
+    return sent.length >= 3 ? sent : undefined;
+  }, 'the three messages');
+  assert.equal(calls[0].params.message, '先说我一句');
+  assert.equal(calls[1].params.message[0].type, 'image');
+  assert.equal(calls[2].params.message, '再补一句');
+});
+
+test('a group sticker-only reply still carries the reply target, on the image itself', async () => {
+  const { onebot, host } = await bootImages({ replyStyle: 'quote' }, {}, {});
+  onebot.push(mention('来一张'));
+  const agent = await until(() => host.list.created[0], 'the group Agent');
+
+  completeTurn(host, agent, '[[图片: .qq-stickers/笑死.png]]');
+  const sent = await until(() => onebot.calls.find((call) => call.action === 'send_group_msg'), 'the group message');
+  assert.equal(sent.params.message[0].type, 'reply');
+  assert.equal(sent.params.message[0].data.id, '7000');
+  assert.equal(sent.params.message[1].type, 'image');
+});
+
+test('a sticker that cannot be sent says so instead of going silent', async () => {
+  const { onebot, host } = await bootImages();
+  onebot.push(privateMessage('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+
+  completeTurn(host, agent, '[[图片: .qq-stickers/nope.png]]');
+  const sent = await until(
+    () => sentTexts(onebot, 'send_private_msg').find((text) => text.includes('表情包没发出去')),
+    'the notice to reach QQ',
+  );
+  assert.match(sent, /表情包没发出去/);
+  // 一张图都没发出去。
+  assert.equal(onebot.calls.some((call) => Array.isArray(call.params.message)), false);
+  assert.ok(host.list.warnings.some((line) => line.includes('nope.png')), host.list.warnings.join('|'));
+});
+
+test('the marker stays literal text when image sending is off or whitelisted away', async () => {
+  const cases = [
+    { config: { imageSend: false }, hostOptions: {} },
+    { config: { allowTools: ['read'] }, hostOptions: { knownTools: ['qq_send_image', 'read'] } },
+  ];
+  for (const { config, hostOptions } of cases) {
+    const { onebot, host } = await bootImages(config, hostOptions);
+    onebot.push(privateMessage('在吗'));
+    const agent = await until(() => host.list.created[0], 'the Agent');
+    completeTurn(host, agent, '[[图片: .qq-stickers/笑死.png]]');
+    const text = await until(() => sentTexts(onebot, 'send_private_msg')[0], 'the literal line');
+    assert.equal(text, '[[图片: .qq-stickers/笑死.png]]');
+    assert.equal(onebot.calls.some((call) => Array.isArray(call.params.message)), false);
+    assert.doesNotMatch(promptText(host, 'qq-bridge:channel'), /\[\[图片/);
+  }
 });
 
 // ---- 禁漫（JM）下载 → PDF → 发到 QQ -----------------------------------------

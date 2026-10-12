@@ -102,6 +102,54 @@ function reasonOf(error) {
 }
 
 /**
+ * 按 HTTP(S) 下载字节：边收边算大小，超限立刻中止，超时直接放弃。
+ *
+ * 入站落盘（`createMediaStore`）与出站发图（`image.js`）共用这一份 ——
+ * 「怎么把一个 URL 变成有上限的字节」只该有一种答案，两边的上限语义才不会有出入。
+ * @param url - http / https 链接。
+ * @param options - `{ maxBytes, timeoutMs, fetchImpl }`；缺省即模块默认。
+ * @returns 完整字节。
+ * @throws 非法 URL、非 http(s)、HTTP 错误、空响应体、超时或超限时抛错。
+ */
+export async function fetchBytes(url, { maxBytes = DEFAULTS.maxBytes, timeoutMs = DEFAULTS.timeoutMs, fetchImpl = globalThis.fetch } = {}) {
+  const byteCap = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : DEFAULTS.maxBytes;
+  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) : DEFAULTS.timeoutMs;
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`not a valid URL: ${String(url).slice(0, 60)}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error(`unsupported URL scheme ${parsed.protocol}`);
+  if (typeof fetchImpl !== 'function') throw new Error('no fetch implementation available');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`timed out after ${timeout}ms`)), timeout);
+  timer.unref?.();
+  try {
+    const response = await fetchImpl(parsed.href, { redirect: 'follow', signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const declared = Number(response.headers?.get?.('content-length'));
+    if (Number.isFinite(declared) && declared > byteCap) throw new Error(`too large (${declared} bytes)`);
+    if (response.body === null || response.body === undefined) throw new Error('empty response body');
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of response.body) {
+      const bytes = Buffer.from(chunk);
+      total += bytes.length;
+      if (total > byteCap) {
+        controller.abort(new Error('too large'));
+        throw new Error(`larger than ${byteCap} bytes`);
+      }
+      chunks.push(bytes);
+    }
+    if (total === 0) throw new Error('empty response body');
+    return Buffer.concat(chunks);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * 解析 `base64://…`、`data:image/png;base64,…` 或裸 base64。
  * @param text - OneBot 给的 base64 字段。
  * @returns 解码后的字节；明显不是 base64 时 undefined。
@@ -166,41 +214,9 @@ export function createMediaStore({
     return relative(root, target).split(sep).join('/');
   }
 
-  /** 从 HTTP(S) 下载，边收边算大小，超限立刻中止。 */
-  async function download(url) {
-    let parsed;
-    try {
-      parsed = new URL(url);
-    } catch {
-      throw new Error(`not a valid URL: ${url.slice(0, 60)}`);
-    }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error(`unsupported URL scheme ${parsed.protocol}`);
-    if (typeof fetchImpl !== 'function') throw new Error('no fetch implementation available');
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error(`timed out after ${timeout}ms`)), timeout);
-    timer.unref?.();
-    try {
-      const response = await fetchImpl(parsed.href, { redirect: 'follow', signal: controller.signal });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const declared = Number(response.headers?.get?.('content-length'));
-      if (Number.isFinite(declared) && declared > byteCap) throw new Error(`too large (${declared} bytes)`);
-      if (response.body === null || response.body === undefined) throw new Error('empty response body');
-      const chunks = [];
-      let total = 0;
-      for await (const chunk of response.body) {
-        const bytes = Buffer.from(chunk);
-        total += bytes.length;
-        if (total > byteCap) {
-          controller.abort(new Error('too large'));
-          throw new Error(`larger than ${byteCap} bytes`);
-        }
-        chunks.push(bytes);
-      }
-      if (total === 0) throw new Error('empty response body');
-      return Buffer.concat(chunks);
-    } finally {
-      clearTimeout(timer);
-    }
+  /** 从 HTTP(S) 下载，边收边算大小，超限立刻中止（上限与超时取自本 store 的配置）。 */
+  function download(url) {
+    return fetchBytes(url, { maxBytes: byteCap, timeoutMs: timeout, fetchImpl });
   }
 
   /** 读本机上已经存在的文件（共享卷、`disableGetUrl` 给的本地路径、`file://`）。 */

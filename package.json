@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Bidirectional QQ (OneBot v11) bridge: QQ messages drive Harness agents, any agent can send QQ messages, and JM comics can be downloaded as PDFs straight into a chat.",
+  "description": "Bidirectional QQ (OneBot v11) bridge: QQ messages drive Harness agents, any agent can send QQ messages, images and stickers, and JM comics can be downloaded as PDFs straight into a chat.",
   "exports": {
     ".": "./index.js",
     "./package.json": "./package.json",
     "./jm.js": "./jm.js",
+    "./image.js": "./image.js",
     "./locale/*.json": "./locale/*.json"
   },
   "icon": "./icon.svg",
@@ -15,6 +16,7 @@
     "index.js",
     "onebot.js",
     "media.js",
+    "image.js",
     "jm.js",
     "cordis.patch.yml",
     "icon.svg",
