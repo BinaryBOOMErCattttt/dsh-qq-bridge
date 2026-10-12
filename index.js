@@ -175,17 +175,15 @@ export const Config = z.object({
   jmFilePort: z.number().default(0).description('给 NapCat 用的 HTTP 文件服务端口；0 = 由系统分配'),
   jmUrlTtlMs: z.number().default(10 * 60 * 1000).description('交给 NapCat 的一次性下载 URL 有效期（毫秒）'),
   // ---- 长期记忆：聊天记录落盘 + 定时摘要 + 认知库（见 README「长期记忆」）----
-  memory: z.boolean().default(true).description('是否启用长期记忆：把聊天记录写进 memoryDir、按 digestIntervalMs 定时让一个专用「摘要 Agent」写成摘要与认知，并提供 qq_transcript / qq_memory 工具（配套 skill 在 .dsh/skills/ 里）'),
+  memory: z.boolean().default(true).description('是否启用长期记忆：把聊天记录写进 memoryDir、每天在 digestAtHour 点让一个专用「摘要 Agent」写成摘要与认知，并提供 qq_transcript / qq_memory 工具（配套 skill 在 .dsh/skills/ 里）'),
   memoryDir: z.string().default('.qq-memory').description('长期记忆目录，相对 cwd（必须落在 cwd 内）：聊天记录、摘要、认知库都在这里；同时充当 qq_memory / qq_transcript 的写入边界'),
   memoryFileMaxBytes: z.number().default(32768).description('单个记忆文件的字节上限：超过时 qq_memory 的 write 会报错，append 也只按剩余空间写入，逼着摘要 Agent 保持精炼'),
   memorySearchHits: z.number().default(40).description('qq_transcript / qq_memory 一次 search 最多返回多少条命中'),
-  digestIntervalMs: z.number().default(30 * 60 * 1000).description('多久检查一次「有没有新聊天值得摘要」（毫秒）；单个会话两次摘要之间至少间隔 digestMinIntervalMs'),
-  digestMinIntervalMs: z.number().default(6 * 60 * 60 * 1000).description('同一个会话两次摘要之间的最短间隔（毫秒）：防止一个活跃的群每半小时就被摘要一遍'),
-  digestMinLines: z.number().default(20).description('攒够多少条新消息才值得为这个会话跑一次摘要：不够就留到下一轮，避免为零星几句花费一次模型调用'),
+  digestAtHour: z.number().default(4).description('每天几点做长期记忆的摘要（本地时间，0~23）：默认凌晨 4 点，群里没人说话的时候。同一个会话**一天至多摘要一次**（靠记忆目录里记的日期，重启也不会重复）；没有新消息的会话直接跳过'),
+  digestMinLines: z.number().default(20).description('当天攒够多少条新消息才值得为这个会话跑一次摘要：不够就留到明天，避免为零星几句花费一次模型调用（首次摘要不受此限）'),
   digestMaxChars: z.number().default(24000).description('一次摘要最多把多少字符的聊天记录喂给摘要 Agent：超出部分按最近优先截断（更早的内容留给上一次摘要）'),
   digestTimeoutMs: z.number().default(10 * 60 * 1000).description('单次摘要的硬超时（毫秒）：超时就把摘要 Agent 销毁（下次重开一个），避免一个卡住的 turn 让摘要永远不再发生'),
-  digestCooldownMs: z.number().default(30 * 60 * 1000).description('消息条数没攒够（digestMinLines）时的重试冷却（毫秒）：避免每隔一个 digestIntervalMs 就为一个安静的群白跑一次调度'),
-  digestCatchUp: z.boolean().default(true).description('启动时是否补一次：上一条摘要之后再没人说过话的会话跳过，有积压的立刻摘要一遍，不用等一个 digestIntervalMs'),
+  digestCatchUp: z.boolean().default(true).description('是否补课：如果今天的摘要点已经过了、而某个会话在重启之后才有人说话（或者摘要那一刻进程正在重启），它一开口就补一次摘要，不用等到明天；关掉则只在 digestAtHour 点摘要'),
 });
 
 /**
@@ -277,6 +275,42 @@ function localDate(at = Date.now()) {
   const date = new Date(at);
   const pad = (value) => String(value).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/**
+ * 本地日期时间（`YYYY-MM-DD HH:MM:SS`）：转录输出与日志里统一用它。
+ *
+ * 与 {@link localDate} 一样刻意用**本地时间** —— 「上一次摘要是昨天还是今天」这件事
+ * 必须按人所在地的日界线算，否则东八区的凌晨 4 点会被算成前一天的 UTC。
+ * @param at - 毫秒时间戳。
+ * @returns 本地时间戳字符串。
+ */
+function localStamp(at) {
+  const date = new Date(Number(at) || Date.now());
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/**
+ * 计算「下一个每天 `hour` 点」距今多少毫秒。
+ *
+ * 定时摘要只在每天固定的一个时刻醒来，所以间隔不是常数：醒来一次之后必须重新算到
+ * 明天的那个点。跨过夏令时/时区变更时以本地时间为准（差一小时无所谓，摘要不是列车
+ * 时刻表），但**刚过点时必须排到明天**，否则会在同一个点上反复醒来。
+ * @param hour - 本地小时（0~23）。
+ * @param now - 当前时刻（毫秒），测试里可注入。
+ * @returns 距下一次触发点的毫秒数，至少 1 秒。
+ */
+function msUntilDailyHour(hour, now = Date.now()) {
+  const next = new Date(now);
+  next.setHours(hour, 0, 0, 0);
+  if (next.getTime() <= now) next.setDate(next.getDate() + 1);
+  return Math.max(1000, next.getTime() - now);
+}
+
+/** 本地 `HH:00`：日志与报错里描述触发点的写法。 */
+function hourLabel(hour) {
+  return `${String(hour).padStart(2, '0')}:00`;
 }
 
 /** 把一行记忆里的换行折掉：记忆是「一行一条事实」，格式被换行破坏就没法读了。 */
@@ -604,14 +638,21 @@ export function apply(ctx, config) {
   /**
    * 会话 key → 上一次成功摘要的时间戳。
    *
-   * 启动时从 `digest.json` 预读进内存，之后每次摘要就地更新：`runDigestSweep` 是
-   * 定时器回调（每 `digestIntervalMs` 一次），不该每次都去磁盘上读一遍状态。
+   * 启动时从 `digest.json` 预读进内存，之后每次摘要就地更新：它既是转录窗口的起点，
+   * 也是「今天这条会话摘要过没有」的判据（见 `runDigestSweep`），而 `runDigestSweep`
+   * 是定时器回调（每天 `digestAtHour` 点一次），不该每次都去磁盘上读一遍状态。
    */
   const memoryLastDigest = new Map();
   /** 记忆文件的写盘队列（每个文件一条串行链，见 writeMemoryFile）。 */
   const memoryWrites = new Map();
-  /** 定时器句柄：插件卸载时由 ctx.effect 收走。 */
-  let digestTimerDisposer;
+  /** 这次启动是否已经跑过一轮「补课」摘要（见 maybeCatchUpDigest）。 */
+  let digestCatchUpKicked = false;
+
+  /** 摘要点（本地小时，0~23）：配置非法时退回 4 点。 */
+  function digestAtHour() {
+    const raw = Math.floor(Number(config.digestAtHour));
+    return Number.isFinite(raw) ? Math.min(23, Math.max(0, raw)) : 4;
+  }
   /** 摘要 Agent 的会话 id（确定性派生，重启后 resume，摘要历史不会断）。 */
   const digestSessionId = sessionIdFor('bridge:digest');
   /** 摘要任务的串行链：一次只跑一个会话，也不与自己的下一轮重叠。 */
@@ -649,6 +690,23 @@ export function apply(ctx, config) {
   /** 索引片段与认知库的绝对路径（两者都在记忆目录顶层）。 */
   const memoryIndexFile = memoryEnabled ? join(memoryRoot, 'INDEX.md') : undefined;
   const memoryCognitionFile = memoryEnabled ? join(memoryRoot, 'COGNITION.md') : undefined;
+
+  /**
+   * 某个目录下已经排队的转录写入（用来在**读**之前把写等干净）。
+   *
+   * 读转录的两条路（摘要、`qq_transcript`）都可能紧跟在一条消息后面发生，而写入是
+   * 后台排队的 —— 这里把在飞的 Promise 交出去，调用方 `await` 一下就得到「写完了」
+   * 这个确定状态。
+   * @param dir - 转录目录的绝对路径（以分隔符结尾）。
+   * @returns 该目录下所有未完成的写入 Promise。
+   */
+  function writesFor(dir) {
+    const pending = [];
+    for (const [file, promise] of memoryWrites) {
+      if (file.startsWith(dir)) pending.push(promise);
+    }
+    return pending;
+  }
 
   /**
    * 把聊天记录按会话串行追加到当天转录里（qq_transcript 的原料）。
@@ -755,14 +813,38 @@ export function apply(ctx, config) {
       return;
     }
     write(admitted.conversation.key, {}, admitted.conversation);
+    // 顺手看一眼这个会话是不是「本该在今天的摘要点被摘要、却错过了」—— 比如凌晨 4 点
+    // 那一刻进程正好在重启，或者这个会话是重启之后才有人说话的（启动时的补课扫不到它：
+    // 那时 conversations 还是空的）。判据由 cd 时间决定，所以一天最多补一次。
+    maybeCatchUpDigest(admitted.conversation);
   }
 
   /**
-   * 读 `/workspace/.qq-memory/digest.json`：每个会话上一次成功摘要的时间与当时的日期。
+   * 「今天已经过了摘要点、但这个会话今天还没摘要过」时补一次。
+   *
+   * 为什么不能只在启动时扫一遍：`conversations` 是运行时状态（重启即空），凌晨重启后
+   * 第一个说话的人才是这条会话「重新出现」的时刻 —— 补课必须挂在这个时刻上，
+   * 否则那一天的记忆要等到明天的 4:00。
+   * @param conversation - 刚收到消息的会话。
+   */
+  function maybeCatchUpDigest(conversation) {
+    if (!memoryEnabled || config.digestCatchUp === false) return;
+    const atHour = digestAtHour();
+    const now = new Date();
+    if (now.getHours() < atHour) return; // 今天还没到点，等定时器
+    const last = memoryLastDigest.get(conversation.key) ?? 0;
+    if (last > 0 && localDate(last) === localDate(now.getTime())) return; // 今天摘要过了
+    if (digestCatchUpKicked) return; // 一次启动只补一轮，别变成每条消息扫一遍
+    digestCatchUpKicked = true;
+    runDigestSweep();
+  }
+
+  /**
+   * 读记忆目录里的 `digest.json`：每个会话上一次成功摘要的时间与日期。
    *
    * 放在磁盘上而不是内存里，是为了让「本该摘要但进程重启了」不会把那批消息算丢：
-   * 重启后 `lastDigestAt` 还是旧值，积压会被认出来并补一次。
-   * @returns `{ conversations: { <key>: { lastDigestAt, lastAttemptAt } } }`。
+   * 重启后 `lastDigestAt` 还是旧值，日期判据认得出「今天还没摘要」，于是补一次。
+   * @returns `{ conversations: { <key>: { lastDigestAt, lastDigestDate, lastLines, lastLabel } } }`。
    */
   async function readDigestState() {
     const text = await readTextOrUndefined(join(memoryRoot, 'digest.json'));
@@ -1098,13 +1180,6 @@ export function apply(ctx, config) {
     return `${line.at ?? ''} ${tag}${line.user ?? '?'}: ${line.text ?? ''}`.trim();
   }
 
-  /** 本地时间戳 `YYYY-MM-DD HH:MM:SS`，转录输出里统一用它。 */
-  function localStamp(at) {
-    const date = new Date(Number(at) || Date.now());
-    const pad = (value) => String(value).padStart(2, '0');
-    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-  }
-
   /** 转录工具共享的参数上限。 */
   function transcriptLimit(raw, fallback) {
     const value = Math.floor(Number(raw) || 0);
@@ -1370,41 +1445,36 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 扫描所有会话，把「值得摘要」的排进串行队列。
+   * 扫描所有会话，把「今天该摘要」的排进串行队列。
    *
-   * 判据是两条（都要满足）：距上次摘要超过 `digestMinIntervalMs`，且攒下的新消息
-   * 不少于 `digestMinLines`。前者防止活跃群被反复摘要，后者防止为两三句话白跑一次
-   * 模型调用 —— 没攒够就留到下一轮，消息不会丢。
+   * 每天在 `digestAtHour` 点醒一次，所以判据不是「距上次多久」而是**日期**：这条会话
+   * 今天已经摘要过就跳过（记在 `digest.json` 里的日期，重启也不会在同一天重复摘要，
+   * 比「距上次 ≥ N 小时」稳）。外加一条 `digestMinLines`：今天没攒够新消息就留到明天
+   * —— 为一两句话白跑一次模型调用不值得，消息也不会丢（dirty 计数按天累加）。
    */
   function runDigestSweep() {
     if (!memoryEnabled) return;
     digestChain = digestChain
       .then(async () => {
-        const state = await readDigestState();
-        const now = Date.now();
-        const minInterval = Math.max(0, Math.floor(Number(config.digestMinIntervalMs) || 0));
+        // 状态都不必现读磁盘：`memoryLastDigest` 在启动时从 `digest.json` 预热、每次
+        // 摘要成功后就地更新；`memoryDirty` 是本进程攒的计数（重启归零，靠日期重新算）。
+        const today = localDate();
         const minLines = Math.max(1, Math.floor(Number(config.digestMinLines) || 1));
-        const cooldown = Math.max(0, Math.floor(Number(config.digestCooldownMs) || 0));
         const queue = [];
-        let touched = false;
         for (const conversation of conversations.values()) {
           if (digestQueued.has(conversation.key)) continue;
-          const entry = state.conversations[conversation.key] ?? {};
           const lastDigestAt = memoryLastDigest.get(conversation.key) ?? 0;
-          if (now - lastDigestAt < minInterval) continue;
+          // 今天已经摘要过：同一个会话一天至多一次。
+          if (lastDigestAt > 0 && localDate(lastDigestAt) === today) continue;
           const dirty = memoryDirty.get(conversation.key) ?? 0;
-          if (dirty < minLines) {
-            // 还没攒够：记一次尝试时间当作冷却锚点，免得每 digestIntervalMs 都白扫一遍。
-            const lastAttempt = Number(entry.lastAttemptAt) || 0;
-            if (lastDigestAt > 0 && now - lastAttempt < cooldown) continue;            state.conversations[conversation.key] = { ...entry, lastAttemptAt: now };
-            touched = true;
-            continue;
-          }
+          // 攒够新消息才值得跑一次模型调用：没攒够就留到明天，消息不会丢
+          // （dirty 计数一直累加，明天的窗口里还是它们）。
+          if (dirty < minLines) continue;
           queue.push({ conversation, since: lastDigestAt });
         }
-        if (touched) await writeDigestState(state);
         for (const item of queue) {
-          // 排进队列这一刻就把 dirty 清零：这一轮之后无论成败，都不该把同一批消息再喂一遍。
+          // 排进队列这一刻就把 dirty 清零：这一轮之后无论成败，都不该把同一批消息再喂一遍
+          // （失败的时间戳不会推进，明天的摘要会把它们连同新消息一起补上）。
           memoryDirty.set(item.conversation.key, 0);
           void enqueueDigest(item.conversation, item.since);
         }
@@ -1424,6 +1494,10 @@ export function apply(ctx, config) {
     digestChain = digestChain
       .then(async () => {
         const paths = memoryPaths(conversation.key);
+        // 先把已经排队的转录落盘等干净：转录是**后台**追加的（不挡事件热路径），而
+        // 「补课」这条路是收到消息后立刻触发的 —— 不等的话会读到一个还没写出来的日志
+        // 目录，摘要就被静默跳过了（消息不会丢，但要等到明天的摘要点）。
+        await Promise.all(writesFor(paths.logDir));
         const files = (await readdirOrEmpty(paths.logDir)).filter((name) => name.endsWith('.jsonl')).sort();
         // 多读一天：跨越午夜时「今天」和「昨天」两个文件都要，靠 at 时间戳再筛一次。
         const cutoff = since > 0 ? since - 24 * 60 * 60 * 1000 : 0;
@@ -1459,10 +1533,14 @@ export function apply(ctx, config) {
           instruction,
         });
         const state = await readDigestState();
-        memoryLastDigest.set(conversation.key, Date.now());
+        const finishedAt = Date.now();
+        memoryLastDigest.set(conversation.key, finishedAt);
         state.conversations[conversation.key] = {
           ...(state.conversations[conversation.key] ?? {}),
-          lastDigestAt: Date.now(),
+          // `at` 与 `date` 都要写：`date` 是「今天摘要过没有」的判据（本地日界线），
+          // `at` 是转录窗口的起点。两份都在，读的时候就不必再换算时区。
+          lastDigestAt: finishedAt,
+          lastDigestDate: localDate(finishedAt),
           lastLines: window.length,
           lastLabel: label,
         };
@@ -3662,28 +3740,11 @@ export function apply(ctx, config) {
 
   // ---- 长期记忆：定时摘要的生命周期 -------------------------------------------
   //
-  // 用 `ctx.timeout` / `ctx.interval`（dsh-base 的 timer 服务）而不是裸 setInterval：
-  // 定时器挂在当前 fiber 上，插件卸载时自动清掉，不会留下一个还在跑的摘要循环。
-  // 测试用的 Host 桩没有 timer 服务，所以有裸 setInterval 的退路。
+  // 用 `ctx.interval`（dsh-base 的 timer 服务）而不是裸 setInterval：定时器挂在当前
+  // fiber 上，插件卸载时自动清掉，不会留下一个还在跑的摘要循环。测试用的 Host 桩
+  // 没有 timer 服务，所以有裸 setInterval 的退路。
   if (memoryEnabled) {
-    // 启动补课 + 预热：把落盘的摘要时间读进内存，然后（可选）立刻扫一遍。
-    // 不这么做的话，`digestIntervalMs` 可能长达半小时，重启后刚发过言的群要等一轮。
-    if (config.digestCatchUp !== false) {
-      void (async () => {
-        try {
-          const state = await readDigestState();
-          for (const [key, entry] of Object.entries(state.conversations)) {
-            const at = Number(entry?.lastDigestAt) || 0;
-            if (at > 0) memoryLastDigest.set(key, at);
-          }
-          report('info', `memory: ${memoryLastDigest.size} conversation(s) with a previous digest`);
-          runDigestSweep();
-        } catch (error) {
-          report('warn', `could not load digest state: ${errorText(error)}`);
-        }
-      })();
-    }
-    const every = Math.max(60 * 1000, Math.floor(Number(config.digestIntervalMs) || 0));
+    const atHour = digestAtHour();
     const tick = () => {
       try {
         runDigestSweep();
@@ -3691,19 +3752,51 @@ export function apply(ctx, config) {
         report('warn', `digest sweep threw: ${errorText(error)}`);
       }
     };
-    ctx.effect(() => {
-      if (typeof ctx.interval === 'function') {
-        digestTimerDisposer = ctx.interval(tick, every);
-        return () => {
-          digestTimerDisposer?.();
-          digestTimerDisposer = undefined;
-        };
+    // 预热：把落盘的摘要时间读进内存，`runDigestSweep` 才能判断「今天这条会话摘要过没有」。
+    // 注意**不**在这里立刻扫一遍：`conversations` 是运行时状态，此刻还是空的，扫也扫不到
+    // 任何东西。真正需要补的那次由 `maybeCatchUpDigest` 在第一条消息到达时触发。
+    void (async () => {
+      try {
+        const state = await readDigestState();
+        for (const [key, entry] of Object.entries(state.conversations)) {
+          const at = Number(entry?.lastDigestAt) || 0;
+          if (at > 0) memoryLastDigest.set(key, at);
+        }
+        report('info', `memory: ${memoryLastDigest.size} conversation(s) with a previous digest`);
+      } catch (error) {
+        report('warn', `could not load digest state: ${errorText(error)}`);
       }
-      const handle = setInterval(tick, every);
-      handle.unref?.();
-      return () => clearInterval(handle);
+    })();
+    let digestTimerDisposer;
+    ctx.effect(() => {
+      // 每天醒一次，醒来跑完摘要再排下一次：每次算的都是「距离下一个整点还有多久」，
+      // 所以刚过点时会排到明天，不会在同一个点上反复醒。
+      const schedule = () => {
+        const wait = msUntilDailyHour(atHour);
+        if (typeof ctx.interval === 'function') {
+          digestTimerDisposer = ctx.interval(() => {
+            digestTimerDisposer?.();
+            tick();
+            schedule();
+          }, wait);
+          return;
+        }
+        // 没有 timer 服务（例如测试桩或最小组合）时退回裸定时器：同样是「跑完再排」，
+        // 不是固定周期。
+        const handle = setTimeout(() => {
+          tick();
+          schedule();
+        }, wait);
+        handle.unref?.();
+        digestTimerDisposer = () => clearTimeout(handle);
+      };
+      schedule();
+      return () => {
+        digestTimerDisposer?.();
+        digestTimerDisposer = undefined;
+      };
     }, 'qq-bridge:memory-digest');
-    report('info', `memory enabled at ${memoryLabel} (digest every ${Math.round(every / 60000)}min, min ${Math.round(Math.max(0, Number(config.digestMinIntervalMs) || 0) / 60000)}min between digests per conversation)`);
+    report('info', `memory enabled at ${memoryLabel} (daily digest at ${hourLabel(atHour)}; a conversation needs ${Math.max(1, Math.floor(Number(config.digestMinLines) || 1))} new lines, once a day)`);
   }
 
   // 表情包目录：启动时确保它存在 —— 「往里丢几张图就能用」比「先读文档建目录」友好。

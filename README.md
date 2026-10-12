@@ -91,13 +91,11 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | `memoryDir` | `.qq-memory` | 长期记忆目录，相对 `cwd`；必须落在 `cwd` 内，否则整个功能记 warn 并停用 |
 | `memoryFileMaxBytes` | `32768` | 单个记忆文件的字节上限：超了 `qq_memory` 的 append 会报错、逼着摘要重写得更精炼 |
 | `memorySearchHits` | `40` | `qq_memory` / `qq_transcript` 一次 search 最多返回多少条命中 |
-| `digestIntervalMs` | `1800000` | 每 30 分钟检查一次有没有新聊天值得摘要（毫秒） |
-| `digestMinIntervalMs` | `21600000` | 同一个会话两次摘要之间的最短间隔（默认 6 小时） |
-| `digestMinLines` | `20` | 至少攒够多少条新消息才值得跑一次摘要；不够就留到下一轮 |
+| `digestAtHour` | `4` | 每天几点做摘要（本地时间，0~23）：默认凌晨 4 点，群里没人说话的时候 |
+| `digestMinLines` | `20` | 当天至少攒够多少条新消息才值得跑一次摘要；不够就留到明天 |
 | `digestMaxChars` | `24000` | 一次摘要最多喂给摘要 Agent 多少字符（超出按最近优先截断） |
 | `digestTimeoutMs` | `600000` | 单次摘要的硬超时；卡住的摘要 Agent 会被销毁，下次重开 |
-| `digestCooldownMs` | `1800000` | 「还没攒够」时的重试冷却，避免每轮都为安静的群白扫一遍 |
-| `digestCatchUp` | `true` | 启动时补一次：有积压的会话立刻摘要，不用等第一个 `digestIntervalMs` |
+| `digestCatchUp` | `true` | 错过摘要点（那一刻进程在重启、或会话是之后才有人说话的）时，一开口就补一次，不用等到明天 |
 
 ## 像真实群友一样说话
 
@@ -599,7 +597,7 @@ rm -rf ~/Projects/qqbot/.qq-jm             # 手动清
 ```
 QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写，不经过模型
                  │
-                 │  每 digestIntervalMs 扫一遍：这个会话攒够 digestMinLines 条了吗？
+                 │  每天 digestAtHour（默认 04:00）醒一次：这个会话今天攒够了吗？
                  ▼
             独立「摘要会话」（qq_memory + qq_transcript + skill）
                  │  按 message-digest skill 读转录、写记忆
@@ -623,7 +621,7 @@ QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写�
 | `conversations/<slug>/MEMORY.md` | 摘要 Agent | 这个会话的长期记忆（人、约定、偏好、在追的东西） |
 | `COGNITION.md` | 摘要 Agent / 聊天中的模型 | 跨会话的公共认知：梗、黑话、表情包含义 |
 | `INDEX.md` | 摘要 Agent | 「去哪里找什么」的短索引，每次提示词都注入 |
-| `digest.json` | 插件 | 摘要进度（上次摘要时间），重启后据此补课 |
+| `digest.json` | 插件 | 摘要进度（上次摘要时间 + **本地日期**），重启后据此补课、并保证一天至多摘要一次 |
 
 `<slug>` 是会话 key 去掉冒号：`group:100000001` → `group-100000001`。
 
@@ -632,12 +630,16 @@ QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写�
 
 ### 定时摘要怎么跑
 
-- 插件用 `ctx.interval`（dsh-base 的 timer 服务）每 `digestIntervalMs` 扫一遍，
-  判据是两条**都**满足：距上次摘要超过 `digestMinIntervalMs`、且攒下的新消息
-  ≥ `digestMinLines`。前者防止活跃的群被反复摘要，后者防止为两三句话白跑一次模型。
-- 判定的结果记在 `digest.json` 里，所以**重启不丢**：重启后会认出积压并补一次
-  （`digestCatchUp`）。新会话头一次摘要时 `digestMinLines` 不设防（不然一个刚建的小群
-  永远等不到第一次）。
+- **每天在 `digestAtHour`（默认凌晨 4:00，本地时间）醒一次**，醒来先跑摘要、再把下一次
+  排到明天的同一个整点。挑凌晨是因为那时群里没人说话；每天一次也就意味着一个会话
+  **一天至多摘要一次** —— 这条判据是「`digest.json` 里记的日期」（本地日界线），
+  所以白天重启、重复启动都不会在同一天把同一个会话摘要两遍。
+- 醒来后逐会话问两个问题：**今天摘要过吗**（日期判据）、**今天攒够 `digestMinLines`
+  条新消息了吗**。攒不够就留到明天 —— 消息不会丢（计数一直累加），只是不为两三句话
+  白跑一次模型调用。
+- **错过就补课**（`digestCatchUp`）：如果摘要点那一刻进程正好在重启，或者这个会话是
+  重启之后才有人说话的，那么它**一开口就补一次**，而不是等到明天。补课每次启动只跑
+  一轮，不是每条消息一轮。
 - 摘要在**独立会话**里跑（session id 由 `bridge:digest` 确定性派生）：它没有人格、
   不挂在任何 QQ 会话上、输出**不会**发到 QQ。它拿到的正文就是这段时间的转录，
   并被告知要处理哪个会话。
@@ -696,8 +698,12 @@ journalctl --user -u qqbot -f | grep 'qq-bridge: digest'        # 摘要开始 /
 journalctl --user -u qqbot | grep 'qq-bridge: memory'           # 目录、定时器、启动补课
 ```
 
-- **不摘要**：先看 `digestMinLines` / `digestMinIntervalMs`，再看 journal 里的
-  `qq-bridge: digest` 行 —— 每次真的跑摘要都会打一行「digest <key>: N/M lines」。
+- **不摘要**：先看 `digestAtHour`（默认 4 点，别在下午找它）和 `digestMinLines`
+  （没攒够就留到明天），再看 journal 里的 `qq-bridge: digest` 行 —— 每次真的跑摘要
+  都会打一行「digest <key>: N/M lines」，每小时几点排的下一次定时器则在
+  `qq-bridge: memory enabled at …` 那一行里。
+- **错过了摘要点**：只要 `digestCatchUp` 没关，那个会话下次有人说话时就会补一次；
+  关掉的话就要等到明天的 `digestAtHour`。
 - **记忆是空的**：确认 `memoryDir` 在 `cwd` 内（配到外面只会有一条 warn 然后停用）。
 - **摘要报错**：多半是预设里没有 `skill` 工具，或 `qq_memory` / `qq_transcript`
   被 `allowTools` 挡掉了（摘要 Agent 用的是同一份预设与白名单）。
@@ -1023,11 +1029,13 @@ OneBot 按真实形状回 `image` 段，另外起一个 HTTP 服务假装腾讯�
 最后是「长期记忆」那一组：每条别人的消息都落一行转录（**没 @ 机器人的群聊也算**，
 并标出 `addressed`）、闲聊不会凭空把某个群变成「已处理会话」、`qq_transcript` 的
 list / read / search（默认就是调用它的那个会话）、`qq_memory` 的 append / read /
-write / search / list 与「路径写出记忆目录一律被拒」、定时器睡醒后为一个攒够消息的
-会话起一个**独立摘要会话**并把转录正文交给它（并在 `digest.json` 里记下进度）、
-同一批消息不会被摘要第二遍、没攒够条数就不建摘要会话、索引与记忆进了渠道提示、
-`memoryDir` 配到 `cwd` 外时工具与定时器都不存在、以及摘要卡住时硬超时会销毁那个
-摘要 Agent 并在下一轮重试。
+write / search / list 与「路径写出记忆目录一律被拒」、每天一次的定时器**排到下一个
+`digestAtHour`**（断言它落在一天之内、且指向下一个整点）、定时器睡醒后为一个攒够消息的
+会话起一个**独立摘要会话**并把转录正文交给它（并在 `digest.json` 里记下时间与本地日期）、
+同一个会话**一天至多摘要一次**、没攒够条数就不建摘要会话、错过摘要点时下次有人说话就
+补课（而 `digestCatchUp: false` 时不补、补课也只跑一轮而不是每条消息一轮）、索引与记忆
+进了渠道提示、`memoryDir` 配到 `cwd` 外时工具与定时器都不存在、以及摘要卡住时硬超时会
+销毁那个摘要 Agent 并重试。
 
 ## 安全提醒
 

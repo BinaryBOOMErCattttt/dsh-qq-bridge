@@ -118,22 +118,23 @@
           - qq_jm_pdf
         # ---- 长期记忆：聊天记录落盘 + 定时摘要 + 认知库（见 README「长期记忆」）----
         # 每条别人的消息（含没 @ 机器人的群聊）都会按会话追加到 .qq-memory 里的
-        # 当天转录；插件按 digestIntervalMs 定时唤起一个**独立的摘要会话**，
-        # 让它照着 message-digest skill 把转录写成摘要与认知。
+        # 当天转录；插件每天 digestAtHour 点唤起一个**独立的摘要会话**，让它照着
+        # message-digest skill 把转录写成摘要与认知。挑凌晨是因为那时群里没人说话。
         memory: true
         memoryDir: .qq-memory
         # 一个记忆文件的字节上限：先校验再写，逼着摘要 Agent 精炼而不是无限堆料。
         memoryFileMaxBytes: 32768
-        # 每 30 分钟看一眼有没有新聊天值得摘要；同一个会话两次摘要至少隔 6 小时，
-        # 且至少要攒够 20 条新消息 —— 免得活跃的群被反复摘要、安静的群白跑模型。
-        digestIntervalMs: 1800000
-        digestMinIntervalMs: 21600000
+        # 每天凌晨 4 点做摘要（本地时间）。同一个会话**一天至多摘要一次**（判据是
+        # digest.json 里记的日期，重启也不会在同一天重复）；当天攒够 20 条新消息才值得
+        # 跑一次模型 —— 不够就留到明天，消息不会丢（首次摘要不受条数限制）。
+        digestAtHour: 4
         digestMinLines: 20
         # 一次摘要最多喂给摘要 Agent 的字符数（超出按最近优先截断）。
         digestMaxChars: 24000
         # 单次摘要的硬超时：卡住的 turn 会被销毁，下次重新开一个，不让摘要永远堵着。
         digestTimeoutMs: 600000
-        # 启动时补一次：上一条摘要之后有积压的会话立刻摘要，不用等第一个 interval。
+        # 启动时补一次：今天还没摘要过、之后又有人说过话的会话立刻补上，
+        # 免得一次凌晨的重启把这一天的记忆拖到明天。
         digestCatchUp: true
         # 单条 QQ 消息最大长度（协议上限），超出自动分段
         maxReplyChars: 1500

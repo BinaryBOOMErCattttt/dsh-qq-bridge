@@ -95,7 +95,7 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 | 媒体 | `resolveMessageMedia` `mediaFor` `resolveQuote` `hydrateAmbientMedia` | 环境上下文与复读**共用同一次下载**（`mediaResolutions` 这个 WeakMap 就是干这个的） |
 | 攒批 | `enqueue` `holdForBatch` `flushBatch` `submitBatch` `renderBatch` | 前后脚到的消息合成一条再投给 Agent |
 | 事件轮转 | `handleEvent`（约 55 行）+ 持久化事件路由 | 见 §4.A |
-| 长期记忆 | `rememberTranscript` `appendTranscript` `readDigestState` `ensureDigestAgent` `runDigestSweep` `enqueueDigest` `memoryIndexText` `resolveMemoryConversation` | 见 §4.E |
+| 长期记忆 | `rememberTranscript` `appendTranscript`（+`writesFor`）`maybeCatchUpDigest` `readDigestState` `ensureDigestAgent` `runDigestSweep` `enqueueDigest` `memoryIndexText` `resolveMemoryConversation` | 见 §4.E |
 | 工具注册 | `qq_send_message` / `qq_send_image` / `qq_list_conversations` / `qq_jm_pdf` / `qq_transcript` / `qq_memory` | 全局宿主平面。**这是文件里最大的一块**（6 个 `defineTool` 声明），不是函数 |
 | 生命周期 | `ctx.effect(...)` | 托管 socket、JM 的 HTTP 服务、摘要定时器 |
 
@@ -104,8 +104,9 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 「一个大闭包 + 6 个大工具声明 + 大段取舍注释」，不是因为函数失控。
 
 **模块级纯函数**（在 `apply()` 外面，只有记忆这一块有）：`memorySlug` / `localDate` /
-`memoryRelativePath`（写边界）/ `readJsonl` / `writeJsonTextAtomic`。它们不碰闭包状态，
-改它们不影响运行时不变量。
+`localStamp` / `msUntilDailyHour`（下一个整点还有多久）/ `memoryRelativePath`（写边界）/
+`readJsonl` / `writeJsonTextAtomic`。它们不碰闭包状态，改它们不影响运行时不变量 ——
+`msUntilDailyHour` 尤其值得单独测边界（刚过点要排到明天，不能原地反复醒）。
 
 ## 4. 五条数据流（改任何一条先读对应的那条）
 
@@ -166,26 +167,34 @@ spawn `.venv/bin/python scripts/jm_download.py`（JSON Lines 协议，先 `meta`
 ```
 handleEvent ─▶ rememberTranscript ─▶ .qq-memory/conversations/<slug>/log/YYYY-MM-DD.jsonl
                                      （后台串行追加，不等落盘；路径按会话 key 派生）
+              └─▶ maybeCatchUpDigest（错过了今天的摘要点就立刻补一轮，每次启动至多一轮）
 
-ctx.interval(digestIntervalMs) ─▶ runDigestSweep
-       判据：距 memoryLastDigest 超过 digestMinIntervalMs 且 memoryDirty ≥ digestMinLines
+ctx.interval（排到下一个 digestAtHour，默认 04:00）─▶ runDigestSweep
+       判据：今天这条会话还没摘要过（localDate(lastDigestAt) ≠ 今天）且 memoryDirty ≥ digestMinLines
              └─▶ enqueueDigest（串行链 digestChain，一次只跑一个会话）
+                     │ 先 await 该会话未完成的转录写入（写入是后台的，不等会读到空目录）
                      │ 读转录窗口 → renderTranscriptWindow（最近优先截断）
                      ▼
                  runDigest ─▶ ensureDigestAgent（sessionIdFor('bridge:digest')，独立会话）
                      │          followup(转录正文) → await whenIdle()（有 digestTimeoutMs 守卫）
                      ▼
                  模型自己用 qq_transcript / qq_memory 读转录、写 MEMORY.md / COGNITION.md
-                     └─▶ 成功后才写 digest.json 的 lastDigestAt（失败/超时下轮重试）
+                     └─▶ 成功后才写 digest.json 的 lastDigestAt + lastDigestDate（失败/超时不推进）
 ```
 
 几条不能踩的：
 
 - **摘要 Agent 不是记忆的载体**：它只读磁盘上的转录、只写磁盘上的记忆文件。所以它被
   压缩、被销毁、被重启都不影响记忆 —— 别把「记住」实现成会话上下文里的东西。
-- **`digest.json` 只在成功之后才推进** `lastDigestAt`；正在排队的消息靠内存里的
-  `memoryDirty` 计数（重启归零，靠 `lastDigestAt` 重新数），所以「摘要没跑成」不会
-  把消息算丢。
+- **一天至多一次靠日期判据**（`localDate(lastDigestAt)` vs 今天），不是「距上次 ≥ N 小时」：
+  定时器是「每天一个整点」，重启后同一天不能摘要第二遍。改这个判据时要一起改
+  `lastDigestDate` 的写入。
+- **`digest.json` 只在成功之后才推进**；正在排队的消息靠内存里的 `memoryDirty` 计数
+  （重启归零，靠 `lastDigestAt` 重新数），所以「摘要没跑成」不会把消息算丢。
+- **别在启动时直接扫一遍**：`conversations` 是运行时状态，`apply()` 那一刻还是空的，
+  扫不到任何东西。补课挂在「重启后第一条消息到达」这个时刻上（`maybeCatchUpDigest`）。
+- **读转录之前要先等写入**（`writesFor` + `Promise.all`）：转录是后台追加的，而摘要
+  可能紧跟一条消息触发 —— 不等就会读到一个还没写出来的目录，然后静默跳过。
 - **摘要 Agent 不在 `sessionIndex` 里**，它的 turn/end 因此不会往 QQ 发东西 —— 这是
   「后台会话」与「QQ 会话」唯一的区别机制，别把 digest session 注册进去。
 - **写边界只有一处**：`memoryRelativePath`（模块级纯函数）。`qq_memory` 的写路径必须
@@ -237,6 +246,7 @@ ctx.interval(digestIntervalMs) ─▶ runDigestSweep
 | 改群触发/白名单/复读 | index.js 的 `admit` / `maybeRepeat` 区块 |
 | 改 QQ 会话能用哪些工具 | `cordis.patch.yml` 的 `preset-qq` + `Config.allowTools`（见 §7） |
 | 改长期记忆的行为 | `Config` 的 `memory*` / `digest*` + index.js 的记忆区块 + README「长期记忆」 |
+| 改摘要的触发时刻 | `digestAtHour` + `msUntilDailyHour`（模块级纯函数）+ `runDigestSweep` 的日期判据 |
 | 改摘要/学梗的流程（提示词） | `.dsh/skills/` 里的 SKILL.md（改完**不用重启**，watcher 会重载） |
 | 加一个 skill | 新建 `.dsh/skills/<kebab-name>/SKILL.md`（frontmatter 必填 `name` + `description`），并把 `skill` 留在 allowTools 里 |
 
@@ -278,11 +288,12 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 改完按它核对要不要补用例。
 
 - 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**
-  （当前基线：`test/` 下 104 个用例全过，约 16 秒）。
+  （当前基线：`test/` 下 107 个用例全过，约 17 秒）。
 - 加行为就加用例，并在用例名/注释里用中文写清意图。
 - 纯函数（`onebot.js` 里的拆分/延迟/采集、`image.js`、`media.js`）尽量单独测边界。
 - 长期记忆这套东西的用例在 `test/bridge.test.mjs` 末尾（转录落盘、两个工具、
-  摘要调度、索引注入、`memoryDir` 越界停用、摘要超时自愈）。**改记忆相关行为必跑它们。**
+  每日摘要调度与「一天至多一次」、错过摘要点的补课、索引注入、`memoryDir` 越界停用、
+  摘要超时自愈）。**改记忆相关行为必跑它们。**
 - **插件进程本身不归测试管**，改完记得重启（§5.1）再看真实效果。
 
 ## 9. 改完的检查清单

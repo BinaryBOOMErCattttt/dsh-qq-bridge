@@ -2718,8 +2718,8 @@ test('the channel prompt offers qq_jm_pdf unless the tool whitelist hides it', a
 /**
  * 起一个开了长期记忆的实例：cwd 是新的临时目录，`.qq-memory` 就落在里面。
  *
- * `digestCatchUp: false` 是默认值 —— 启动补课那条路会在 `apply()` 里顺序执行，
- * 用例希望自己决定什么时候触发摘要（`host.list.timers.fireInterval()`）。
+ * 默认 `digestCatchUp: false` —— 补课会在第一条消息到达时就摘要一次，用例希望自己
+ * 决定什么时候触发摘要（`host.list.timers.fireInterval()`）；要验补课就显式打开。
  */
 async function bootMemory(config = {}, hostOptions = {}, onebotOptions = {}) {
   const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-memory-'));
@@ -2728,6 +2728,14 @@ async function bootMemory(config = {}, hostOptions = {}, onebotOptions = {}) {
     hostOptions,
     onebotOptions,
   );
+}
+
+/** 距下一个本地整点还有多少毫秒（与插件 msUntilDailyHour 同一个口径）。 */
+function msUntilHour(hour) {
+  const next = new Date();
+  next.setHours(hour, 0, 0, 0);
+  if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
+  return next.getTime() - Date.now();
 }
 
 /** 读 `.qq-memory/` 里的一个文件；不存在时抛错（用例里通常意味着「本该写出来」）。 */
@@ -2774,10 +2782,13 @@ test('every incoming message is appended to the transcript, including ambient gr
   assert.equal(lines[0].addressed, true);
 
   const groupLog = join(cwd, '.qq-memory', 'conversations', 'group-100000001', 'log', `${localDateOf()}.jsonl`);
-  await until(() => existsSync(groupLog), 'the group transcript to be written');
-  const groupLines = (await readFile(groupLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
   // 两条都记：一条是没人 @ 的闲聊（addressed: false），一条是被叫到的。
-  assert.equal(groupLines.length, 2);
+  // 转录是后台串行写盘的，两条不一定同一瞬间落地，所以这里等它写全再看内容。
+  const groupLines = await until(async () => {
+    if (!existsSync(groupLog)) return undefined;
+    const parsed = (await readFile(groupLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    return parsed.length >= 2 ? parsed : undefined;
+  }, 'both group messages to be written to the transcript');
   assert.deepEqual(groupLines.map((line) => line.addressed), [false, true]);
   assert.equal(groupLines[0].name, '路人');
 
@@ -2856,20 +2867,26 @@ test('qq_memory appends, reads back and overwrites, and refuses paths outside th
   assert.equal(existsSync(join(cwd, 'evil.md')), false);
 });
 
-/** 计时器睡醒后：帮会话摘要一次，并记下摘要状态。 */
+/** 定时器每天醒一次（默认 04:00），醒来帮会话摘要一次并记下进度。 */
 test('a digest sweep summarizes a conversation that has something new', async () => {
-  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 2, digestIntervalMs: 60000 });
+  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 2 });
   onebot.push(privateMessage('第一条'));
   onebot.push(privateMessage('第二条'));
   await until(() => host.list.created[0], 'the conversation Agent to be created');
 
-  // 摘要循环是插件在 effect 里挂上来的周期定时器。
+  // 定时器是每天一次的「下一个 04:00」：不是固定周期，所以间隔必须落在
+  // (0, 24h] 里，且大致等于「距下一个整点还有多久」。
   const intervals = host.list.timers.live('intervals');
-  assert.equal(intervals.length, 1, 'the memory digest interval should be registered');
+  assert.equal(intervals.length, 1, 'the daily digest timer should be registered');
+  const armed = intervals[0].delay;
+  assert.ok(armed > 0 && armed <= 24 * 60 * 60 * 1000, `delay should be within a day, got ${armed}`);
+  assert.ok(Math.abs(armed - msUntilHour(4)) < 5000, `delay should point at the next 04:00, got ${armed}`);
+
   host.list.timers.fireInterval();
 
   const record = await waitForDigestRecord(cwd, 'private:100000002');
   assert.equal(record.lastLines, 2);
+  assert.equal(record.lastDigestDate, localDateOf(), 'the digest should be recorded under today\'s date');
 
   // 摘要 Agent 是一个**独立会话**（不是那个正在聊天的会话），它拿到的正文是转录窗口。
   const digestAgent = host.list.created.find((agent) => agent.id !== host.list.created[0].id);
@@ -2884,24 +2901,69 @@ test('a digest sweep summarizes a conversation that has something new', async ()
   assert.match(digestPromptText, /记忆维护会话/);
   assert.match(digestPromptText, /message-digest/);
 
-  // 同一批消息不该被摘要第二遍：dirty 计数在排队时就清零了。
+  // 一天至多一次：即使定时器又醒一次、这期间又来了两条（远超 digestMinLines），
+  // 同一个会话今天也不该再被摘要一遍。
+  onebot.push(privateMessage('第三条'));
+  onebot.push(privateMessage('第四条'));
+  await settle(80);
   const before = await readMemory(cwd, 'digest.json');
+  const digests = host.list.created.length;
   host.list.timers.fireInterval();
-  await settle(120);
+  await settle(200);
   assert.equal(await readMemory(cwd, 'digest.json'), before);
+  assert.equal(host.list.created.length, digests, 'a conversation is digested at most once a day');
 });
 
-/** 消息太少时不该白跑一次模型调用 —— 留到下一轮，只记一笔「看过但没动手」。 */
+/** 消息太少时不该白跑一次模型调用 —— 留到明天，什么都不写。 */
 test('a digest sweep leaves a quiet conversation for later', async () => {
-  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 20, digestIntervalMs: 60000 });
+  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 20 });
   onebot.push(privateMessage('就一句'));
   await until(() => host.list.created[0], 'the conversation Agent to be created');
   host.list.timers.fireInterval();
   await settle(200);
   assert.equal(host.list.created.length, 1, 'no digest session should be created for a single message');
-  const state = JSON.parse(await readMemory(cwd, 'digest.json'));
-  assert.equal(state.conversations['private:100000002'].lastDigestAt, undefined, 'nothing was digested');
-  assert.ok(state.conversations['private:100000002'].lastAttemptAt > 0, 'the sweep should remember when it looked');
+  // 没攒够就什么都不记（连 digest.json 都不该出现），明天再看 —— 消息不会丢，
+  // dirty 计数一直在。
+  assert.equal(existsSync(join(cwd, '.qq-memory', 'digest.json')), false);
+});
+
+/**
+ * 错过了摘要点就补课：进程在 04:00 那一刻没跑（重启了），重启后第一个说话的人
+ * 一开口就把这条会话补摘要一次 —— 而不是等到明天。
+ *
+ * 这里把 `digestAtHour` 设成 0（今天必然已经过了这个点），于是「补课」是确定性的，
+ * 不依赖测试在一天里的哪个时刻跑。
+ */
+test('a conversation that missed the digest hour is caught up on its next message', async () => {
+  const { onebot, host, cwd } = await bootMemory({ digestAtHour: 0, digestMinLines: 1, digestCatchUp: true });
+  onebot.push(privateMessage('重启之后的第一句'));
+  await until(() => host.list.created.length > 1, 'the catch-up digest session to be created')
+    .catch((error) => {
+      throw new Error(`${error.message} | created=${host.list.created.length} warnings=${JSON.stringify(host.list.warnings)} timers=${host.list.timers.live('intervals').length} tools=${[...host.tools.keys()].join(',')}`);
+    });
+  const record = await waitForDigestRecord(cwd, 'private:100000002');
+  assert.equal(record.lastDigestDate, localDateOf(), 'the catch-up should be recorded under today');
+  assert.equal(record.lastLines, 1);
+});
+
+/** 补课是每次启动一轮，不是每条消息一轮。 */
+test('the catch-up sweep runs once per process, not once per message', async () => {
+  const { onebot, host } = await bootMemory({ digestAtHour: 0, digestMinLines: 1, digestCatchUp: true });
+  onebot.push(privateMessage('第一句'));
+  await until(() => host.list.created.length > 1, 'the first catch-up digest');
+  const after = host.list.created.length;
+  onebot.push(privateMessage('第二句'));
+  await settle(200);
+  assert.equal(host.list.created.length, after, 'no second digest session should be created');
+});
+
+/** 关掉 digestCatchUp 时，错过摘要点就只在明天的点上摘要。 */
+test('digestCatchUp: false leaves a missed digest until the next daily run', async () => {
+  const { onebot, host } = await bootMemory({ digestAtHour: 0, digestMinLines: 1, digestCatchUp: false });
+  onebot.push(privateMessage('今天不补'));
+  await until(() => host.list.created[0], 'the conversation Agent to be created');
+  await settle(200);
+  assert.equal(host.list.created.length, 1, 'no digest session without a timer tick');
 });
 
 /** 索引 + 本会话记忆会出现在渠道提示里，好让模型「知道自己记得什么」。 */
@@ -2940,7 +3002,7 @@ test('memory is disabled when memoryDir leaves cwd', async () => {
  * 这里让 `whenIdle()` 永不 resolve（模拟一个卡死的模型请求），然后手动让超时守卫醒来。
  */
 test('a digest that never goes idle is given up on and cleaned up', async () => {
-  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 1, digestIntervalMs: 60000 });
+  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 1 });
   // 让这个实例的每个 Agent 都「永不结束这一轮」。
   host.list.stallIdle = true;
   onebot.push(privateMessage('帮我看个东西'));
