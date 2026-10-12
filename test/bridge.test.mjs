@@ -150,6 +150,29 @@ function makeHost({
   const warnings = [];
   const disposers = [];
   const cleanups = [];
+  /**
+   * 假 timer 服务：把 `ctx.timeout` / `ctx.interval` 的定时器**收集起来**而不是真的排期。
+   *
+   * 长期记忆的摘要循环故意是「按小时」量级的，测试不可能等它；所以由用例自己决定
+   * 什么时候让定时器醒来（`host.list.timers.fire()`）。这样验的是插件的调度判定本身，
+   * 而不是 Node 的定时器精度。
+   */
+  const timers = { timeouts: [], intervals: [], cleared: new Set() };
+  /** 用例把 `host.list.stallIdle` 置真后创建的 Agent，`whenIdle()` 永不 resolve。 */
+  let stalledIdle = false;
+  /** 每次摘要都挂一个超时守卫；用例可以伪造「卡住」来验证超时后的自愈。 */
+  const fakeTimer = {
+    timeout(callback, delay) {
+      const entry = { callback, delay, kind: 'timeout' };
+      timers.timeouts.push(entry);
+      return () => timers.cleared.add(entry);
+    },
+    interval(callback, delay) {
+      const entry = { callback, delay, kind: 'interval' };
+      timers.intervals.push(entry);
+      return () => timers.cleared.add(entry);
+    },
+  };
   // 记录每一次成功生效的工具收窄：{ sessionId, filter }。
   const restrictions = [];
   // join 过的预设（按 Agent），以及 create 时收到的 meta。
@@ -213,7 +236,7 @@ function makeHost({
           },
         };
         await options.setup?.(agentCtx, { id: options.sessionId });
-        // 最小 Agent 桩：只保留插件真正用到的 id / options / inbox / followup。
+        // 最小 Agent 桩：只保留插件真正用到的 id / options / inbox / followup / whenIdle。
         const agent = {
           id: options.sessionId,
           options: options.agentOptions,
@@ -221,7 +244,13 @@ function makeHost({
           followup(message) {
             this.inbox.push(message);
           },
-        };
+          /** 摘要链路会 `await agent.whenIdle()`；桩里这一轮「已经结束了」。 */
+          whenIdle() {
+            // `host.list.stallIdle = true` 模拟一个卡死的模型请求：永不 resolve，
+            // 用来验证摘要的硬超时会把这个 Agent 收掉（而不是让摘要永远排队）。
+            if (stalledIdle) return new Promise(() => {});
+            return Promise.resolve();
+          },        };
         agents.set(options.sessionId, agent);
         created.push(agent);
         metas.push({ sessionId: options.sessionId, meta: options.meta });
@@ -259,12 +288,22 @@ function makeHost({
       disposers.push(body);
       return () => {};
     },
+    // 真宿主上这两个来自 @deepseek-ai/cordis-plugin-timer 服务；这里转发到假定时器，
+    // 好让用例自己决定「摘要循环什么时候醒」。
+    timeout(callback, delay) {
+      return fakeTimer.timeout(callback, delay);
+    },
+    interval(callback, delay) {
+      return fakeTimer.interval(callback, delay);
+    },
     get(service) {
       // 模拟部署默认模型选择，验证「配置为空时继承默认值」。
       if (service === 'agentDefaultModel') {
         return { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' }) };
       }
       if (service === 'approval') return { setPolicy() {} };
+      // 定时器服务：插件用它排摘要循环（见上面 timeout / interval）。
+      if (service === 'timer') return fakeTimer;
       // Agent 预设平面：只有传了 presets 的用例才有（与 headless 组合形成对照）。
       if (service === 'agentPresets') return presetService;
       // 会话持久化后端：插件用它的 root 定位要删除的会话目录。
@@ -276,6 +315,12 @@ function makeHost({
     ctx,
     tools,
     list: {
+      get stallIdle() {
+        return stalledIdle;
+      },
+      set stallIdle(value) {
+        stalledIdle = value === true;
+      },
       created,
       prompts,
       warnings,
@@ -299,6 +344,24 @@ function makeHost({
       stop() {
         for (const cleanup of cleanups.splice(0)) cleanup();
       },
+      timers: {
+        /** 目前还活着的定时器（没被 disposer 清掉的）。 */
+        live(kind) {
+          return timers[kind].filter((entry) => !timers.cleared.has(entry));
+        },
+        /**
+         * 让所有活着的周期定时器醒一次（摘要循环就是挂在它上面的）。
+         * 回调是同步触发 `runDigestSweep` 的，真正的摘要是异步的 —— 所以用例
+         * 还需要再等摘要状态落盘。
+         */
+        fireInterval() {
+          for (const entry of this.live('intervals')) entry.callback();
+        },
+        /** 让所有活着的超时定时器醒一次（摘要的硬超时守卫）。 */
+        fireTimeout() {
+          for (const entry of this.live('timeouts')) entry.callback();
+        },
+      },
     },
   };
 }
@@ -319,7 +382,8 @@ function promptText(host, name) {
 async function until(check, message, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const value = check();
+    // `await` 让异步断言（例如「等工具能从磁盘上读到两条转录」）也能直接用这个轮询。
+    const value = await check();
     if (value) return value;
     if (Date.now() > deadline) throw new Error(`timed out waiting for: ${message}`);
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -496,7 +560,7 @@ async function boot(config = {}, hostOptions = {}, onebotOptions = {}) {
   // 等到 get_login_info 发出，说明 socket 已就绪、selfId 即将可用。
   await until(() => onebot.calls.some((call) => call.action === 'get_login_info'), 'the plugin to identify itself');
   await waitForSelfId(host);
-  const instance = { onebot, host, sessionsRoot };
+  const instance = { onebot, host, sessionsRoot, cwd: config.cwd ?? '/tmp' };
   liveBoots.push(instance);
   return instance;
 }
@@ -980,7 +1044,11 @@ test('agentPreset selects the mount explicitly and none skips it', async () => {
 // 所以：配置里的 agentPreset 必须指向本 bundle 声明的、不含任何 delegation 行的预设，
 // 且 allowTools 里每个名字都要在该预设里有出处。
 test('the bundled patch declares the narrowed preset the plugin mounts', async () => {
-  const doc = yaml.load(await readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8'));
+  // Loader 的 `!!js` 标签（`!!js <expression>`）不在标准 schema 里：注册成普通标量，
+  // 本用例只关心结构，不关心那些表达式怎么求值。
+  const jsExpression = new yaml.Type('tag:yaml.org,2002:js', { kind: 'scalar', construct: (data) => data });
+  const schema = yaml.DEFAULT_SCHEMA.extend([jsExpression]);
+  const doc = yaml.load(await readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8'), { schema });
   const rows = doc.flatMap((entry) => entry.insert ?? []);
   const bridge = rows.find((row) => row.name === '@qqbot/dsh-plugin-qq');
   assert.ok(bridge, 'the bridge row must exist in cordis.patch.yml');
@@ -1005,12 +1073,23 @@ test('the bundled patch declares the narrowed preset the plugin mounts', async (
   ];
   for (const name of forbidden) assert.ok(!names.includes(name), `${name} must not be in the QQ preset`);
 
+  // 本地 skill 平面：dsh-web-app 把宿主的 skill-filesystem / tool-skill 停掉了
+  // （「presets own local discovery」），所以预设里必须自己挂一份，否则
+  // `<项目根>/.dsh/skills` 下的 skill 对 QQ 会话根本不存在。
+  assert.ok(names.includes('@deepseek-ai/dsh-skill-filesystem'), 'the QQ preset must provide local skill discovery');
+  assert.ok(names.includes('@deepseek-ai/dsh-tool-skill'), 'the QQ preset must provide the skill tool');
+
   // 白名单只能收窄、不能授予：每个放开的工具名都要能在这个预设里找到出处。
-  // 本插件的四个工具是**宿主平面**的全局工具（不在预设里），所以直接算作出处。
-  const provided = new Set(['qq_send_message', 'qq_send_image', 'qq_list_conversations', 'qq_jm_pdf']);
+  // 本插件的工具是**宿主平面**的全局工具（不在预设里），所以直接算作出处：
+  //   - qq_send_* / qq_jm_pdf：一直注册；
+  //   - qq_transcript / qq_memory：memory 开着时才注册；
+  //   - skill：由预设里的 tool-skill 提供。
+  const provided = new Set(['qq_send_message', 'qq_send_image', 'qq_list_conversations', 'qq_jm_pdf', 'skill']);
+  if (bridge.config.memory !== false) for (const name of ['qq_transcript', 'qq_memory']) provided.add(name);
   if (names.includes('@deepseek-ai/dsh-tool-fs')) for (const name of ['read', 'read_image', 'write', 'edit']) provided.add(name);
   if (names.includes('@deepseek-ai/dsh-tool-fs-search')) for (const name of ['glob', 'grep']) provided.add(name);
   if (names.includes('@deepseek-ai/dsh-tool-web')) for (const name of ['web_search', 'web_fetch']) provided.add(name);
+  if (names.includes('@deepseek-ai/dsh-tool-skill')) provided.add('skill');
   for (const name of bridge.config.allowTools) {
     assert.ok(provided.has(name), `allowTools entry "${name}" has no provider in the QQ preset`);
   }
@@ -2632,6 +2711,256 @@ test('the channel prompt offers qq_jm_pdf unless the tool whitelist hides it', a
   off.onebot.push(privateMessage('在吗'));
   await until(() => off.host.list.created[0], 'the second Agent');
   assert.doesNotMatch(promptText(off.host, 'qq-bridge:channel'), /qq_jm_pdf/);
+});
+
+// ---- 长期记忆：转录 → 工具 → 定时摘要 -------------------------------------------------
+
+/**
+ * 起一个开了长期记忆的实例：cwd 是新的临时目录，`.qq-memory` 就落在里面。
+ *
+ * `digestCatchUp: false` 是默认值 —— 启动补课那条路会在 `apply()` 里顺序执行，
+ * 用例希望自己决定什么时候触发摘要（`host.list.timers.fireInterval()`）。
+ */
+async function bootMemory(config = {}, hostOptions = {}, onebotOptions = {}) {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-memory-'));
+  return boot(
+    { memory: true, digestCatchUp: false, readDelayMs: 0, ...config, cwd },
+    hostOptions,
+    onebotOptions,
+  );
+}
+
+/** 读 `.qq-memory/` 里的一个文件；不存在时抛错（用例里通常意味着「本该写出来」）。 */
+async function readMemory(cwd, relative) {
+  return readFile(join(cwd, '.qq-memory', relative), 'utf8');
+}
+
+/** 等 `.qq-memory/digest.json` 里出现某个会话的摘要记录（摘要跑完了）。 */
+async function waitForDigestRecord(cwd, key) {
+  return until(async () => {
+    try {
+      const parsed = JSON.parse(await readMemory(cwd, 'digest.json'));
+      return parsed?.conversations?.[key]?.lastDigestAt ? parsed.conversations[key] : undefined;
+    } catch {
+      return undefined;
+    }
+  }, `digest.json to record ${key}`);
+}
+
+/** 本地日期（`YYYY-MM-DD`），与插件切分转录文件用的口径一致。 */
+function localDateOf(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/**
+ * 一条入站消息落一行转录，而且**没被 @ 的群消息也算**：长期记忆的原料正是那些
+ * 没人跟机器人说话的闲聊。同时验证「闲聊不会凭空建出会话记录」这条旧不变量。
+ */
+test('every incoming message is appended to the transcript, including ambient group chatter', async () => {
+  const { onebot, host, cwd } = await bootMemory();
+  onebot.push(privateMessage('第一条'));
+  onebot.push(groupMessage([{ type: 'text', data: { text: '他们聊他们的' } }], { messageId: 7001, userId: 10001, card: '路人' }));
+  onebot.push(mention('机器人你好'));
+
+  const agent = await until(() => host.list.created[0], 'the conversation Agent to be created');
+  // 转录是后台写盘（不挡事件热路径），所以这里等它落下来。目录名是 key 去掉冒号：
+  // group:100000001 → group-100000001（见 memorySlug）。
+  const logFile = join(cwd, '.qq-memory', 'conversations', 'private-100000002', 'log', `${localDateOf()}.jsonl`);
+  await until(() => existsSync(logFile), 'the private transcript to be written');
+  const lines = (await readFile(logFile, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].text, '第一条');
+  assert.equal(lines[0].addressed, true);
+
+  const groupLog = join(cwd, '.qq-memory', 'conversations', 'group-100000001', 'log', `${localDateOf()}.jsonl`);
+  await until(() => existsSync(groupLog), 'the group transcript to be written');
+  const groupLines = (await readFile(groupLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+  // 两条都记：一条是没人 @ 的闲聊（addressed: false），一条是被叫到的。
+  assert.equal(groupLines.length, 2);
+  assert.deepEqual(groupLines.map((line) => line.addressed), [false, true]);
+  assert.equal(groupLines[0].name, '路人');
+
+  // 旧的硬约束不变量：没被 @ 的群消息不该让这个群出现在「处理过的会话」表里。
+  const list = await host.tools.get('qq_list_conversations').execute({}, {});
+  assert.deepEqual(list.sessions.map((session) => session.conversation), ['private:100000002', 'group:100000001']);
+  assert.equal(agent.id, list.sessions[0].session_id);
+});
+
+/** qq_transcript 的 list / read / search 三个动作，以及「默认就是当前会话」。 */
+test('qq_transcript lists conversations and reads and searches their records', async () => {
+  const { onebot, host } = await bootMemory();
+  onebot.push(privateMessage('周六去看那个展吗'));
+  onebot.push(privateMessage('展叫什么来着'));
+  const agent = await until(() => host.list.created[0], 'the conversation Agent to be created');
+  const tool = host.tools.get('qq_transcript');
+  assert.ok(tool, 'qq_transcript should be registered');
+  // 等两条都进转录（第二条提交后才算完一轮，但转录是先写的）。
+  await until(async () => {
+    const value = await tool.execute({ action: 'read' }, { agent });
+    return value.returned >= 2 ? value : undefined;
+  }, 'both private messages to be recorded');
+
+  const listed = await tool.execute({ action: 'list' }, {});
+  assert.equal(listed.lines.length, 1);
+  assert.equal(listed.lines[0].conversation, 'private:100000002');
+  assert.equal(listed.lines[0].messages, 2);
+
+  // 不传 conversation 时默认就是调用它的那个 Agent 的会话。
+  const read = await tool.execute({ action: 'read', limit: 1 }, { agent });
+  assert.equal(read.returned, 1);
+  assert.equal(read.truncated, true);
+  assert.equal(read.lines[0].text, '展叫什么来着');
+  assert.equal(read.lines[0].user, 'iroha');
+
+  const found = await tool.execute({ action: 'search', query: '展' }, { agent });
+  assert.equal(found.returned, 2);
+  const missing = await tool.execute({ action: 'search', query: '不存在的词' }, { agent });
+  assert.equal(missing.returned, 0);
+  await assert.rejects(() => tool.execute({ action: 'search' }, { agent }), /"query" is required/);
+});
+
+/** qq_memory：追加、读回、覆盖，以及「写不出记忆目录」这条边界。 */
+test('qq_memory appends, reads back and overwrites, and refuses paths outside the memory directory', async () => {
+  const { onebot, host, cwd } = await bootMemory();
+  onebot.push(privateMessage('你好'));
+  const agent = await until(() => host.list.created[0], 'the conversation Agent to be created');
+  const tool = host.tools.get('qq_memory');
+  assert.ok(tool, 'qq_memory should be registered');
+
+  const target = 'conversations/group-100000001/MEMORY.md';
+  const written = await tool.execute({ action: 'append', path: target, text: '- 群主叫kaguya，周六常组织打本' }, {});
+  assert.equal(written.action, 'append');
+  assert.match(await readMemory(cwd, target), /群主叫kaguya/);
+
+  await tool.execute({ action: 'append', path: target, text: '- 群里不喜欢被叫「大佬」' }, {});
+  const read = await tool.execute({ action: 'read', path: target }, {});
+  assert.match(read.text, /群主叫kaguya/);
+  assert.match(read.text, /不喜欢被叫/);
+  assert.match(read.text, /^\s+1 \| /m, 'read should number the lines');
+
+  const overwritten = await tool.execute({ action: 'write', path: target, text: '- 只留这一条' }, {});
+  assert.equal(overwritten.action, 'write');
+  assert.doesNotMatch(await readMemory(cwd, target), /群主叫kaguya/);
+
+  const found = await tool.execute({ action: 'search', path: target, query: '只留' }, {});
+  assert.equal(found.returned, 1);
+
+  const files = await tool.execute({ action: 'list' }, {});
+  assert.ok(files.files.some((file) => file.endsWith(target)), 'list should show the memory file');
+
+  // 边界：绝对路径、`..`、以及写到记忆目录之外都必须被拒 —— 记忆工具是宿主平面的，
+  // QQ 消息是拿不到它的，但摘要 Agent 会照着模型输出的路径写，路径必须由插件说了算。
+  await assert.rejects(() => tool.execute({ action: 'write', path: '../evil.md', text: 'x' }, {}), /not inside the memory directory/);
+  await assert.rejects(() => tool.execute({ action: 'write', path: '/tmp/evil.md', text: 'x' }, {}), /not inside the memory directory/);
+  assert.equal(existsSync(join(cwd, 'evil.md')), false);
+});
+
+/** 计时器睡醒后：帮会话摘要一次，并记下摘要状态。 */
+test('a digest sweep summarizes a conversation that has something new', async () => {
+  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 2, digestIntervalMs: 60000 });
+  onebot.push(privateMessage('第一条'));
+  onebot.push(privateMessage('第二条'));
+  await until(() => host.list.created[0], 'the conversation Agent to be created');
+
+  // 摘要循环是插件在 effect 里挂上来的周期定时器。
+  const intervals = host.list.timers.live('intervals');
+  assert.equal(intervals.length, 1, 'the memory digest interval should be registered');
+  host.list.timers.fireInterval();
+
+  const record = await waitForDigestRecord(cwd, 'private:100000002');
+  assert.equal(record.lastLines, 2);
+
+  // 摘要 Agent 是一个**独立会话**（不是那个正在聊天的会话），它拿到的正文是转录窗口。
+  const digestAgent = host.list.created.find((agent) => agent.id !== host.list.created[0].id);
+  assert.ok(digestAgent, 'a separate digest session should have been created');
+  const instruction = digestAgent.inbox[digestAgent.inbox.length - 1].content[0].text;
+  assert.match(instruction, /private:100000002/);
+  assert.match(instruction, /第一条/);
+  assert.match(instruction, /第二条/);
+
+  // 摘要会话的系统提示点明它是后台记忆维护会话，并指定了要处理的会话。
+  const digestPromptText = promptText(host, 'qq-bridge:digest');
+  assert.match(digestPromptText, /记忆维护会话/);
+  assert.match(digestPromptText, /message-digest/);
+
+  // 同一批消息不该被摘要第二遍：dirty 计数在排队时就清零了。
+  const before = await readMemory(cwd, 'digest.json');
+  host.list.timers.fireInterval();
+  await settle(120);
+  assert.equal(await readMemory(cwd, 'digest.json'), before);
+});
+
+/** 消息太少时不该白跑一次模型调用 —— 留到下一轮，只记一笔「看过但没动手」。 */
+test('a digest sweep leaves a quiet conversation for later', async () => {
+  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 20, digestIntervalMs: 60000 });
+  onebot.push(privateMessage('就一句'));
+  await until(() => host.list.created[0], 'the conversation Agent to be created');
+  host.list.timers.fireInterval();
+  await settle(200);
+  assert.equal(host.list.created.length, 1, 'no digest session should be created for a single message');
+  const state = JSON.parse(await readMemory(cwd, 'digest.json'));
+  assert.equal(state.conversations['private:100000002'].lastDigestAt, undefined, 'nothing was digested');
+  assert.ok(state.conversations['private:100000002'].lastAttemptAt > 0, 'the sweep should remember when it looked');
+});
+
+/** 索引 + 本会话记忆会出现在渠道提示里，好让模型「知道自己记得什么」。 */
+test('the channel prompt carries the memory index once it exists', async () => {
+  const { onebot, host, cwd } = await bootMemory();
+  await mkdir(join(cwd, '.qq-memory'), { recursive: true });
+  await writeFile(join(cwd, '.qq-memory', 'INDEX.md'), '- kaguya：群主，周六常组织打本', 'utf8');
+  onebot.push(privateMessage('在吗'));
+  await until(() => host.list.created[0], 'the first Agent');
+  // 索引是异步刷新进缓存的（提示词装配是同步的），所以第一次装配可能还是空的。
+  const text = await until(() => {
+    const current = promptText(host, 'qq-bridge:channel');
+    return current.includes('群主，周六常组织打本') ? current : undefined;
+  }, 'the memory index to reach the channel prompt');
+  assert.match(text, /长期记忆的索引/);
+});
+
+/** memoryDir 配到 cwd 外面时整个功能停用（与 mediaDir / stickerDir / jmDir 一致）。 */
+test('memory is disabled when memoryDir leaves cwd', async () => {
+  const outside = await mkdtemp(join(tmpdir(), 'qq-bridge-outside-'));
+  const { onebot, host } = await bootMemory({ memoryDir: join(outside, 'memory') });
+  onebot.push(privateMessage('你好'));
+  await until(() => host.list.created[0], 'the conversation Agent to be created');
+  assert.equal(host.tools.get('qq_transcript'), undefined);
+  assert.equal(host.tools.get('qq_memory'), undefined);
+  assert.equal(host.list.timers.live('intervals').length, 0);
+  assert.ok(
+    host.list.warnings.some((warning) => warning.includes('resolves outside cwd')),
+    `expected a warning, got: ${host.list.warnings.join(' | ')}`,
+  );
+});
+
+/**
+ * 摘要卡住时不能把摘要永久堵死：硬超时到点就销毁那个 Agent，下次重新开一个。
+ *
+ * 这里让 `whenIdle()` 永不 resolve（模拟一个卡死的模型请求），然后手动让超时守卫醒来。
+ */
+test('a digest that never goes idle is given up on and cleaned up', async () => {
+  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 1, digestIntervalMs: 60000 });
+  // 让这个实例的每个 Agent 都「永不结束这一轮」。
+  host.list.stallIdle = true;
+  onebot.push(privateMessage('帮我看个东西'));
+  await until(() => host.list.created[0], 'the conversation Agent to be created');
+  host.list.timers.fireInterval();
+  await until(() => host.list.timers.live('timeouts').length > 0, 'the digest timeout guard to be armed');
+
+  host.list.timers.fireTimeout();
+  await until(
+    () => host.list.warnings.some((warning) => warning.includes('timed out')),
+    'the digest to report its timeout',
+  );
+  await settle(80);
+  // 超时的这次不算数：状态里不该留下 lastDigestAt（下一轮还会再试），而被销毁的
+  // 摘要 Agent 已经不在 ctx.agents 里了。
+  const state = await readMemory(cwd, 'digest.json').then((text) => JSON.parse(text)).catch(() => ({ conversations: {} }));
+  assert.equal(state.conversations['private:100000002']?.lastDigestAt, undefined);
+  const digestAgent = host.list.created[1];
+  assert.ok(digestAgent, 'the digest session should have been created');
+  assert.equal(host.ctx.agents.get(digestAgent.id), undefined, 'the stuck digest agent should have been disposed');
 });
 
 

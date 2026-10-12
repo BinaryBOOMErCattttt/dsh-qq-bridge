@@ -21,7 +21,7 @@
 #      用不到的东西；能力面在组合层面就收窄，比事后靠白名单过滤可靠。
 #
 # 所以这里只放：fs（read / read_image / write / edit）、fs-search（glob / grep）、
-# web（web_search / web_fetch）与压缩；没有 shell、没有子代理、没有 workflow。
+# web（web_search / web_fetch）、本地 skill、与压缩；没有 shell、没有子代理、没有 workflow。
 # write / edit 由下面 allowTools 再挡一层（预设层是「继承来的」工具，收得掉）。
 - insert:
     - id: preset-qq
@@ -30,7 +30,7 @@
         id: qq
         order: 50
         name: QQ bridge
-        description: QQ 会话使用：只读文件 + 文件检索 + 联网抓取，没有 shell / 子代理 / workflow
+        description: QQ 会话使用：只读文件 + 文件检索 + 联网抓取 + 本地 skill，没有 shell / 子代理 / workflow
         plugins:
           # 只读文件（write / edit 也在这个包里，由 allowTools 挡掉）
           - id: tool-fs
@@ -46,6 +46,18 @@
             config:
               fetch: true
               searchTimeoutMs: 60000
+          # 本地 skill 的发现与加载（`skill` 工具 + 会话目录）。dsh-web-app 把宿主的
+          # skill-filesystem / tool-skill 两行停掉了（「presets own local discovery」），
+          # 所以想让 QQ 会话看见 <项目根>/.dsh/skills 下的 skill，必须在预设里自己挂一份。
+          # 扫的目录：项目根 .dsh/skills、项目根 .agents/skills、~/.dsh/skills，外加
+          # dsh-agent-preset 随包出货的那套（写法与 standard 预设一致）。
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              customSkillDirs:
+                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
           # 长会话的上下文压缩，与 standard 预设里的那一组同构
           - id: compaction
             name: cordis:group
@@ -78,7 +90,7 @@
         groupTrigger: mention
         # 无人值守：需要审批的操作一律直接拒绝
         approvalPolicy: never
-        # QQ 会话挂载的 Agent 预设：上面声明的 qq（只读文件 + 检索 + 联网）。
+        # QQ 会话挂载的 Agent 预设：上面声明的 qq（只读文件 + 检索 + 联网 + 本地 skill）。
         # 必须指向一个真实存在、且能力面本身就收窄的预设；留空 = 用部署默认预设，
         # none = 不挂预设（那样 QQ 会话只剩宿主平面的 qq_* 那几个工具）。
         agentPreset: qq
@@ -93,10 +105,36 @@
           - grep
           - web_search
           - web_fetch
+          # 加载 .dsh/skills 下的 skill（message-digest / update-cognition）。
+          # 白名单里没有它时，模型看得见目录却打不开，只能靠提示词里的索引。
+          - skill
+          # 长期记忆：查聊天记录 / 读改写记忆文件。两个都是宿主平面的工具，
+          # 写只发生在 memoryDir 之内 —— QQ 会话始终没有 write / edit / bash。
+          - qq_memory
+          - qq_transcript
           - qq_send_message
           - qq_send_image
           - qq_list_conversations
           - qq_jm_pdf
+        # ---- 长期记忆：聊天记录落盘 + 定时摘要 + 认知库（见 README「长期记忆」）----
+        # 每条别人的消息（含没 @ 机器人的群聊）都会按会话追加到 .qq-memory 里的
+        # 当天转录；插件按 digestIntervalMs 定时唤起一个**独立的摘要会话**，
+        # 让它照着 message-digest skill 把转录写成摘要与认知。
+        memory: true
+        memoryDir: .qq-memory
+        # 一个记忆文件的字节上限：先校验再写，逼着摘要 Agent 精炼而不是无限堆料。
+        memoryFileMaxBytes: 32768
+        # 每 30 分钟看一眼有没有新聊天值得摘要；同一个会话两次摘要至少隔 6 小时，
+        # 且至少要攒够 20 条新消息 —— 免得活跃的群被反复摘要、安静的群白跑模型。
+        digestIntervalMs: 1800000
+        digestMinIntervalMs: 21600000
+        digestMinLines: 20
+        # 一次摘要最多喂给摘要 Agent 的字符数（超出按最近优先截断）。
+        digestMaxChars: 24000
+        # 单次摘要的硬超时：卡住的 turn 会被销毁，下次重新开一个，不让摘要永远堵着。
+        digestTimeoutMs: 600000
+        # 启动时补一次：上一条摘要之后有积压的会话立刻摘要，不用等第一个 interval。
+        digestCatchUp: true
         # 单条 QQ 消息最大长度（协议上限），超出自动分段
         maxReplyChars: 1500
         # ---- 图片 / 表情包：下载到本地，Agent 才能真的「看」到 ----

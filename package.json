@@ -21,6 +21,7 @@
     "cordis.patch.yml",
     "icon.svg",
     "locale/*.json",
+    ".dsh/skills/*/SKILL.md",
     "README.md",
     "scripts/*",
     "test/*.mjs",

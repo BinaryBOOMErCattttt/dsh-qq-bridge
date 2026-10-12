@@ -8,6 +8,8 @@
 - **复读**：群里连着出现同一条消息时，它跟着复读一句；连着两张一样的表情包时，就把那张原样发回去 —— 这一句/这张图**不经过模型**，插件自己发，见[自动复读](#自动复读repeat)。
 - **禁漫下载**：QQ 里发 `/jm 422866`（或让 Agent 调 `qq_jm_pdf`）→ 下载整本、合并成
   一个 PDF、直接把文件发回会话。见[禁漫（JM）下载](#禁漫jm下载车号--pdf--发到-qq)。
+- **长期记忆**：每句话都落盘，定时由一个独立的摘要会话把它整理成「这个群记得什么」，
+  聊天时随时能查；顺带学会群里的梗和表情包。见[长期记忆](#长期记忆聊天记录--摘要--认知)。
 
 ## 工作原理
 
@@ -85,6 +87,17 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | `persona` | `''` | 替换内置的「群友口吻」段落；空 = 用内置的那份 |
 | `instructions` | `''` | 追加到 QQ 会话系统提示的额外要求 |
 | `jm*` | 见下文 | 禁漫（JM）下载 → PDF → 发到 QQ 的一组开关，单独一张表：见[禁漫下载](#禁漫jm下载车号--pdf--发到-qq) |
+| `memory` | `true` | 是否启用长期记忆（聊天记录落盘 + 定时摘要 + 认知库 + 两个记忆工具 + `.dsh/skills` 里的两个 skill） |
+| `memoryDir` | `.qq-memory` | 长期记忆目录，相对 `cwd`；必须落在 `cwd` 内，否则整个功能记 warn 并停用 |
+| `memoryFileMaxBytes` | `32768` | 单个记忆文件的字节上限：超了 `qq_memory` 的 append 会报错、逼着摘要重写得更精炼 |
+| `memorySearchHits` | `40` | `qq_memory` / `qq_transcript` 一次 search 最多返回多少条命中 |
+| `digestIntervalMs` | `1800000` | 每 30 分钟检查一次有没有新聊天值得摘要（毫秒） |
+| `digestMinIntervalMs` | `21600000` | 同一个会话两次摘要之间的最短间隔（默认 6 小时） |
+| `digestMinLines` | `20` | 至少攒够多少条新消息才值得跑一次摘要；不够就留到下一轮 |
+| `digestMaxChars` | `24000` | 一次摘要最多喂给摘要 Agent 多少字符（超出按最近优先截断） |
+| `digestTimeoutMs` | `600000` | 单次摘要的硬超时；卡住的摘要 Agent 会被销毁，下次重开 |
+| `digestCooldownMs` | `1800000` | 「还没攒够」时的重试冷却，避免每轮都为安静的群白扫一遍 |
+| `digestCatchUp` | `true` | 启动时补一次：有积压的会话立刻摘要，不用等第一个 `digestIntervalMs` |
 
 ## 像真实群友一样说话
 
@@ -579,6 +592,116 @@ rm -rf ~/Projects/qqbot/.qq-jm             # 手动清
 | `jmFileHost` / `jmFilePort` | `172.17.0.1` / `0` | 给 NapCat 取文件用的地址与端口（0 = 自动） |
 | `jmUrlTtlMs` | `600000` | 一次性下载 URL 的有效期（毫秒） |
 
+## 长期记忆：聊天记录 → 摘要 → 认知
+
+默认开着。三件事：**每一句话都落盘**、**定时把它总结成记忆**、**聊天时随时能查**。
+
+```
+QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写，不经过模型
+                 │
+                 │  每 digestIntervalMs 扫一遍：这个会话攒够 digestMinLines 条了吗？
+                 ▼
+            独立「摘要会话」（qq_memory + qq_transcript + skill）
+                 │  按 message-digest skill 读转录、写记忆
+                 ▼
+  conversations/<slug>/MEMORY.md   这个群的记忆        ┐
+  COGNITION.md                     公共认知（梗/表情包） ├─ 摘要成 INDEX.md 的一行
+  INDEX.md                         短索引 ─────────────┘   每次提示词都带上
+```
+
+**为什么是「摘要」而不是「把聊天记录塞回上下文」**：一个群一天的记录就能撑爆窗口，
+而模型真正需要的是「kaguya是群主、周六打本、他不喜欢被叫大佬」这种**结论**。
+转录是原料、记忆是成品 —— 成品每次进提示词，原料只在摘要与追问时才被翻。
+
+### 记什么、记在哪
+
+`memoryDir`（默认 `.qq-memory/`，**必须落在 `cwd` 内**，否则整个功能记一条 warn 并停用）：
+
+| 路径 | 谁写 | 是什么 |
+|---|---|---|
+| `conversations/<slug>/log/YYYY-MM-DD.jsonl` | 插件 | 原始转录：每条**别人的**消息一行（含没 @ 机器人的群聊） |
+| `conversations/<slug>/MEMORY.md` | 摘要 Agent | 这个会话的长期记忆（人、约定、偏好、在追的东西） |
+| `COGNITION.md` | 摘要 Agent / 聊天中的模型 | 跨会话的公共认知：梗、黑话、表情包含义 |
+| `INDEX.md` | 摘要 Agent | 「去哪里找什么」的短索引，每次提示词都注入 |
+| `digest.json` | 插件 | 摘要进度（上次摘要时间），重启后据此补课 |
+
+`<slug>` 是会话 key 去掉冒号：`group:100000001` → `group-100000001`。
+
+落到转录里的消息要**先过一遍准入规则**（私聊开关、群/私聊白名单）—— 记忆不会成为绕过
+白名单的后门。机器人自己发出去的话不进转录（QQ 会把它们回灌成 message 事件，那是回音）。
+
+### 定时摘要怎么跑
+
+- 插件用 `ctx.interval`（dsh-base 的 timer 服务）每 `digestIntervalMs` 扫一遍，
+  判据是两条**都**满足：距上次摘要超过 `digestMinIntervalMs`、且攒下的新消息
+  ≥ `digestMinLines`。前者防止活跃的群被反复摘要，后者防止为两三句话白跑一次模型。
+- 判定的结果记在 `digest.json` 里，所以**重启不丢**：重启后会认出积压并补一次
+  （`digestCatchUp`）。新会话头一次摘要时 `digestMinLines` 不设防（不然一个刚建的小群
+  永远等不到第一次）。
+- 摘要在**独立会话**里跑（session id 由 `bridge:digest` 确定性派生）：它没有人格、
+  不挂在任何 QQ 会话上、输出**不会**发到 QQ。它拿到的正文就是这段时间的转录，
+  并被告知要处理哪个会话。
+- 一次摘要最多喂 `digestMaxChars` 个字符（超出按**最近优先**截断，并在提示里说明
+  前面还有更早的记录），单次有 `digestTimeoutMs` 硬超时：卡住的摘要 Agent 会被销毁，
+  下次重新开一个，不让一个死掉的 turn 把摘要永久堵住。
+- 摘要会话本身也有上下文窗口，但它**不是**记忆的载体：记忆在磁盘上、由 `qq_memory`
+  读进来 —— 所以就算那个会话被压缩、被重启，记忆也不会丢。
+
+### 聊天时怎么用
+
+- **`qq_transcript`**：`list`（哪些会话有记录）／`read`（按会话读，可给日期范围）／
+  `search`（按关键词找原话）。提示词里只放最近 `ambientMessages` 条，更早的靠它翻。
+- **`qq_memory`**：`read`／`append`／`write`／`search`／`list`。**写被限制在 `memoryDir`
+  之内**（`../`、绝对路径都直接报错），并有单文件字节上限 —— QQ 会话因此始终拿不到
+  `write` / `edit` / `bash`，能力面没有被记忆功能放大。
+- **`INDEX.md` + 本会话的 `MEMORY.md` 每次提示词都注入**（有 15 秒缓存，上限 4KB）：
+  模型一开口就「知道自己记得什么」，而不是先撞一次「不知道」再去查。
+
+两个工具都在**宿主平面**注册，所以 Web UI 里的主会话也能直接用来翻记录 / 读记忆。
+
+### 两个 skill（`.dsh/skills/`）
+
+| skill | 什么时候加载 |
+|---|---|
+| `message-digest` | 定时摘要的那一轮；或有人在群里问「以前说过什么」需要系统整理时 |
+| `update-cognition` | 遇到看不懂的梗 / 黑话 / 表情包，要弄懂并记进 `COGNITION.md` 时 |
+
+skill 由**预设**发现（不是宿主）：`dsh-web-app` 把宿主的 `skill-filesystem` 停掉了，
+「locality 归预设管」。所以 `cordis.patch.yml` 的 `qq` 预设里挂了
+`skill-filesystem` + `tool-skill`，扫的目录是 `<项目根>/.dsh/skills`、
+`<项目根>/.agents/skills`、`~/.dsh/skills`，外加 `dsh-agent-preset` 随包出货的那套。
+`allowTools` 里必须留着 `skill`，否则模型看得见目录却打不开。
+
+新增自己的 skill：在 `.dsh/skills/<名字>/SKILL.md` 写一份（frontmatter 必填 `name`
+与 `description`，name 要 kebab-case 且与目录同名），文件**不需要重启**就被发现。
+
+### 认知（学梗）是怎么发生的
+
+两条路，都写同一份 `COGNITION.md`：
+
+1. **聊天中按需**：遇到不懂的说法，先 `read_image` 看那张图、再（必要时）`web_search`
+   查一下，弄懂后按 `update-cognition` skill 的格式追加一条；懂之前不要装懂。
+2. **摘要时自动**：定时摘要扫到**新的**梗 / 表情包含义时顺手沉淀一条；
+   只是又用了一次老梗就不动（认知库要短，长了没人读）。
+
+### 关掉 / 排查
+
+```bash
+# 关掉整个长期记忆（工具、skill 提示、定时器都消失）
+memory: false
+
+ls -la ~/Projects/qqbot/.qq-memory                  # 看到目录结构
+cat ~/Projects/qqbot/.qq-memory/digest.json         # 上次摘要时间与条数
+journalctl --user -u qqbot -f | grep 'qq-bridge: digest'        # 摘要开始 / 失败 / 超时
+journalctl --user -u qqbot | grep 'qq-bridge: memory'           # 目录、定时器、启动补课
+```
+
+- **不摘要**：先看 `digestMinLines` / `digestMinIntervalMs`，再看 journal 里的
+  `qq-bridge: digest` 行 —— 每次真的跑摘要都会打一行「digest <key>: N/M lines」。
+- **记忆是空的**：确认 `memoryDir` 在 `cwd` 内（配到外面只会有一条 warn 然后停用）。
+- **摘要报错**：多半是预设里没有 `skill` 工具，或 `qq_memory` / `qq_transcript`
+  被 `allowTools` 挡掉了（摘要 Agent 用的是同一份预设与白名单）。
+
 ## QQ 会话的工具从哪来（`agentPreset`）
 
 在 **Web 表面**（本 profile 用的 `@deepseek-ai/dsh-web-app`）里，`bash` / `read` /
@@ -594,8 +717,9 @@ rm -rf ~/Projects/qqbot/.qq-jm             # 手动清
 agentPreset: qq   # 留空 = 用部署默认预设；none = 不挂
 ```
 
-`qq` 预设只放四样东西：`tool-fs`（read / read_image / write / edit）、
-`tool-fs-search`（glob / grep）、`tool-web`（web_search / web_fetch）、以及压缩
+`qq` 预设只放五样东西：`tool-fs`（read / read_image / write / edit）、
+`tool-fs-search`（glob / grep）、`tool-web`（web_search / web_fetch）、
+`skill-filesystem` + `tool-skill`（发现并加载 `.dsh/skills` 下的 skill）、以及压缩
 （compaction / tool-result-pruner）。没有 shell、没有子代理、没有 workflow、没有计划模式。
 
 **为什么不直接挂 `standard`**（踩过的坑）：
@@ -694,11 +818,14 @@ allowTools:
 | `qq_send_image` | 向指定 QQ 号或群发一张图 / 表情包：来源是 `cwd` 里的图片路径（含 `.qq-stickers/…`、`.qq-media/…`）或一个 http(s) 图片链接；从 QQ 会话里调用时默认发回当前会话 |
 | `qq_list_conversations` | 列出在线群/好友列表，以及本 Harness 已处理过的 QQ 会话及其 Session id |
 | `qq_jm_pdf` | 下载禁漫（JM）整本/单话 → 合并成一个 PDF → 发到 QQ（从 QQ 会话里调用时默认发回当前会话） |
+| `qq_transcript` | 读某个 QQ 会话的聊天记录：`list` / `read` / `search`（长期记忆的原料，见[长期记忆](#长期记忆聊天记录--摘要--认知)） |
+| `qq_memory` | 读 / 追加 / 覆盖 / 搜索长期记忆文件：`conversations/<slug>/MEMORY.md`、`COGNITION.md`、`INDEX.md`；写被限制在 `memoryDir` 之内 |
 
-这四个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
+这六个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
 `qq_send_image` 见[它也能发表情包](#它也能发表情包)；`qq_jm_pdf` 需要 python 环境与
 NapCat 能访问到本机（见[禁漫下载](#禁漫jm下载车号--pdf--发到-qq)），关掉 `jmDownload`
-后调用会明确报错。
+后调用会明确报错；`qq_transcript` / `qq_memory` 见[长期记忆](#长期记忆聊天记录--摘要--认知)，
+关掉 `memory` 后它们**根本不会注册**。
 
 ## NapCat 端要求
 
@@ -892,6 +1019,15 @@ OneBot 按真实形状回 `image` 段，另外起一个 HTTP 服务假装腾讯�
 `/jm` 旁路（不进 Agent、不建会话）、群/私聊分别走 `upload_group_file` /
 `upload_private_file`、上传失败与下载失败的措辞、`qq_jm_pdf` 从 QQ 会话里默认发回
 当前会话、以及 `allowTools` 挡掉它之后提示词里不再提它。
+
+最后是「长期记忆」那一组：每条别人的消息都落一行转录（**没 @ 机器人的群聊也算**，
+并标出 `addressed`）、闲聊不会凭空把某个群变成「已处理会话」、`qq_transcript` 的
+list / read / search（默认就是调用它的那个会话）、`qq_memory` 的 append / read /
+write / search / list 与「路径写出记忆目录一律被拒」、定时器睡醒后为一个攒够消息的
+会话起一个**独立摘要会话**并把转录正文交给它（并在 `digest.json` 里记下进度）、
+同一批消息不会被摘要第二遍、没攒够条数就不建摘要会话、索引与记忆进了渠道提示、
+`memoryDir` 配到 `cwd` 外时工具与定时器都不存在、以及摘要卡住时硬超时会销毁那个
+摘要 Agent 并在下一轮重试。
 
 ## 安全提醒
 

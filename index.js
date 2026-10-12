@@ -26,9 +26,9 @@
 import crypto from 'node:crypto';
 import { readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, relative, resolve, sep } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdir, readdir, rm, stat } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -174,6 +174,18 @@ export const Config = z.object({
   jmFileHost: z.string().default('172.17.0.1').description('NapCat 取 PDF 时访问的地址：容器里要能连到宿主机，默认 docker 网桥 172.17.0.1（只在本机容器网段可达）'),
   jmFilePort: z.number().default(0).description('给 NapCat 用的 HTTP 文件服务端口；0 = 由系统分配'),
   jmUrlTtlMs: z.number().default(10 * 60 * 1000).description('交给 NapCat 的一次性下载 URL 有效期（毫秒）'),
+  // ---- 长期记忆：聊天记录落盘 + 定时摘要 + 认知库（见 README「长期记忆」）----
+  memory: z.boolean().default(true).description('是否启用长期记忆：把聊天记录写进 memoryDir、按 digestIntervalMs 定时让一个专用「摘要 Agent」写成摘要与认知，并提供 qq_transcript / qq_memory 工具（配套 skill 在 .dsh/skills/ 里）'),
+  memoryDir: z.string().default('.qq-memory').description('长期记忆目录，相对 cwd（必须落在 cwd 内）：聊天记录、摘要、认知库都在这里；同时充当 qq_memory / qq_transcript 的写入边界'),
+  memoryFileMaxBytes: z.number().default(32768).description('单个记忆文件的字节上限：超过时 qq_memory 的 write 会报错，append 也只按剩余空间写入，逼着摘要 Agent 保持精炼'),
+  memorySearchHits: z.number().default(40).description('qq_transcript / qq_memory 一次 search 最多返回多少条命中'),
+  digestIntervalMs: z.number().default(30 * 60 * 1000).description('多久检查一次「有没有新聊天值得摘要」（毫秒）；单个会话两次摘要之间至少间隔 digestMinIntervalMs'),
+  digestMinIntervalMs: z.number().default(6 * 60 * 60 * 1000).description('同一个会话两次摘要之间的最短间隔（毫秒）：防止一个活跃的群每半小时就被摘要一遍'),
+  digestMinLines: z.number().default(20).description('攒够多少条新消息才值得为这个会话跑一次摘要：不够就留到下一轮，避免为零星几句花费一次模型调用'),
+  digestMaxChars: z.number().default(24000).description('一次摘要最多把多少字符的聊天记录喂给摘要 Agent：超出部分按最近优先截断（更早的内容留给上一次摘要）'),
+  digestTimeoutMs: z.number().default(10 * 60 * 1000).description('单次摘要的硬超时（毫秒）：超时就把摘要 Agent 销毁（下次重开一个），避免一个卡住的 turn 让摘要永远不再发生'),
+  digestCooldownMs: z.number().default(30 * 60 * 1000).description('消息条数没攒够（digestMinLines）时的重试冷却（毫秒）：避免每隔一个 digestIntervalMs 就为一个安静的群白跑一次调度'),
+  digestCatchUp: z.boolean().default(true).description('启动时是否补一次：上一条摘要之后再没人说过话的会话跳过，有积压的立刻摘要一遍，不用等一个 digestIntervalMs'),
 });
 
 /**
@@ -215,6 +227,151 @@ function visibleText(content) {
 function errorText(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/\s+/g, ' ').trim().slice(0, 200) || 'unknown error';
+}
+
+// ---- 长期记忆：纯函数工具 ---------------------------------------------------------
+//
+// 这一层刻意不碰任何闭包状态（不认 cwd、不认配置），只做「把会话 key 变成目录名」
+// 「把一行记忆安全地拼进一个文件」「读写一个文件」这几件纯事：记忆的边界检查、
+// 摘要的触发条件都留在 apply() 里对着配置算。
+
+/** 索引片段（INDEX.md）最多这么大：它每次提示词装配都会被读一遍，不能无节制地长。 */
+const MEMORY_INDEX_MAX_CHARS = 4096;
+
+/** 转录里单条消息最多保留多少字：摘要只需要「大概说了什么」，不需要全文。 */
+const MEMORY_LINE_MAX_CHARS = 500;
+
+/**
+ * `qq_memory read` 一次最多返回多少字符。
+ *
+ * 读不设「拒绝」的硬上限（该翻的时候要能翻个够），但一次工具结果塞进上下文的东西
+ * 必须有数：超出的部分截断并明说，模型据此自己决定要不要用 search 精确定位。
+ */
+const MEMORY_FILE_RETURN_CHARS = 12000;
+
+/**
+ * 会话 key 里所有会被当成路径分隔符或非法文件名的字符。
+ *
+ * 冒号在 `group:123` 里是分隔符，但在 Windows 上不能出现在文件名里，也会让
+ * `.qq-memory/conversations/group:123/` 这种路径在所有平台上都难读 —— 所以它
+ * 和空格、斜杠一样折成 `-`（`MEMORY_SLUG_UNSAFE` 之外的字符才原样保留）。
+ */
+const MEMORY_SLUG_UNSAFE = /[^A-Za-z0-9._-]+/g;
+
+/**
+ * 把会话 key（`group:100000001` / `private:100000002`）变成安全的目录名。
+ *
+ * 只做「可逆地可读」：`group:` 换成 `group-`（冒号在部分文件系统上不合法），
+ * 其余非法字符一律折成 `-`。真正的稳定性靠 key 本身而不是这个变换 —— 调用方
+ * 每个进程只算一次并存进 `memorySlugs`，同一个会话永远只有一个目录。
+ * @param key - 会话 key。
+ * @returns 目录名，例如 `group-100000001`。
+ */
+function memorySlug(key) {
+  const slug = String(key ?? '').replace(MEMORY_SLUG_UNSAFE, '-').replace(/^[.-]+/, '');
+  return slug.length > 0 ? slug.slice(0, 120) : 'unknown';
+}
+
+/** 本地日期（`YYYY-MM-DD`）：聊天记录按人所在地的日期切分，不用 UTC。 */
+function localDate(at = Date.now()) {
+  const date = new Date(at);
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** 把一行记忆里的换行折掉：记忆是「一行一条事实」，格式被换行破坏就没法读了。 */
+function memoryOneLine(text) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 把模型给的路径解析成记忆目录内的相对路径；越界（`../`、绝对路径）时返回 undefined。
+ *
+ * 这是 qq_memory 的写边界：模型只能动 `.qq-memory/` 里的东西。故意不做 glob、
+ * 不跟随符号链接 —— 这里的目标是「模型不会因为一次幻觉把仓库写坏」，不是完整的
+ * 沙箱（真正的沙箱在 Harness 的 fs 工具那一侧）。
+ * @param base - 记忆目录的绝对路径（以分隔符结尾）。
+ * @param raw - 模型给的路径。
+ * @returns 规范化后的相对路径（正斜杠）；越界或为空时 undefined。
+ */
+function memoryRelativePath(base, raw) {
+  const text = String(raw ?? '').trim().replace(/\\/g, '/');
+  if (text.length === 0) return undefined;
+  const trimmed = text.replace(/^\.\/+/, '');
+  if (trimmed.startsWith('/')) return undefined;
+  const segments = trimmed.split('/').filter((segment) => segment.length > 0 && segment !== '.');
+  if (segments.length === 0 || segments.includes('..')) return undefined;
+  const absolute = resolve(base, ...segments);
+  if (absolute !== resolve(base) && !absolute.startsWith(base)) return undefined;
+  return segments.join('/');
+}
+
+/**
+ * 把一个 JSON 对象原子地写进文件：先写同目录的临时文件再 rename。
+ *
+ * 记忆文件很小、写得也少，但「写到一半进程被杀」会留下一个半截 JSON —— 而它正是
+ * 摘要 Agent 每次开工都要读的东西。rename 在同一个文件系统内是原子的。
+ * @param absolute - 目标绝对路径。
+ * @param payload - 可 JSON 序列化的值。
+ */
+async function writeJsonAtomic(absolute, payload) {
+  const temp = `${absolute}.tmp`;
+  await writeFile(temp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  await rename(temp, absolute);
+}
+
+/**
+ * 把一段文本原子地写进文件（同上，用于 Markdown 记忆文件）。
+ * @param absolute - 目标绝对路径。
+ * @param text - 文件正文。
+ */
+async function writeTextAtomic(absolute, text) {
+  const temp = `${absolute}.tmp`;
+  await writeFile(temp, text, 'utf8');
+  await rename(temp, absolute);
+}
+
+/** 读取一个文本文件；不存在时返回 undefined（而不是抛错）。 */
+async function readTextOrUndefined(absolute) {
+  try {
+    return await readFile(absolute, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return undefined;
+    throw error;
+  }
+}
+
+/**
+ * 读一个 JSONL 转录文件；单行坏掉（写到一半被杀、手工编辑出错）时跳过那一行，
+ * 不让一条坏记录把整个会话的历史变成读不出来。
+ * @param absolute - 转录文件的绝对路径。
+ * @returns 解析成功的记录数组。
+ */
+async function readJsonl(absolute) {
+  const text = await readTextOrUndefined(absolute);
+  if (text === undefined) return [];
+  const out = [];
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed !== null && typeof parsed === 'object') out.push(parsed);
+    } catch {
+      // 坏行直接跳过：转录是「尽力而为」的历史，不是账本。
+    }
+  }
+  return out;
+}
+
+/** 列出一个目录下的文件名；目录不存在时返回空数组。 */
+async function readdirOrEmpty(absolute) {
+  try {
+    return await readdir(absolute);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return [];
+    throw error;
+  }
 }
 
 /**
@@ -402,6 +559,923 @@ export function apply(ctx, config) {
   }
   /** 表情包目录的展示路径（相对 cwd、正斜杠），就是模型该写进 qq_send_image 的那种写法。 */
   const stickerLabel = stickerInside ? relative(resolve(cwd), stickerRoot).split(sep).join('/') : undefined;
+
+  // ---- 长期记忆：目录、布局边界与内存态 ----
+  //
+  // 三样东西同住 memoryDir（默认 `.qq-memory`，必须在 cwd 内 —— 它是 qq_memory 工具的
+  // 写入边界，也是摘要 Agent 唯一允许动手的地方）：
+  //
+  //   conversations/<key>/{meta.json,log/YYYY-MM-DD.jsonl}   每个会话的聊天记录（原始事实）
+  //   conversations/<key>/MEMORY.md                           这个群的长期记忆
+  //   COGNITION.md                                            跨会话的公共认知（梗 / 表情包含义）
+  //   INDEX.md                                                两份索引的拼接，注入渠道提示
+  //
+  // 插件只负责**记**（每条入站消息同步落一行），**读/写**交给模型通过
+  // qq_transcript / qq_memory 两个工具做 —— 好处是纯宿主平面工具，QQ 会话不用为了
+  // 记忆拿到 write / bash；摘要则由下面的定时器驱动一个独立会话跑 message-digest skill。
+  const memoryOn = config.memory !== false;
+  const memoryCfg = typeof config.memoryDir === 'string' ? config.memoryDir.trim() : '';
+  const memoryRoot = memoryCfg.length > 0 ? resolve(cwd, memoryCfg) : undefined;
+  const memoryInside = memoryRoot !== undefined && insideDirectory(resolve(cwd), memoryRoot);
+  if (memoryOn && memoryRoot !== undefined && !memoryInside) {
+    report('warn', `memoryDir "${memoryCfg}" resolves outside cwd (${cwd}); episodic memory is disabled`);
+  } else if (memoryOn && memoryRoot === undefined) {
+    report('warn', 'memory is enabled but memoryDir is empty; episodic memory is disabled');
+  }
+  const memoryEnabled = memoryOn && memoryInside;
+  /** 记忆目录的展示路径（相对 cwd、正斜杠），提示词与工具返回值里都用它。 */
+  const memoryLabel = memoryEnabled ? relative(resolve(cwd), memoryRoot).split(sep).join('/') : '';
+  /**
+   * 记忆目录的绝对路径（以 `/` 结尾），给「写盘」这一侧用。
+   *
+   * 相对路径在概念上是相对 **Agent 的 cwd** 的，所以这里必须解析成绝对路径再拼；
+   * 而兼容旧配置的那条分支（memoryDir 与 stickerDir 同名时复用已解析的 stickerRoot）
+   * 说明 stderr 上确实出现过「相对进程 cwd」的写法，两种都认。
+   */
+  const memoryBase = memoryEnabled
+    ? (stickerRoot !== undefined && memoryCfg === config.stickerDir.trim()
+        ? `${stickerRoot}${sep}`
+        : `${memoryRoot}${sep}`)
+    : undefined;
+  /** 会话 key → 记忆目录下的安全子目录名（见 memorySlug）。 */
+  const memorySlugs = new Map();
+  /** 会话 key → 上一次成功摘要之后、这个会话又来了多少条消息（内存计数，重启归零）。 */
+  const memoryDirty = new Map();
+  /**
+   * 会话 key → 上一次成功摘要的时间戳。
+   *
+   * 启动时从 `digest.json` 预读进内存，之后每次摘要就地更新：`runDigestSweep` 是
+   * 定时器回调（每 `digestIntervalMs` 一次），不该每次都去磁盘上读一遍状态。
+   */
+  const memoryLastDigest = new Map();
+  /** 记忆文件的写盘队列（每个文件一条串行链，见 writeMemoryFile）。 */
+  const memoryWrites = new Map();
+  /** 定时器句柄：插件卸载时由 ctx.effect 收走。 */
+  let digestTimerDisposer;
+  /** 摘要 Agent 的会话 id（确定性派生，重启后 resume，摘要历史不会断）。 */
+  const digestSessionId = sessionIdFor('bridge:digest');
+  /** 摘要任务的串行链：一次只跑一个会话，也不与自己的下一轮重叠。 */
+  let digestChain = Promise.resolve();
+  /** 已经排进队列、还没跑完的会话 key，避免同一个会话被重复排队。 */
+  const digestQueued = new Set();
+
+  /**
+   * 取一个会话在记忆目录下的安全目录名（每个进程只算一次，保证稳定）。
+   * @param key - 会话 key。
+   * @returns 目录名，例如 `group-100000001`。
+   */
+  function memorySlugFor(key) {
+    let slug = memorySlugs.get(key);
+    if (slug === undefined) {
+      slug = memorySlug(key);
+      memorySlugs.set(key, slug);
+    }
+    return slug;
+  }
+
+  /** 某个会话在记忆目录下的绝对路径集合（会话目录、转录目录、记忆文件）。 */
+  function memoryPaths(key) {
+    const slug = memorySlugFor(key);
+    const dir = join(memoryRoot, 'conversations', slug);
+    return {
+      slug,
+      dir: `${dir}${sep}`,
+      logDir: `${join(dir, 'log')}${sep}`,
+      memoryFile: join(dir, 'MEMORY.md'),
+      metaFile: join(dir, 'meta.json'),
+    };
+  }
+
+  /** 索引片段与认知库的绝对路径（两者都在记忆目录顶层）。 */
+  const memoryIndexFile = memoryEnabled ? join(memoryRoot, 'INDEX.md') : undefined;
+  const memoryCognitionFile = memoryEnabled ? join(memoryRoot, 'COGNITION.md') : undefined;
+
+  /**
+   * 把聊天记录按会话串行追加到当天转录里（qq_transcript 的原料）。
+   *
+   * 这里刻意**不**等落盘：`handleEvent` 是 OneBot 事件的热路径（攒批定时器也在它
+   * 里面），一次 await 就会把「消息有没有被及时接住」交给磁盘。所以写是后台的，
+   * 按会话排队（`memoryWrites`），失败只记一条 warn。
+   *
+   * @param conversation - 归属的会话记录。
+   * @param line - 已渲染成一行的一条记录。
+   * @param date - 日期（`YYYY-MM-DD`）。
+   */
+  function appendTranscript(key, line, date, conversation) {
+    const paths = memoryPaths(key);
+    const file = join(paths.logDir, `${date}.jsonl`);
+    const previous = memoryWrites.get(file) ?? Promise.resolve();
+    const next = previous
+      .then(async () => {
+        await mkdir(paths.logDir, { recursive: true });
+        await appendFile(file, `${JSON.stringify(line)}\n`, 'utf8');
+      })
+      .catch((error) => {
+        report('warn', `could not append transcript for ${key}: ${errorText(error)}`);
+      });
+    memoryWrites.set(file, next);
+    // 这个会话还没有目录（第一次说话）时落一份元信息，qq_transcript 的 list 靠它认出群名。
+    if (conversation !== undefined && conversation.metaWritten !== true) {
+      conversation.metaWritten = true;
+      void (async () => {
+        try {
+          await mkdir(paths.dir, { recursive: true });
+          const existing = await readTextOrUndefined(paths.metaFile);
+          const parsed = existing === undefined ? undefined : JSON.parse(existing);
+          await writeJsonAtomic(paths.metaFile, {
+            key: conversation.key,
+            type: conversation.type,
+            id: conversation.id,
+            name: conversation.name || conversation.senderName,
+            createdAt: parsed?.createdAt ?? new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          report('warn', `could not write memory meta for ${conversation.key}: ${errorText(error)}`);
+        }
+      })();
+    }
+  }
+
+  /**
+   * 收下一条入站消息时顺手记一行转录。
+   *
+   * 只记**别人的**消息（机器人自己发出去的话会以 message 事件回灌，那是回音不是历史），
+   * 并且限定在插件本来就允许处理的范围内（私聊开关、群白名单、私聊白名单）——
+   * 记忆不该成为绕过准入规则的后门。
+   * @param event - 已解码的 OneBot 事件。
+   * @param selfId - 机器人自己的 QQ 号。
+   * @param state - `handleEvent` 已有的判定结果 `{ admitted, jmCommand, reset }`。
+   */
+  function rememberTranscript(event, selfId, state) {
+    if (!memoryEnabled) return;
+    if (event?.post_type !== 'message') return;
+    if (selfId === '' || String(event.user_id ?? '') === String(selfId)) return;
+    const isGroup = event.message_type === 'group';
+    if (isGroup) {
+      if (!config.groupChat) return;
+      const groupId = String(event.group_id);
+      if (config.allowGroups.length > 0 && !config.allowGroups.includes(groupId)) return;
+    } else {
+      if (!config.privateChat) return;
+      const userId = String(event.user_id);
+      if (config.allowUsers.length > 0 && !config.allowUsers.includes(userId)) return;
+    }
+    const message = event.message ?? event.raw_message;
+    const text = memoryOneLine(messageToText(message, selfId)).slice(0, MEMORY_LINE_MAX_CHARS);
+    const sender = event.sender ?? {};
+    const name = isGroup
+      ? String(sender.card ?? sender.nickname ?? event.user_id ?? '')
+      : String(sender.nickname ?? sender.card ?? event.user_id ?? '');
+    const write = (key, extra = {}, conversation) => {
+      const date = localDate();
+      appendTranscript(key, {
+        at: Date.now(),
+        date,
+        // state 由 handleEvent 一次算好：被 @ 的（进会话）与只是路过的（环境上下文）都记，
+        // 但标出来 —— 摘要时「它是被叫到才说话」和「它只是看着」是两种不同的事实。
+        kind: isGroup ? 'group' : 'private',
+        addressed: state.admitted !== undefined,
+        command: state.jmCommand !== undefined ? 'jm' : state.reset ? 'reset' : undefined,
+        id: String(event.message_id ?? ''),
+        user: String(event.user_id ?? ''),
+        name,
+        text,
+        hasMedia: collectMedia(message).length > 0,
+        ...extra,
+      }, date, conversation);
+      memoryDirty.set(key, (memoryDirty.get(key) ?? 0) + 1);
+    };
+    // 没被 @ 的群消息**不建**会话记录（`conversations` 是「这个 Harness 处理过哪些会话」
+    // 的表，qq_list_conversations 与摘要调度都读它 —— 让一条闲聊把某个群「变成处理过」
+    // 是行为上的谎言）。转录仍然照记：长期记忆的原料正是那些没人 @ 它的闲聊。
+    const admitted = state.admitted;
+    if (admitted === undefined) {
+      write(`${isGroup ? 'group' : 'private'}:${isGroup ? event.group_id : event.user_id}`);
+      return;
+    }
+    write(admitted.conversation.key, {}, admitted.conversation);
+  }
+
+  /**
+   * 读 `/workspace/.qq-memory/digest.json`：每个会话上一次成功摘要的时间与当时的日期。
+   *
+   * 放在磁盘上而不是内存里，是为了让「本该摘要但进程重启了」不会把那批消息算丢：
+   * 重启后 `lastDigestAt` 还是旧值，积压会被认出来并补一次。
+   * @returns `{ conversations: { <key>: { lastDigestAt, lastAttemptAt } } }`。
+   */
+  async function readDigestState() {
+    const text = await readTextOrUndefined(join(memoryRoot, 'digest.json'));
+    if (text === undefined) return { conversations: {} };
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed === null || typeof parsed !== 'object' || typeof parsed.conversations !== 'object' || parsed.conversations === null) {
+        return { conversations: {} };
+      }
+      return { conversations: parsed.conversations };
+    } catch (error) {
+      report('warn', `could not parse digest.json (starting over): ${errorText(error)}`);
+      return { conversations: {} };
+    }
+  }
+
+  /** 把摘要状态写回磁盘（原子写）。 */
+  async function writeDigestState(state) {
+    await mkdir(memoryRoot, { recursive: true });
+    await writeJsonAtomic(join(memoryRoot, 'digest.json'), state);
+  }
+
+  /**
+   * 把一批转录记录渲染成给摘要 Agent 看的正文（旧 → 新）。
+   *
+   * 超长时**从最旧的一端**截断并明确告诉模型「前面还有更早的记录没给你」：摘要
+   * 最怕的是模型以为手上这批就是全部，于是把「群里最近很安静」写成结论。
+   * @param lines - 转录记录（按时间升序）。
+   * @param budget - 字符预算。
+   * @returns `{ text, included, dropped }`。
+   */
+  function renderTranscriptWindow(lines, budget) {
+    const rendered = lines.map((line) => {
+      const when = new Date(Number(line.at) || Date.now());
+      const pad = (value) => String(value).padStart(2, '0');
+      const stamp = `${pad(when.getHours())}:${pad(when.getMinutes())}`;
+      const who = String(line.name ?? line.user ?? '?');
+      const tags = [line.kind === 'private' ? '私聊' : '群'];
+      if (line.addressed === true) tags.push('被叫到');
+      if (line.command !== undefined) tags.push(`指令:${line.command}`);
+      if (line.hasMedia === true) tags.push('带图');
+      return `${stamp} [${tags.join(' ')}] ${who}: ${String(line.text ?? '')}`;
+    });
+    let used = 0;
+    const kept = [];
+    for (let index = rendered.length - 1; index >= 0; index -= 1) {
+      const line = rendered[index];
+      if (used + line.length + 1 > budget && kept.length > 0) break;
+      used += line.length + 1;
+      kept.push(line);
+    }
+    kept.reverse();
+    return { text: kept.join('\n'), included: kept.length, dropped: rendered.length - kept.length };
+  }
+
+  /**
+   * 摘要 Agent：跑 message-digest skill 的那个独立会话。
+   *
+   * 为什么必须是独立会话而不是「往正在聊天的会话里塞一条」：QQ 会话的 persona 是
+   * 一个正在群里唠嗑的群友，让它「现在开始写摘要」既污染聊天上下文，又会把摘要当
+   * 聊天内容发回 QQ。独立会话则干净、可 resume（摘要历史连续）、而且它的输出本来
+   * 就不经过回复链路（`sessionIndex` 里没有它）。
+   */
+  async function ensureDigestAgent(notice) {
+    const live = ctx.agents.get(digestSessionId);
+    if (live !== undefined) {
+      if (digestHandle?.agent !== live) digestHandle = undefined;
+      return live;
+    }
+    const chosen = resolveRoute();
+    const agentOptions = {};
+    if (chosen.provider.length > 0) agentOptions.provider = chosen.provider;
+    if (chosen.model.length > 0) agentOptions.model = chosen.model;
+    if (chosen.model.length === 0) {
+      throw new Error(`qq-bridge: no model for the digest agent (${chosen.error}); set provider/model on the plugin`);
+    }
+    const presetId = await resolveAgentPreset();
+    const setup = async (agentCtx, agent) => {
+      await mountAgentPreset(agentCtx, agent, presetId);
+      restrictAgentTools(agentCtx, agent);
+      const prompt = agentCtx.get?.('systemPrompt');
+      if (prompt === undefined) return;
+      prompt.variable('model', () => agentOptions.model);
+      prompt.variable('provider', () => agentOptions.provider);
+      prompt.section({
+        name: 'qq-bridge:digest',
+        order: CHANNEL_SECTION_ORDER + 10,
+        interpolate: false,
+        text: () => digestPrompt(notice),
+      });
+    };
+    let handle;
+    try {
+      handle = await ctx.agents.resume({ resumeSessionId: digestSessionId, agentOptions, setup });
+      report('info', `resumed digest session ${digestSessionId}`);
+    } catch {
+      handle = await ctx.agents.create({
+        sessionId: digestSessionId,
+        meta: presetId.length > 0 ? { cwd, agentPreset: presetId } : { cwd },
+        agentOptions,
+        setup,
+      });
+      report('info', `created digest session ${digestSessionId}`);
+    }
+    digestHandle = handle;
+    if (approvalPolicy === 'never') {
+      const approval = ctx.get('approval');
+      try {
+        approval?.setPolicy(handle.agent, 'never');
+      } catch (error) {
+        report('warn', `could not set approval policy on the digest agent: ${errorText(error)}`);
+      }
+    }
+    return handle.agent;
+  }
+
+  /** 摘要 Agent 的句柄（只在 /reset 之外的生命周期里复用；超时销毁后置空）。 */
+  let digestHandle;
+
+  /**
+   * 提示词里那段「记忆索引」的缓存。
+   *
+   * `SystemPrompt.section()` 的 text provider 是**同步**求值的（每次装配提示词都会
+   * 重新算），所以这里只能读缓存、由后台异步刷新 —— 与表情包目录用同步 readdir 的
+   * 理由一样，只是记忆文件在磁盘上、大小不定，同步读会把一次可观测的 IO 放进装配路径。
+   * @type {{ at: number, text: string }}
+   */
+  let memoryIndexCache = { at: 0, text: '' };
+
+  /**
+   * 读一小段记忆索引（`INDEX.md` + 当前会话的 `MEMORY.md`）供提示词使用。
+   *
+   * 只取开头的 `MEMORY_INDEX_MAX_CHARS` 个字：索引是「摘要 Agent 替大家维护的目录」，
+   * 它的长度由摘要 Agent 的写法决定，插件这边只做兜底截断 —— 提示词被记忆撑爆比
+   * 记忆不够详细糟糕得多。
+   * @param conversation - 目标会话。
+   * @returns 可直接拼进提示词的若干行；没有内容时为空串。
+   */
+  function memoryIndexText(conversation) {
+    if (!memoryEnabled) return '';
+    if (Date.now() - memoryIndexCache.at > 15000) {
+      // 先发一次刷新（不 await），这一轮用上一份缓存 —— 冷启动时是空的，15 秒后就位。
+      memoryIndexCache.at = Date.now();
+      if (!memoryIndexRefreshing) {
+        memoryIndexRefreshing = true;
+        void (async () => {
+          try {
+            const paths = memoryPaths(conversation.key);
+            const parts = [];
+            const index = await readTextOrUndefined(memoryIndexFile);
+            if (index !== undefined && index.trim().length > 0) parts.push(index.trim());
+            const own = await readTextOrUndefined(paths.memoryFile);
+            if (own !== undefined && own.trim().length > 0) {
+              parts.push(`### ${conversation.type === 'group' ? '本群' : '与这个人'}的记忆（${memoryLabel}/conversations/${paths.slug}/MEMORY.md）\n${own.trim()}`);
+            }
+            const text = parts.join('\n\n').slice(0, MEMORY_INDEX_MAX_CHARS);
+            memoryIndexCache = { at: Date.now(), text };
+          } catch (error) {
+            report('warn', `could not read the memory index: ${errorText(error)}`);
+            memoryIndexCache = { at: Date.now(), text: memoryIndexCache.text };
+          } finally {
+            memoryIndexRefreshing = false;
+          }
+        })();
+      }
+    }
+    return memoryIndexCache.text;
+  }
+
+  /** 索引刷新是否正在进行（避免一个慢磁盘把刷新任务堆起来）。 */
+  let memoryIndexRefreshing = false;
+
+  /**
+   * 解析 `qq_memory` 要操作的文件。
+   *
+   * 三种来源，按优先级：
+   *   1. 显式 `path`（相对记忆目录，越界直接报错）；
+   *   2. 说了 `conversation`、没说 path → 那个会话的 `MEMORY.md`；
+   *   3. 都没说 → 当前 QQ 会话的 `MEMORY.md`；连会话都没有就是 `INDEX.md`。
+   * @param args - 工具参数。
+   * @param tool - 工具名（报错用）。
+   * @param exec - 工具执行上下文。
+   * @returns 记忆目录内的相对路径（正斜杠）。
+   */
+  function resolveMemoryPath(args, tool, exec) {
+    const raw = String(args?.path ?? '').trim();
+    if (raw.length > 0) {
+      const relative = memoryRelativePath(memoryBase, raw);
+      if (relative === undefined) {
+        throw new Error(`${tool}: path "${raw}" is not inside the memory directory ${memoryLabel}/ (no absolute paths, no "..")`);
+      }
+      return relative;
+    }
+    const fromAgent = exec?.agent?.id !== undefined ? conversations.get(sessionIndex.get(exec.agent.id)) : undefined;
+    const wanted = String(args?.conversation ?? '').trim();
+    if (wanted.length > 0 || fromAgent !== undefined) {
+      const target = resolveMemoryConversation(args, exec, tool);
+      return `conversations/${target.slug}/MEMORY.md`;
+    }
+    return 'INDEX.md';
+  }
+
+  /** 记忆目录下已存在的文件（相对路径），按名称排序；没有时是空数组。 */
+  async function listMemoryFiles() {
+    const out = [];
+    for (const top of ['INDEX.md', 'COGNITION.md', 'digest.json']) {
+      if ((await readTextOrUndefined(join(memoryBase, top))) !== undefined) out.push(`${memoryLabel}/${top}`);
+    }
+    for (const slug of await readdirOrEmpty(join(memoryBase, 'conversations'))) {
+      for (const name of await readdirOrEmpty(join(memoryBase, 'conversations', slug))) {
+        if (name.endsWith('.md') || name.endsWith('.json')) out.push(memoryRelativeConvPath(slug, name));
+      }
+    }
+    return { action: 'list', files: out.sort(), returned: out.length, truncated: false };
+  }
+
+  /**
+   * 读一个记忆文件，带行号。
+   * @param relative - 记忆目录内的相对路径。
+   * @returns 工具输出。
+   */
+  async function readMemoryFile(relative) {
+    const text = await readTextOrUndefined(join(memoryBase, relative));
+    if (text === undefined) {
+      return { action: 'read', path: `${memoryLabel}/${relative}`, bytes: 0, lines_total: 0, returned: 0, truncated: false, note: '(file does not exist yet — append to create it)' };
+    }
+    const lines = text.split('\n');
+    // 行号让模型能引用「第 12 行」，也让长文件的截断看得出来是截断。
+    const numbered = lines.map((line, index) => `${String(index + 1).padStart(4, ' ')} | ${line}`).join('\n');
+    const truncated = numbered.length > MEMORY_FILE_RETURN_CHARS;
+    return {
+      action: 'read',
+      path: `${memoryLabel}/${relative}`,
+      bytes: Buffer.byteLength(text, 'utf8'),
+      lines_total: lines.length,
+      returned: lines.length,
+      truncated,
+      text: truncated ? `${numbered.slice(0, MEMORY_FILE_RETURN_CHARS)}\n…（已截断）` : numbered,
+    };
+  }
+
+  /**
+   * 在记忆文件里按子串搜索（不区分大小写），返回命中行及其上下文。
+   * @param relative - 记忆目录内的相对路径。
+   * @param query - 要找的文本。
+   * @param limit - 最多返回多少条命中。
+   * @returns 工具输出。
+   */
+  async function searchMemoryFile(relative, query, limit) {
+    const text = await readTextOrUndefined(join(memoryBase, relative));
+    const hits = [];
+    if (text !== undefined) {
+      const lines = text.split('\n');
+      const needle = query.trim().toLowerCase();
+      const max = Math.max(1, Math.floor(Number(limit) || Number(config.memorySearchHits) || 40));
+      for (let index = 0; index < lines.length && hits.length < max; index += 1) {
+        if (!lines[index].toLowerCase().includes(needle)) continue;
+        const from = Math.max(0, index - 2);
+        const to = Math.min(lines.length, index + 3);
+        hits.push(lines.slice(from, to).map((line, offset) => `${String(from + offset + 1).padStart(4, ' ')} | ${line}`).join('\n'));
+      }
+    }
+    return {
+      action: 'search',
+      path: `${memoryLabel}/${relative}`,
+      returned: hits.length,
+      truncated: hits.length >= Math.max(1, Math.floor(Number(limit) || Number(config.memorySearchHits) || 40)),
+      text: hits.length > 0 ? hits.join('\n---\n') : '(no match)',
+      bytes: text === undefined ? 0 : Buffer.byteLength(text, 'utf8'),
+    };
+  }
+
+  /**
+   * 追加或覆盖一个记忆文件。
+   *
+   * 顺序是「先校验大小、再写盘」：写一半才发现超限会留下一个半截文件（记忆文件是
+   * 摘要 Agent 下一次开工要读的输入，半截比不写更坏）。写走 `writeMemoryFile` 的
+   * 串行队列 —— 同一个文件的两次写入可能来自同一轮里的两个并行工具调用。
+   * @param relative - 记忆目录内的相对路径。
+   * @param text - 要写入的 markdown。
+   * @param append - true = 追加，false = 覆盖。
+   * @returns 工具输出。
+   */
+  async function writeMemoryFile(relative, text, append) {
+    const absolute = join(memoryBase, relative);
+    const maxBytes = Math.max(256, Math.floor(Number(config.memoryFileMaxBytes) || 0));
+    const body = append ? `\n${text.replace(/\s+$/, '')}\n` : `${text.replace(/\s+$/, '')}\n`;
+    const previousRaw = (await readTextOrUndefined(absolute)) ?? '';
+    const previousBytes = Buffer.byteLength(previousRaw, 'utf8');
+    const bodyBytes = Buffer.byteLength(body, 'utf8');
+    if (!append && bodyBytes > maxBytes) {
+      throw new Error(`qq_memory: ${bodyBytes} bytes exceeds memoryFileMaxBytes (${maxBytes}); write less, or split it across files`);
+    }
+    if (append && previousBytes + bodyBytes > maxBytes) {
+      const room = maxBytes - previousBytes;
+      throw new Error(
+        `qq_memory: appending ${bodyBytes} bytes would exceed memoryFileMaxBytes (${maxBytes}) — ` +
+          `\`${memoryLabel}/${relative}\` is already ${previousBytes} bytes (room for ${Math.max(0, room)} more). ` +
+          'Rewrite it shorter with action "write" (keep only what still matters), or put the new fact in a different file.',
+      );
+    }
+    const next = append ? `${previousRaw.replace(/\s*$/, '')}\n${text.replace(/\s+$/, '')}\n` : body;
+    const queueKey = absolute;
+    const previous = memoryWrites.get(queueKey) ?? Promise.resolve();
+    const done = previous
+      .catch(() => {})
+      .then(async () => {
+        await mkdir(dirname(absolute), { recursive: true });
+        await writeTextAtomic(absolute, next);
+      });
+    memoryWrites.set(queueKey, done);
+    await done;
+    return {
+      action: append ? 'append' : 'write',
+      path: `${memoryLabel}/${relative}`,
+      bytes: Buffer.byteLength(next, 'utf8'),
+      lines_total: next.split('\n').length,
+      returned: 1,
+      truncated: false,
+      note: append ? `appended ${bodyBytes} bytes` : `replaced ${previousBytes} bytes with ${bodyBytes} bytes`,
+    };
+  }
+
+  /** 一条转录记录在工具结果里的一行文本。 */
+  function describeTranscriptLine(line) {
+    if (line.conversation !== undefined) return `[${line.date ?? '?'}] ${line.conversation} — ${line.messages ?? 0} 条，最后 ${line.last_at ?? '?'} ${line.last_text ?? ''}`.trim();
+    const tags = [];
+    if (line.kind !== undefined) tags.push(line.kind);
+    if (line.addressed === true) tags.push('被叫到');
+    if (line.command !== undefined) tags.push(`指令:${line.command}`);
+    if (line.media === true) tags.push('带图');
+    const tag = tags.length > 0 ? `[${tags.join(' ')}] ` : '';
+    return `${line.at ?? ''} ${tag}${line.user ?? '?'}: ${line.text ?? ''}`.trim();
+  }
+
+  /** 本地时间戳 `YYYY-MM-DD HH:MM:SS`，转录输出里统一用它。 */
+  function localStamp(at) {
+    const date = new Date(Number(at) || Date.now());
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  }
+
+  /** 转录工具共享的参数上限。 */
+  function transcriptLimit(raw, fallback) {
+    const value = Math.floor(Number(raw) || 0);
+    if (value > 0) return Math.min(value, 2000);
+    return fallback;
+  }
+
+  /** `qq_transcript list`：磁盘上有记录的会话、条数与最后一条消息。 */
+  async function listTranscripts() {
+    const lines = [];
+    const root = join(memoryBase, 'conversations');
+    for (const slug of await readdirOrEmpty(root)) {
+      const dir = join(root, slug);
+      const files = (await readdirOrEmpty(join(dir, 'log'))).filter((name) => name.endsWith('.jsonl')).sort();
+      if (files.length === 0) continue;
+      let messages = 0;
+      let newest;
+      for (const name of files) {
+        const records = await readJsonl(join(dir, 'log', name));
+        messages += records.length;
+        for (const record of records) {
+          if (newest === undefined || (Number(record.at) || 0) > (Number(newest.at) || 0)) newest = record;
+        }
+      }
+      let meta;
+      try {
+        meta = JSON.parse((await readTextOrUndefined(join(dir, 'meta.json'))) ?? '{}');
+      } catch {
+        meta = {};
+      }
+      lines.push({
+        conversation: String(meta.key ?? slug),
+        name: String(meta.name ?? ''),
+        date: `${files[0]} → ${files[files.length - 1]}`,
+        messages,
+        last_at: newest === undefined ? '' : localStamp(newest.at),
+        last_text: newest === undefined ? '' : String(newest.text ?? '').slice(0, 80),
+      });
+    }
+    // 最近活跃的排在前面：摘要时第一眼该看到有人在说话的群。
+    lines.sort((a, b) => String(b.last_at).localeCompare(String(a.last_at)));
+    return { action: 'list', lines, returned: lines.length, truncated: false };
+  }
+
+  /**
+   * `qq_transcript read`：读一个会话的转录。
+   * @param target - `{ key, slug, label }`。
+   * @param args - 工具参数（`date` / `since` / `until` / `limit`）。
+   */
+  async function readTranscript(target, args) {
+    const dir = join(memoryBase, 'conversations', target.slug, 'log');
+    const available = (await readdirOrEmpty(dir)).filter((name) => name.endsWith('.jsonl')).sort();
+    const limit = transcriptLimit(args.limit, 200);
+    const day = typeof args.date === 'string' ? args.date.trim() : '';
+    const from = typeof args.since === 'string' ? args.since.trim() : '';
+    const to = typeof args.until === 'string' ? args.until.trim() : '';
+    const inRange = (name) => {
+      const date = name.replace(/\.jsonl$/, '');
+      if (day.length > 0) return date === day;
+      if (from.length > 0 && date < from) return false;
+      if (to.length > 0 && date > to) return false;
+      return true;
+    };
+    const wanted = available.filter(inRange);
+    const records = [];
+    for (const name of wanted) records.push(...await readJsonl(join(dir, name)));
+    records.sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0));
+    // 超限时保留**最近**的那些：问「刚刚/后来怎么样了」远多于问「最开始是什么」。
+    const truncated = records.length > limit;
+    const kept = truncated ? records.slice(records.length - limit) : records;
+    return {
+      action: 'read',
+      conversation: target.key,
+      returned: kept.length,
+      truncated,
+      note: truncated ? `只给了最近 ${kept.length} 条（共 ${records.length} 条）` : '',
+      lines: kept.map((record) => ({
+        at: localStamp(record.at),
+        user: String(record.name ?? record.user ?? '?'),
+        text: String(record.text ?? ''),
+        kind: String(record.kind ?? ''),
+        addressed: record.addressed === true,
+        command: record.command === undefined ? undefined : String(record.command),
+        media: record.hasMedia === true,
+      })),
+    };
+  }
+
+  /**
+   * `qq_transcript search`：在某个会话的转录里按子串找（文本、昵称、日期都算）。
+   * @param target - `{ key, slug, label }`。
+   * @param args - 工具参数（`query` / `limit`）。
+   */
+  async function searchTranscript(target, args) {
+    const dir = join(memoryBase, 'conversations', target.slug, 'log');
+    const limit = transcriptLimit(args.limit, Math.max(1, Math.floor(Number(config.memorySearchHits) || 40)));
+    const needle = String(args.query).trim().toLowerCase();
+    const hits = [];
+    for (const name of (await readdirOrEmpty(dir)).filter((file) => file.endsWith('.jsonl')).sort().reverse()) {
+      for (const record of await readJsonl(join(dir, name))) {
+        const haystack = `${record.text ?? ''}\n${record.name ?? ''}\n${record.date ?? ''}`.toLowerCase();
+        if (!haystack.includes(needle)) continue;
+        hits.push({
+          at: localStamp(record.at),
+          user: String(record.name ?? record.user ?? '?'),
+          text: String(record.text ?? ''),
+          kind: String(record.kind ?? ''),
+          addressed: record.addressed === true,
+          media: record.hasMedia === true,
+        });
+      }
+    }
+    hits.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+    const kept = hits.slice(0, limit);
+    return {
+      action: 'search',
+      conversation: target.key,
+      returned: kept.length,
+      truncated: hits.length > kept.length,
+      note: hits.length > kept.length ? `共 ${hits.length} 条命中，只给了最新的 ${kept.length} 条` : '',
+      lines: kept,
+    };
+  }
+
+  /**
+   * 记忆文件的展示路径（相对 cwd）：工具返回值里给模型看的永远是这一种写法，
+   * 它同时也是 `qq_memory` 下次调用时该回传的 `path`。
+   * @param slug - 会话目录名。
+   * @param file - 会话目录内的文件名。
+   * @returns 形如 `.qq-memory/conversations/group-123/MEMORY.md`。
+   */
+  function memoryRelativeConvPath(slug, file) {
+    return `${memoryLabel}/conversations/${slug}/${file}`;
+  }
+
+  /**
+   * 解析工具调用「在说哪个会话」，并给出它的记忆目录。
+   *
+   * 两条来源，按优先级：
+   *   1. 调用它的那个 Agent 就是某个 QQ 会话的 Agent（`exec.agent.id` → 会话 key）；
+   *   2. 显式给的 `conversation`（`group:100000001` / `private:100000002`）——
+   *      摘要会话不是任何 QQ 会话的 Agent，必须走这条。
+   *
+   * 显式给的名字会先按「已见过的会话」核对：记忆目录是按 key 派生目录名的，一个
+   * 拼错的 key 会安静地开出一个新的空目录，看起来就像「记忆丢了」。核对不上就报错。
+   *
+   * @param args - 工具参数（可能带 `conversation`）。
+   * @param exec - 工具执行上下文（`exec.agent.id`）。
+   * @param tool - 工具名，只用于报错。
+   * @returns `{ key, slug, label, memoryFile }`；无法确定时抛错。
+   */
+  function resolveMemoryConversation(args, exec, tool) {
+    if (!memoryEnabled) throw new Error(`${tool} is unavailable: long-term memory is disabled (qq-bridge config memory/memoryDir)`);
+    const fromAgent = exec?.agent?.id !== undefined ? conversations.get(sessionIndex.get(exec.agent.id)) : undefined;
+    const explicit = String(args?.conversation ?? '').trim();
+    let conversation = fromAgent;
+    if (explicit.length > 0) {
+      // 容忍「裸群号」这类写法：权威格式是 `group:<id>` / `private:<id>`，其余尽量往
+      // 已知会话上靠；靠不上且本来就不是 key 形态时报错，而不是开一个新目录。
+      const known = explicit.includes(':') ? explicit : [...conversations.keys()].find((key) => key.endsWith(`:${explicit}`));
+      conversation = known !== undefined ? conversations.get(known) : undefined;
+      if (conversation === undefined && !explicit.includes(':')) {
+        throw new Error(`${tool}: unknown conversation "${explicit}"; use a key like "group:123456" (see qq_transcript list)`);
+      }
+    }
+    const key = conversation?.key ?? explicit;
+    if (key.length === 0) {
+      throw new Error(`${tool}: cannot tell which conversation this is about; pass conversation: "group:<群号>" or "private:<QQ号>"`);
+    }
+    const paths = memoryPaths(key);
+    const label = conversation !== undefined
+      ? `${conversation.type === 'group' ? '群' : '私聊'} ${conversation.name || conversation.id}`
+      : key;
+    return { key, slug: paths.slug, label, memoryFile: paths.memoryFile };
+  }
+
+  /**
+   * 记忆工具到底能不能用：开关开着，并且没有被 `allowTools` 挡在外面。
+   *
+   * 白名单是使用者的明确意图（「只给 read」），提示词里推荐一个被挡掉的工具会让模型
+   * 去撞一次「工具不存在」；记忆相关的提示、索引注入都跟着这个判定走。
+   * @returns 两个记忆工具都可见时为 true。
+   */
+  function memoryToolsAllowed() {
+    if (!memoryEnabled) return false;
+    if (allowTools.length === 0) return true;
+    return allowTools.includes('qq_memory') && allowTools.includes('qq_transcript');
+  }
+
+  /**
+   * 摘要 Agent 的系统提示：不放人格，只放规矩与「今天要处理哪个会话」。
+   * @param notice - `{ key, label, since, until }`。
+   * @returns 系统提示小节正文。
+   */
+  function digestPrompt(notice) {
+    if (notice === undefined) {
+      return [
+        '## 记忆维护会话',
+        '',
+        '你不是在跟任何人聊天。这个会话只有一个用途：在后台把 QQ 群的聊天记录整理成',
+        `长期记忆，写进 \`${memoryLabel}/\` 里的 Markdown 文件。你写的字不会发给任何人，也不会有人回复你。`,
+        '',
+        `- 永远先加载 \`message-digest\` skill（\`skill\` 工具，名字就叫 message-digest），按它写的流程做。`,
+        `- 只写 \`${memoryLabel}/\` 里的文件，用 \`qq_memory\` 工具写；不要试图写别的位置。`,
+        '- 没有实质内容就什么都不写，回一句「无事」即可 —— 空摘要比编造的摘要好。',
+      ].join('\n');
+    }
+    return [
+      '## 记忆维护会话',
+      '',
+      '你不是在跟任何人聊天。这个会话只有一个用途：在后台把 QQ 群的聊天记录整理成',
+      `长期记忆，写进 \`${memoryLabel}/\` 里的 Markdown 文件。你写的字不会发给任何人，也不会有人回复你。`,
+      '',
+      `本轮要处理的会话：**${notice.label}**（\`${notice.key}\`，目录 \`${memoryLabel}/conversations/${notice.slug}/\`），`,
+      `时间窗：${notice.since} 之后到 ${notice.until}（本地时间）为止。`,
+      '',
+      '做法：',
+      `1. 用 \`skill\` 工具加载 \`message-digest\` skill，按它写的流程做（它是这一步的准绳）。`,
+      `2. 用 \`qq_transcript\` 读这个会话在这个时间窗里的记录${notice.queue && notice.queue.length > 0 ? `；本批还有其它会话排队（${notice.queue.join('、')}），它们各有自己的一轮，不用在这里处理` : ''}。`,
+      `3. 用 \`qq_memory\` 更新 \`conversations/${notice.slug}/MEMORY.md\`；只有出现**新的**梗或表情包含义时才动 \`COGNITION.md\`（加载 \`update-cognition\` skill 按它的规矩写）。`,
+      `4. 严格止步于 \`${memoryLabel}/\` 之内：不要读源码、不要改仓库里任何其它文件、不要发 QQ 消息。`,
+      '',
+      '如果这个时间窗里没有值得一提的内容，就什么都不写，回一句「无事」即可 —— 空摘要比编造的摘要好。',
+    ].join('\n');
+  }
+
+  /**
+   * 真正跑一次摘要：把转录窗口交给摘要 Agent，等这一轮结束。
+   *
+   * 摘要 Agent 的上下文只由转录与它自己写下的记忆两样东西决定，所以「模型忘了」
+   * 不构成丢记忆的理由：记忆在磁盘上，摘要只是它的读者与改写者。
+   * @param notice - 见 {@link digestPrompt}。
+   * @returns 消耗的字符数，供日志用。
+   */
+  async function runDigest(notice) {
+    const agent = await ensureDigestAgent(notice);
+    const message = createUserMessage({
+      content: [{ type: 'text', text: notice.instruction }],
+      source: { kind: 'user' },
+    });
+    agent.followup(message);
+    const timeoutMs = Math.max(1000, Math.floor(Number(config.digestTimeoutMs) || 0));
+    let timer;
+    const timeout = new Promise((resolve) => {
+      // ctx.timeout 把定时器挂在当前 fiber 上，插件卸载时自动清掉；它返回 disposer。
+      timer = typeof ctx.timeout === 'function' ? ctx.timeout(() => resolve('timeout'), timeoutMs) : setTimeout(() => resolve('timeout'), timeoutMs);
+      timer?.unref?.();
+    });
+    const outcome = await Promise.race([agent.whenIdle?.().then(() => 'idle') ?? Promise.resolve('idle'), timeout]);
+    if (typeof timer === 'function') timer();
+    else clearTimeout(timer);
+    if (outcome === 'timeout') {
+      // 卡住的 turn 不该把摘要永久堵死：销毁这个 Agent，下一次重新开一个（转录还在磁盘上）。
+      report('warn', `digest for ${notice.key} timed out after ${timeoutMs}ms; disposing the digest agent`);
+      try {
+        await digestHandle?.dispose();
+      } catch (error) {
+        report('warn', `could not dispose the digest agent: ${errorText(error)}`);
+      }
+      digestHandle = undefined;
+      throw new Error(`digest timed out after ${timeoutMs}ms`);
+    }
+  }
+
+  /**
+   * 扫描所有会话，把「值得摘要」的排进串行队列。
+   *
+   * 判据是两条（都要满足）：距上次摘要超过 `digestMinIntervalMs`，且攒下的新消息
+   * 不少于 `digestMinLines`。前者防止活跃群被反复摘要，后者防止为两三句话白跑一次
+   * 模型调用 —— 没攒够就留到下一轮，消息不会丢。
+   */
+  function runDigestSweep() {
+    if (!memoryEnabled) return;
+    digestChain = digestChain
+      .then(async () => {
+        const state = await readDigestState();
+        const now = Date.now();
+        const minInterval = Math.max(0, Math.floor(Number(config.digestMinIntervalMs) || 0));
+        const minLines = Math.max(1, Math.floor(Number(config.digestMinLines) || 1));
+        const cooldown = Math.max(0, Math.floor(Number(config.digestCooldownMs) || 0));
+        const queue = [];
+        let touched = false;
+        for (const conversation of conversations.values()) {
+          if (digestQueued.has(conversation.key)) continue;
+          const entry = state.conversations[conversation.key] ?? {};
+          const lastDigestAt = memoryLastDigest.get(conversation.key) ?? 0;
+          if (now - lastDigestAt < minInterval) continue;
+          const dirty = memoryDirty.get(conversation.key) ?? 0;
+          if (dirty < minLines) {
+            // 还没攒够：记一次尝试时间当作冷却锚点，免得每 digestIntervalMs 都白扫一遍。
+            const lastAttempt = Number(entry.lastAttemptAt) || 0;
+            if (lastDigestAt > 0 && now - lastAttempt < cooldown) continue;            state.conversations[conversation.key] = { ...entry, lastAttemptAt: now };
+            touched = true;
+            continue;
+          }
+          queue.push({ conversation, since: lastDigestAt });
+        }
+        if (touched) await writeDigestState(state);
+        for (const item of queue) {
+          // 排进队列这一刻就把 dirty 清零：这一轮之后无论成败，都不该把同一批消息再喂一遍。
+          memoryDirty.set(item.conversation.key, 0);
+          void enqueueDigest(item.conversation, item.since);
+        }
+      })
+      .catch((error) => {
+        report('warn', `digest sweep failed: ${errorText(error)}`);
+      });
+  }
+
+  /**
+   * 把一个会话的摘要任务挂到串行链尾；完成后记一次状态。
+   * @param conversation - 目标会话。
+   * @param since - 上一次摘要的时间戳（0 = 头一次）。
+   */
+  function enqueueDigest(conversation, since) {
+    digestQueued.add(conversation.key);
+    digestChain = digestChain
+      .then(async () => {
+        const paths = memoryPaths(conversation.key);
+        const files = (await readdirOrEmpty(paths.logDir)).filter((name) => name.endsWith('.jsonl')).sort();
+        // 多读一天：跨越午夜时「今天」和「昨天」两个文件都要，靠 at 时间戳再筛一次。
+        const cutoff = since > 0 ? since - 24 * 60 * 60 * 1000 : 0;
+        const lines = [];
+        for (const name of files) {
+          for (const line of await readJsonl(join(paths.logDir, name))) {
+            if ((Number(line.at) || 0) >= cutoff) lines.push(line);
+          }
+        }
+        lines.sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0));
+        const window = lines.filter((line) => (Number(line.at) || 0) > since);
+        if (window.length === 0) return;
+        const budget = Math.max(1000, Math.floor(Number(config.digestMaxChars) || 0));
+        const rendered = renderTranscriptWindow(window, budget);
+        if (rendered.included === 0) return;
+        const until = new Date().toLocaleString('zh-CN', { hour12: false });
+        const label = `${conversation.type === 'group' ? '群' : '私聊'} ${conversation.name || conversation.id}`;
+        const header = rendered.dropped > 0
+          ? `本批共 ${window.length} 条（${new Date(since || window[0].at).toLocaleString('zh-CN', { hour12: false })} 起），为了让这次摘要放得下，只给了你**最近**的 ${rendered.included} 条，更早的 ${rendered.dropped} 条这次没给（它们大多在上一次摘要里已经处理过了）。\n\n`
+          : `本批共 ${window.length} 条。\n\n`;
+        const instruction =
+          `处理 ${label} 的聊天记录：${conversation.key}\n` +
+          `（窗口起点：${since > 0 ? new Date(since).toLocaleString('zh-CN', { hour12: false }) : '首次摘要，看你能拿到的全部'}）\n\n` +
+          `${header}${rendered.text}`;
+        report('info', `digest ${conversation.key}: ${rendered.included}/${window.length} lines, ${rendered.text.length} chars`);
+        await runDigest({
+          key: conversation.key,
+          label,
+          slug: paths.slug,
+          since: since > 0 ? new Date(since).toLocaleString('zh-CN', { hour12: false }) : '（此前没有摘要）',
+          until,
+          queue: [...digestQueued].filter((key) => key !== conversation.key),
+          instruction,
+        });
+        const state = await readDigestState();
+        memoryLastDigest.set(conversation.key, Date.now());
+        state.conversations[conversation.key] = {
+          ...(state.conversations[conversation.key] ?? {}),
+          lastDigestAt: Date.now(),
+          lastLines: window.length,
+          lastLabel: label,
+        };
+        await writeDigestState(state);
+      })
+      .catch((error) => {
+        report('warn', `digest for ${conversation.key} failed: ${errorText(error)}`);
+      })
+      .finally(() => {
+        digestQueued.delete(conversation.key);
+      });
+  }
+
 
   /**
    * 禁漫（JM）下载服务：起 python 子进程下载 → 合并 PDF → 用一次性 URL 交给 NapCat。
@@ -726,6 +1800,18 @@ export function apply(ctx, config) {
         : []),
       (config.persona.trim().length > 0 ? config.persona.trim() : DEFAULT_PERSONA),
       '',
+    ];
+    // 长期记忆：把「已记住的东西」摆到眼前，模型才不会每次都从零开始 —— 并明确
+    // 告诉它「忘了就去查」，而不是凭印象编。索引是摘要 Agent 维护的，这里只读。
+    if (memoryToolsAllowed()) {
+      const index = memoryIndexText(conversation);
+      if (index.length > 0) {
+        lines.push('你记得的事（长期记忆的索引；原文件在 `' + memoryLabel + '/`）：', '', index, '');
+      } else {
+        lines.push(`你的长期记忆在 \`${memoryLabel}/\` 里（现在还是空的）。`, '');
+      }
+    }
+    lines.push(
       '硬性要求：',
       // 表情包标记只有在真的能发图时才提：不能发的时候提它，模型会把标记当正文写出来。
       `- 你的回复正文会原样发到 QQ${imageAllowed() ? '（只有 `[[图片: …]]` 这种标记例外，它变成一张图）' : ''}，直接写要说的话，不要写思考过程、也不要解释你在做什么。`,
@@ -735,13 +1821,25 @@ export function apply(ctx, config) {
       '- 你是在 QQ 上跟真人聊天，不是在被调用：群里可能有人同时插话，对方也可能过一会儿才回你；按聊天的节奏来，不必每次都给出完整的答复。',
       '- 别把每条回复都弄成同一个形状 —— 尤其别固定成「一句短的 + 一句长的」两条：一句话能说完就只发一条，长度跟着内容走，有的回复就几个字，偶尔才多说几句。',
       '- 想连说几句就直接换行，每一行都会作为单独的一条消息发出去；反过来，别用换行给一段话排版（那会变成连着刷好几条）。',
-    ];
+    );
     // 被白名单挡住的工具不能在提示里推荐，否则模型会去调用一个它根本看不见的工具。
     const recommended = ['qq_send_message', 'qq_list_conversations'].filter(
       (tool) => allowTools.length === 0 || allowTools.includes(tool),
     );
     if (recommended.length > 0) {
       lines.push(`- 需要主动给其他人或群发消息、或查询联系人时，使用 ${recommended.join(' / ')} 工具。`);
+    }
+    // 长期记忆的用法：索引已经在上面了，这里说清「怎么查、怎么记、什么时候该去学个新梗」。
+    // 三个工具名都先过白名单，避免推荐一个模型根本看不见的工具。
+    if (memoryToolsAllowed()) {
+      const canSkill = allowTools.length === 0 || allowTools.includes('skill');
+      lines.push(
+        `- 凭印象记不清「以前谁说过什么 / 这个群里发生过什么」时，别顺着猜：用 qq_transcript 查聊天记录（可以按关键词 search），用 qq_memory 读 \`${memoryLabel}/\` 里的记忆文件——先查再答，而不是先答再编。`,
+        `- 真遇到值得长期记住的事（某人的偏好、群里的约定、一件发生过的事），用 qq_memory 追加到 \`conversations/<会话目录>/MEMORY.md\`；不要为了记而记，一两句就够。`,
+        canSkill
+          ? '- 遇到看不懂的梗、黑话或表情包（图里写了什么、为什么大家都在笑），先用 read_image 看那张图，再加载 `update-cognition` skill 按它的规矩把它记进认知库；弄懂了再接着聊，不要不懂装懂、也不要一本正经地解释网络梗。'
+          : '- 遇到看不懂的梗、黑话或表情包，先用 read_image 看那张图；弄不懂就直接说不懂，不要不懂装懂、也不要一本正经地解释网络梗。',
+      );
     }
     // 图片/表情包只有落盘之后才「看得见」：把路径告诉模型，还得告诉它该用哪个工具读。
     // 没有 read_image 就别提这件事，否则模型会去调用一个它根本看不见的工具。
@@ -1271,6 +2369,8 @@ export function apply(ctx, config) {
       pending: [],
       batchTimer: undefined,
       speakers: [],
+      /** 记忆元信息（群名等）是否已经写过一次，避免每条消息都重写一遍 meta.json。 */
+      metaWritten: false,
     };
   }
 
@@ -1927,6 +3027,14 @@ export function apply(ctx, config) {
     const admitted = admit(event, selfId);
     // 复读链在所有别人的群消息上进账（被 @ 的那条也打断「连着」），但只有没被 @ 的才真的跟。
     maybeRepeat(event, selfId, admitted === undefined);
+    // 长期记忆：把这条消息记进这个会话的转录（**所有**别人的消息，包括没 @ 机器人的
+    // 群聊）。放在复读/环境上下文之前 —— 那两条路都会提前 return，而转录不该漏掉任何一条。
+    const jmCommandForLog = admitted === undefined ? undefined : readJmCommand(messageToText(admitted.message, selfId).trim());
+    rememberTranscript(event, selfId, {
+      admitted,
+      jmCommand: jmCommandForLog,
+      reset: resetCommand.length > 0 && admitted !== undefined && admitted.preview.toLowerCase() === resetCommand,
+    });
     if (admitted === undefined) {
       rememberAmbient(event, selfId);
       return;
@@ -1938,7 +3046,7 @@ export function apply(ctx, config) {
     if (submitted.size > 512) submitted.clear();
     // 禁漫下载指令走**旁路**：它不进会话队列、也不建 Agent 会话。整本要下十几分钟，
     // 排在队列里会把后面所有消息堵死；而且「/jm 123」是一个明确任务，不需要模型参与。
-    const jmCommand = readJmCommand(messageToText(message, selfId).trim());
+    const jmCommand = jmCommandForLog;
     if (jmCommand !== undefined) {
       // 攒着的那批比这条指令先到，先放它们走，回复顺序才不颠倒。
       flushBatch(conversation);
@@ -2349,6 +3457,187 @@ export function apply(ctx, config) {
     }),
   );
 
+  // ---- 长期记忆：两个宿主平面的工具 ------------------------------------------
+  //
+  // 都注册在宿主平面上（和 qq_send_message 一样），因此**任何** Agent 都能用：QQ 会话
+  // 的 Agent 用它查/记，摘要会话用它读写记忆文件。好处是 QQ 会话不必为了「记忆」拿到
+  // write / edit / bash —— 写只发生在 memoryDir 之内，边界由插件自己守。
+  if (memoryEnabled) {
+    /**
+     * 工具五：qq_transcript —— 查某个 QQ 会话的聊天记录（长期记忆的原料）。
+     *
+     * 这是「想不起来就去查」的那条路：`ambientMessages` 只喂最近十来条，一旦真需要
+     * 「上周三讨论的那个链接是什么」就必须能翻到更早的记录，而不是靠模型编。
+     */
+    ctx.tools.register(
+      defineTool({
+        name: 'qq_transcript',
+        description:
+          'Read the recorded chat transcript of a QQ conversation (long-term memory raw material). Use it when you need details of what was said earlier — who said what, when, and what was shared — instead of guessing from the short recent-message context. Actions: "list" (which conversations have records, with message counts and the newest time), "read" (messages, oldest first, optionally limited to a date range), "search" (substring match across the records).',
+        parameters: {
+          action: {
+            type: 'string',
+            enum: ['list', 'read', 'search'],
+            description: 'list = the conversations on disk with counts; read = messages of one conversation; search = find a keyword across a conversation\'s records.',
+          },
+          conversation: {
+            type: 'string',
+            description: 'Conversation key such as "group:100000001" or "private:100000002". Defaults to the QQ conversation this tool was called from. Not needed for "list".',
+          },
+          query: {
+            type: 'string',
+            description: 'The text to look for (action: search). Matched case-insensitively as a substring of the message text, sender name, or date.',
+          },
+          date: {
+            type: 'string',
+            description: 'Local date to read, "YYYY-MM-DD" (action: read). Defaults to today.',
+          },
+          since: {
+            type: 'string',
+            description: 'Earliest date to include, "YYYY-MM-DD" (action: read). Use with until.',
+          },
+          until: {
+            type: 'string',
+            description: 'Latest date to include, "YYYY-MM-DD" (action: read).',
+          },
+          limit: {
+            type: 'integer',
+            description: 'Maximum messages/hits to return (default 200 for read, memorySearchHits for search).',
+          },
+        },
+        output: {
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              action: { type: 'string', required: true },
+              conversation: { type: 'string' },
+              lines: {
+                type: 'array',
+                required: true,
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    conversation: { type: 'string' },
+                    name: { type: 'string' },
+                    date: { type: 'string' },
+                    messages: { type: 'integer' },
+                    last_at: { type: 'string' },
+                    last_text: { type: 'string' },
+                    at: { type: 'string' },
+                    time: { type: 'string' },
+                    user: { type: 'string' },
+                    text: { type: 'string' },
+                    kind: { type: 'string' },
+                    addressed: { type: 'boolean' },
+                    command: { type: 'string' },
+                    media: { type: 'boolean' },
+                  },
+                },
+              },
+              returned: { type: 'integer', required: true },
+              truncated: { type: 'boolean', required: true },
+              note: { type: 'string' },
+            },
+          },
+          render: (_args, value) => {
+            const head = value.action === 'list'
+              ? `${value.lines.length} conversation(s) with recorded transcripts.`
+              : `${value.returned} line(s)${value.truncated ? ' (truncated)' : ''}${value.conversation !== undefined ? ` for ${value.conversation}` : ''}.`;
+            return [{ type: 'text', text: [head, value.note ?? '', ...value.lines.map((line) => describeTranscriptLine(line))].filter((part) => part.length > 0).join('\n') }];
+          },
+        },
+        async execute(args, exec) {
+          if (args.action === 'list') return listTranscripts();
+          const target = resolveMemoryConversation(args, exec, 'qq_transcript');
+          if (args.action === 'search') {
+            if (typeof args.query !== 'string' || args.query.trim().length === 0) throw new Error('qq_transcript: "query" is required for action "search"');
+            return searchTranscript(target, args);
+          }
+          return readTranscript(target, args);
+        },
+      }),
+    );
+
+    /**
+     * 工具六：qq_memory —— 读/追加/覆盖记忆文件（`MEMORY.md` / `COGNITION.md` / `INDEX.md`）。
+     *
+     * 写路径被限制在 memoryDir 之内（`memoryRelativePath`），单个文件也有字节上限：
+     * 记忆的价值在「精炼且总是被读到」，一个无限增长的文件只会把提示词撑爆。
+     * 读不设上限（要翻就翻个够），只按 `memorySearchHits` 限制搜索命中数。
+     */
+    ctx.tools.register(
+      defineTool({
+        name: 'qq_memory',
+        description:
+          'Read, append to, search, or overwrite a long-term memory file for the QQ bridge. All paths live under the memory directory and are relative to it, for example "conversations/group-100000001/MEMORY.md" (one conversation\'s memory, "write"/"append" create it if missing), "COGNITION.md" (shared knowledge about memes, slang, emoji and sticker meanings), or "INDEX.md" (the short index that is injected into every QQ agent\'s prompt — keep it to a handful of lines). Paths outside the memory directory are rejected.',
+        parameters: {
+          action: {
+            type: 'string',
+            enum: ['read', 'append', 'write', 'search', 'list'],
+            description: 'read = full file (with line numbers); append = add text at the end (the normal way to record something new); write = replace the whole file (only when reorganising); search = substring match with context lines; list = the files that already exist.',
+          },
+          path: {
+            type: 'string',
+            description: 'Memory-relative file path, e.g. "conversations/group-100000001/MEMORY.md", "COGNITION.md", "INDEX.md". For read/write/append it defaults to this conversation\'s MEMORY.md when a conversation is known.',
+          },
+          conversation: {
+            type: 'string',
+            description: 'Conversation key such as "group:100000001". Defaults to the QQ conversation this tool was called from; the digest session must pass it.',
+          },
+          text: {
+            type: 'string',
+            description: 'The markdown to append or write (action: append / write).',
+          },
+          query: {
+            type: 'string',
+            description: 'The text to look for (action: search).',
+          },
+          limit: {
+            type: 'integer',
+            description: 'Maximum hits to return (action: search; default memorySearchHits).',
+          },
+        },
+        output: {
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              action: { type: 'string', required: true },
+              path: { type: 'string' },
+              bytes: { type: 'integer' },
+              lines_total: { type: 'integer' },
+              returned: { type: 'integer', required: true },
+              truncated: { type: 'boolean', required: true },
+              files: { type: 'array', items: { type: 'string' } },
+              text: { type: 'string' },
+              note: { type: 'string' },
+            },
+          },
+          render: (_args, value) => {
+            if (value.action === 'list') {
+              return [{ type: 'text', text: `memory files:\n${(value.files ?? []).join('\n') || '(none yet)'}` }];
+            }
+            const head = `${value.action} ${value.path ?? ''} (${value.bytes ?? 0} bytes)${value.truncated ? ', truncated' : ''}`;
+            return [{ type: 'text', text: [head, value.note ?? '', value.text ?? ''].filter((part) => part.length > 0).join('\n') }];
+          },
+        },
+        async execute(args, exec) {
+          if (args.action === 'list') return listMemoryFiles();
+          const path = resolveMemoryPath(args, 'qq_memory', exec);
+          if (args.action === 'read') return readMemoryFile(path);
+          if (args.action === 'search') {
+            if (typeof args.query !== 'string' || args.query.trim().length === 0) throw new Error('qq_memory: "query" is required for action "search"');
+            return searchMemoryFile(path, args.query, args.limit);
+          }
+          if (typeof args.text !== 'string' || args.text.trim().length === 0) throw new Error(`qq_memory: "text" is required for action "${args.action}"`);
+          return writeMemoryFile(path, args.text, args.action === 'append');
+        },
+      }),
+    );
+  }
+
   // ---- 连接生命周期 ----------------------------------------------------------
 
   // 用 ctx.effect 托管连接：插件卸载/停用时自动 dispose，不留悬挂的定时器与 socket。
@@ -2370,6 +3659,52 @@ export function apply(ctx, config) {
 
   // 下载链路的托管：关掉那个给 NapCat 取文件的小 HTTP 服务与一次性 token。
   ctx.effect(() => () => jmService.close(), 'qq-bridge:jm');
+
+  // ---- 长期记忆：定时摘要的生命周期 -------------------------------------------
+  //
+  // 用 `ctx.timeout` / `ctx.interval`（dsh-base 的 timer 服务）而不是裸 setInterval：
+  // 定时器挂在当前 fiber 上，插件卸载时自动清掉，不会留下一个还在跑的摘要循环。
+  // 测试用的 Host 桩没有 timer 服务，所以有裸 setInterval 的退路。
+  if (memoryEnabled) {
+    // 启动补课 + 预热：把落盘的摘要时间读进内存，然后（可选）立刻扫一遍。
+    // 不这么做的话，`digestIntervalMs` 可能长达半小时，重启后刚发过言的群要等一轮。
+    if (config.digestCatchUp !== false) {
+      void (async () => {
+        try {
+          const state = await readDigestState();
+          for (const [key, entry] of Object.entries(state.conversations)) {
+            const at = Number(entry?.lastDigestAt) || 0;
+            if (at > 0) memoryLastDigest.set(key, at);
+          }
+          report('info', `memory: ${memoryLastDigest.size} conversation(s) with a previous digest`);
+          runDigestSweep();
+        } catch (error) {
+          report('warn', `could not load digest state: ${errorText(error)}`);
+        }
+      })();
+    }
+    const every = Math.max(60 * 1000, Math.floor(Number(config.digestIntervalMs) || 0));
+    const tick = () => {
+      try {
+        runDigestSweep();
+      } catch (error) {
+        report('warn', `digest sweep threw: ${errorText(error)}`);
+      }
+    };
+    ctx.effect(() => {
+      if (typeof ctx.interval === 'function') {
+        digestTimerDisposer = ctx.interval(tick, every);
+        return () => {
+          digestTimerDisposer?.();
+          digestTimerDisposer = undefined;
+        };
+      }
+      const handle = setInterval(tick, every);
+      handle.unref?.();
+      return () => clearInterval(handle);
+    }, 'qq-bridge:memory-digest');
+    report('info', `memory enabled at ${memoryLabel} (digest every ${Math.round(every / 60000)}min, min ${Math.round(Math.max(0, Number(config.digestMinIntervalMs) || 0) / 60000)}min between digests per conversation)`);
+  }
 
   // 表情包目录：启动时确保它存在 —— 「往里丢几张图就能用」比「先读文档建目录」友好。
   // 建不出来（只读挂载、权限不对）只是没有表情包可挑，发图本身照常，所以只记一条 warn。
