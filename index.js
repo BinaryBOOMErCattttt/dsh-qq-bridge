@@ -8,6 +8,10 @@
  * 出站（Agent → QQ）：注册全局工具，任何 Harness Agent 都能主动发 QQ
  * 消息、发图片/表情包、按需查询当前在线的好友/群列表，以及把禁漫本子下成 PDF 发过去。
  *
+ * 复读（QQ → QQ）：群里连着出现同一条消息时，插件自己跟着复读一句（同一张表情包也会被
+ * 原样发回去），不经过 Agent（见 `maybeRepeat`）—— 复读机的笑点就在「原样接上」，
+ * 等模型想一句俏皮话早就过去了。
+ *
  * 文件结构（自上而下）：
  *   1. 插件身份与配置 schema（name / inject / Config）
  *   2. 纯函数工具（sessionIdFor / visibleText）
@@ -28,7 +32,7 @@ import { mkdir, readdir, rm, stat } from 'node:fs/promises';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { OneBotClient, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, messageToText, splitBurst, splitStickerLines, typingDelayMs } from './onebot.js';
+import { OneBotClient, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from './onebot.js';
 import { createMediaStore } from './media.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
 import { createJmService, parseJmRef } from './jm.js';
@@ -134,6 +138,14 @@ export const Config = z.object({
   // ---- 以下为「像真人一样在群里说话」的开关，默认全部开启 ----
   ambientMessages: z.number().default(12).description('群聊里注入给 Agent 的最近消息条数（让它知道大家在聊什么，不只是被 @ 的那一句）；0 = 关闭'),
   ambientLineChars: z.number().default(120).description('群聊上下文里每条消息最多保留的字符数'),
+  // ---- 自动复读：群里连着出现同一条消息时，跟着复读一句（不经过模型）----
+  repeat: z.boolean().default(true).description('是否自动复读：群里连着出现相同的消息时跟着复读一句；复读不经过模型（直接发原文/原图），只认没 @ 机器人的群消息（纯文字，或整条就是一张表情包）'),
+  repeatMedia: z.boolean().default(true).description('是否连表情包一起复读：整条消息就是一张图或一个系统表情时，连着出现两个一样的就跟着发第三个（图片按内容哈希判断是不是同一张）。它不额外下载：用的是环境上下文那次落盘，所以 ambientMedia: false 或 ambientMessages: 0 时自动退化成只复读文字，imageSend: false 时同样不发图'),
+  repeatCount: z.number().default(2).description('连着几条相同的消息之后跟着复读；2 = 有人接了一句就跟（至少 2）'),
+  repeatDistinct: z.boolean().default(true).description('是否要求这些相同的消息来自至少两个不同的人：true = 一个人自己连发两遍只是手滑，算不上复读；false = 连发两遍也跟'),
+  repeatWindowMs: z.number().default(300000).description('间隔超过这么久就不算「连着」了，重新开始数（毫秒）：免得早上有人说过的一句，晚上再被跟一遍；0 = 不限间隔'),
+  repeatMaxChars: z.number().default(100).description('纯文字复读的长度上限：只复读不超过这么多字的短消息（复读机跟的是「6」「草」这种短句，不是一整段话）；0 = 不限'),
+  repeatChance: z.number().default(1).description('真要复读时的概率（0~1）：1 = 每次都跟，调小可以让它偶尔不跟（下一条相同的消息会再掷一次）'),
   humanize: z.boolean().default(true).description('自动回复是否像真人：按换行/短句拆成几条独立消息并加入打字延迟（换行 = 分条）；false = 一条整段直接发出（旧行为）'),
   burstMaxChars: z.number().default(60).description('把一行长句拆开时的单条目标长度；0 = 不按长度拆（换行仍然分条）'),
   burstMaxParts: z.number().default(3).description('单行长句最多拆成几条；超出部分并进该行最后一条，避免刷屏'),
@@ -314,6 +326,18 @@ export function apply(ctx, config) {
    * 真要发出去时再读一次 —— 变大了说明中间有人插话，裸文本会让人看不出在回谁。
    */
   const chatterSeq = new Map();
+  /**
+   * 群号 → 复读状态 `{ chain, queue }`（见 `maybeRepeat`）。
+   *
+   * - `chain` 是「最近一条还值得跟的东西」：`{ kind, key, count, senders, at, … }`，
+   *   三种 kind 各自带自己的载荷（文字原文 / 表情包本地路径 / 系统表情 id）。
+   *   跟过一句、或者中间有人说了别的，这条链就没了 —— 不按群累积历史。
+   * - `queue` 是这个群自己的串行链：判断表情包要先把图下载下来（异步），同一个群里
+   *   两条消息谁先回来并不确定，不排队的话链上的顺序就跟群里说话的顺序对不上了。
+   */
+  const repeatStates = new Map();
+  /** 消息对象 → 这条消息的媒体解析 Promise（见 `mediaFor`）：环境上下文与表情包复读共用一次下载。 */
+  const mediaResolutions = new WeakMap();
 
   // OneBot 客户端：事件回调统一 try/catch，保证单个消息处理失败不会打穿 socket 回调。
   const client = new OneBotClient({
@@ -813,13 +837,30 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 把一次发送挂到会话的串行链上。
+   *
+   * 同一个会话的发送挂在 `conversation.sending` 上串行执行：拟人延迟会让一次回复
+   * 持续好几秒，若不排队，下一轮回复（或一句复读）会插进来，群里看到的就是两条
+   * 消息交错。前一次失败也要继续排下一次，所以两个分支都接上 `run`。
+   *
+   * @param conversation - 目标会话。
+   * @param run - 真正的发送步骤（调用方保证自己不会 reject）。
+   * @returns 本次发送完成时兑现的 Promise，绝不 reject。
+   */
+  function enqueueSend(conversation, run) {
+    const chained = (conversation.sending ?? Promise.resolve()).then(run, run);
+    conversation.sending = chained.then(
+      () => {},
+      () => {},
+    );
+    return chained;
+  }
+
+  /**
    * 把一条回复发到 QQ：拆段、按真人打字节奏加延迟，任一段失败即停止。
    *
    * 正文里的 `[[图片: 路径]]` 标记会变成一张真的图（见 `replyPieces`）——「只发表情、
    * 一个字都不说」就是整条正文只有那一处标记。
-   *
-   * 同一个会话的发送挂在 `conversation.sending` 上串行执行：拟人延迟会让一次回复
-   * 持续好几秒，若不排队，下一轮回复会插进来，群里看到的就是两条消息交错。
    *
    * @param conversation - 目标会话。
    * @param text - 要发送的正文（可含表情包标记）。
@@ -828,14 +869,26 @@ export function apply(ctx, config) {
    * @returns 本次发送（含延迟）完成时兑现的 Promise，绝不 reject。
    */
   function sendToConversation(conversation, text, { human = false, quote } = {}) {
-    const run = () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 });
-    // 前一次发送失败也要继续排下一次，所以两个分支都接上 run。
-    const chained = (conversation.sending ?? Promise.resolve()).then(run, run);
-    conversation.sending = chained.then(
-      () => {},
-      () => {},
-    );
-    return chained;
+    return enqueueSend(conversation, () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 }));
+  }
+
+  /**
+   * 把一段正文**原样**发给会话：不认 `[[图片: …]]` 标记、不拆短句、不加打字延迟。
+   *
+   * 复读专用 —— 群里有人把 `[[图片: .qq-media/…]]` 这种字样打两遍时，那是两句**文字**，
+   * 不是让机器人发文件的指令：标记只解析模型写的回复（`replyPieces`）。复读机的正文
+   * 全部来自不可信的群消息，所以这里一步都不多做，只按协议上限分段。
+   *
+   * @param conversation - 目标会话。
+   * @param text - 要原样发出的正文。
+   * @returns 本次发送完成时兑现的 Promise，绝不 reject。
+   */
+  function sendLiteral(conversation, text) {
+    return enqueueSend(conversation, async () => {
+      for (const part of chunkText(text, protocolLimit())) {
+        if (!(await sendOne(conversation, part))) return;
+      }
+    });
   }
 
   /**
@@ -1186,7 +1239,10 @@ export function apply(ctx, config) {
       if (slot.startsWith(`${sessionId}:`)) transcripts.delete(slot);
     }
     // 群聊上下文也算「刚才那些话」，一起忘掉；否则重置后模型还知道群里之前聊了什么。
-    if (conversation.type === 'group') ambient.delete(conversation.id);
+    if (conversation.type === 'group') {
+      ambient.delete(conversation.id);
+      repeatStates.delete(conversation.id);
+    }
     report('info', `reset ${conversation.key} (${sessionId}), removed ${removed} stored log(s)`);
     return true;
   }
@@ -1379,6 +1435,203 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 自动复读：群里**连着**出现同一条消息时，跟着复读一句（或把那张表情包发回去）。
+   *
+   * 这是插件自己的行为，不经过模型、也不建会话 —— 群里刷「6」的时候，等模型想一句
+   * 俏皮话再回来，那个梗早就过去了；复读机的笑点就在于同一句话、同一张图被原样接上。
+   *
+   * 记账范围是所有**别人的**群消息（被 @ 的那条也算，它同样会打断「连着」），
+   * 但真跟不跟还要看这几条：
+   *   - 只有**没 @ 机器人**的那条才跟：被 @ 的会走 Agent 去回答，再复读一遍等于
+   *     同一句话回两遍（`groupTrigger: all` 时每条都算被 @，于是复读不会触发）；
+   *   - 只有两种消息跟得动：**纯文字**（trim + 折叠空白后一样，`6` 和 `6 ` 算同一句）
+   *     与**整条就是一张表情包**（图片按落盘后的内容哈希认同一张，见 `repeatCandidate`）；
+   *   - 中间有任何人说了别的话就重新数（认不出的消息也一样打断：群里插了别的话，
+   *     前后两条就不再是「连着」的）；
+   *   - 间隔超过 `repeatWindowMs` 也不续链；默认还要至少两个不同的人说过
+   *     （一个人自己连发两遍是手滑，不是复读）；文字太长（`repeatMaxChars`）不跟。
+   * 跟过一次之后链就断掉：否则群里一直刷同一个字时，它会一句不落地跟着刷。
+   *
+   * 判定要下载表情包才知道是不是同一张（异步），所以整个判定挂在每个群自己的串行链
+   * `state.queue` 上按到达顺序跑 —— 见 `repeatStates`。
+   *
+   * @param event - 已解码的 OneBot 事件。
+   * @param selfId - 机器人自己的 QQ 号（机器人自己的消息不入链，也不打断链）。
+   * @param canAct - 这条消息能不能触发复读（被 @ 的那条只能记账，不能跟）。
+   */
+  function maybeRepeat(event, selfId, canAct) {
+    if (!config.repeat) return;
+    if (!config.groupChat || event?.message_type !== 'group') return;
+    const groupId = String(event.group_id);
+    if (config.allowGroups.length > 0 && !config.allowGroups.includes(groupId)) return;
+    const userId = String(event.user_id ?? '');
+    if (userId === String(selfId)) return;
+    const message = event.message ?? event.raw_message;
+    const state = repeatStateFor(groupId);
+    // 判定要下载表情包（异步），`arrivedAt` 记的是**消息到达**的时刻：链上的时间戳
+    // 该按「群里什么时候说的」算，而不是「我们什么时候判完的」。
+    const arrivedAt = Date.now();
+    // 判定失败不该打穿这条链：出错只记一条 warn，后面的消息照常排队。
+    const step = async () => {
+      try {
+        await repeatStep(state, groupId, message, userId, canAct, arrivedAt);
+      } catch (error) {
+        report('warn', `repeat check failed: ${errorText(error)}`);
+      }
+    };
+    state.queue = state.queue.then(step, step);
+  }
+
+  /** 取（或建）某个群的复读状态 `{ chain, queue }`。 */
+  function repeatStateFor(groupId) {
+    let state = repeatStates.get(groupId);
+    if (state === undefined) {
+      state = { chain: undefined, queue: Promise.resolve() };
+      repeatStates.set(groupId, state);
+      // 兜底：见过面的群不该这么多；真超了就丢掉最早的那个群，它接下来的复读退化成「从头攒」。
+      if (repeatStates.size > 512) {
+        const oldest = repeatStates.keys().next().value;
+        if (oldest !== undefined && oldest !== groupId) repeatStates.delete(oldest);
+      }
+    }
+    return state;
+  }
+
+  /**
+   * 复读判定的正题：把这条消息接到链上，够条件就跟着发一条。
+   *
+   * @param state - 该群的复读状态（`chain` 就地更新）。
+   * @param groupId - 群号（发送目标）。
+   * @param message - OneBot 的 `message` 字段。
+   * @param userId - 发送者 QQ 号。
+   * @param canAct - 这条消息能不能触发复读（被 @ 的那条只能记账）。
+   * @param arrivedAt - 这条消息到达的时刻（链上的时间戳一律用它，见 `maybeRepeat`）。
+   */
+  async function repeatStep(state, groupId, message, userId, canAct, arrivedAt) {
+    const candidate = await repeatCandidate(message);
+    const previous = state.chain;
+    // 认不出的消息（@、卡片、太长、抓不到的图）同样是「群里又说了别的话」，把链打断。
+    if (candidate === undefined) {
+      state.chain = undefined;
+      return;
+    }
+    const windowMs = Math.max(0, Math.floor(Number(config.repeatWindowMs) || 0));
+    const chained =
+      previous !== undefined &&
+      previous.key === candidate.key &&
+      (windowMs <= 0 || arrivedAt - previous.at <= windowMs);
+    const senders = chained ? [...new Set([...previous.senders, userId])] : [userId];
+    const count = chained ? previous.count + 1 : 1;
+    const threshold = Math.max(2, Math.floor(Number(config.repeatCount) || 0));
+    const distinct = config.repeatDistinct ? senders.length >= 2 : true;
+    const entry = { ...candidate, count, senders, at: arrivedAt };
+    if (!canAct || count < threshold || !distinct) {
+      state.chain = entry;
+      return;
+    }
+    const chance = Math.min(1, Math.max(0, Number(config.repeatChance)));
+    if (!(Math.random() < chance)) {
+      // 这次没跟：链留着，下一条相同的消息再掷一次，而不是重新攒人数。
+      state.chain = entry;
+      return;
+    }
+    // 跟过就断链，免得群里刷屏时它一句不落地跟着刷。
+    state.chain = undefined;
+    const conversation = targetConversation('group', groupId);
+    report('info', `→ ${describeConversation(conversation)}: ${describeRepeat(candidate)}（复读）`);
+    sendRepeat(conversation, candidate);
+  }
+
+  /**
+   * 复读候选：这条消息「值不值得跟」，以及要跟的话拿什么去跟。
+   *
+   * 两种消息跟得动：
+   *   1. **纯文字**：整条都是 `text` 段（见 `repeatableText`），正文不能超过
+   *      `repeatMaxChars`（复读机跟的是「6」「草」这种短句，不是一整段话）；比较用的
+   *      `key` 归一化空白，真正发出去的是原样正文（`raw`）—— 复读机不该改人家的字。
+   *   2. **整条就是一张表情包**：只有一个 `image` / `mface` 段，或只有一个系统表情
+   *      （`face`）段。图片得先落盘，`key` 就是内容哈希路径 —— 同一张图重新上传会拿到
+   *      不同的 `file` / URL，只有字节哈希说了算。系统表情不用下载，`id` 就是它的身份。
+   *
+   * 图 + 文字、两张图、@ 别人的消息都不算候选：复读要的是「原样接上一句/一张」，把图
+   * 和话拆开复读、或者把 @ 段再发一遍都不是那回事。它们照样会打断链（调用方的处理）。
+   *
+   * @param message - OneBot 的 `message` 字段。
+   * @returns `{ kind, key, raw }` / `{ kind, key, path }` / `{ kind, key, id }`；不复读时 undefined。
+   */
+  async function repeatCandidate(message) {
+    const text = repeatableText(message);
+    if (text !== undefined) {
+      const raw = text.trim();
+      if (raw.length === 0) return undefined;
+      const maxChars = Math.floor(Number(config.repeatMaxChars));
+      if (Number.isFinite(maxChars) && maxChars > 0 && raw.length > maxChars) return undefined;
+      return { kind: 'text', key: `text:${raw.replace(/\s+/g, ' ')}`, raw };
+    }
+    // 表情包复读**不自己下载**：判「是不是同一张」只能靠内容哈希，而那份字节正是环境上下文
+    // 落盘时留下的（`mediaFor` 按消息对象共用同一次下载，所以默认配置下它一次带宽都不多花）。
+    // 于是关掉 `ambientMedia`、或者把 `ambientMessages` 设成 0（群聊上下文整个关掉）时，
+    // 群里的图根本不会被取下来 —— 表情包复读自动退化成「只复读文字」，不会偷偷花带宽。
+    const ambientDownloads = config.ambientMedia && Math.floor(Number(config.ambientMessages) || 0) > 0;
+    if (!config.repeatMedia || !imageSend || !ambientDownloads) return undefined;
+    if (!Array.isArray(message) || message.length !== 1) return undefined;
+    const only = message[0];
+    if (only?.type === 'face') {
+      const id = String(only.data?.id ?? '');
+      // 只认纯数字 id：这条路径的输入完全不可信，别把乱七八糟的字段原样发回去。
+      if (!/^\d{1,12}$/.test(id)) return undefined;
+      return { kind: 'face', key: `face:${id}`, id };
+    }
+    if (only?.type !== 'image' && only?.type !== 'mface') return undefined;
+    const resolved = await mediaFor(message);
+    const outcome = resolved?.outcomes?.get(0);
+    // 拿不到字节（URL 过期、实现没有可下载地址、下载功能关着）就不复读：
+    // 「是不是同一张」只能由内容哈希说了算，猜不得。
+    if (outcome?.path === undefined) return undefined;
+    // 出站上限比这张图还小的话，跟了也发不出去，不如别跟（链照样被它打断）。
+    if (outcome.bytes > imageMaxBytes) return undefined;
+    return { kind: 'image', key: `image:${outcome.path}`, path: outcome.path };
+  }
+
+  /** 复读的日志措辞：文字给正文，表情包给一张「占位符」。 */
+  function describeRepeat(candidate) {
+    if (candidate.kind === 'text') return candidate.raw.slice(0, 120);
+    if (candidate.kind === 'image') return `[表情包 ${candidate.path}]`;
+    return `[表情 ${candidate.id}]`;
+  }
+
+  /**
+   * 把复读发出去（按候选类型选载体），全都挂在会话的发送队列上。
+   *
+   * 图片走 `loadOutgoingImage` + `imageSegment`：和 Agent 主动发表情包同一条出站链路
+   * （读本地文件、校验格式与大小、base64 交给 NapCat）。发不出去只记一条 warn ——
+   * 复读本来就是插话，静默不跟比在群里喊一句「我发不出去」更像真人。
+   *
+   * @param conversation - 目标会话。
+   * @param candidate - {@link repeatCandidate} 的结果。
+   */
+  function sendRepeat(conversation, candidate) {
+    if (candidate.kind === 'text') {
+      void sendLiteral(conversation, candidate.raw);
+      return;
+    }
+    if (candidate.kind === 'face') {
+      void enqueueSend(conversation, () => sendOne(conversation, [{ type: 'face', data: { id: candidate.id } }]));
+      return;
+    }
+    void enqueueSend(conversation, async () => {
+      let bytes;
+      try {
+        bytes = (await loadOutgoingImage({ source: candidate.path, cwd, maxBytes: imageMaxBytes })).bytes;
+      } catch (error) {
+        report('warn', `could not repeat the sticker ${candidate.path}: ${errorText(error)}`);
+        return;
+      }
+      await sendOne(conversation, [imageSegment(bytes)]);
+    });
+  }
+
+  /**
    * 把一条消息里的图片/表情包落到本地，并给出「段下标 → 替身文本」的映射。
    *
    * 三个调用点：发给机器人的那条（`submitBatch`）、被它引用的那条（`resolveQuote`）、
@@ -1386,20 +1639,24 @@ export function apply(ctx, config) {
    * 同一张图被反复发也没关系 —— 缓存按内容哈希命名，命中的是同一个文件。
    *
    * @param message - OneBot 的 `message` 字段。
-   * @returns `{ rendered, fetched }`：前者是映射，后者是真正落盘成功的个数（用来让
-   *   调用方区分「这张图拿到了」与「全是取不到文件的占位符」）；这条消息里没有媒体段、
-   *   或下载功能被关掉时返回 undefined。
+   * @returns `{ rendered, fetched, outcomes }`：`rendered` 是「段下标 → 替身文本」的映射，
+   *   `fetched` 是真正落盘成功的个数（用来让调用方区分「这张图拿到了」与「全是取不到文件
+   *   的占位符」），`outcomes` 是「段下标 → 落盘结果」（`{ path, bytes, cached }` 或
+   *   `{ error }`，表情包复读靠它拿内容哈希路径）；这条消息里没有媒体段、或下载功能被
+   *   关掉时返回 undefined。
    */
   async function resolveMessageMedia(message) {
     if (!mediaStore.enabled) return undefined;
     const items = collectMedia(message);
     if (items.length === 0) return undefined;
     const rendered = new Map();
+    const outcomes = new Map();
     let fetched = 0;
     // 并行取：一条消息里同时发几张图很常见，串行会一条条排队。
     await Promise.all(
       items.map(async (item) => {
         const outcome = await mediaStore.resolve(item);
+        outcomes.set(item.index, outcome);
         if (outcome.path !== undefined) {
           fetched += 1;
           report('info', `media: ${item.kind}${item.label.length > 0 ? ` "${item.label}"` : ''} → ${outcome.path} (${outcome.bytes} bytes)`);
@@ -1411,7 +1668,26 @@ export function apply(ctx, config) {
         rendered.set(item.index, mediaPlaceholder(item, '', outcome.error));
       }),
     );
-    return { rendered, fetched };
+    return { rendered, fetched, outcomes };
+  }
+
+  /**
+   * 一条消息的媒体解析结果，按**消息对象**记忆（同一个对象的解析只做一次）。
+   *
+   * 同一条群消息里的图会被两处需要：环境上下文要把路径写进提示词（`hydrateAmbientMedia`），
+   * 表情包复读要拿落盘后的内容哈希判断「是不是同一张」（`maybeRepeat`）。两边各下载一遍
+   * 就是白白多拉一次 CDN —— 所以共用同一个 Promise。事件对象是短命的，WeakMap 不会留住它。
+   * @param message - OneBot 的 `message` 字段。
+   * @returns 与 {@link resolveMessageMedia} 同形的 Promise（非消息段数组时为 undefined）。
+   */
+  function mediaFor(message) {
+    if (typeof message !== 'object' || message === null) return Promise.resolve(undefined);
+    let pending = mediaResolutions.get(message);
+    if (pending === undefined) {
+      pending = resolveMessageMedia(message);
+      mediaResolutions.set(message, pending);
+    }
+    return pending;
   }
 
   /**
@@ -1472,7 +1748,7 @@ export function apply(ctx, config) {
    */
   async function hydrateAmbientMedia(message, entry, lineChars) {
     try {
-      const resolved = await resolveMessageMedia(message);
+      const resolved = await mediaFor(message);
       // 一张都没拿到（URL 过期、CDN 报错）时保留原来的朴素占位符：环境上下文里
       // 「没能取到文件: HTTP 403」只是一行噪音，没人会去追。
       if (resolved === undefined || resolved.fetched === 0) return;
@@ -1576,7 +1852,7 @@ export function apply(ctx, config) {
       const entries = [];
       for (const item of batch) {
         // 本条自己的图和「它在回复的那条」里的图一起取：两件事互不依赖，串起来等只是白等。
-        const [resolved, quote] = await Promise.all([resolveMessageMedia(item.message), resolveQuote(item.message)]);
+        const [resolved, quote] = await Promise.all([mediaFor(item.message), resolveQuote(item.message)]);
         // 引用成功时把 `[回复]` 占位符换成真正的引用前缀：否则模型会看到
         // 「（引用 kaguya: …）\n[回复]这啥」这种一半有内容、一半是噪音的正文。
         const rendered = new Map(resolved?.rendered ?? []);
@@ -1649,6 +1925,8 @@ export function apply(ctx, config) {
     // 快照与发送时读到的值相等就说明没人插话，`auto` 便不引用。
     noteChatter(event, selfId);
     const admitted = admit(event, selfId);
+    // 复读链在所有别人的群消息上进账（被 @ 的那条也打断「连着」），但只有没被 @ 的才真的跟。
+    maybeRepeat(event, selfId, admitted === undefined);
     if (admitted === undefined) {
       rememberAmbient(event, selfId);
       return;

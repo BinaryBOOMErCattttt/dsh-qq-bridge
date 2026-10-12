@@ -149,6 +149,31 @@ export function messageToText(message, skipAtId, media) {
 }
 
 /**
+ * 取一条消息里「值得复读的原文」。
+ *
+ * 复读机只跟**纯文字**：整条消息都由 `text` 段组成时才返回正文，其余消息
+ * （图片、表情包、语音、卡片，以及带 `at` 的「@某人 …」）一律返回 undefined。
+ * 两个理由：
+ *   - 复读 `at` 段等于再 @ 人家一次，图和文件更没法原样发回（入站只有会过期的 URL）；
+ *   - 「跟着说一句同样的话」才是复读，把 `[图片]` 这种占位符复读出去只是噪音。
+ *
+ * CQ 码字符串（非 array 上报格式）里面藏了什么看不出来，含 `[CQ:` 就直接放弃。
+ *
+ * @param message - OneBot 的 `message` 字段。
+ * @returns 原始正文（未 trim，由调用方决定怎么归一化）；不该复读时 undefined。
+ */
+export function repeatableText(message) {
+  if (typeof message === 'string') return message.includes('[CQ:') ? undefined : message;
+  if (!Array.isArray(message)) return undefined;
+  let text = '';
+  for (const segment of message) {
+    if (segment?.type !== 'text') return undefined;
+    if (typeof segment.data?.text === 'string') text += segment.data.text;
+  }
+  return text;
+}
+
+/**
  * 判断消息段数组里是否 @ 了某个确定的 QQ 号。
  * 用于群消息的 mention 触发判定。
  * @param message - OneBot 的 `message` 字段。
