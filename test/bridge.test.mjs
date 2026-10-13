@@ -1801,6 +1801,128 @@ test('humanize: false restores the single-message reply', async () => {
   }
 });
 
+// 用例十六·补：burstMaxMessages: 1 —— 一轮回复不管模型写了几行、几个句号，
+// 都并成一条发出去（模型爱拆「短句 + 长句」两拍，光靠提示词压不住）。
+test('burstMaxMessages: 1 collapses a whole reply into a single message', async () => {
+  // 同一个句子里被标点拆出来的几段：接回去应当和原文一模一样（不留痕）。
+  const oneLine = '今天天气不错。要不出去走走？顺便吃个饭吧！';
+  const first = await boot({ burstMaxChars: 12, burstMaxParts: 3, burstMaxMessages: 1, readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0 });
+  try {
+    first.onebot.push(privateMessage('在吗'));
+    const agent = await until(() => first.host.list.created[0], 'the Agent');
+    completeTurn(first.host, agent, oneLine);
+    const sent = await until(() => sentTexts(first.onebot, 'send_private_msg')[0], 'the single reply');
+    assert.deepEqual(sentTexts(first.onebot, 'send_private_msg'), [oneLine]);
+    assert.equal(sent, oneLine);
+  } finally {
+    await first.onebot.close();
+  }
+
+  // 模型自己换行写的两段：跨行合并用空格接，仍然只有一条。
+  const multiline = '今天天气不错。\n要不出去走走？顺便吃个饭吧！';
+  const second = await boot({ burstMaxChars: 12, burstMaxParts: 3, burstMaxMessages: 1, readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0 });
+  try {
+    second.onebot.push(privateMessage('在吗'));
+    const agent = await until(() => second.host.list.created[0], 'the Agent');
+    completeTurn(second.host, agent, multiline);
+    await until(() => sentTexts(second.onebot, 'send_private_msg')[0], 'the single reply');
+    assert.deepEqual(sentTexts(second.onebot, 'send_private_msg'), ['今天天气不错。 要不出去走走？顺便吃个饭吧！']);
+  } finally {
+    await second.onebot.close();
+  }
+
+  // 长内容不会被这一段吞掉：并条只影响「分几条」，内容一字不动；真的超过协议上限
+  // （maxReplyChars）时仍然按上限切成两段 —— 那是 QQ 协议的限制，不是这条配置。
+  const third = await boot({ burstMaxChars: 12, burstMaxParts: 3, burstMaxMessages: 1, maxReplyChars: 20, readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0 });
+  try {
+    third.onebot.push(privateMessage('在吗'));
+    const agent = await until(() => third.host.list.created[0], 'the Agent');
+    completeTurn(third.host, agent, oneLine);
+    await until(() => sentTexts(third.onebot, 'send_private_msg').length === 2, 'the protocol-limit chunks');
+    const chunks = sentTexts(third.onebot, 'send_private_msg');
+    assert.ok(chunks.every((part) => part.length <= 20));
+    assert.equal(chunks.join(''), oneLine, '内容必须一字不少');
+  } finally {
+    await third.onebot.close();
+  }
+});
+
+// 用例十六·补二：burstSingleMaxChars —— 日常闲聊并成一条，真要展开时才拆成多条短句。
+// 这是默认的口味：模型爱把一句话写成「短句 + 长句」两拍，靠长度门槛而不是提示词压住。
+test('burstSingleMaxChars keeps chit-chat to one message and splits long answers', async () => {
+  const options = {
+    burstMaxChars: 12,
+    burstMaxParts: 3,
+    burstMaxMessages: 0, // 长回复不封顶：该拆几条拆几条
+    burstSingleMaxChars: 20,
+    readDelayMs: 0,
+    minDelayMs: 0,
+    maxDelayMs: 0,
+    delayJitter: 0,
+  };
+
+  // 短回复（去掉空白 5 字 < 20）：换行写的两段也并成一条。
+  const short = await boot(options);
+  try {
+    short.onebot.push(privateMessage('在吗'));
+    const agent = await until(() => short.host.list.created[0], 'the Agent');
+    completeTurn(short.host, agent, '在的\n刚吃完');
+    await until(() => sentTexts(short.onebot, 'send_private_msg')[0], 'the single reply');
+    assert.deepEqual(sentTexts(short.onebot, 'send_private_msg'), ['在的 刚吃完']);
+  } finally {
+    await short.onebot.close();
+  }
+
+  // 长回复（去掉空白 28 字 > 20）：换行照旧分条，一行一条短句（这就是「需要深入时多条短句」）。
+  const long = '今天天气不错\n要不要出去走走\n顺便吃个饭吧\n附近新开的店还不错';
+  const deep = await boot(options);
+  try {
+    deep.onebot.push(privateMessage('在吗'));
+    const agent = await until(() => deep.host.list.created[0], 'the Agent');
+    completeTurn(deep.host, agent, long);
+    const sent = await until(() => {
+      const list = sentTexts(deep.onebot, 'send_private_msg');
+      return list.length === 4 ? list : undefined;
+    }, 'the split answer');
+    assert.deepEqual(sent, ['今天天气不错', '要不要出去走走', '顺便吃个饭吧', '附近新开的店还不错']);
+    assert.ok(sent.every((part) => part.length <= 12));
+  } finally {
+    await deep.onebot.close();
+  }
+});
+
+// 用例十六·补三：两条「反人机」硬要求必须在渠道提示里，而且换成自定义 persona 也照样生效：
+//   ① 一条回复只有一个形状（要么短、要么长）—— 压住「短句 + 长句」两拍；
+//   ② 是 / 否题只回一个是 / 否 ——「知不知道」这种别接一段解释。
+test('the channel prompt carries the anti-robot reply rules', async () => {
+  const plain = await boot({});
+  try {
+    plain.onebot.push(privateMessage('在吗'));
+    await until(() => plain.host.list.created[0], 'the Agent');
+    const text = promptText(plain.host, 'qq-bridge:channel');
+    assert.match(text, /一条回复只有一个形状/);
+    assert.match(text, /是 \/ 否题就回一个是 \/ 否/);
+    assert.match(text, /知不知道/);
+  } finally {
+    await plain.onebot.close();
+  }
+
+  // 自定义 persona 会整段替换内置那份口吻，但这两条硬要求挂在「硬性要求」里，必须还在；
+  // 同时内置 persona 的那句「像真人群友一样」应当已经不在了（证明确实被替换）。
+  const custom = await boot({ persona: '你是个普通群友，说话随意。' });
+  try {
+    custom.onebot.push(privateMessage('在吗'));
+    await until(() => custom.host.list.created[0], 'the Agent');
+    const text = promptText(custom.host, 'qq-bridge:channel');
+    assert.match(text, /一条回复只有一个形状/);
+    assert.match(text, /是 \/ 否题就回一个是 \/ 否/);
+    assert.ok(text.includes('你是个普通群友，说话随意。'));
+    assert.ok(!text.includes('像真人群友一样'));
+  } finally {
+    await custom.onebot.close();
+  }
+});
+
 // 用例十七：群聊回复可以带上指向（引用被回复的消息 / @ 对方），且只挂在第一条上。
 test('group replies can quote or mention the message they answer', async () => {
   // quote（默认）：reply 段引用入站消息的 message_id，正文跟在后面。
@@ -1942,6 +2064,16 @@ test('splitBurst and typingDelayMs behave as documented', () => {
   assert.deepEqual(splitBurst('一。\n二。三。四。', 4, 2), ['一。', '二。三。', '四。']);
   // maxChars = 0 只关掉「长句自动拆」，换行照样分条。
   assert.deepEqual(splitBurst('a\nb', 0, 3), ['a', 'b']);
+  // maxMessages：整轮回复的总条数上限。默认 0 = 不限（上面那些用例就是这个行为）。
+  // 同一行内部并条是「接回原文」，不留空格；跨行并条补一个空格，不能把两句粘成一个词。
+  assert.deepEqual(splitBurst('a。b。c。', 4, 3, 1), ['a。b。c。']);
+  assert.deepEqual(splitBurst('a。b。c。', 4, 3, 2), ['a。b。', 'c。']);
+  assert.deepEqual(splitBurst('在的\n刚吃完\n你呢', 60, 3, 1), ['在的 刚吃完 你呢']);
+  assert.deepEqual(splitBurst('在的\n刚吃完', 60, 3, 1), ['在的 刚吃完']);
+  // 额度内不并：一条就够时原样返回。
+  assert.deepEqual(splitBurst('在的', 60, 3, 1), ['在的']);
+  // 空文本仍然是空数组。
+  assert.deepEqual(splitBurst('   ', 60, 3, 1), []);
 
   const base = { charsPerSecond: 10, minDelayMs: 0, maxDelayMs: 60000, jitter: 0 };
   // 打字时间 = 字数 / 速度。

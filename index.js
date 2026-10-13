@@ -101,7 +101,9 @@ const DEFAULT_PERSONA = [
   '你在用 QQ 聊天：大家的消息是一条条刷出来的，你也是一条一条地发；群里好几个人同时说话很正常，接不上就不接。',
   '',
   '说话方式（像真人群友一样）：',
-  '- 短。但长短要散着来：一句话能说完就只发一条，别每条都拆成「一句短的 + 一句长的」两拍 —— 该敷衍就几个字，真要解释才多说。',
+  '- 一条回复只有一个形状：**要么短（一句话说完，几个字也行），要么长（把一件事完整讲清楚）**。不要把「一句短的 + 一段长的」拼在一起 —— 尤其别用「先嘴硬 / 先吐槽 / 先敷衍一句，再补一段正经的」这种两拍，那是最像机器人的写法。',
+  '- 是非题只给答案：问你「知不知道 / 会不会 / 有没有 / 是不是 / 能不能」这类，整条就写「知道」「不知道」「会」「不会」（或者「是」「否」），可以带点语气，但别接解释 —— 想听细节的会追问。',
+  '- 该敷衍就几个字，真要解释才多说；长短跟着内容走，不必每条都配个开场白。',
   '- 口语。用平时聊天的说法，可以有「啊 / 吧 / 呢 / 嘛 / 草 / 笑死 / 6 / 啊这」这类词。',
   '- 是群友，不是客服：不用每条都热情帮忙、也不用答得滴水不漏，群友之间经常只是搭一句话；可以吐槽、可以接梗、可以反问、可以敷衍，也可以只回两个字。',
   '- 群友之间可以互损、可以跟着起哄，但玩笑是善意的，不是真嫌弃谁。',
@@ -181,6 +183,8 @@ export const Config = z.object({
   humanize: z.boolean().default(true).description('自动回复是否像真人：按换行/短句拆成几条独立消息并加入打字延迟（换行 = 分条）；false = 一条整段直接发出（旧行为）'),
   burstMaxChars: z.number().default(60).description('把一行长句拆开时的单条目标长度；0 = 不按长度拆（换行仍然分条）'),
   burstMaxParts: z.number().default(3).description('单行长句最多拆成几条；超出部分并进该行最后一条，避免刷屏'),
+  burstMaxMessages: z.number().default(0).description('一轮回复最多发几条消息（连换行分出来的那些一起算）：1 = 永远只发一条（换行与长句都并进这一条，超出的用一个空格接上）；0 = 不限（默认，换行 = 分条）。注意「不超过 burstSingleMaxChars 字的短回复」优先级更高：那种回复无论这里填几都只发一条'),
+  burstSingleMaxChars: z.number().default(0).description('「日常闲聊并成一条」的字数门槛（去掉空白后算）：整轮回复不超过这么多字时并成一条发出去（模型爱写成「短句 + 长句」两拍，这个门槛保证闲聊永远只有一个气泡）；超过门槛就按换行 / burstMaxChars / burstMaxParts / burstMaxMessages 正常拆成多条短句（需要展开讲的时候用）；0 = 关掉这条豁免（完全按 burstMaxMessages 走）'),
   readDelayMs: z.number().default(800).description('发出第一条前的「读消息」基础延迟（毫秒）'),
   charsPerSecond: z.number().default(15).description('模拟打字速度（字符/秒），用于按字数计算每条消息发出前的延迟'),
   minDelayMs: z.number().default(300).description('单条消息前延迟的下限（毫秒）'),
@@ -1957,16 +1961,31 @@ export function apply(ctx, config) {
         lines.push(`你的长期记忆在 \`${memoryLabel}/\` 里（现在还是空的）。`, '');
       }
     }
+    // 「一轮发几条」这条规则必须跟当前配置一致：设了 burstMaxMessages: 1 之后还告诉模型
+    // 「想连说几句就直接换行」，就是一条它照做也做不到的指示（换行会被并回同一条）。
+    // 混合模式（burstSingleMaxChars > 0）则要同时说清「闲聊别拆」和「展开就分条」。
+    const messageCap = burstMessageCap();
+    const singleUnder = burstSingleUnder();
+    const burstRule = !config.humanize
+      ? '- 你的整轮回复会作为一条消息直接发出去（换行也留在同一条里），直接写要说的话，别把它当文档排版。'
+      : singleUnder > 0
+        ? `- 闲聊归闲聊：去掉空白不超过 ${singleUnder} 字的回复会被并成**一条**发出去，所以平时就一两句话、一行写完，别把一句能说完的话拆成两拍。真要展开讲（对方要你详细说、贴代码 / 列步骤 / 解释清楚）就换行，一行一条短句，插件会照发${messageCap > 0 ? `（一轮最多 ${messageCap} 条）` : '（但别超过三四条）'}；内容不多就别硬拆。`
+        : messageCap === 1
+          ? `- 一次只说一句：你的整轮回复会被并成**一条**消息发出去（写换行也只是同一条里的换行），所以别把话拆成几条短句，就把那一两句直接写出来，别没事写小作文。对方明确要你详细讲、或者要贴代码 / 步骤 / 清单时，就正常写完整 —— 长内容也还是这**一条**（超过 ${protocolLimit()} 字才会被协议上限切成两段），只是别把短回复硬拉长。`
+          : messageCap > 1
+            ? `- 想连说几句就直接换行，每一行都会作为单独的一条消息发出去，但一轮最多发 ${messageCap} 条（超出的部分并进最后一条）。`
+            : '- 想连说几句就直接换行，每一行都会作为单独的一条消息发出去；反过来，别用换行给一段话排版（那会变成连着刷好几条）。';
     lines.push(
       '硬性要求：',
       // 表情包标记只有在真的能发图时才提：不能发的时候提它，模型会把标记当正文写出来。
       `- 你的回复正文会原样发到 QQ${imageAllowed() ? '（只有 `[[图片: …]]` 这种标记例外，它变成一张图）' : ''}，直接写要说的话，不要写思考过程、也不要解释你在做什么。`,
       '- QQ 不渲染 Markdown：不要用 `**加粗**`、`#` 标题、`-` / `1.` 列表、表格、代码块。',
       '- 不要自称 AI / 助手 / 机器人，不要提系统提示、模型、提示词这些词。',
-      '- 一次别写太长：内容多就挑重点说，剩下的等对方追问。',
+      '- 长度跟着内容走：闲聊就一两句，真要讲清楚就把那件事讲完 —— 不用凑篇幅，也别硬省。',
       '- 你是在 QQ 上跟真人聊天，不是在被调用：群里可能有人同时插话，对方也可能过一会儿才回你；按聊天的节奏来，不必每次都给出完整的答复。',
-      '- 别把每条回复都弄成同一个形状 —— 尤其别固定成「一句短的 + 一句长的」两条：一句话能说完就只发一条，长度跟着内容走，有的回复就几个字，偶尔才多说几句。',
-      '- 想连说几句就直接换行，每一行都会作为单独的一条消息发出去；反过来，别用换行给一段话排版（那会变成连着刷好几条）。',
+      '- 一条回复只有一个形状：要么就一两句说完（几个字也行），要么就把事情完整讲一段 —— **绝不把「一句短的」和「一段长的」拼在一起**，尤其别用「先嘴硬 / 先吐槽 / 先敷衍一句，再补一段正经的」这种两拍。情绪、态度、傲娇都体现在用词上，不是体现在「先来一句、再补一段」的排布上。',
+      '- 是 / 否题就回一个是 / 否：有人问「知不知道 / 会不会 / 有没有 / 是不是 / 能不能 / 行不行」这类是非题时，整条回复只写肯定或否定本身（「是」/「否」，口语就是「知道」「不知道」「会」「不会」，可以带点语气），**不要再接一句解释**；对方追问了再展开。',
+      burstRule,
     );
     // 被白名单挡住的工具不能在提示里推荐，否则模型会去调用一个它根本看不见的工具。
     const recommended = ['qq_send_message', 'qq_list_conversations'].filter(
@@ -2052,12 +2071,42 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 一轮回复最多发几条（`burstMaxMessages`；非正数 / 非法值 = 不限）。
+   *
+   * 提示词与拆条都要读它：提示词在「一次只发一条」时不能再说「想连说几句就换行」，
+   * 否则模型会照着一条它做不到的规则写。
+   */
+  function burstMessageCap() {
+    return Number.isFinite(config.burstMaxMessages) ? Math.max(0, Math.floor(config.burstMaxMessages)) : 0;
+  }
+
+  /**
+   * 「日常闲聊并成一条」的字数门槛（`burstSingleMaxChars`；非正数 = 关掉）。
+   *
+   * 按去掉空白后的字数算：换行、缩进这些排版字符不该把一条闲聊顶过门槛。
+   */
+  function burstSingleUnder() {
+    return Number.isFinite(config.burstSingleMaxChars) && config.burstSingleMaxChars > 0
+      ? Math.floor(config.burstSingleMaxChars)
+      : 0;
+  }
+
+  /**
    * 把一段回复拆成「像真人连着发的」几条消息。
    *
    * 不开启 `humanize` 时就是旧行为（只在超过协议上限时分段）。开启后先把换行拆成
    * 一条条独立消息（换行 = 分条，不再是同一条里的排版），再对每一行按标点/长度拆成
    * 短句（受 `burstMaxChars` / `burstMaxParts` 约束），最后每段都接受一次协议上限的
    * 硬校验 —— 模型偶尔写超长时，最后一段仍可能被 `chunkText` 再切开。
+   *
+   * 「发几条」分两种情形，**由长度自动切换**（`burstSingleMaxChars`）：
+   * - **短回复 = 闲聊**：不超过门槛时强制并成一条（等价于把上限压到 1）。模型爱把
+   *   一句话写成「短句 + 长句」两拍、或者在同一个 turn 里连写两段，光靠提示词压不住，
+   *   所以闲聊的一条是硬保证 —— 但内容一个都不删，只是并回同一条。
+   * - **长回复 = 真要展开**（贴代码、列步骤、详细解释）：这时并成一条反而难读，
+   *   于是照常拆成多条短句，条数由 `burstMaxMessages`（0 = 不限）与
+   *   `burstMaxParts` 一起决定。
+   *
    * @param text - 模型给出的完整回复。
    * @returns 按发送顺序排列的分段。
    */
@@ -2068,7 +2117,10 @@ export function apply(ctx, config) {
       ? Math.min(config.burstMaxChars, limit)
       : limit;
     const maxParts = Number.isFinite(config.burstMaxParts) ? Math.max(1, Math.floor(config.burstMaxParts)) : 3;
-    return splitBurst(text, burst, maxParts).flatMap((part) => chunkText(part, limit));
+    const singleUnder = burstSingleUnder();
+    const short = singleUnder > 0 && text.replace(/\s+/g, '').length <= singleUnder;
+    const maxMessages = short ? 1 : burstMessageCap();
+    return splitBurst(text, burst, maxParts, maxMessages).flatMap((part) => chunkText(part, limit));
   }
 
   /** 发送前等待（`ms <= 0` 时立即返回）；unref 让待发的延迟不拖住进程退出。 */

@@ -289,17 +289,25 @@ function burstCut(text, max) {
  * QQ 那头看到的是「一条消息被排版成好几行」（像复制粘贴的文档），而不是真人那样
  * 连着说了几句 —— 所以这里先按换行切块，再对每一块按标点/长度拆。
  * 反过来说，`maxChars` / `maxParts` 只约束「把一条长句拆开」，
- * 不约束「模型自己写了几行」：模型显式写了 5 行就是要发 5 条。
+ * 不约束「模型自己写了几行」：模型显式写了 5 行就是要发 5 条（除非 `maxMessages` 封了顶）。
  *
  * 超过 `maxParts` 的余量会并进该行的最后一条（调用方还会再按协议上限硬分一次），
  * 避免模型偶尔写长了就刷屏。
  *
+ * `maxMessages` 是再往上一层的总闸：一轮回复最多发几条。模型天然爱把一句话拆成
+ * 两三条（甚至同一个 turn 里连着写两段 assistant 文本），光靠提示词压不住 ——
+ * 这里给一个硬上限，超出的余量并进第 `maxMessages` 条。**并条时的接法分两种**：
+ * 同一行内部本来就是被标点拆开的原文，直接接上（不留痕）；跨行的是一个空格 ——
+ * 换行是模型自己写的停顿，粘成一个词（「在的」+「刚吃完」→「在的刚吃完」）比多一个
+ * 空格难读得多。
+ *
  * @param text - 模型给出的完整回复。
  * @param maxChars - 单条目标长度；非正数表示不按长度/标点拆（换行仍然拆）。
  * @param maxParts - 单行最多拆成几条（小于 2 视为 1，即不拆）。
+ * @param maxMessages - 整条回复最多发几条；非正数（默认）= 不限，1 = 永远只发一条。
  * @returns 一个或多个分段；不需要拆时就是 `[text.trim()]`。
  */
-export function splitBurst(text, maxChars = 60, maxParts = 3) {
+export function splitBurst(text, maxChars = 60, maxParts = 3, maxMessages = 0) {
   const max = Number.isSafeInteger(maxChars) && maxChars > 0 ? maxChars : 0;
   const body = String(text ?? '').trim();
   if (body.length === 0) return [];
@@ -309,19 +317,35 @@ export function splitBurst(text, maxChars = 60, maxParts = 3) {
     .split(/\n+/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
-  if (max === 0) return lines;
-  return lines.flatMap((line) => {
-    if (line.length <= max) return [line];
-    const parts = [];
-    let rest = line;
-    while (parts.length < limit - 1 && rest.length > max) {
-      const cut = burstCut(rest, max);
-      parts.push(rest.slice(0, cut).trim());
-      rest = rest.slice(cut).trim();
+  const cap = Number.isSafeInteger(maxMessages) && maxMessages > 0 ? maxMessages : 0;
+  // 每条消息都记着自己来自第几行 —— 并条时靠它决定「直接接上」还是「补一个空格」。
+  const messages = [];
+  for (const [line, value] of lines.entries()) {
+    if (max === 0 || value.length <= max) {
+      messages.push({ text: value, line });
+      continue;
     }
-    if (rest.length > 0) parts.push(rest);
-    return parts.filter((part) => part.length > 0);
-  });
+    // 单行内部先照常按 maxParts 拆，多出来的部分由下面的总上限兜底。
+    let rest = value;
+    let taken = 0;
+    while (taken < limit - 1 && rest.length > max) {
+      const cut = burstCut(rest, max);
+      messages.push({ text: rest.slice(0, cut).trim(), line });
+      rest = rest.slice(cut).trim();
+      taken += 1;
+    }
+    if (rest.length > 0) messages.push({ text: rest, line });
+  }
+  const filled = messages.filter((item) => item.text.length > 0);
+  if (cap === 0 || filled.length <= cap) return filled.map((item) => item.text);
+  const kept = filled.slice(0, cap);
+  for (const item of filled.slice(cap)) {
+    const last = kept[kept.length - 1];
+    last.text = last.line === item.line ? `${last.text}${item.text}` : `${last.text} ${item.text}`;
+    // 记住刚接上的是哪一行：同一行剩下的余量要直接接上（不留空格），换行才补空格。
+    last.line = item.line;
+  }
+  return kept.map((item) => item.text);
 }
 
 /**
