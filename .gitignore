@@ -9,9 +9,22 @@ data/
 node_modules
 .venv/
 
-# 本地编译产物
-/hello
+# 凭据。
+# README「凭据」一节的解析顺序里 `<启动 cwd>/.env` 是合法来源 —— 也就是说把 key 写在
+# 项目根的 .env 里是能生效的，所以这一条必须挡住它，否则 `git add .` 会把真 key 提交上去。
+# （data/api-keys.txt 那把轮换用的池子由上面的 data/ 盖住。）
+.env
+.env.*
+!.env.example
 
 # 日志与临时文件
 *.log
 *.tmp
+*.pdf
+
+# 编辑器 / 系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

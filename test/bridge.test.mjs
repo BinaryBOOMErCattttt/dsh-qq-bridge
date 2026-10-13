@@ -1255,7 +1255,10 @@ test('plugin logs are mirrored to stderr in a real host', async () => {
     }
     // 只挑本插件每次创建 Agent 必打的那条：先前用例留下的客户端会不定期
     // 重连并打日志，不能对其他行做断言。
-    return lines.filter((line) => line.startsWith('qq-bridge: ') && line.includes('created efefff51'));
+    // 会话 id 由 PRIVATE_USER_ID 经 SHA-256 派生，所以这里**现算**前缀 ——
+    // 写死一个常量的话，改测试用的 QQ 号就会莫名其妙地弄红这个用例。
+    const prefix = sessionIdFor(`private:${PRIVATE_USER_ID}`, 0).slice(0, 8);
+    return lines.filter((line) => line.startsWith('qq-bridge: ') && line.includes(`created ${prefix}`));
   };
 
   // 真实宿主的 logger 门面带 exporter() -> 镜像。

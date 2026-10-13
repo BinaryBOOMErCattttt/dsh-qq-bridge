@@ -93,8 +93,13 @@
         # OneBot v11 正向 WebSocket 地址（容器 napcat 映射出来的 3001 端口）
         endpoint: ws://127.0.0.1:3001
         accessToken: ''
-        # QQ 会话 Agent 的工作目录，同时也是它的沙箱根
-        cwd: ~/Projects/qqbot
+        # QQ 会话 Agent 的工作目录，同时也是它的沙箱根。
+        # 留空（= 注释掉这一行）= 用 Harness 进程的当前目录；deploy/qqbot.service 里的
+        # WorkingDirectory 已经指向本仓库，所以本机这样就是对的。
+        # 换机器 / 换目录部署时，把下面这行改开并写成你自己的**绝对路径** ——
+        # 这里不认 `~`，写相对路径也只会相对进程 cwd（mediaDir / stickerDir / jmDir /
+        # memoryDir 都相对它解析，且必须落在它里面，否则对应功能记 warn 并停用）。
+        # cwd: /absolute/path/to/this/repo
         privateChat: true
         groupChat: true
         # 群里只有被 @ 时才响应：mention / prefix / all
@@ -154,7 +159,7 @@
         # 只能读本地文件 —— 所以收到图时插件会先把它落到下面这个目录，再把路径写进正文
         # （`[图片: .qq-media/xxxx.gif]`）。取不到就只留一句占位符，不影响消息本身。
         mediaDownload: true
-        # 缓存目录：相对 cwd（也就是上面的 ~/Projects/qqbot），必须落在 cwd 内。
+        # 缓存目录：相对 cwd（本机 = 本仓库根目录），必须落在 cwd 内。
         # 文件按内容哈希命名（同一张表情包反复发只会存一份），超过条数按 LRU 淘汰。
         mediaDir: .qq-media
         mediaMaxBytes: 8388608        # 8MB：超过这个大小的图不下载，只留占位符
@@ -347,7 +352,7 @@
         # QQ 里直接触发：`/jm 422866`（也可 `jm 422866`），支持 18comic 的 album / photo 链接。
         # 车号是本子的就是整本、是某一话的就只下那一话；留空则只保留 qq_jm_pdf 工具。
         jmCommand: /jm
-        # PDF 落盘目录（相对 cwd，也就是上面的 ~/Projects/qqbot），必须落在 cwd 内。
+        # PDF 落盘目录（相对 cwd，本机 = 本仓库根目录），必须落在 cwd 内。
         # 超过 jmMaxFiles 按最近使用时间淘汰最旧的；图片中间产物下完即删，只留 PDF。
         jmDir: .qq-jm
         # 跑 jmcomic 的解释器：相对 cwd 或绝对路径

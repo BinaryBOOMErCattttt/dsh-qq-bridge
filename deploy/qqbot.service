@@ -1,6 +1,6 @@
 [Unit]
 Description=DeepSeek Harness — QQ bot (profile: qqbot)
-Documentation=file://~/Projects/qqbot/README.md
+Documentation=file://%h/Projects/qqbot/README.md
 After=network-online.target
 Wants=network-online.target
 

@@ -1,7 +1,7 @@
 # AGENTS.md — 给智能体的项目说明书
 
 给要**改这个项目**的智能体看的最小充分上下文。用户视角的功能说明在
-[README.md](README.md)（1199 行，中文，写得很好）—— 本文只讲「代码长什么样、动哪里、
+[README.md](README.md)（中文，写得很好）—— 本文只讲「代码长什么样、动哪里、
 什么不能碰、改完怎么验」。
 
 > **这个文件会被自动注入到在本目录下工作的每个 DSH Agent 的上下文里**
@@ -586,7 +586,7 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 改完按它核对要不要补用例。
 
 - 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**
-  （当前基线：`test/` 下 227 个用例全过，约 30 秒；其中 `settings.test.mjs` / `chatter.test.mjs` /
+  （当前基线：`test/` 下 234 个用例全过，约 30 秒；其中 `settings.test.mjs` / `chatter.test.mjs` /
   `util.test.mjs` / `filestore.test.mjs` 是不用假 Host 的纯函数用例，几百毫秒就跑完）。
 - 加行为就加用例，并在用例名/注释里用中文写清意图。
 - 纯函数（`onebot.js` 里的拆分/延迟/采集/`mentionsOthers`、`image.js`、`media.js`、
@@ -658,7 +658,7 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 
 ```
 profile   ~/.dsh/profiles/qqbot/      bundles: dsh-base + dsh-web-app + @qqbot/dsh-plugin-qq
-安装方式  @qqbot/dsh-plugin-qq -> link:~/Projects/qqbot
+安装方式  @qqbot/dsh-plugin-qq -> link:<本仓库的绝对路径>
 UI        http://127.0.0.1:3081/
 启动      systemctl --user restart qqbot   或   dsh --profile qqbot --port 3081 --no-open
 日志      journalctl --user -u qqbot -f

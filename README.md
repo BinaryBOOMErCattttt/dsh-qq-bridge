@@ -1,5 +1,9 @@
 # @qqbot/dsh-plugin-qq — QQ ↔ DSH 桥接插件
 
+> 个人自用项目，顺手传到 GitHub 方便朋友下载。文档里的配置与取舍都是照着
+> 我这一台机器的用法写的，没有做成通用插件，也不保证开箱即用 ——
+> 想拿去玩的话，照着下面慢慢改就行。
+
 把 QQ（通过 OneBot v11，如 NapCat / Lagrange / go-cqhttp）接到 DeepSeek Harness：
 
 - **入站**：QQ 私聊或群里 @机器人 的消息 → 交给一个专属的 DSH Agent 会话处理 → 处理结果自动发回 QQ。
@@ -1226,7 +1230,7 @@ profile   ~/.dsh/profiles/qqbot/         （从 dsh 自带的 web 模板克隆�
 bundles   @deepseek-ai/dsh-base
           @deepseek-ai/dsh-web-app
           @qqbot/dsh-plugin-qq
-依赖      @qqbot/dsh-plugin-qq -> link:~/Projects/qqbot
+依赖      @qqbot/dsh-plugin-qq -> link:<本仓库的绝对路径>   （`link:` 不认 `~`）
 UI        http://127.0.0.1:3081/
 ```
 
@@ -1247,7 +1251,7 @@ stdio JSON-RPC 服务），所以从 `web` 模板克隆：进程常驻，并且�
 自己的登录会话或 systemd 托管。仓库里备好了 user unit：
 
 ```bash
-cp ~/Projects/qqbot/deploy/qqbot.service ~/.config/systemd/user/
+cp deploy/qqbot.service ~/.config/systemd/user/     # 在仓库根目录执行
 systemctl --user daemon-reload
 systemctl --user enable --now qqbot
 
