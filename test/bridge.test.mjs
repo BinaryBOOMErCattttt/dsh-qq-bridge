@@ -1993,6 +1993,56 @@ test('auto reply style quotes only when someone spoke in between', async () => {
   }
 });
 
+// 用例十七之二·补：中间隔着**机器人自己刚发的话**时也要引用。
+//
+// 真实日志里的样子（group:100000001，15:33）：iroha 问天气（第 44 轮，入站时快照 S）→ 三秒后
+// 另一个人发来一张表情包（第 45 轮，快照 S+1）→ 第 44 轮的回复「桂林今天多云…」发出去
+// （我在这个群里说了话，进度 S+2）→ 第 45 轮回「又发我照片干嘛」时，被回的那张图后面已经
+// 多了一条**我自己的**消息，得带引用才看得出来在回哪条。
+//
+// 这一票是在 `sendOne` 里发的，不是等回灌：NapCat 的 `reportSelfMessage` 关着，自己发出的
+// 消息不会作为事件回来，所以用例里也只推别人的消息、靠真发出去的那条回复推动进度。
+test("auto reply style also counts the bot's own replies in between", async () => {
+  const { onebot, host } = await boot({ replyStyle: 'auto' });
+  try {
+    // 第 44 轮：iroha 问天气；不等它回完，紧接着又来一条（这条排在下一轮）。
+    onebot.push(mention('今天桂林天气怎么样', { messageId: 4241 }));
+    const agent = await until(() => host.list.created[0], 'the group Agent');
+    await until(() => agent.inbox.length === 1, 'the weather question to reach the Agent');
+    onebot.push(mention('又发我照片', { messageId: 4242 }));
+    await until(() => agent.inbox.length === 2, 'the second message to queue up behind it');
+
+    // 第 44 轮正常发完：这时候群里已经出现了我自己的话（「被回的那条被挤远」）。
+    const session = { id: agent.id };
+    host.list.emit('agent/inbox/claimed', { agent, message: agent.inbox[0], turn: 44 });
+    host.list.emit('session/event', session, {
+      type: 'assistant/message',
+      data: { turn: 44, step: 1, message: { content: [{ type: 'text', text: '桂林今天多云，23到34度' }] } },
+    });
+    host.list.emit('session/event', session, { type: 'turn/end', data: { turn: 44, reason: { kind: 'completed' } } });
+    // 问天气的时候另一个人插了一句，所以第 44 轮自己就带引用。
+    assert.deepEqual(await until(() => sentTexts(onebot)[0], 'the weather reply'), [
+      { type: 'reply', data: { id: '4241' } },
+      { type: 'text', data: { text: '桂林今天多云，23到34度' } },
+    ]);
+
+    // 第 45 轮回那张照片：中间只多了我自己那句话，也得点名。
+    host.list.emit('agent/inbox/claimed', { agent, message: agent.inbox[1], turn: 45 });
+    host.list.emit('session/event', session, {
+      type: 'assistant/message',
+      data: { turn: 45, step: 1, message: { content: [{ type: 'text', text: '又发我照片干嘛' }] } },
+    });
+    host.list.emit('session/event', session, { type: 'turn/end', data: { turn: 45, reason: { kind: 'completed' } } });
+    const sent = await until(() => sentTexts(onebot)[1], 'the quoted second reply');
+    assert.deepEqual(sent, [
+      { type: 'reply', data: { id: '4242' } },
+      { type: 'text', data: { text: '又发我照片干嘛' } },
+    ]);
+  } finally {
+    await onebot.close();
+  }
+});
+
 // 用例十七之三：一次回复里的换行拆成多条独立消息，且引用只挂在第一条上。
 test('a multiline group reply becomes separate messages with the quote only on the first', async () => {
   const { onebot, host } = await boot({ replyStyle: 'quote' });
@@ -3849,4 +3899,38 @@ test('activeFollow: a followed message never triggers a command bypass', async (
   assert.equal(agent.inbox[1].content[0].text, '/reset');
   await settle(80);
   assert.ok(!sentTexts(onebot).some((text) => String(text).includes('已清空')), 'the window must not run commands');
+});
+
+// 用例：`.dsh/skills/` 下的每个 skill 都必须是**能被发现**的文件。
+//
+// frontmatter 写坏的代价是**静默消失**：dsh-skill-filesystem 只在 `ctx.logger.warn`
+// 里记一句，而这个部署看不到 cordis logger，模型那边就是「这个 skill 不存在」。
+// 所以把「目录名 = name、description 非空、有正文」钉成用例，顺手把 moegirl 依赖的
+// 两个接口形状也钉住 —— 换成 `list=search` 那种全文搜索接口会当场失效。
+test('.dsh/skills 下的每个 skill 都能被 skill-filesystem 发现', async () => {
+  const root = new URL('../.dsh/skills/', import.meta.url);
+  const dirs = (await readdir(root, { withFileTypes: true })).filter((entry) => entry.isDirectory());
+  assert.deepEqual(
+    dirs.map((entry) => entry.name).sort(),
+    ['message-digest', 'moegirl', 'update-cognition'],
+    '本地 skill 的清单变了就要同步这里（README「三个 skill」那张表也一样）',
+  );
+  for (const dir of dirs) {
+    const text = await readFile(new URL(`${dir.name}/SKILL.md`, root), 'utf8');
+    const frontmatter = /^---\n([\s\S]*?)\n---\n/.exec(text);
+    assert.ok(frontmatter, `${dir.name}/SKILL.md 缺 YAML frontmatter，会被整个忽略`);
+    const data = yaml.load(frontmatter[1]);
+    assert.equal(data.name, dir.name, 'frontmatter 的 name 必须与目录同名');
+    assert.ok(
+      typeof data.description === 'string' && data.description.trim().length > 0,
+      `${dir.name} 的 description 不能为空（skill 目录里只列 description）`,
+    );
+    assert.ok(text.length > frontmatter[0].length, `${dir.name}/SKILL.md 要有正文`);
+    if (dir.name === 'moegirl') {
+      // 实测：匿名调 `list=search` / `rest.php/v1/search/page` 都被封，条目网页的正文是
+      // 脚本渲染的；只有 opensearch（找条目名）+ prop=extracts（取正文）拿得到东西。
+      assert.ok(text.includes('action=opensearch'), 'moegirl 要留着前缀搜索接口');
+      assert.ok(text.includes('prop=extracts'), 'moegirl 要留着取正文的接口');
+    }
+  }
 });

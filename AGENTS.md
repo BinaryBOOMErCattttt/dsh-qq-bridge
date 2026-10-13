@@ -27,7 +27,8 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
   与「回完对方安静一会儿再补一句」（见 §4.G）。
 - **长期记忆**：每条消息落盘成转录，定时由一个**独立摘要会话**照 `.dsh/skills/` 里的
   `message-digest` skill 整理成「这个群记得什么」，聊天时用 `qq_transcript` / `qq_memory`
-  查；顺带用 `update-cognition` skill 学会群里的梗和表情包（见 §4.E）。
+  查；顺带用 `update-cognition` skill 学会群里的梗和表情包，看不懂的二次元梗先走
+  `moegirl` skill 查萌娘百科（见 §4.E）。
 
 技术约束（决定了代码的写法，别无意打破）：
 
@@ -50,6 +51,7 @@ perceptual.js 约 1060 行  图片指纹：JPEG(DC)/PNG/GIF → 16×16 灰度 �
 scripts/jm_download.py  禁漫下载的 python 实现（jmcomic + img2pdf），唯一非 JS 的逻辑
 .dsh/skills/message-digest/SKILL.md    聊天记录 → 长期记忆的流程（定时摘要与「以前说过什么」用它）
 .dsh/skills/update-cognition/SKILL.md  学梗 / 表情包含义 → COGNITION.md 的流程
+.dsh/skills/moegirl/SKILL.md           二次元梗 → 萌娘百科 MediaWiki 接口查意思的流程（只读，不落盘）
 test/bridge.test.mjs  集成测试：假 OneBot 服务端 + 假 Harness ctx（含假 timer），跑完整往返
 test/jm.test.mjs      下载链路的单元/协议测试（假 python shell 脚本）
 test/perceptual.test.mjs  图片指纹的单元测试（同图不同编码 / 异图 / 畸形输入 / 解压炸弹）
@@ -93,7 +95,7 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 |---|---|---|
 | 顶部常量 | `CHANNEL_SECTION_ORDER=8950`、`PRESET_NONE`、`QUOTE_TEXT_CHARS`、`STICKER_PROMPT_MAX` | 调提示词用 |
 | `Config` schema | 第 106–199 行 | **配置的唯一真相来源**，`.description()` 就是 Web UI 上给用户看的文档 |
-| 运行时状态 | 第 532–571 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / `chatterSeq` / `repeatStates` / `mediaResolutions`，以及记忆的 `memorySlugs` / `memoryDirty` / `memoryLastDigest` / `memoryWrites` / `memoryIndexCache`；每条会话记录里还挂着 `lastActiveAt` / `lastBotSpeakAt` 与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
+| 运行时状态 | 第 532–571 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / `chatterSeq`（只算别人）/ `quoteSeq`（**含机器人自己发的**，答复指向用；`noteOwnMessage` 在发出去那一刻记账）/ `repeatStates` / `mediaResolutions`，以及记忆的 `memorySlugs` / `memoryDirty` / `memoryLastDigest` / `memoryWrites` / `memoryIndexCache`；每条会话记录里还挂着 `lastActiveAt` / `lastBotSpeakAt` 与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
 | Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` | 见 §7 |
 | 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` | 串行队列保证同一会话的消息不乱序；`sendOne` 顺便记 `lastBotSpeakAt`（主动说话靠它避免独白） |
 | JM 旁路 | `readJmCommand` `runJmCommand` `sendJmFile` `downloadJm` | `/jm 422866` 不进 Agent、不建会话 |
@@ -298,7 +300,11 @@ turn/end（正常回复发完之后）
   「活跃」会变成一个永远不结束的状态。
 - **「中间有别人说话就断」靠 `chatterSeq` / `activeSeq` 比大小**，别改成时间戳：
   它要判的是「有没有人插话」，不是「隔了多久」。当前这条消息自己已经把序号 +1，
-  所以合法值恰好是 `activeSeq + 1`。
+  所以合法值恰好是 `activeSeq + 1`。这张表**只算别人**：机器人自己的话走 `quoteSeq`
+  （回复指向用，见 `quoteHead`），别把两张表并成一张 —— 我自己说话不该把自己的一对一
+  窗口打断，但答复引用的判据要把它算进去。`quoteSeq` 里我自己的那一票是在**发出去**那一刻
+  由 `noteOwnMessage` 记的（NapCat 配的是 `reportSelfMessage: false`，自己发的消息不会回灌，
+  别指望事件）：`sendOne` + 两个发送工具 + JM 上传四处。
 - **`continued` 一路要传到 `submitBatch`**：前缀模式下按前缀长度硬切会切掉正文首字
   （`dropPrefix` 只对**显式带前缀**的那条调用）。
 - **窗口接上的那句不是指令**：`handleEvent` 里 `commanded`（= 被叫到且不是 continued）
@@ -357,6 +363,7 @@ turn/end（正常回复发完之后）
 | 改出站图片校验或传输 | `image.js` |
 | 改下载/PDF/上传 | `jm.js` + `scripts/jm_download.py` |
 | 改群触发/白名单/复读 | index.js 的 `admit` / `maybeRepeat` 区块 |
+| 改回复的指向（引用 / @） | index.js 的 `quoteHead` + `admit` 里快照的进度序号 + `Config.replyStyle`；那张 `quoteSeq` **含机器人自己发的话**，别换成只算别人的 `chatterSeq`，也别把 `noteOwnMessage` 那几处删了（NapCat 的 `reportSelfMessage: false`，自己发的话等不到回灌） |
 | 改「两张图算不算同一张」 | `perceptual.js`（指纹方案与阈值校准都写在文件头和 README「表情包那半边的账要算清」里）+ `Config.repeatImageTolerance` |
 | 改主动说话的闸门 / 文案 | index.js 的主动说话区块（`proactiveSweep` / `proactiveEligible` / `proactiveNudge`）+ `Config` 的 `proactive*` + README「偶尔主动说话」（见 §4.F） |
 | 改主动说话的时段语义 | `withinActiveHours`（**模块级纯函数**，导出给测试用）+ 它的边界用例 |
@@ -406,7 +413,7 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 改完按它核对要不要补用例。
 
 - 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**
-  （当前基线：`test/` 下 150 个用例全过，约 26 秒）。
+  （当前基线：`test/` 下 152 个用例全过，约 26 秒）。
 - 加行为就加用例，并在用例名/注释里用中文写清意图。
 - 纯函数（`onebot.js` 里的拆分/延迟/采集/`mentionsOthers`、`image.js`、`media.js`、
   `perceptual.js`、`index.js` 里导出的 `withinActiveHours`）尽量单独测边界。

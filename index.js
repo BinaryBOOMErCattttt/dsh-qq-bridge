@@ -190,7 +190,7 @@ export const Config = z.object({
   minDelayMs: z.number().default(300).description('单条消息前延迟的下限（毫秒）'),
   maxDelayMs: z.number().default(5000).description('单条消息前延迟的上限（毫秒）'),
   delayJitter: z.number().default(0.4).description('延迟的随机抖动比例（0 = 固定延迟，0.4 = 上下浮动 40%）'),
-  replyStyle: z.union(['auto', 'plain', 'quote', 'at']).default('auto').description('群聊回复的指向方式：auto = 只在「回的那条后面又有人说话」时才引用（默认），quote = 引用被回复的那条消息，at = @ 对方，plain = 直接发；指向只挂在第一条上，私聊始终为 plain'),
+  replyStyle: z.union(['auto', 'plain', 'quote', 'at']).default('auto').description('群聊回复的指向方式：auto = 只在「回的那条后面又出现了消息（包括我自己发的）」时才引用（默认），quote = 引用被回复的那条消息，at = @ 对方，plain = 直接发；指向只挂在第一条上，私聊始终为 plain'),
   persona: z.string().default('').description('替换默认的「群友口吻」段落；留空使用插件内置的那份'),
   instructions: z.string().default('').description('追加到 QQ 会话系统提示的额外要求'),
   // ---- 禁漫（JM / 18comic）下载 → PDF → 发到 QQ ----
@@ -574,12 +574,22 @@ export function apply(ctx, config) {
    */
   const ambient = new Map();
   /**
-   * 群号 → 群里迄今收到的消息条数（单调递增的「聊天进度」）。
+   * 群号 → 群里**别人**说的话的条数（单调递增的「聊天进度」）。
    *
-   * `auto` 回复指向靠它判断「我回的那条后面还有没有别人说话」：入站时快照一个数，
-   * 真要发出去时再读一次 —— 变大了说明中间有人插话，裸文本会让人看不出在回谁。
+   * 活跃对话靠它判断「这次一对一中间有没有人插话」（见 `activeFollowAllows` / `runChime`）：
+   * 所以**只算别人**，我自己说的话不能把自己的窗口打断。
    */
   const chatterSeq = new Map();
+  /**
+   * 群号 → 群里**所有**消息的条数（别人的 + 我自己发出去的）。
+   *
+   * `auto` 回复指向靠它判断「我回的那条是不是已经被后来的话挤远了」：入站时快照一个数，
+   * 真要发出去时再读一次 —— 变大了就带上引用段。与 `chatterSeq` 的区别是算不算我自己的话：
+   * 上一轮的回复、复读、主动搭话同样会把我回的那条挤走，看的人一样会对不上话头，所以也要算。
+   * 别人的话在 `noteChatter` 里进账，我自己的话在**发出去**那一刻由 `noteOwnMessage` 进账 ——
+   * 这个部署的 NapCat 配着 `reportSelfMessage: false`，自己发的消息不会回灌成事件，等不来。
+   */
+  const quoteSeq = new Map();
   /**
    * 群号 → 复读状态 `{ chain, queue }`（见 `maybeRepeat`）。
    *
@@ -830,7 +840,7 @@ export function apply(ctx, config) {
   /**
    * 收下一条入站消息时顺手记一行转录。
    *
-   * 只记**别人的**消息（机器人自己发出去的话会以 message 事件回灌，那是回音不是历史），
+   * 只记**别人的**消息（机器人自己发出去的话不算群里的历史，按 selfId 排除），
    * 并且限定在插件本来就允许处理的范围内（私聊开关、群白名单、私聊白名单）——
    * 记忆不该成为绕过准入规则的后门。
    * @param event - 已解码的 OneBot 事件。
@@ -2002,7 +2012,7 @@ export function apply(ctx, config) {
         `- 凭印象记不清「以前谁说过什么 / 这个群里发生过什么」时，别顺着猜：用 qq_transcript 查聊天记录（可以按关键词 search），用 qq_memory 读 \`${memoryLabel}/\` 里的记忆文件——先查再答，而不是先答再编。`,
         `- 真遇到值得长期记住的事（某人的偏好、群里的约定、一件发生过的事），用 qq_memory 追加到 \`conversations/<会话目录>/MEMORY.md\`；不要为了记而记，一两句就够。`,
         canSkill
-          ? '- 遇到看不懂的梗、黑话或表情包（图里写了什么、为什么大家都在笑），先用 read_image 看那张图，再加载 `update-cognition` skill 按它的规矩把它记进认知库；弄懂了再接着聊，不要不懂装懂、也不要一本正经地解释网络梗。'
+          ? '- 遇到看不懂的梗、黑话或表情包（图里写了什么、为什么大家都在笑），先用 read_image 看那张图；二次元 / ACG 那一类加载 `moegirl` skill 去萌娘百科查（比搜索引擎准），其它话题用 web_search。弄懂后按 `update-cognition` skill 的规矩记进认知库；不要不懂装懂、也不要一本正经地解释网络梗。'
           : '- 遇到看不懂的梗、黑话或表情包，先用 read_image 看那张图；弄不懂就直接说不懂，不要不懂装懂、也不要一本正经地解释网络梗。',
       );
     }
@@ -2222,6 +2232,9 @@ export function apply(ctx, config) {
       // （见 proactiveEligible）。所有真正发出去的消息都走这个函数，所以自动回复、
       // 复读、主动搭话都会被记上；出站工具那条路自己发，不计也无关紧要。
       conversation.lastBotSpeakAt = Date.now();
+      // 我自己的话也算「把被回复的那条挤远了」：回复指向的进度表在这一刻进账
+      // （NapCat 不回灌自己的消息，等不到事件，见 `noteOwnMessage`）。
+      noteOwnMessage(conversation.type, conversation.id);
       return true;
     } catch (error) {
       report('warn', `could not send to ${conversation.key}: ${error?.message ?? error}`);
@@ -2279,10 +2292,10 @@ export function apply(ctx, config) {
     if (index !== 0 || conversation.type !== 'group') return undefined;
     const style = config.replyStyle;
     if (style === 'auto') {
-      // 只在「我回的那条后面又有人说话」时才引用。紧挨着回时引用是纯噪音：一轮问答
-      // 本来就看得出来在回谁，每条都挂个引用块反而像机器人在逐条点着回复。
-      // 中间隔了别人的话才需要点名，不然接不上话头。
-      const drifted = typeof quote.seq === 'number' && (chatterSeq.get(conversation.id) ?? 0) > quote.seq;
+      // 只在「我回的那条后面又出现了消息」时才引用 —— **包括我自己刚发出去的话**
+      // （上一轮的回复、复读、主动搭话）：紧挨着回时引用是纯噪音，一轮问答本来就看得出来
+      // 在回谁；被后来的话挤远了才需要点名，不然看的人对不上话头。
+      const drifted = typeof quote.seq === 'number' && (quoteSeq.get(conversation.id) ?? 0) > quote.seq;
       if (!drifted || quote.messageId.length === 0) return undefined;
       return { type: 'reply', data: { id: quote.messageId } };
     }
@@ -2390,6 +2403,8 @@ export function apply(ctx, config) {
       : { user_id: conversation.id, file: url, name: job.name };
     try {
       await client.call(action, params, config.jmUploadTimeoutMs);
+      // 传进群里的这份 PDF 也是一条「我自己发的消息」（见 `noteOwnMessage`）。
+      noteOwnMessage(conversation.type, conversation.id);
       report('info', `jm: uploaded ${job.name} (${job.bytes} bytes) to ${conversation.key}`);
       return { ok: true };
     } catch (error) {
@@ -2690,7 +2705,8 @@ export function apply(ctx, config) {
    */
   function admit(event, selfId) {
     if (event?.post_type !== 'message') return undefined;
-    // 机器人自己发的消息会以 message 事件回灌，必须排除；selfId 未就绪时也一律不处理。
+    // 机器人自己发的消息一律排除（本机的 NapCat 关着 `reportSelfMessage`，本来收不到；
+    // 换个开着回灌的部署，这些回音也不该被当成「有人在跟它说话」）。selfId 未就绪时同样不处理。
     if (String(event.user_id ?? '') === String(selfId) || selfId === '') return undefined;
     const message = event.message ?? event.raw_message;
     const isGroup = event.message_type === 'group';
@@ -2731,9 +2747,9 @@ export function apply(ctx, config) {
         preview,
         continued,
         // 回复指向：引用被回复的那条消息（`reply` 段要 message_id），或 @ 回提问者（要 QQ 号）。
-        // `seq` 是这条消息在群里的进度，供 `auto` 判断「等我回话时有没有人插话」。三样都
-        // 在这里一次性快照：发送在几秒后，那时会话记录和群里的进度都可能已经变了。
-        quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: chatterSeq.get(groupId) ?? 0 },
+        // `seq` 是这条消息在群里的进度，供 `auto` 判断「等我回话时有没有人（包括我自己）
+        // 又说了话」。三样都在这里一次性快照：发送在几秒后，那时会话记录和群里的进度都可能变了。
+        quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: quoteSeq.get(groupId) ?? 0 },
       };
     }
     if (!config.privateChat) return undefined;
@@ -2759,27 +2775,58 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 记一次「群里又有人说话了」，返回该群当前的进度序号。
+   * 把某个群的进度序号 +1 并返回新值。
    *
-   * 每条**别人的**群消息都算（被 @ 的和没被 @ 的都算）：`auto` 回复指向靠入站与
-   * 发送两个时刻的序号差判断该不该引用。机器人自己发的消息会作为 message 事件回灌，
-   * 那是我自己的话、不是「有人插话」，所以按 selfId 剔除。
+   * 两张表都设了 512 个群的上限：见过面的群不该这么多，真超了就丢掉最早的那个群，
+   * 它接下来的回复退化成没有引用（序号从头开始也只影响「要不要引用」这一个判断）。
+   * @param seqs - `chatterSeq` 或 `quoteSeq`。
+   * @param groupId - 群号。
+   * @returns 该群在计入这条消息之后的序号。
+   */
+  function bumpSeq(seqs, groupId) {
+    const next = (seqs.get(groupId) ?? 0) + 1;
+    seqs.set(groupId, next);
+    if (seqs.size > 512) {
+      const oldest = seqs.keys().next().value;
+      if (oldest !== undefined && oldest !== groupId) seqs.delete(oldest);
+    }
+    return next;
+  }
+
+  /**
+   * 记一次「群里又有人说话了」，返回该群当前**别人**说话的进度序号。
+   *
+   * 两张表都进账：`quoteSeq` 是回复指向的判据（谁说的话都算挤），`chatterSeq` 只服务活跃对话
+   * （判的是「有没有**别人**插话」，我自己说话不该把自己的一对一窗口打断，见
+   * `activeFollowAllows` / `runChime`）。机器人自己发的话不走这里 —— 见 `noteOwnMessage`。
    * @param event - 已解码的 OneBot 事件。
    * @param selfId - 机器人自己的 QQ 号。
-   * @returns 该群在计入这条消息之后的序号。
+   * @returns 该群在计入这条消息之后的序号（`chatterSeq` 的口径）。
    */
   function noteChatter(event, selfId) {
     if (event?.message_type !== 'group') return 0;
+    // 自己的话不在这里记：这个部署的 NapCat 配着 `reportSelfMessage: false`，自己发的消息
+    // 根本不会回灌成事件；就算哪个部署开着回灌，那也在 `noteOwnMessage` 记过一遍了。
     if (String(event.user_id ?? '') === String(selfId)) return 0;
     const groupId = String(event.group_id);
-    const next = (chatterSeq.get(groupId) ?? 0) + 1;
-    chatterSeq.set(groupId, next);
-    // 兜底：见过面的群不该这么多；真超了就丢掉最早的那个群，它接下来的回复退化成 plain。
-    if (chatterSeq.size > 512) {
-      const oldest = chatterSeq.keys().next().value;
-      if (oldest !== undefined && oldest !== groupId) chatterSeq.delete(oldest);
-    }
-    return next;
+    bumpSeq(quoteSeq, groupId);
+    return bumpSeq(chatterSeq, groupId);
+  }
+
+  /**
+   * 记一次「我自己往这个群发了一条消息」。
+   *
+   * 为什么在**发出去**的那一刻记、而不是等 QQ 回灌：本机的 NapCat 里
+   * `reportSelfMessage: false`（`onebot11_<QQ>.json` 的 websocketServers），自己发出去的话
+   * 一条都不会回来 —— 而「我回的那条被我自己后来的话挤远了」恰恰是最需要点名的情况
+   * （上一轮的回复、复读、主动搭话都算）。所以出站这几条路（`sendOne`、两个发送工具、
+   * JM 上传）各记一次，不依赖任何回灌配置。
+   * @param type - `'group'` / `'private'`（私聊不挂指向，直接不记）。
+   * @param id - 群号。
+   */
+  function noteOwnMessage(type, id) {
+    if (type !== 'group') return;
+    bumpSeq(quoteSeq, String(id));
   }
 
   /**
@@ -2790,7 +2837,8 @@ export function apply(ctx, config) {
    * 主动搭话恰恰最不该发生，所以那些没人理机器人的消息也必须算作活跃。
    *
    * 只更新**已经存在**的会话记录：没聊过的群不该因为一条闲聊就变成候选（这也是
-   * 「主动说话只对已经聊过的群生效」的落点）。机器人自己的消息会回灌，按 selfId 排除。
+   * 「主动说话只对已经聊过的群生效」的落点）。机器人自己的消息不算活跃，按 selfId 排除
+   * （这个部署里也回灌不回来，见 `noteOwnMessage`）。
    * @param event - 已解码的 OneBot 事件。
    * @param selfId - 机器人自己的 QQ 号。
    */
@@ -3861,7 +3909,7 @@ export function apply(ctx, config) {
     if (event?.post_type !== 'message') return;
     if (selfId === '') return;
     // 先记「群里又有人说了一句」，`admit` 紧接着快照的序号才算上这条自己 ——
-    // 快照与发送时读到的值相等就说明没人插话，`auto` 便不引用。
+    // 快照与发送时读到的值相等就说明中间没有新消息，`auto` 便不引用。
     noteChatter(event, selfId);
     // 同一时刻记一次「这个会话是活跃的」：主动说话只挑安静下来的群（见 touchActivity）。
     touchActivity(event, selfId);
@@ -4052,6 +4100,8 @@ export function apply(ctx, config) {
         // 不做拆句、不加打字延迟 —— 拟人节奏只加在 QQ 会话的自动回复上。
         const parts = chunkText(body, protocolLimit());
         for (const part of parts) await client.call(action, { [idKey]: targetId, message: part });
+        // 发进群里的工具消息也是「我自己说的话」，回复指向的进度要跟着走（见 `noteOwnMessage`）。
+        noteOwnMessage(targetType, targetId);
         return { target_type: targetType, target_id: targetId, parts: parts.length };
       },
     }),
@@ -4115,6 +4165,8 @@ export function apply(ctx, config) {
         const action = type === 'group' ? 'send_group_msg' : 'send_private_msg';
         const idKey = type === 'group' ? 'group_id' : 'user_id';
         await client.call(action, { [idKey]: id, message: [imageSegment(image.bytes)] });
+        // 同 `qq_send_message`：我发进群的图也要算进回复指向的进度。
+        noteOwnMessage(type, id);
         report('info', `→ ${type === 'group' ? '群' : '私聊'} ${id}: ${image.format} 图 ${image.bytes.length} bytes（来源 ${image.label}）`);
         return { target_type: type, target_id: id, bytes: image.bytes.length, format: image.format, source: image.label };
       },
