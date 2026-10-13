@@ -48,7 +48,8 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 ## 2. 文件地图
 
 ```
-index.js      4337 行  插件本体：全部运行时状态、事件路由、发送/准入/复读/记忆/主动说话/活跃对话、连接生命周期
+index.js      4255 行  插件本体：全部运行时状态、事件路由、发送/准入/复读/记忆/主动说话/活跃对话、连接生命周期
+chatter.js      214 行  群里「谁在说话」的三本账（插话序号 / 回答指向 / 热度窗口）：只暴露语义动作，不暴露 Map
 util.js        233 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 记忆路径边界 / key 池解析与打码 / withinActiveHours
 filestore.js    78 行  几个「原子写 / 尽力而为读」的小工具（读不到返回空而不是抛错），记忆与转录都走它
 config.js      137 行  配置 schema（**配置的唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段
@@ -65,6 +66,7 @@ scripts/jm_download.py  禁漫下载的 python 实现（jmcomic + img2pdf），�
 .dsh/skills/moegirl/SKILL.md           二次元梗 → 萌娘百科 MediaWiki 接口查意思的流程（只读，不落盘）
 test/bridge.test.mjs  集成测试：假 OneBot 服务端 + 假 Harness ctx（含假 timer），跑完整往返
 test/settings.test.mjs  配置归一化的契约测试（默认值 / 非法值 / 白名单不 trim 这类刻意的不对称）
+test/chatter.test.mjs   「谁在说话」三本账的**不变量**测试（合并两本账就会红的那种）
 test/jm.test.mjs      下载链路的单元/协议测试（假 python shell 脚本）
 test/perceptual.test.mjs  图片指纹的单元测试（同图不同编码 / 异图 / 畸形输入 / 解压炸弹）
 test/image-fixtures.mjs  上面两个测试共用的图片 fixture（真编码的字节，不是 test 文件）
@@ -87,6 +89,7 @@ AGENTS.md             **本文件**：给改代码的智能体的说明书（DSH
 index.js ──▶ config.js（schema，纯数据）
          ──▶ settings.js ──▶ image.js（只借 DEFAULT_IMAGE_MAX_BYTES）
          ──▶ tools.js ──▶ onebot.js / image.js / jm.js（工具只用这三个的纯函数）
+         ──▶ chatter.js（谁在说话的三本账，纯内存结构）
          ──▶ util.js（纯函数，无 IO）/ filestore.js（原子读写）
          ──▶ onebot.js / media.js / image.js / jm.js / perceptual.js
                       └── media.js 用到 onebot.js 的占位符/嗅探约定
@@ -117,14 +120,14 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 | 顶部常量 | `CHANNEL_SECTION_ORDER=8950`、`PRESET_NONE`、`QUOTE_TEXT_CHARS`、`STICKER_PROMPT_MAX` | 调提示词用 |
 | 配置 schema | **不在这里**：在 `config.js`（第 125 行只是 `export { Config } from './config.js'`） | 唯一真相来源，`.description()` 就是 Web UI 上给用户看的文档 |
 | 配置的取值 | **不在这里**：`settings = createSettings(config, process.cwd())`（第 465 行）之后一律读 `settings.*` | 取默认值/夹紧/去空白都在 `settings.js`；`index.js` 里**没有一处**直接读 `config.xxx` |
-| 运行时状态 | 第 536–671 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / `chatterSeq`（只算别人，判「有没有人插话」）/ `groupChatter`（群号 → 最近发言 `{ userId, at }`，判「最近聊得够不够热」，见 §4.G）/ `quoteSeq`（**含机器人自己发的**，答复指向用；`noteOwnMessage` 在发出去那一刻记账）/ `repeatStates` / `mediaResolutions`，以及记忆的 `memorySlugs` / `memoryDirty` / `memoryLastDigest` / `memoryWrites` / `memoryIndexCache`；每条会话记录里还挂着 `sessionGeneration`（第几轮会话，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` 与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
+| 运行时状态 | 第 536–671 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / **`chatter`**（谁在说话的三本账，见 `chatter.js`；`chatterSeq` / `groupChatter` / `quoteSeq` 是它搬出去之前的名字）/ `repeatStates` / `mediaResolutions`，以及记忆的 `memorySlugs` / `memoryDirty` / `memoryLastDigest` / `memoryWrites` / `memoryIndexCache`；每条会话记录里还挂着 `sessionGeneration`（第几轮会话，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` / `activeInterposeSeq`（那条消息那一刻的插话序号快照）与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
 | Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` | 见 §7 |
 | 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` | 串行队列保证同一会话的消息不乱序；`sendOne` 顺便记 `lastBotSpeakAt`（主动说话靠它避免独白） |
 | JM 旁路 | `readJmCommand` `runJmCommand` `sendJmFile` `downloadJm` | `/jm 422866` 不进 Agent、不建会话 |
 | 会话管理 | `resetConversation` `conversationFor` `sessionIdFor` `resetMarkerDir` `loadConversationResetCounts` `writeConversationResetCount` `refreshSessionGeneration` | `/reset` 开新一轮（**不删旧会话**，代次 +1 并落盘），以及在线会话列表（新一轮时连主动说话的节奏一起清） |
 | 准入与复读 | `admit` `noteChatter` `touchActivity` `rememberAmbient` `maybeRepeat` `repeatStep` `sketchOf` `sameCandidate` | 白名单、群触发判定、环境上下文、复读状态机（图片来源判定 = 字节相同 **或** 画面指纹相近，见 `perceptual.js`）；`admit` 里还有「活跃对话」那条免 @ 的旁路 |
 | 主动说话 | `proactiveSweep` `proactiveEligible` `proactiveSpeak` `proactiveNudge` `proactiveSkip` `busyWithTurn` `proactiveTodayCount` | 见 §4.F；定时器在生命周期那一节，`withinActiveHours` 是模块级纯函数 |
-| 活跃对话 | `noteActiveMessage` `activeFollowAllows` `groupTalkActive` `recordGroupChatter` `batchScale` `scheduleChime` `cancelChime` `runChime` `chimeSpeak` `chimeNudge` `chimeTodayUsed` | 见 §4.G；A（一对一免 @ 接话）与 C（多人搭话）都在 `admit` 里判，倾听倍数在 `holdForBatch` 里用，B（补一句）挂在 `turn/end` 之后 |
+| 活跃对话 | `noteActiveMessage` `activeFollowAllows` `activeTurnsLeft` `groupTalkActive` `batchScale` `scheduleChime` `cancelChime` `runChime` `chimeSpeak` `chimeNudge` `chimeTodayUsed`；三本账的读写都在 `chatter.js` | 见 §4.G；A（一对一免 @ 接话）与 C（多人搭话）都在 `admit` 里判，倾听倍数在 `holdForBatch` 里用，B（补一句）挂在 `turn/end` 之后 |
 | 攒批 | `enqueue` `holdForBatch` `flushBatch` `submitBatch` `renderBatch` `batchWindow` `batchCap` `batchScale` | 前后脚到的消息合成一条再投给 Agent；多人搭话时窗口与上限同倍放大（见 §4.G） |
 | 媒体 | `resolveMessageMedia` `mediaFor` `resolveQuote` `hydrateAmbientMedia` | 环境上下文与复读**共用同一次下载**（`mediaResolutions` 这个 WeakMap 就是干这个的） |
 | 事件轮转 | `handleEvent`（约 77 行）+ 持久化事件路由 | 见 §4.A；`turn/end` 里按 `owner.proactive` 分流 |
@@ -139,7 +142,8 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 注释密度 25%–45%。文件大是因为「一个大闭包 + 大段取舍注释」，**不是因为函数失控** ——
 所以别把「拆函数」当成这里的重构方向，这里的边界问题是**模块级**的（见下）。
 
-**往外搬的两条纪律**（工具与配置已经这么做了，后续按同样方式拆记忆/主动说话）：
+**往外搬的两条纪律**（`tools.js` / `config.js` / `settings.js` / `util.js` / `filestore.js` /
+`chatter.js` 都是这么搬的，后续按同样方式拆记忆与主动说话）：
 
 1. 被搬出去的模块**不 import `index.js`**，需要什么由 `index.js` 显式传（`tools.js` 的
    `deps` 对象就是样例）。这样依赖方向永远是单向的，也一眼看得出那个模块能碰什么状态。
@@ -317,9 +321,9 @@ admit（群聊）
   │      重置 activeTurns、清 chime 计数、把 activeUntil 滑到 now + activeWindowMs
   ├─ A 没被叫到 → activeFollowAllows？五个条件：activeFollow 开着 · 是 activeSpeakerId 本人
   │     · 窗口没过期 · activeTurns < activeMaxTurns · 群里没人插过话
-  │     （chatterSeq == activeSeq + 1）· 这句没 @ 别人（mentionsOthers）
+  │     （chatter.others() == activeInterposeSeq + 1）· 这句没 @ 别人（mentionsOthers）
   │     └─ 通过 → noteActiveMessage(..., continued=true)（activeTurns +1）
-  └─ C 没被叫到 → groupTalkActive(群号)？最近 activeWindowMs 的 groupChatter 里
+  └─ C 没被叫到 → groupTalkActive(群号)？最近 activeWindowMs 的热度窗口里
         ≥ activeGroupLines 条 且 来自 ≥ activeGroupSpeakers 个人（纯查询，不写状态）
         └─ 通过 → 同样 continued=true（谁接话都算，不消耗 activeMaxTurns）
              └─ admit 返回 { continued: true }：正文**不能**再走 dropPrefix
@@ -334,7 +338,7 @@ turn/end（正常回复发完之后）
             └─ runChime：编号还对得上 · 窗口还热 · 没有在飞的 turn/批次
                  · chimeCount < activeChimeMax · 当天 < activeChimeDailyMax
                  · lastBotSpeakAt > lastActiveAt（我回过、对方没接）
-                 · 群里 chatterSeq == activeSeq（中间没人插话）
+                 · 群里 chatter.others() == activeInterposeSeq（中间没人插话）
                  · 掷中 proactiveChance
                     └─ chimeSpeak：先记账再 enqueue → followup(chimeNudge())
                          submitted.set(msg.id, { …, proactive: true })  ← 与 F 共用分流
@@ -344,13 +348,15 @@ turn/end（正常回复发完之后）
 
 - **窗口只靠别人发来的消息往后滑**（机器人自己说的话不滑）：否则它自己就能给窗口续命，
   「活跃」会变成一个永远不结束的状态。
-- **两张表分工不同，别合并**：一对一的「有没有人插话」靠 `chatterSeq` / `activeSeq` 比大小
-  （当前这条消息自己已经把序号 +1，所以合法值恰好是 `activeSeq + 1`），判的是「隔没隔着人」；
-  多人搭话靠 `groupChatter`（群号 → 最近 `{ userId, at }`，由 `noteChatter` 进账，上限
-  `GROUP_CHATTER_MAX`）**比时间**，判的是「最近够不够热」。别把前者改成时间戳，也别拿
-  `chatterSeq` 当窗口用。两张表都**只算别人**：机器人自己的话走 `quoteSeq`（回复指向用，
-  见 `quoteHead`），我自己说话不该把自己的一对一窗口打断，但答复引用的判据要把它算进去。
-  `quoteSeq` 里我自己的那一票是在**发出去**那一刻由 `noteOwnMessage` 记的（NapCat 配的是
+- **三本账别合并，而且这件事已经不由注释维持了**：都搬进了 `chatter.js`，只暴露语义动作 ——
+  `noteOther`（别人的话：插话序号 +1，并记进热度窗口）/ `noteSelf`（我自己的话：只推回答指向）
+  / `others`（比**大小**，判「中间有没有人插过话」）/ `anchor`（**含我自己**，判「我回的那条
+  被挤远了没有」）/ `isHot`（比**时间**，判「最近够不够热」，纯查询）/ `forgetHeat`（`/reset`）。
+  `chatter.js` 的模块注释里写着为什么不能并成一张表，`test/chatter.test.mjs` 把那几条不变量
+  钉成了断言（「我自己说一句不该推进别人的账」「一个人刷屏不算热」「窗口一过就退出」）——
+  **合并了两本账，那些用例会直接红**，不用再靠人记得读这段文字。
+  想知道「算不算我自己说的话」，看调的是 `noteOther` 还是 `noteSelf` 就够了。
+  我自己那一票是在**发出去**那一刻由 `noteOwnMessage` 记的（NapCat 配的是
   `reportSelfMessage: false`，自己发的消息不会回灌，别指望事件）：`sendOne` + 两个发送工具
   + JM 上传四处。
 - **多人搭话是纯查询（`groupTalkActive`），不存「搭话状态」**：大家一停，窗口自己就空了，
@@ -371,7 +377,7 @@ turn/end（正常回复发完之后）
   `cancelChime`，但正确性只依赖「编号对不对得上」，不依赖每个取消点都记得 `clearTimeout`。
 - **`activeFollow` 默认关**：它放松的是「群里只在被 @ 时才说话」这条默认约定（A 与 C 一起），
   属于安全面（§5.5）。默认值、README 的配置表与「安全提醒」三处要一起改。
-- **`/reset` 要清 `groupChatter`**：不然新一轮的第一句就可能被上一轮的热度判成多人搭话。
+- **`/reset` 要清热度窗口**（`chatter.forgetHeat`）：不然新一轮的第一句就可能被上一轮的热度判成多人搭话。两个序号刻意不清（理由写在 `forgetHeat` 上）。
 - **B 需要 `proactive: true`**：`scheduleChime` 的第一行就是总开关 —— 「允许它主动发消息」
   只有一个开关，别让补一句绕过它；A 与 C 不需要 `proactive`（启动自述因此挪到了
   `if (proactiveEnabled)` 块外面）。
@@ -496,12 +502,12 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
 | 改出站图片校验或传输 | `image.js` |
 | 改下载/PDF/上传 | `jm.js` + `scripts/jm_download.py` |
 | 改群触发/白名单/复读 | index.js 的 `admit` / `maybeRepeat` 区块 |
-| 改回复的指向（引用 / @） | index.js 的 `quoteHead` + `admit` 里快照的进度序号 + `Config.replyStyle`；那张 `quoteSeq` **含机器人自己发的话**，别换成只算别人的 `chatterSeq`，也别把 `noteOwnMessage` 那几处删了（NapCat 的 `reportSelfMessage: false`，自己发的话等不到回灌） |
+| 改回复的指向（引用 / @） | index.js 的 `quoteHead` + `admit` 里快照的 `chatter.anchor()` + `Config.replyStyle`；这个读数**含机器人自己发的话**（`noteSelf`），别换成只算别人的 `others()`，也别把 `noteOwnMessage` 那四处删了（NapCat 的 `reportSelfMessage: false`，自己发的话等不到回灌） |
 | 改「两张图算不算同一张」 | `perceptual.js`（指纹方案与阈值校准都写在文件头和 README「表情包那半边的账要算清」里）+ `Config.repeatImageTolerance` |
 | 改主动说话的闸门 / 文案 | index.js 的主动说话区块（`proactiveSweep` / `proactiveEligible` / `proactiveNudge`）+ `Config` 的 `proactive*` + README「偶尔主动说话」（见 §4.F） |
 | 改主动说话的时段语义 | `withinActiveHours`（**模块级纯函数**，导出给测试用）+ 它的边界用例 |
-| 改「聊起来之后保持搭话」 | index.js 的活跃对话区块（`activeFollowAllows` / `groupTalkActive` / `recordGroupChatter` / `batchScale` / `scheduleChime` / `runChime` / `chimeNudge`）+ `admit` 里那两条免 @ 分支 + `holdForBatch` 的倾听倍数 + `Config` 的 `active*` + README「聊起来之后保持搭话」（见 §4.G） |
-| 改「谁算在跟它聊」 | 一对一：`chatterSeq` / `activeSeq` 那套序号比较（`noteActiveMessage` / `activeFollowAllows` / `runChime`）—— 别改成时间戳，它判的是「有没有人插话」；多人搭话：`groupChatter` 的时间窗口（`recordGroupChatter` / `groupTalkActive`）—— 别改成序号，它判的是「最近够不够热」 |
+| 改「聊起来之后保持搭话」 | index.js 的活跃对话区块（`noteActiveMessage` / `activeFollowAllows` / `groupTalkActive` / `batchScale` / `scheduleChime` / `runChime` / `chimeNudge`）+ `chatter.js`（三本账）+ `admit` 里那两条免 @ 分支 + `holdForBatch` 的倾听倍数 + `settings` 的 `active*` + README「聊起来之后保持搭话」（见 §4.G） |
+| 改「谁算在跟它聊」 | `chatter.js`。一对一：`others()` 与 `activeInterposeSeq` 比大小（`noteActiveMessage` / `activeFollowAllows` / `runChime`）—— 别改成时间戳，它判的是「有没有人插话」；多人搭话：`isHot()` 的时间窗口（`groupTalkActive`）—— 别改成序号，它判的是「最近够不够热」。**两条判据的语义差别写在模块注释里，还有 `test/chatter.test.mjs` 守着** |
 | 改 `/reset` 的行为（轮次的算法 / 标记落盘 / 清哪些记账） | `sessionIdFor` + `resetConversation` + `resetMarkerDir` / `loadConversationResetCounts`（见 §4.H、§5.3、§5.4） |
 | 改「谁能重置会话」 | `Config.resetUsers` + `canReset` + `handleEvent` 里的 `/reset` 分支（**空白名单 = 谁都不能**，别改成 `allowUsers` 那种语义）+ README「新开一轮会话」 |
 | 改 QQ 会话能用哪些工具 | `cordis.patch.yml` 的 `preset-qq` + `Config.allowTools`（见 §7） |
@@ -536,8 +542,9 @@ subagent 会绕过 `allowTools` 出现在 QQ 会话里。改预设前先读那�
 ## 8. 测试与验证
 
 ```bash
-node --test test/                      # 全部（bridge + jm + perceptual + settings）
+node --test test/                      # 全部（bridge + jm + perceptual + settings + chatter）
 node --test test/settings.test.mjs     # 只跑配置取值口径（最快，0.2 秒）
+node --test test/chatter.test.mjs      # 只跑「谁在说话」的三本账
 node --test test/jm.test.mjs           # 只跑下载链路
 node --test --test-name-pattern 复读 test/   # 按名字过滤
 ```
@@ -550,7 +557,8 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 改完按它核对要不要补用例。
 
 - 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**
-  （当前基线：`test/` 下 187 个用例全过，约 30 秒；其中 16 个是 `settings.test.mjs` 的纯函数用例，不用假 Host、两百毫秒就跑完）。
+  （当前基线：`test/` 下 198 个用例全过，约 30 秒；其中 27 个是 `settings.test.mjs` + `chatter.test.mjs`
+  的纯函数用例，不用假 Host、三百毫秒就跑完）。
 - 加行为就加用例，并在用例名/注释里用中文写清意图。
 - 纯函数（`onebot.js` 里的拆分/延迟/采集/`mentionsOthers`、`image.js`、`media.js`、
   `perceptual.js`、`index.js` 里导出的 `withinActiveHours` / `parseApiKeyPool`）尽量单独测边界。
@@ -558,6 +566,10 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
   （`allowUsers` / `allowGroups` 逐字比较不 trim；`proactiveFromHour` 不夹紧、交给 `withinActiveHours`；
   攒批的 0 = 关闭，而毫秒项非法时退回默认）。**改 `settings.js` 必跑它** —— 这些分支在真宿主上
   几乎触发不到，只有它守着。
+- **「谁在说话」的三本账**（插话序号 / 回答指向 / 热度窗口）在 `test/chatter.test.mjs`：那里
+  钉的是**不变量**而不是实现 —— 「我自己说一句不该推进别人的账」（合并两本账就会红）、
+  「一个人刷屏不算热」、「窗口一过就退出」、「纯查询不改状态」、
+  「门槛配得比缓冲上限还大时缓冲要跟着留够」。**改 `chatter.js` 或活跃对话的判定必跑它。**
 - 图片指纹的用例在 `test/perceptual.test.mjs`（fixture 是 `test/image-fixtures.mjs` 里的真
   编码字节）。**改 `perceptual.js` 或复读的图片判定必跑它**：那里钉住了「同一张画面的十种
   编码指纹逐位一致」「同一套画风换掉文字必须判成两张」（真实世界最容易误判的一类）以及

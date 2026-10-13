@@ -17,6 +17,7 @@
     "settings.js",
     "filestore.js",
     "util.js",
+    "chatter.js",
     "config.js",
     "tools.js",
     "onebot.js",

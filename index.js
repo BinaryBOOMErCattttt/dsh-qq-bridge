@@ -38,6 +38,7 @@ import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingIma
 import { createJmService, parseJmRef } from './jm.js';
 import { registerQqTools } from './tools.js';
 import { createSettings, MAX_TIMER_MS } from './settings.js';
+import { createChatter } from './chatter.js';
 import {
   apiKeyFingerprint,
   errorText,
@@ -113,14 +114,6 @@ const QUOTE_FETCH_TIMEOUT_MS = 5000;
  * 超出的部分模型仍然可以用 glob 自己看。
  */
 const STICKER_PROMPT_MAX = 40;
-
-/**
- * 每个群保留多少条「最近说过的话」用于多人搭话的判定（见 `groupChatter`）。
- *
- * 判定只需要回答「最近这个窗口里够不够 N 条、够不够 M 个人」，所以留着整段历史毫无意义；
- * 上限取 64：默认门槛是 6 条，留一个数量级的余量，也挡掉刷屏群把这张表撑大。
- */
-const GROUP_CHATTER_MAX = 64;
 
 /**
  * 默认的「群友口吻」要求，注入系统提示的 QQ 渠道小节。
@@ -289,35 +282,13 @@ export function apply(ctx, config) {
    */
   const ambient = new Map();
   /**
-   * 群号 → 群里**别人**说的话的条数（单调递增的「聊天进度」）。
+   * 群里「谁在说话」的三本账：插话序号 / 回答指向 / 热度窗口。
    *
-   * 活跃对话靠它判断「这次一对一中间有没有人插话」（见 `activeFollowAllows` / `runChime`）：
-   * 所以**只算别人**，我自己说的话不能把自己的窗口打断。
+   * 它们判的是三件不同的事，**别合并成一张表** —— 论证与各自的语义写在 `chatter.js` 的
+   * 模块注释里（那边离代码更近，也不会被这段闭包里的注释挤丢）。这里只留一句：
+   * **想知道「算不算我自己说的话」，看调的是 `noteOther` 还是 `noteSelf`。**
    */
-  const chatterSeq = new Map();
-  /**
-   * 群号 → 最近一段时间里**别人**说过的话（`{ userId, at }`，旧 → 新）。
-   *
-   * 只服务「多人搭话」的进入判定：最近 `activeWindowMs` 内累计够 `activeGroupLines` 条、
-   * 且来自 `activeGroupSpeakers` 个不同的人，就说明这个群自己聊热了 —— 这时候谁接话都算
-   * 在跟它聊（见 `groupTalkActive`）。
-   *
-   * 与 `chatterSeq` 的区别就在时间戳：那张表判的是「这个一对一中间有没有人插话」（比大小），
-   * 这张判的是「最近这段时间聊得够不够热」（比时间），别把两张表并成一张 —— 一个要的单调
-   * 递增的序号，一个要的是会过期的窗口。每条只保留最近 `GROUP_CHATTER_MAX` 条
-   * （`activeGroupLines` 配得更大时按那个数留，见 `recordGroupChatter`）。
-   */
-  const groupChatter = new Map();
-  /**
-   * 群号 → 群里**所有**消息的条数（别人的 + 我自己发出去的）。
-   *
-   * `auto` 回复指向靠它判断「我回的那条是不是已经被后来的话挤远了」：入站时快照一个数，
-   * 真要发出去时再读一次 —— 变大了就带上引用段。与 `chatterSeq` 的区别是算不算我自己的话：
-   * 上一轮的回复、复读、主动搭话同样会把我回的那条挤走，看的人一样会对不上话头，所以也要算。
-   * 别人的话在 `noteChatter` 里进账，我自己的话在**发出去**那一刻由 `noteOwnMessage` 进账 ——
-   * 这个部署的 NapCat 配着 `reportSelfMessage: false`，自己发的消息不会回灌成事件，等不来。
-   */
-  const quoteSeq = new Map();
+  const chatter = createChatter();
   /**
    * 群号 → 复读状态 `{ chain, queue }`（见 `maybeRepeat`）。
    *
@@ -2262,7 +2233,7 @@ export function apply(ctx, config) {
       // 只在「我回的那条后面又出现了消息」时才引用 —— **包括我自己刚发出去的话**
       // （上一轮的回复、复读、主动搭话）：紧挨着回时引用是纯噪音，一轮问答本来就看得出来
       // 在回谁；被后来的话挤远了才需要点名，不然看的人对不上话头。
-      const drifted = typeof quote.seq === 'number' && (quoteSeq.get(conversation.id) ?? 0) > quote.seq;
+      const drifted = typeof quote.seq === 'number' && chatter.anchor(conversation.id) > quote.seq;
       if (!drifted || quote.messageId.length === 0) return undefined;
       return { type: 'reply', data: { id: quote.messageId } };
     }
@@ -2495,7 +2466,7 @@ export function apply(ctx, config) {
       repeatStates.delete(conversation.id);
       // 「大家正聊着」的那段窗口也算刚才那些话：不清掉的话，新一轮第一条消息就可能被
       // 判成多人搭话接着接（那条判据只看最近这一小段群里的发言）。
-      groupChatter.delete(conversation.id);
+      chatter.forgetHeat(conversation.id);
       // 主动说话的节奏也跟着忘掉：刚 /reset 完不该还被「两小时前主动说过」挡着。
       // 只清计时与计数，不动 `lastActiveAt` / `lastBotSpeakAt` —— 那两个描述的是群里
       // 真实发生过什么（谁最后说的话），不是这个会话的记忆。
@@ -2507,7 +2478,7 @@ export function apply(ctx, config) {
     cancelChime(conversation);
     conversation.activeUntil = 0;
     conversation.activeSpeakerId = '';
-    conversation.activeSeq = 0;
+    conversation.activeInterposeSeq = 0;
     conversation.activeTurns = 0;
     conversation.chimeCount = 0;
     conversation.chimeDay = '';
@@ -2575,12 +2546,12 @@ export function apply(ctx, config) {
        *
        * `activeUntil` 是这次聊天的截止时刻（每接一句就往后滑），`activeSpeakerId` 是正在
        * 跟它聊的那个人 —— 群里只有这个人接着说的话才可能免 @ 算进来（别人插话就另说了）。
-       * `activeSeq` 是那条消息在群里的进度序号，用来判断「中间有没有别人说过话」；
+       * `activeInterposeSeq` 是那条消息那一刻的插话序号，用来判断「中间有没有别人说过话」；
        * `activeTurns` 是这次活跃对话里已经免 @ 接了几轮（受 activeMaxTurns 约束）。
        */
       activeUntil: 0,
       activeSpeakerId: '',
-      activeSeq: 0,
+      activeInterposeSeq: 0,
       activeTurns: 0,
       /**
        * 「自己补一句」的定时器与记账（见 scheduleChime）。
@@ -2684,7 +2655,7 @@ export function apply(ctx, config) {
       // 的会话 —— 闲聊不该因为「窗口」把某个群变成「处理过」的群。）
       const existing = conversations.get(`group:${groupId}`);
       // 多人搭话：这个群最近自己聊热了（够条数、够人数），那之后谁接话都算 —— 这也是
-      // 「有人插话就进入多人搭话」的落点：插话的人与那句话本身就记在 `groupChatter` 里，
+      // 「有人插话就进入多人搭话」的落点：插话的人与那句话本身就记在 chatter 的热度窗口里，
       // 大家说得够多就整体升级，而不是像一对一那样被一句话打断。
       //
       // 它**不**消耗 `activeMaxTurns`：那个上限是防「一个人揪着它刷屏」的，而这里的闸门
@@ -2708,7 +2679,7 @@ export function apply(ctx, config) {
         // 回复指向：引用被回复的那条消息（`reply` 段要 message_id），或 @ 回提问者（要 QQ 号）。
         // `seq` 是这条消息在群里的进度，供 `auto` 判断「等我回话时有没有人（包括我自己）
         // 又说了话」。三样都在这里一次性快照：发送在几秒后，那时会话记录和群里的进度都可能变了。
-        quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: quoteSeq.get(groupId) ?? 0 },
+        quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: chatter.anchor(groupId) },
       };
     }
     if (!settings.privateChat) return undefined;
@@ -2734,45 +2705,24 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 把某个群的进度序号 +1 并返回新值。
+   * 记一次「群里又有人说话了」，返回该群当前**别人**说话的插话序号。
    *
-   * 两张表都设了 512 个群的上限：见过面的群不该这么多，真超了就丢掉最早的那个群，
-   * 它接下来的回复退化成没有引用（序号从头开始也只影响「要不要引用」这一个判断）。
-   * @param seqs - `chatterSeq` 或 `quoteSeq`。
-   * @param groupId - 群号。
-   * @returns 该群在计入这条消息之后的序号。
-   */
-  function bumpSeq(seqs, groupId) {
-    const next = (seqs.get(groupId) ?? 0) + 1;
-    seqs.set(groupId, next);
-    if (seqs.size > 512) {
-      const oldest = seqs.keys().next().value;
-      if (oldest !== undefined && oldest !== groupId) seqs.delete(oldest);
-    }
-    return next;
-  }
-
-  /**
-   * 记一次「群里又有人说话了」，返回该群当前**别人**说话的进度序号。
-   *
-   * 两张表都进账：`quoteSeq` 是回复指向的判据（谁说的话都算挤），`chatterSeq` 只服务活跃对话
-   * （判的是「有没有**别人**插话」，我自己说话不该把自己的一对一窗口打断，见
-   * `activeFollowAllows` / `runChime`）。机器人自己发的话不走这里 —— 见 `noteOwnMessage`。
-   * 顺带记进 `groupChatter` 的窗口：多人搭话要判「最近这个群聊得够不够热」，那份记账同样
-   * 只算别人（我自己说话不该把自己算进「几个人在聊」里）。
+   * 别人的一句话要同时喂两条判据（回答指向的序号 + 多人搭话的热度窗口），而两条判据
+   * 都**只算别人** —— 我自己说话不该把自己的一对一窗口打断，也不该把自己算进「几个人在聊」。
+   * 机器人自己发的话走 `noteOwnMessage`，不从事件里来。
    * @param event - 已解码的 OneBot 事件。
    * @param selfId - 机器人自己的 QQ 号。
-   * @returns 该群在计入这条消息之后的序号（`chatterSeq` 的口径）。
+   * @returns 该群在计入这条消息之后的插话序号。
    */
   function noteChatter(event, selfId) {
     if (event?.message_type !== 'group') return 0;
     // 自己的话不在这里记：这个部署的 NapCat 配着 `reportSelfMessage: false`，自己发的消息
     // 根本不会回灌成事件；就算哪个部署开着回灌，那也在 `noteOwnMessage` 记过一遍了。
     if (String(event.user_id ?? '') === String(selfId)) return 0;
-    const groupId = String(event.group_id);
-    bumpSeq(quoteSeq, groupId);
-    recordGroupChatter(groupId, String(event.user_id ?? ''), Date.now());
-    return bumpSeq(chatterSeq, groupId);
+    return chatter.noteOther(String(event.group_id), String(event.user_id ?? ''), Date.now(), {
+      windowMs: settings.activeWindowMs,
+      keepLines: settings.activeGroupLines,
+    });
   }
 
   /**
@@ -2788,7 +2738,7 @@ export function apply(ctx, config) {
    */
   function noteOwnMessage(type, id) {
     if (type !== 'group') return;
-    bumpSeq(quoteSeq, String(id));
+    chatter.noteSelf(String(id));
   }
 
   /**
@@ -3128,7 +3078,7 @@ export function apply(ctx, config) {
    *
    * 计数刻意放在**内存**里：重启后归零是可以接受的（重启本身很稀有，而且重启后
    * 至少要等 `proactiveIdleMs` 才可能开口），换成落盘状态得多维护一个文件，
-   * 与 `ambient` / `chatterSeq` / 复读链这些运行时状态的口径也一致。
+   * 与 `ambient` / 复读链这些运行时状态的口径也一致。
    * @param conversation - 目标会话。
    * @returns 今天已主动说话的次数。
    */
@@ -3335,7 +3285,7 @@ export function apply(ctx, config) {
   //
   // 窗口只靠**别人发来的消息**往后滑（机器人自己说的话不算，否则它自己就能给窗口续命）；
   // 一对一窗口里有人插话，这次「你跟我聊」就算断了，要重新叫它一次 —— 但插话本身会记进
-  // `groupChatter`，大家一起说的话够多、够热闹时，走的就是 C 而不是 A 了（这就是
+  // 热度窗口，大家一起说的话够多、够热闹时，走的就是 C 而不是 A 了（这就是
   // 「有人插话就考虑进入多人搭话」的落点）。
 
 
@@ -3348,31 +3298,6 @@ export function apply(ctx, config) {
 
 
 
-
-  /**
-   * 把「这个群里又有人说话」记进多人搭话的时间窗口（由 `noteChatter` 调用）。
-   *
-   * 只留最近 `GROUP_CHATTER_MAX` 条：判定要的是「窗口内够不够热」，不是全部历史。过期的
-   * 条目在这里顺手裁掉 —— 真要看的时候（`groupTalkActive`）不必再担心列表无限长。
-   * 按群数也做了和 `chatterSeq` 一样的兜底：见过面的群不该这么多，超了丢最早的。
-   * @param groupId - 群号。
-   * @param userId - 说话的人（判「够几个人」用）。
-   * @param at - 这条消息到达的时刻（毫秒）。
-   */
-  function recordGroupChatter(groupId, userId, at) {
-    const list = groupChatter.get(groupId) ?? [];
-    list.push({ userId, at });
-    const cutoff = at - Math.max(1, settings.activeWindowMs);
-    // 条数上限取「默认上限」与「配置的门槛」的较大者：有人把 activeGroupLines 配到 64 以上时，
-    // 不能因为这份缓冲只留 64 条就永远凑不够。真正的边界还是上面那个时间窗口。
-    const keep = Math.max(GROUP_CHATTER_MAX, settings.activeGroupLines);
-    while (list.length > keep || (list.length > 0 && list[0].at < cutoff)) list.shift();
-    groupChatter.set(groupId, list);
-    if (groupChatter.size > 512) {
-      const oldest = groupChatter.keys().next().value;
-      if (oldest !== undefined && oldest !== groupId) groupChatter.delete(oldest);
-    }
-  }
 
   /**
    * 这个群现在算不算「大家正聊着」（多人搭话）？
@@ -3389,15 +3314,7 @@ export function apply(ctx, config) {
    */
   function groupTalkActive(groupId) {
     if (settings.activeFollow !== true) return false;
-    const window = settings.activeWindowMs;
-    if (window <= 0) return false;
-    const lines = settings.activeGroupLines;
-    const speakers = settings.activeGroupSpeakers;
-    if (lines <= 0 || speakers <= 0) return false;
-    const cutoff = Date.now() - window;
-    const recent = (groupChatter.get(groupId) ?? []).filter((entry) => entry.at >= cutoff);
-    if (recent.length < lines) return false;
-    return new Set(recent.map((entry) => entry.userId)).size >= speakers;
+    return chatter.isHot(groupId, settings.activeWindowMs, settings.activeGroupLines, settings.activeGroupSpeakers);
   }
 
 
@@ -3410,7 +3327,7 @@ export function apply(ctx, config) {
    * 与**窗口内接上话**（`continued === true`，轮数 +1）。私聊的每条消息都算「被叫到」，
    * 所以私聊不需要 `activeFollow` 也能有「补一句」——窗口照样在滑。
    *
-   * `activeSeq` 记的是这条消息在群里的进度序号：用来判断「这条之后有没有别人说过话」，
+   * `activeInterposeSeq` 记的是这条消息那一刻的**插话序号**：用来判断「这条之后有没有别人说过话」，
    * 见 `activeFollowAllows` 与 `runChime`。
    *
    * @param conversation - 这条消息所属的会话。
@@ -3421,7 +3338,7 @@ export function apply(ctx, config) {
     conversation.activeUntil = Date.now() + settings.activeWindowMs;
     conversation.activeSpeakerId = userId;
     conversation.activeTurns = continued ? (conversation.activeTurns ?? 0) + 1 : 0;
-    if (conversation.type === 'group') conversation.activeSeq = chatterSeq.get(conversation.id) ?? 0;
+    if (conversation.type === 'group') conversation.activeInterposeSeq = chatter.others(conversation.id);
     // 对方又说话了：这一句对应的「补一句」额度重新算，旧的那个定时器也就作废了。
     conversation.chimeCount = 0;
     cancelChime(conversation);
@@ -3453,9 +3370,9 @@ export function apply(ctx, config) {
     if (String(conversation.activeSpeakerId ?? '') !== String(userId)) return false;
     if ((Number(conversation.activeUntil) || 0) <= Date.now()) return false;
     if (!activeTurnsLeft(conversation)) return false;
-    // `activeSeq` 停在上一次接话那条上；这里已经比它大 1 以上就说明中间有人插过话
+    // 快照停在上一次接话那条上；这里已经比它大 1 以上就说明中间有人插过话
     // （当前这条自己会把序号 +1，所以「紧跟着的下一条」正好是 +1）。
-    if ((chatterSeq.get(conversation.id) ?? 0) > (Number(conversation.activeSeq) || 0) + 1) return false;
+    if (chatter.others(conversation.id) > (Number(conversation.activeInterposeSeq) || 0) + 1) return false;
     if (mentionsOthers(message, selfId)) return false;
     return true;
   }
@@ -3547,7 +3464,7 @@ export function apply(ctx, config) {
     if (dailyMax > 0 && chimeTodayUsed(conversation) >= dailyMax) return;
     if ((Number(conversation.lastBotSpeakAt) || 0) <= (Number(conversation.lastActiveAt) || 0)) return;
     // 群里中间又有人说话了：那不是接在我这句后面的事，插进去就是抢话。
-    if (conversation.type === 'group' && (chatterSeq.get(conversation.id) ?? 0) !== (Number(conversation.activeSeq) || 0)) return;
+    if (conversation.type === 'group' && chatter.others(conversation.id) !== (Number(conversation.activeInterposeSeq) || 0)) return;
     const chance = Math.min(1, Math.max(0, Number(settings.proactiveChance)));
     if (!(chance > 0) || !(Math.random() < chance)) return;
     chimeSpeak(conversation, now);
