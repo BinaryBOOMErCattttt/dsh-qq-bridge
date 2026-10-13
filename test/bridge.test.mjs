@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import yaml from 'js-yaml';
-import { Config, apply, inject, sessionIdFor, withinActiveHours } from '../index.js';
+import { Config, apply, inject, parseApiKeyPool, sessionIdFor, withinActiveHours } from '../index.js';
 import { collectMedia, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
@@ -144,6 +144,11 @@ function makeHost({
   knownTools = ['qq_send_message', 'qq_list_conversations', 'read', 'bash'],
   sessionsRoot,
   presets,
+  /**
+   * `ctx.get('credentials')` 的桩：API key 轮换用它读写 `$DSH_HOME/.credentials.yaml`
+   * （见下面的 `fakeCredentials`）。不传 = 组合里没有凭据服务。
+   */
+  credentials,
   /** 真实宿主的 cordis LoggerService 门面带 exporter()；带上它插件会额外镜像一份到 stderr。 */
   loggerExporter = false,
 } = {}) {
@@ -153,6 +158,8 @@ function makeHost({
   const prompts = [];
   const created = [];
   const warnings = [];
+  /** 所有 info 日志（轮换成功／没配置时的自述都在这一级）—— 用来验「key 没被整条打出来」。 */
+  const infos = [];
   const disposers = [];
   const cleanups = [];
   /**
@@ -213,7 +220,7 @@ function makeHost({
   const ctx = {
     // warn 会被收集起来，方便断言/排查插件上报的异常。
     logger: {
-      info() {},
+      info: (...args) => infos.push(args.join(' ')),
       warn: (...args) => warnings.push(args.join(' ')),
       error() {},
       ...(loggerExporter ? { exporter: () => () => {} } : {}),
@@ -321,6 +328,9 @@ function makeHost({
         return { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' }) };
       }
       if (service === 'approval') return { setPolicy() {} };
+      // 凭据服务：只有显式传了 credentials 的用例才有（与真实部署里一定有形成对照，
+      // 也让「服务看不见时只记一条 warn、不炸」这条退路能被验到）。
+      if (service === 'credentials') return credentials;
       // 定时器服务：插件用它排摘要循环（见上面 timeout / interval）。
       if (service === 'timer') return fakeTimer;
       // Agent 预设平面：只有传了 presets 的用例才有（与 headless 组合形成对照）。
@@ -343,6 +353,7 @@ function makeHost({
       created,
       prompts,
       warnings,
+      infos,
       restrictions,
       disposed,
       mountedPresets,
@@ -3246,7 +3257,9 @@ test('qq_memory appends, reads back and overwrites, and refuses paths outside th
 
 /** 定时器每天醒一次（默认 04:00），醒来帮会话摘要一次并记下进度。 */
 test('a digest sweep summarizes a conversation that has something new', async () => {
-  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 2 });
+  // `apiKeyRotate: false`：这条用例要数清楚「挂着几个定时器、排到几点」，
+  // 而 API key 轮换默认开着、也排在 04:00，会一起出现在这张表里。
+  const { onebot, host, cwd } = await bootMemory({ digestMinLines: 2, apiKeyRotate: false });
   onebot.push(privateMessage('第一条'));
   onebot.push(privateMessage('第二条'));
   await until(() => host.list.created[0], 'the conversation Agent to be created');
@@ -3361,7 +3374,9 @@ test('the channel prompt carries the memory index once it exists', async () => {
 /** memoryDir 配到 cwd 外面时整个功能停用（与 mediaDir / stickerDir / jmDir 一致）。 */
 test('memory is disabled when memoryDir leaves cwd', async () => {
   const outside = await mkdtemp(join(tmpdir(), 'qq-bridge-outside-'));
-  const { onebot, host } = await bootMemory({ memoryDir: join(outside, 'memory') });
+  // 这条用例断言的是「一个周期定时器都不该挂」：API key 轮换的定时器与记忆无关
+  // （它默认开着），显式关掉才数得清记忆这一侧。
+  const { onebot, host } = await bootMemory({ memoryDir: join(outside, 'memory'), apiKeyRotate: false });
   onebot.push(privateMessage('你好'));
   await until(() => host.list.created[0], 'the conversation Agent to be created');
   assert.equal(host.tools.get('qq_transcript'), undefined);
@@ -3536,6 +3551,8 @@ test('proactive is off by default: no timer, and no unprompted message', async (
     proactiveToHour: 0,
     digestCatchUp: false,
     digestMinLines: 9999,
+    // 这里要数清楚「挂着几个周期定时器」：API key 轮换默认开着、与主动说话无关。
+    apiKeyRotate: false,
   });
   const agent = await groupWhereBotSpoke(onebot, host);
   await groupChatter(onebot);
@@ -4023,6 +4040,153 @@ test('activeFollow: a followed message never triggers a command bypass', async (
   assert.ok(!sentTexts(onebot).some((text) => String(text).includes('已开始新会话')), 'the window must not run commands');
 });
 
+// ---- 多人搭话：群里几个人自己聊热了，它插进去接着聊 ---------------------------------------
+
+/** 多人搭话的默认值：1 分钟窗口、6 条、2 个人、倾听时间 ×2。 */
+test('group talk defaults: a 1-minute window, 6 lines from 2 speakers, listening doubled', () => {
+  assert.equal(Config({}).activeWindowMs, 60 * 1000);
+  assert.equal(Config({}).activeGroupLines, 6);
+  assert.equal(Config({}).activeGroupSpeakers, 2);
+  assert.equal(Config({}).activeGroupBatchScale, 2);
+});
+
+/**
+ * 一对一的免 @ 窗口只有 `activeWindowMs`（默认 1 分钟）那么长：被 @ 一次买的是这一小段，
+ * 不是「这一天它都归你了」。
+ */
+test('the one-to-one window is the short activeWindowMs, not a long leash', async () => {
+  const { onebot, host } = await bootActive({ activeWindowMs: 1 });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  await settle(30);
+  onebot.push(groupText('那你说呢', { messageId: 7051 }));
+  await settle(80);
+  assert.equal(agent.inbox.length, 1, 'once the window is over the @ requirement is back');
+});
+
+/** 群里几个人聊够条数之后，谁接话都不用再 @ 它 —— 这就是多人搭话。 */
+test('group talk: once a few people have been chatting, anyone can talk without a mention', async () => {
+  const { onebot, host } = await bootActive({ activeGroupLines: 4, activeGroupSpeakers: 2 });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+  await until(() => agent.inbox.length >= 1, 'the mention to reach the Agent');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply to go out');
+
+  // 别人插话：一对一窗口认的是被 @ 的那个人，所以这两句都不该进去；但它们记进了
+  // 「这个群最近聊了几句、几个人」，也就是搭话状态的门槛。
+  onebot.push(groupText('这个我也想知道', { messageId: 7101, userId: 10001, card: '路人甲' }));
+  onebot.push(groupText('+1', { messageId: 7102, userId: 10002, card: '路人乙' }));
+  await settle(60);
+  assert.equal(agent.inbox.length, 1, 'below the threshold a stranger is still not part of the exchange');
+
+  // 第 4 句（@ 的那条 + 这 3 条）踩到门槛：从这一条起群聊算「热起来了」，谁接话都算。
+  onebot.push(groupText('那到底行不行', { messageId: 7103, userId: 10001, card: '路人甲' }));
+  await until(() => agent.inbox.length >= 2, 'the group talk message to reach the Agent');
+  assert.equal(agent.inbox[1].content[0].text, '那到底行不行');
+
+  // 门槛过了之后，换一个人、甚至同一个人再说，都还在搭话状态里。
+  onebot.push(groupText('我觉得行', { messageId: 7104, userId: 10002, card: '路人乙' }));
+  await until(() => agent.inbox.length >= 3, 'another speaker to be admitted as well');
+});
+
+/** 人多才算「聊起来了」：同一个人自己刷屏，条数再多也不进搭话状态。 */
+test('group talk: one person talking a lot is not a conversation', async () => {
+  const { onebot, host } = await bootActive({ activeGroupLines: 3, activeGroupSpeakers: 3 });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  // 同一个人连发 6 句：条数远超 3，但说过话的只有「@ 它的那位」和「这个人」两个人，
+  // 不够 activeGroupSpeakers: 3。
+  for (let i = 0; i < 6; i += 1) {
+    onebot.push(groupText(`第 ${i} 句`, { messageId: 7200 + i, userId: 10001, card: '路人甲' }));
+  }
+  await settle(80);
+  assert.equal(agent.inbox.length, 1, 'a single person spamming must not open group talk');
+});
+
+/** 搭话状态里「倾听时间」变长：攒批窗口与整批上限一起放大，多听几句再合成一轮。 */
+test('group talk: it listens longer before answering', async () => {
+  const { onebot, host } = await bootActive({
+    batchWindowMs: 80,
+    batchMaxWaitMs: 200,
+    activeGroupLines: 4,
+    activeGroupSpeakers: 2,
+    activeGroupBatchScale: 6,
+  });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  onebot.push(groupText('这家伙谁啊', { messageId: 7301, userId: 10001, card: '路人甲' }));
+  onebot.push(groupText('不知道', { messageId: 7302, userId: 10002, card: '路人乙' }));
+  // 第 4 句（@ 的那条 + 这 3 条）踩到门槛：这一条起攒批窗口从 80ms 变成 80×6 = 480ms。
+  onebot.push(groupText('问问他', { messageId: 7303, userId: 10001, card: '路人甲' }));
+  // 200ms 早就超过不放大时的 80ms，但还不到放大后的 480ms —— 说明它还在听。
+  await settle(200);
+  assert.equal(agent.inbox.length, 1, 'in group talk it keeps listening instead of cutting a batch short');
+  await until(() => agent.inbox.length >= 2, 'the longer batch to flush eventually');
+});
+
+/** 多人搭话也在 `activeFollow` 这道总闸门后面：默认关着，群里照旧只在被 @ 时说话。 */
+test('group talk needs activeFollow: the default still requires a mention', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-talk-default-'));
+  const { onebot, host } = await boot({
+    cwd,
+    digestCatchUp: false,
+    digestMinLines: 9999,
+    activeGroupLines: 2,
+    activeGroupSpeakers: 2,
+  });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  onebot.push(groupText('甲', { messageId: 7401, userId: 10001, card: '路人甲' }));
+  onebot.push(groupText('乙', { messageId: 7402, userId: 10002, card: '路人乙' }));
+  onebot.push(groupText('丙', { messageId: 7403, userId: 10001, card: '路人甲' }));
+  await settle(80);
+  assert.equal(agent.inbox.length, 1, 'with activeFollow off the group talk gate stays shut');
+});
+
+/** `/reset` 也把「大家正聊着」的那个窗口忘掉：新一轮不该接着上一轮的群聊热度。 */
+test('/reset forgets the group talk window as well', async () => {
+  const { onebot, host } = await bootActive({ activeGroupLines: 3, activeGroupSpeakers: 2 });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the first Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  // 别人插一句：此刻窗口里是「@ 的那条 + 这一条」= 2 条，还差一条到门槛。
+  onebot.push(groupText('插一句', { messageId: 7501, userId: 10001, card: '路人甲' }));
+  await settle(40);
+  // 明确 @ 它发 /reset：这条自己会把窗口顶到 3 条，正因为如此才要看 /reset 有没有清掉它。
+  onebot.push(mention('/reset', { messageId: 7502 }));
+  await until(
+    () => sentTexts(onebot).some((text) => String(text).includes('已开始新会话')),
+    'the reset confirmation',
+  );
+  await until(() => host.list.disposed.length >= 1, 'the old Agent to be disposed');
+
+  // 若窗口没被清掉，这一条就是第 4 条（够条数、够人数），会开一个新 Agent 去接；
+  // 「没有第二个 Agent」就是「群聊热度确实忘了」的证据。
+  onebot.push(groupText('还在吗', { messageId: 7503, userId: 10001, card: '路人甲' }));
+  await settle(80);
+  assert.equal(host.list.created.length, 1, 'the old heat must not carry into the new round');
+});
+
 // 用例：`.dsh/skills/` 下的每个 skill 都必须是**能被发现**的文件。
 //
 // frontmatter 写坏的代价是**静默消失**：dsh-skill-filesystem 只在 `ctx.logger.warn`
@@ -4055,4 +4219,219 @@ test('.dsh/skills 下的每个 skill 都能被 skill-filesystem 发现', async (
       assert.ok(text.includes('prop=extracts'), 'moegirl 要留着取正文的接口');
     }
   }
+});
+
+// ---- 每天轮换 API key：凭据池 → 探测 → 写回 --------------------------------------------
+
+/**
+ * 造一个假的凭据服务，形状照抄 `$DSH_HOME/.credentials.yaml` 那一层的对外 API：
+ * `resolve` 读值、`set` 写值、`describe` 回答「写进去会不会被启动环境压住」。
+ *
+ * `calls` / `resolves` 是给用例看的账本 —— 「有没有真的写」这件事只能从这里看，
+ * 因为插件从不打印 key 本身。
+ */
+function fakeCredentials({ value = '', writable = true, source = 'file' } = {}) {
+  const calls = [];
+  const resolves = [];
+  const store = { value, writable, source };
+  return {
+    calls,
+    resolves,
+    store,
+    async resolve() {
+      resolves.push(store.value);
+      return store.value.length > 0 ? { value: store.value, source: store.source } : undefined;
+    },
+    async describe() {
+      return { configured: store.value.length > 0, source: store.source, writable: store.writable };
+    },
+    async set(ref, next) {
+      calls.push({ ref, value: next });
+      store.value = next;
+      store.source = 'file';
+    },
+  };
+}
+
+/**
+ * 起一个假的探测端点：按 `Authorization` 头认出候选 key，返回 `statusForKey` 给的状态码。
+ * 真部署里这个地址是 `https://api.deepseek.com/models`（2xx = 这个 key 现在能用）。
+ * @param statusForKey - key → 状态码，或 `(key) => 状态码`。
+ */
+async function startProbeServer(statusForKey) {
+  const hits = [];
+  const server = createServer((request, response) => {
+    const key = String(request.headers.authorization ?? '').replace(/^Bearer\s+/u, '');
+    hits.push(key);
+    const status = typeof statusForKey === 'function' ? statusForKey(key) : (statusForKey[key] ?? 401);
+    response.writeHead(status, { 'content-type': 'application/json' });
+    response.end('{"object":"list","data":[]}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    hits,
+    url: `http://127.0.0.1:${server.address().port}/models`,
+    async close() {
+      // fetch 的连接是 keep-alive 的：不断开的话 close() 会一直等到连接超时。
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+/**
+ * 起一个开了 API key 轮换的实例：cwd 是新的临时目录，池子写在 `data/api-keys.txt`
+ * （也就是默认位置）。
+ *
+ * `memory: false` 是刻意的：`fireInterval()` 会唤醒**所有**周期定时器，关掉记忆之后
+ * 这一组用例里的定时器只剩轮换这一个，不必再靠 `digestMinLines` 去隔离摘要。
+ */
+async function bootKeyRotation({ pool, credentials, config = {} } = {}) {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-keys-'));
+  if (pool !== undefined) {
+    await mkdir(join(cwd, 'data'), { recursive: true });
+    await writeFile(join(cwd, 'data', 'api-keys.txt'), pool, 'utf8');
+  }
+  return boot({ cwd, memory: false, apiKeyRotate: true, ...config }, { credentials });
+}
+
+/** 池子文件的纯函数边界：注释、空行、CRLF、前后空白、重复。 */
+test('parseApiKeyPool keeps order, drops comments/blanks and de-duplicates', () => {
+  assert.deepEqual(parseApiKeyPool('# 我的几个 key\n\n  sk-a  \nsk-b\r\nsk-a\n# 尾注\n'), ['sk-a', 'sk-b']);
+  assert.deepEqual(parseApiKeyPool(''), []);
+  assert.deepEqual(parseApiKeyPool(undefined), []);
+  assert.deepEqual(parseApiKeyPool('# 一个 key 都没填\n'), []);
+});
+
+/** 轮换的主路径：从当前 key 的下一个开始试，跳过探测失败的，写第一个能用的。 */
+test('api key rotation switches to the next key that passes the probe', async () => {
+  const keys = {
+    a: 'sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    b: 'sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    c: 'sk-cccccccccccccccccccccccccccccccc',
+  };
+  const probe = await startProbeServer((key) => (key === keys.c ? 200 : 401));
+  const credentials = fakeCredentials({ value: keys.a });
+  const { host } = await bootKeyRotation({
+    pool: `# 池子\n${keys.a}\n${keys.b}\n${keys.c}\n`,
+    credentials,
+    config: { apiKeyProbeUrl: probe.url, apiKeyProbeTimeoutMs: 3000 },
+  });
+  try {
+    host.list.timers.fireInterval();
+    await until(() => credentials.calls.length > 0, 'the rotation to store the next key');
+    assert.equal(credentials.store.value, keys.c, 'a 是当前值、b 探测 401，应当换成 c');
+    assert.equal(credentials.calls[0].ref, 'DEEPSEEK_API_KEY');
+    assert.deepEqual(probe.hits, [keys.b, keys.c], '只探测候选，且按池子顺序（当前值不用探）');
+    assert.ok(
+      host.list.infos.some((line) => line.includes('switched DEEPSEEK_API_KEY')),
+      `expected an info line about the switch, got: ${host.list.infos.join(' | ')}`,
+    );
+    // 打码是硬要求：日志会进 journal、也会被贴到别处。
+    const logs = [...host.list.infos, ...host.list.warnings];
+    for (const key of Object.values(keys)) {
+      assert.ok(!logs.some((line) => line.includes(key)), `日志里出现了完整的 key：${key}`);
+    }
+  } finally {
+    await probe.close();
+  }
+});
+
+/** 池子里没有一个能用的 key 时，宁可什么都不做也不能把 bot 换成不可用的状态。 */
+test('api key rotation keeps the current key when every candidate fails the probe', async () => {
+  const current = 'sk-11111111111111111111111111111111';
+  const probe = await startProbeServer(() => 401);
+  const credentials = fakeCredentials({ value: current });
+  const { host } = await bootKeyRotation({
+    pool: 'sk-22222222222222222222222222222222\nsk-33333333333333333333333333333333\n',
+    credentials,
+    config: { apiKeyProbeUrl: probe.url, apiKeyProbeTimeoutMs: 3000 },
+  });
+  try {
+    host.list.timers.fireInterval();
+    await until(() => host.list.warnings.some((line) => line.includes('passed the probe')), 'the rotation to give up');
+    assert.equal(credentials.calls.length, 0, '一个都不通过就不该写');
+    assert.equal(credentials.store.value, current);
+  } finally {
+    await probe.close();
+  }
+});
+
+/** key 由启动环境提供时写文件也是白写（环境变量优先级更高）—— 提前说清楚，别假装成功。 */
+test('api key rotation stands down when the key comes from the launching environment', async () => {
+  const credentials = fakeCredentials({ value: 'sk-fromenv', writable: false, source: 'env' });
+  const probe = await startProbeServer(() => 200);
+  const { host } = await bootKeyRotation({
+    pool: 'sk-44444444444444444444444444444444\nsk-55555555555555555555555555555555\n',
+    credentials,
+    config: { apiKeyProbeUrl: probe.url, apiKeyProbeTimeoutMs: 3000 },
+  });
+  try {
+    host.list.timers.fireInterval();
+    await until(
+      () => host.list.warnings.some((line) => line.includes('read-only by the launching environment')),
+      'the rotation to report the read-only credential',
+    );
+    assert.equal(credentials.calls.length, 0);
+    assert.deepEqual(probe.hits, [], '只读凭据下连探测都不该发生');
+  } finally {
+    await probe.close();
+  }
+});
+
+/** 组合里没有凭据服务时只记一条 warn：轮换是顺带的事，不该把插件拖垮。 */
+test('api key rotation reports a missing credentials service instead of throwing', async () => {
+  const { host } = await bootKeyRotation({ pool: 'sk-a\nsk-b\n', credentials: undefined });
+  host.list.timers.fireInterval();
+  await until(
+    () => host.list.warnings.some((line) => line.includes('credentials service is not visible')),
+    'the rotation to report the missing service',
+  );
+});
+
+/** 池子里没有第二个 key（或全是当前这一个）时什么都不做。 */
+test('api key rotation does nothing when the pool holds no other key', async () => {
+  const only = 'sk-66666666666666666666666666666666';
+  const credentials = fakeCredentials({ value: only });
+  const { host } = await bootKeyRotation({ pool: `${only}\n${only}\n`, credentials });
+  host.list.timers.fireInterval();
+  await until(() => credentials.resolves.length > 0, 'the rotation to read the current key');
+  await settle(30);
+  assert.equal(credentials.calls.length, 0);
+  assert.equal(credentials.store.value, only);
+});
+
+/** 池子文件还没建（或还没填 key）时只记一条 info 说清楚该怎么办。 */
+test('api key rotation explains a missing pool file without failing', async () => {
+  const credentials = fakeCredentials({ value: 'sk-77777777777777777777777777777777' });
+  const { host } = await bootKeyRotation({ pool: undefined, credentials });
+  host.list.timers.fireInterval();
+  await until(() => host.list.infos.some((line) => line.includes('no key pool at')), 'the rotation to explain the missing pool');
+  assert.equal(credentials.calls.length, 0);
+});
+
+/** 池子配到 cwd 外就整个停用（与 mediaDir / memoryDir 同一套约定），并且不排定时器。 */
+test('api key rotation is disabled when the pool file leaves cwd', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-keys-outside-'));
+  const credentials = fakeCredentials({ value: 'sk-88888888888888888888888888888888' });
+  const { host } = await boot(
+    { cwd, memory: false, apiKeyRotate: true, apiKeyFile: join(cwd, '..', 'keys.txt') },
+    { credentials },
+  );
+  assert.ok(
+    host.list.warnings.some((line) => line.includes('resolves outside cwd')),
+    `expected a warning, got: ${host.list.warnings.join(' | ')}`,
+  );
+  assert.equal(host.list.timers.live('intervals').length, 0, '停用时不该排轮换定时器');
+});
+
+/** 默认开着（池子不存在时只是不做事），显式关掉则连定时器都不挂。 */
+test('api key rotation is on by default and can be switched off', async () => {
+  const { host } = await boot({ cwd: '/tmp', memory: false }, { credentials: fakeCredentials() });
+  assert.ok(host.list.infos.some((line) => line.includes('api key rotation: on')));
+  assert.equal(host.list.timers.live('intervals').length, 1, '只有一个每日轮换定时器');
+
+  const off = await boot({ cwd: '/tmp', memory: false, apiKeyRotate: false }, { credentials: fakeCredentials() });
+  assert.ok(off.host.list.infos.some((line) => line.includes('api key rotation is off')));
+  assert.equal(off.host.list.timers.live('intervals').length, 0);
 });

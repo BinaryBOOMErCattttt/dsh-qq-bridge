@@ -93,6 +93,14 @@ const QUOTE_FETCH_TIMEOUT_MS = 5000;
 const STICKER_PROMPT_MAX = 40;
 
 /**
+ * 每个群保留多少条「最近说过的话」用于多人搭话的判定（见 `groupChatter`）。
+ *
+ * 判定只需要回答「最近这个窗口里够不够 N 条、够不够 M 个人」，所以留着整段历史毫无意义；
+ * 上限取 64：默认门槛是 6 条，留一个数量级的余量，也挡掉刷屏群把这张表撑大。
+ */
+const GROUP_CHATTER_MAX = 64;
+
+/**
  * 默认的「群友口吻」要求，注入系统提示的 QQ 渠道小节。
  * 配置里的 `persona` 非空时整段替换它（格式与身份红线仍然保留，见 channelPrompt）。
  */
@@ -174,9 +182,12 @@ export const Config = z.object({
   // ---- 活跃对话：聊起来之后保持搭话（见 README「聊起来之后保持搭话」）----
   // 上面的 proactive* 只在**冷场**时开口；这一组管的是「正聊着」的时候：被叫到之后
   // 接着说的话也算在跟它聊（activeFollow），以及它自己回完隔一会儿再补一句（activeChime*）。
-  activeWindowMs: z.number().default(10 * 60 * 1000).description('「活跃对话」窗口（毫秒）：被叫到 / 接上话之后这么久之内算还在跟它聊；群里中间有别人插话就不算了。0 = 整套关闭（既不免 @ 接话，也不补一句）'),
-  activeFollow: z.boolean().default(false).description('活跃对话里**免 @ 接话**：窗口内同一个人接着说的话也当成在跟它聊（默认关闭 —— 它放松了「群里只在被 @ 时才说话」这条默认约定，想更像真人再打开）；只在群聊生效，私聊本来就不需要 @'),
-  activeMaxTurns: z.number().default(10).description('一次「活跃对话」里最多免 @ 接几轮：接够这么多轮就要重新 @ 它；0 = 不限'),
+  activeWindowMs: z.number().default(60 * 1000).description('「活跃对话」窗口（毫秒）：被 @ 到之后这么久之内，同一个人接着说的话算还在跟它聊；「多人搭话」也用它 —— 最近这么久里累计够 activeGroupLines 条、activeGroupSpeakers 个人说过话就进入搭话状态，之后群里谁接话都算。0 = 整套关闭（既不免 @ 接话，也不补一句、不搭话）'),
+  activeFollow: z.boolean().default(false).description('活跃对话里**免 @ 接话**：被叫到之后的窗口内同一个人接着说的话也当成在跟它聊；群里聊热了（见 activeGroupLines）还会进入**多人搭话** —— 那时候谁接话都免 @，直到最近这段时间里凑不齐 activeGroupSpeakers 个人（默认关闭 —— 它放松了「群里只在被 @ 时才说话」这条默认约定，想更像真人再打开）；只在群聊生效，私聊本来就不需要 @'),
+  activeMaxTurns: z.number().default(10).description('一次一对一的活跃对话里最多免 @ 接几轮（按免 @ 进来的消息条数算）：接够这么多就要重新 @ 它一次；多人搭话不看这个，它的闸门是「够条数、够人数」。0 = 不限'),
+  activeGroupLines: z.number().default(6).description('「多人搭话」的进入门槛：最近 activeWindowMs 里群里（除它以外）累计说了这么多条话，就说明大家聊起来了；0 = 关掉多人搭话（只保留一对一的免 @ 接话）'),
+  activeGroupSpeakers: z.number().default(2).description('「多人搭话」还要求最近窗口里至少有这么多**不同的人**说过话：两个人有来有回才算聊起来，一个人自己刷屏不算（与 activeGroupLines 同时满足才进入）'),
+  activeGroupBatchScale: z.number().default(2).description('搭话状态里的「倾听时间」倍数：攒批窗口与整批等待上限都乘上它，于是它会多听几句、再合成一轮回复（1 = 不放大，只在群聊的搭话状态里生效）'),
   activeChimeIdleMs: z.number().default(20 * 1000).description('它回完话、对方安静这么久之后，它可能自己再补一句（毫秒，实际会按 delayJitter 抖动）；0 = 不补。需要 proactive: true 才会补'),
   activeChimeMax: z.number().default(1).description('对方每说一句之后，它最多自己补几句：1 = 顶多追一句「啊对了…」，想让它更黏就调大；0 = 不补'),
   activeChimeDailyMax: z.number().default(12).description('同一个会话一天最多自己补几句（本地日界线，与 proactiveDailyMax 分开算；重启后计数清零）；0 = 不限'),
@@ -220,6 +231,15 @@ export const Config = z.object({
   digestMaxChars: z.number().default(24000).description('一次摘要最多把多少字符的聊天记录喂给摘要 Agent：超出部分按最近优先截断（更早的内容留给上一次摘要）'),
   digestTimeoutMs: z.number().default(10 * 60 * 1000).description('单次摘要的硬超时（毫秒）：超时就把摘要 Agent 销毁（下次重开一个），避免一个卡住的 turn 让摘要永远不再发生'),
   digestCatchUp: z.boolean().default(true).description('是否补课：如果今天的摘要点已经过了、而某个会话在重启之后才有人说话（或者摘要那一刻进程正在重启），它一开口就补一次摘要，不用等到明天；关掉则只在 digestAtHour 点摘要'),
+  // ---- 每天轮换模型凭据（见 README「每天轮换 API key」）----
+  // 池子是一个 cwd 里的纯文本文件而不是配置项：配置会显示在 Web UI 上、也会被复制粘贴到
+  // 别处，key 不该走那条路（见 README「安全提醒」）。
+  apiKeyRotate: z.boolean().default(true).description('是否每天在 apiKeyRotateHour 点尝试把 apiKeyRef 指向的模型凭据换成 apiKeyFile 里的下一个 key：只在池子里还有「另一个探测通过的 key」时才真的改写凭据，池子文件不存在 / 只写了当前这一个 key 时什么都不做'),
+  apiKeyRotateHour: z.number().default(4).description('每天几点尝试轮换模型凭据（本地时间，0~23）：默认凌晨 4 点，与长期记忆的摘要同一个时刻'),
+  apiKeyFile: z.string().default('data/api-keys.txt').description('候选 API key 池：一行一个 key，`#` 开头的行是注释；相对 cwd（必须落在 cwd 内，否则整个轮换记 warn 并停用）。当前生效的 key 在池子里的下一个就是第一个候选'),
+  apiKeyRef: z.string().default('DEEPSEEK_API_KEY').description('要轮换的那个凭据引用名：写进 $DSH_HOME/.credentials.yaml 的就是它（必须是 A-Za-z_ 开头的变量名写法）'),
+  apiKeyProbeUrl: z.string().default('https://api.deepseek.com/models').description('切换前先 GET 一下候选 key 是否可用（2xx 才算可用，不消耗 token）；留空 = 不探测、直接按顺序换下一个。DeepSeek 的 OpenAI 兼容面用 Authorization 头、Anthropic 面用 x-api-key，插件两个头一起带'),
+  apiKeyProbeTimeoutMs: z.number().default(15000).description('探测单个候选 key 的超时（毫秒）；网络不通时按「这个候选不可用」处理，继续试下一个'),
 });
 
 /**
@@ -363,6 +383,46 @@ function msUntilDailyHour(hour, now = Date.now()) {
 /** 本地 `HH:00`：日志与报错里描述触发点的写法。 */
 function hourLabel(hour) {
   return `${String(hour).padStart(2, '0')}:00`;
+}
+
+/**
+ * 解析 API key 池文件（一行一个 key）。
+ *
+ * 规则刻意只有三条：空行跳过、`#` 开头的整行是注释、重复的 key 只留第一条。
+ * 不做「行内注释」也不做 `KEY=value` —— key 自身可能含 `=` 之外的符号，多一种语法就多
+ * 一种「为什么我的 key 没被认出来」；想给某个 key 写备注就单独一行 `#`。
+ *
+ * 导出只为让测试直接验这几条边界（注释 / 空行 / CRLF / 重复）：它不碰任何闭包状态。
+ * @param text - 池子文件的正文。
+ * @returns 按出现顺序去重后的 key 数组。
+ */
+export function parseApiKeyPool(text) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = raw.trim();
+    if (line.length === 0 || line.startsWith('#')) continue;
+    if (seen.has(line)) continue;
+    seen.add(line);
+    out.push(line);
+  }
+  return out;
+}
+
+/**
+ * 日志里给一个 key 打码：露前 6 个字符 + 内容摘要的前 8 位十六进制。
+ *
+ * 日志会进 journal、也可能被贴到别处，所以**绝不能**整条打出来。留前 6 位是为了让
+ * 「换成了哪个」在池子里一眼可辨（`sk-` 之后还有三个随机字符），摘要则用来确认
+ * 「池子里两行是不是同一个 key」—— 两者都不足以还原出一个可用的 key。
+ * @param key - 原始 key。
+ * @returns 形如 `sk-ab1…#1a2b3c4d` 的短标识。
+ */
+function apiKeyFingerprint(key) {
+  const text = String(key ?? '');
+  const digest = crypto.createHash('sha256').update(text).digest('hex').slice(0, 8);
+  const head = text.length > 8 ? `${text.slice(0, 6)}…` : '';
+  return `${head}#${digest}`;
 }
 
 /**
@@ -616,6 +676,19 @@ export function apply(ctx, config) {
    */
   const chatterSeq = new Map();
   /**
+   * 群号 → 最近一段时间里**别人**说过的话（`{ userId, at }`，旧 → 新）。
+   *
+   * 只服务「多人搭话」的进入判定：最近 `activeWindowMs` 内累计够 `activeGroupLines` 条、
+   * 且来自 `activeGroupSpeakers` 个不同的人，就说明这个群自己聊热了 —— 这时候谁接话都算
+   * 在跟它聊（见 `groupTalkActive`）。
+   *
+   * 与 `chatterSeq` 的区别就在时间戳：那张表判的是「这个一对一中间有没有人插话」（比大小），
+   * 这张判的是「最近这段时间聊得够不够热」（比时间），别把两张表并成一张 —— 一个要的单调
+   * 递增的序号，一个要的是会过期的窗口。每条只保留最近 `GROUP_CHATTER_MAX` 条
+   * （`activeGroupLines` 配得更大时按那个数留，见 `recordGroupChatter`）。
+   */
+  const groupChatter = new Map();
+  /**
    * 群号 → 群里**所有**消息的条数（别人的 + 我自己发出去的）。
    *
    * `auto` 回复指向靠它判断「我回的那条是不是已经被后来的话挤远了」：入站时快照一个数，
@@ -776,6 +849,177 @@ export function apply(ctx, config) {
   let digestChain = Promise.resolve();
   /** 已经排进队列、还没跑完的会话 key，避免同一个会话被重复排队。 */
   const digestQueued = new Set();
+
+  // ---- 模型凭据：每天尝试轮换（见 README「每天轮换 API key」）------------------
+  //
+  // 为什么这件事能在这里做成：Harness 的模型调用是**每次请求**去解析凭据的
+  // （llm-deepseek 的 resolveApiKey → ctx.credentials.resolve），而本地凭据层监听
+  // `$DSH_HOME/.credentials.yaml`、写完就地更新内存 —— 所以把新 key 交给 credentials
+  // 服务就等于当场生效，不用重启 Harness。反过来，自己去改那个 YAML 文件是不行的：
+  // 里面还有浏览器会话等 records，手写一份很容易把它们弄丢，也绕过了凭据层自己的文件锁。
+  //
+  // 池子是 cwd 里的一个纯文本文件，而不是配置项：配置会显示在 Web UI 上、也会被复制粘贴
+  // 到别处，key 不该走那条路。它同时也必须在 cwd 内（与该目录的其它约定一致）。
+  const apiKeyRotateOn = config.apiKeyRotate !== false;
+  const apiKeyRefName = typeof config.apiKeyRef === 'string' ? config.apiKeyRef.trim() : '';
+  // 凭据引用名与凭据层自身的语法一致（也是 POSIX 环境变量名）：不合法就整个停用，
+  // 而不是每天写一个语法都不对的 ref 进去。
+  const apiKeyRefValid = /^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyRefName);
+  const apiKeyPoolCfg = typeof config.apiKeyFile === 'string' ? config.apiKeyFile.trim() : '';
+  const apiKeyPoolPath = apiKeyPoolCfg.length > 0 ? resolve(cwd, apiKeyPoolCfg) : undefined;
+  const apiKeyPoolInside = apiKeyPoolPath !== undefined && insideDirectory(resolve(cwd), apiKeyPoolPath);
+  /** 池子的展示路径（相对 cwd、正斜杠），日志与「怎么配」的提示里都用它。 */
+  const apiKeyPoolLabel = apiKeyPoolInside ? relative(resolve(cwd), apiKeyPoolPath).split(sep).join('/') : apiKeyPoolCfg;
+  const apiKeyRotateEnabled = apiKeyRotateOn && apiKeyRefValid && apiKeyPoolInside;
+  if (apiKeyRotateOn && !apiKeyRefValid) {
+    report('warn', `apiKeyRef "${apiKeyRefName}" is not a credential name (A-Za-z_ followed by A-Za-z0-9_); api key rotation is disabled`);
+  } else if (apiKeyRotateOn && !apiKeyPoolInside) {
+    report('warn', `apiKeyFile "${apiKeyPoolCfg}" resolves outside cwd (${cwd}); api key rotation is disabled`);
+  }
+
+  /** 轮换点（本地小时，0~23）：配错时退回 4 点，不因为一个数字把功能整晚挂掉。 */
+  function apiKeyRotateHour() {
+    const raw = Math.floor(Number(config.apiKeyRotateHour));
+    return Number.isFinite(raw) ? Math.min(23, Math.max(0, raw)) : 4;
+  }
+
+  /** 探测超时（毫秒）：低于 1 秒一律按默认 15 秒算，免得配成 0 之后每次探测都瞬时失败。 */
+  function apiKeyProbeTimeoutMs() {
+    const raw = Math.floor(Number(config.apiKeyProbeTimeoutMs));
+    return Number.isFinite(raw) && raw >= 1000 ? raw : 15000;
+  }
+
+  /** 探测地址：留空 = 不探测（直接按池子顺序换下一个），这是唯一的「关掉探测」开关。 */
+  function apiKeyProbeUrl() {
+    return typeof config.apiKeyProbeUrl === 'string' ? config.apiKeyProbeUrl.trim() : '';
+  }
+
+  /**
+   * 探测一个候选 key 现在能不能用。
+   *
+   * 用 GET 而不是发一次真的对话：「换 key」最怕的是从一个没额度的 key 换到另一个同样
+   * 没额度的 key，所以探测必须**便宜且不消耗 token**。DeepSeek 的 OpenAI 兼容面
+   * （`/models`）认 `Authorization: Bearer`，Anthropic 面认 `x-api-key` —— 两个头一起
+   * 带上，同一套配置就能探两种协议（多出来的那个头会被服务端忽略）。
+   *
+   * 判定：2xx = 可用；429 = key 本身有效但被限流/额度用尽，对「找一个现在能用的」来说
+   * 同样算不可用，但日志里要区分出来 —— 那说明池子里这个 key 该换了，而不是写错了。
+   * @param key - 候选 key。
+   * @returns `{ ok, detail }`：detail 是可以直接写进日志的一句话。
+   */
+  async function probeApiKey(key) {
+    const url = apiKeyProbeUrl();
+    if (url.length === 0) return { ok: true, detail: 'probe disabled' };
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { authorization: `Bearer ${key}`, 'x-api-key': key },
+        signal: AbortSignal.timeout(apiKeyProbeTimeoutMs()),
+      });
+      // 响应体一律不要（`/models` 的列表又长又没用），但也不能让连接挂着不给个交代。
+      if (response.body !== null) {
+        try {
+          await response.body.cancel();
+        } catch {
+          // 取不取消都不影响判定：状态码已经拿到了。
+        }
+      }
+      if (response.ok) return { ok: true, detail: `HTTP ${response.status}` };
+      return { ok: false, detail: response.status === 429 ? 'HTTP 429 (额度用尽或被限流)' : `HTTP ${response.status}` };
+    } catch (error) {
+      return { ok: false, detail: `probe failed: ${errorText(error)}` };
+    }
+  }
+
+  /**
+   * 每天到点尝试把当前凭据换成池子里的下一个 key。
+   *
+   * 「尝试」的含义就在这两个循环里：从**当前生效的 key 之后**开始，逐个探测池子里的候选，
+   * 第一个探测通过的才写进去；全都不通过就保留原来的、只记一条 warn。这样池子里混进一个
+   * 失效的 key 不会把 bot 直接换成不可用的状态，也不会因为一行坏 key 就每天卡在同一个位置。
+   *
+   * 状态是**算出来的**，不落盘：当前用的是哪个 key 直接问凭据层要，下一个是谁由它在池子里的
+   * 位置决定。于是重启、手工改过 key、池子刚调整过顺序都不会让轮换跑偏（当前 key 不在池子里
+   * 时从池首开始）。
+   * @param reason - 写进日志的触发原因（例如 `daily at 04:00`）。
+   */
+  async function rotateApiKey(reason) {
+    if (!apiKeyRotateEnabled) return;
+    const text = await readTextOrUndefined(apiKeyPoolPath);
+    // 「文件还没有 / 还没填 key」是**没配置**而不是故障：记 info，把「该怎么办」说清楚，
+    // 别让使用者每天在 journal 里看到一条红黄的 warn 却不知道要做什么。
+    if (text === undefined) {
+      report('info', `api key rotation (${reason}): no key pool at ${apiKeyPoolLabel}; put one key per line there to start rotating`);
+      return;
+    }
+    const pool = parseApiKeyPool(text);
+    if (pool.length === 0) {
+      report('info', `api key rotation (${reason}): key pool ${apiKeyPoolLabel} has no key yet (comments and blank lines do not count)`);
+      return;
+    }
+    const credentials = ctx.get('credentials');
+    if (credentials === undefined || typeof credentials.set !== 'function' || typeof credentials.resolve !== 'function') {
+      report('warn', `api key rotation: the credentials service is not visible from this plugin, cannot switch ${apiKeyRefName}`);
+      return;
+    }
+    // describe() 能直接回答「写进去会不会被启动环境压住」：环境变量里的 DEEPSEEK_API_KEY
+    // 优先级高于凭据文件，那种部署下写文件等于白写 —— 提前说清楚，而不是每天静默地
+    // 「成功」换了一个根本不生效的 key。
+    if (typeof credentials.describe === 'function') {
+      try {
+        const info = await credentials.describe(apiKeyRefName);
+        if (info?.writable === false) {
+          report('warn', `api key rotation: ${apiKeyRefName} is supplied read-only by the launching environment (source ${info.source ?? 'env'}); rotating the stored value would have no effect`);
+          return;
+        }
+      } catch (error) {
+        report('warn', `api key rotation: could not inspect ${apiKeyRefName}: ${errorText(error)}`);
+        return;
+      }
+    }
+    let current = '';
+    try {
+      current = (await credentials.resolve(apiKeyRefName))?.value ?? '';
+    } catch (error) {
+      report('warn', `api key rotation: could not read the current ${apiKeyRefName}: ${errorText(error)}`);
+      return;
+    }
+    const currentLabel = current.length > 0 ? apiKeyFingerprint(current) : '(未设置)';
+    // 候选顺序：当前 key 的下一个开始，绕回池首。当前 key 不在池子里（手工填的、或者
+    // 池子刚换过）时从第一个开始 —— 池子里的顺序就是轮换顺序。
+    const start = current.length > 0 && pool.includes(current) ? (pool.indexOf(current) + 1) % pool.length : 0;
+    const order = [];
+    for (let step = 0; step < pool.length; step += 1) {
+      const candidate = pool[(start + step) % pool.length];
+      if (candidate !== current) order.push(candidate);
+    }
+    if (order.length === 0) {
+      report('info', `api key rotation: ${apiKeyPoolLabel} holds no key other than the one in use (${currentLabel}); nothing to rotate`);
+      return;
+    }
+    for (const candidate of order) {
+      const probe = await probeApiKey(candidate);
+      if (!probe.ok) {
+        report('warn', `api key rotation: candidate ${apiKeyFingerprint(candidate)} rejected (${probe.detail}); trying the next one`);
+        continue;
+      }
+      try {
+        await credentials.set(apiKeyRefName, candidate);
+      } catch (error) {
+        report('warn', `api key rotation: could not store ${apiKeyRefName}: ${errorText(error)}`);
+        return;
+      }
+      // 写回之后回读一次：凭据层的写入是异步的（落盘 + 通知），确认真的换过去了才算成功。
+      const after = await credentials.resolve(apiKeyRefName).catch(() => undefined);
+      if (after?.value !== candidate) {
+        report('warn', `api key rotation: ${apiKeyRefName} still reads back as the old value after a write; the credentials store did not take it`);
+        return;
+      }
+      report('info', `api key rotation: switched ${apiKeyRefName} from ${currentLabel} to ${apiKeyFingerprint(candidate)} (${probe.detail})`);
+      return;
+    }
+    report('warn', `api key rotation: none of the ${order.length} other key(s) in ${apiKeyPoolLabel} passed the probe; keeping ${currentLabel}`);
+  }
 
   // ---- 会话代次（`/reset` 开新一轮会话的记账）------------------------------------
   //
@@ -2660,6 +2904,9 @@ export function apply(ctx, config) {
     if (conversation.type === 'group') {
       ambient.delete(conversation.id);
       repeatStates.delete(conversation.id);
+      // 「大家正聊着」的那段窗口也算刚才那些话：不清掉的话，新一轮第一条消息就可能被
+      // 判成多人搭话接着接（那条判据只看最近这一小段群里的发言）。
+      groupChatter.delete(conversation.id);
       // 主动说话的节奏也跟着忘掉：刚 /reset 完不该还被「两小时前主动说过」挡着。
       // 只清计时与计数，不动 `lastActiveAt` / `lastBotSpeakAt` —— 那两个描述的是群里
       // 真实发生过什么（谁最后说的话），不是这个会话的记忆。
@@ -2847,7 +3094,16 @@ export function apply(ctx, config) {
       // 活跃对话：没被叫到，但同一个人正在跟它聊，接着说的这句也算。（只认**已经存在**
       // 的会话 —— 闲聊不该因为「窗口」把某个群变成「处理过」的群。）
       const existing = conversations.get(`group:${groupId}`);
-      const continued = !explicit && existing !== undefined && activeFollowAllows(existing, userId, message, selfId);
+      // 多人搭话：这个群最近自己聊热了（够条数、够人数），那之后谁接话都算 —— 这也是
+      // 「有人插话就进入多人搭话」的落点：插话的人与那句话本身就记在 `groupChatter` 里，
+      // 大家说得够多就整体升级，而不是像一对一那样被一句话打断。
+      //
+      // 它**不**消耗 `activeMaxTurns`：那个上限是防「一个人揪着它刷屏」的，而这里的闸门
+      // 本身就是「窗口里够条数、够人数」—— 大家一停，窗口自己就空了。再叠一层轮数上限，
+      // 只会让它在最热闹的时候接几句就哑掉（那正是搭话状态该起作用的时候）。
+      const groupTalk = !explicit && existing !== undefined && groupTalkActive(groupId);
+      const followed = !explicit && existing !== undefined && activeFollowAllows(existing, userId, message, selfId);
+      const continued = groupTalk || followed;
       if (!explicit && !continued) return undefined;
       const conversation = conversationFor('group', groupId, {
         groupName: '',
@@ -2913,6 +3169,8 @@ export function apply(ctx, config) {
    * 两张表都进账：`quoteSeq` 是回复指向的判据（谁说的话都算挤），`chatterSeq` 只服务活跃对话
    * （判的是「有没有**别人**插话」，我自己说话不该把自己的一对一窗口打断，见
    * `activeFollowAllows` / `runChime`）。机器人自己发的话不走这里 —— 见 `noteOwnMessage`。
+   * 顺带记进 `groupChatter` 的窗口：多人搭话要判「最近这个群聊得够不够热」，那份记账同样
+   * 只算别人（我自己说话不该把自己算进「几个人在聊」里）。
    * @param event - 已解码的 OneBot 事件。
    * @param selfId - 机器人自己的 QQ 号。
    * @returns 该群在计入这条消息之后的序号（`chatterSeq` 的口径）。
@@ -2924,6 +3182,7 @@ export function apply(ctx, config) {
     if (String(event.user_id ?? '') === String(selfId)) return 0;
     const groupId = String(event.group_id);
     bumpSeq(quoteSeq, groupId);
+    recordGroupChatter(groupId, String(event.user_id ?? ''), Date.now());
     return bumpSeq(chatterSeq, groupId);
   }
 
@@ -3490,22 +3749,101 @@ export function apply(ctx, config) {
   //
   // 上面那块 `proactive` 管的是**冷场**（群里安静 45 分钟之后自己开个话头）；这一块管
   // 「正聊着」的时候。真人不会让对方每句都叫一遍自己的名字，也不会在对方安静十秒之后
-  // 就把话题掐掉。两件事共用一个「活跃对话」窗口（`activeUntil`）：
+  // 就把话题掐掉。三件事共用一个「活跃对话」窗口（`activeUntil`）：
   //
-  //   A. 免 @ 接话（`activeFollow`）：窗口内、正在跟它聊的那个人接着说的话也算在跟它聊；
-  //   B. 自己补一句（`activeChime*`）：它回完之后对方安静了一小会儿，它可能再追一句。
+  //   A. 免 @ 接话（`activeFollow`）：被叫到之后的窗口内、正在跟它聊的那个人接着说的话
+  //      也算在跟它聊（window 默认 1 分钟 —— 一个人 @ 一次只买这一小段）；
+  //   B. 自己补一句（`activeChime*`）：它回完之后对方安静了一小会儿，它可能再追一句；
+  //   C. **多人搭话**（`activeGroup*`）：群里几个人自己聊了起来（最近窗口里够条数、够人数），
+  //      它就进入搭话状态 —— 那之后谁接话都免 @，而且「倾听时间」变长（攒批更久），
+  //      多听几句才合成一轮回复。
   //
   // 窗口只靠**别人发来的消息**往后滑（机器人自己说的话不算，否则它自己就能给窗口续命）；
-  // 群里中间有别人插话，这次「你跟我聊」就算断了，要重新叫它一次。
+  // 一对一窗口里有人插话，这次「你跟我聊」就算断了，要重新叫它一次 —— 但插话本身会记进
+  // `groupChatter`，大家一起说的话够多、够热闹时，走的就是 C 而不是 A 了（这就是
+  // 「有人插话就考虑进入多人搭话」的落点）。
 
-  /** 活跃对话窗口（毫秒）：0 表示整套关闭（免 @ 接话与自己补一句都不做）。 */
+  /** 活跃对话窗口（毫秒）：0 表示整套关闭（免 @ 接话、自己补一句、多人搭话都不做）。 */
   function activeWindowMs() {
-    return proactiveMs('activeWindowMs', 10 * 60 * 1000);
+    return proactiveMs('activeWindowMs', 60 * 1000);
   }
 
-  /** 一次活跃对话里最多免 @ 接几轮；0 = 不限。 */
+  /** 一次**一对一**的活跃对话里最多免 @ 接几轮；0 = 不限。多人搭话不看它（见 `admit`）。 */
   function activeMaxTurns() {
     return proactiveMs('activeMaxTurns', 10);
+  }
+
+  /** 免 @ 接话的轮数还有余额吗（`activeMaxTurns` 为 0 表示不限）。 */
+  function activeTurnsLeft(conversation) {
+    const maxTurns = activeMaxTurns();
+    return maxTurns <= 0 || (Number(conversation.activeTurns) || 0) < maxTurns;
+  }
+
+  /** 「多人搭话」的进入门槛：最近窗口里至少这么多条别人说的话；0 = 关掉多人搭话。 */
+  function activeGroupLines() {
+    return proactiveMs('activeGroupLines', 6);
+  }
+
+  /** 「多人搭话」还要求最近窗口里至少这么多**不同的人**说过话。 */
+  function activeGroupSpeakers() {
+    return proactiveMs('activeGroupSpeakers', 2);
+  }
+
+  /** 搭话状态里的攒批倍数（倾听时间）：小于 1 的一律按 1（不放大）算。 */
+  function activeGroupBatchScale() {
+    const raw = Number(config.activeGroupBatchScale);
+    return Number.isFinite(raw) && raw > 1 ? raw : 1;
+  }
+
+  /**
+   * 把「这个群里又有人说话」记进多人搭话的时间窗口（由 `noteChatter` 调用）。
+   *
+   * 只留最近 `GROUP_CHATTER_MAX` 条：判定要的是「窗口内够不够热」，不是全部历史。过期的
+   * 条目在这里顺手裁掉 —— 真要看的时候（`groupTalkActive`）不必再担心列表无限长。
+   * 按群数也做了和 `chatterSeq` 一样的兜底：见过面的群不该这么多，超了丢最早的。
+   * @param groupId - 群号。
+   * @param userId - 说话的人（判「够几个人」用）。
+   * @param at - 这条消息到达的时刻（毫秒）。
+   */
+  function recordGroupChatter(groupId, userId, at) {
+    const list = groupChatter.get(groupId) ?? [];
+    list.push({ userId, at });
+    const cutoff = at - Math.max(1, activeWindowMs());
+    // 条数上限取「默认上限」与「配置的门槛」的较大者：有人把 activeGroupLines 配到 64 以上时，
+    // 不能因为这份缓冲只留 64 条就永远凑不够。真正的边界还是上面那个时间窗口。
+    const keep = Math.max(GROUP_CHATTER_MAX, activeGroupLines());
+    while (list.length > keep || (list.length > 0 && list[0].at < cutoff)) list.shift();
+    groupChatter.set(groupId, list);
+    if (groupChatter.size > 512) {
+      const oldest = groupChatter.keys().next().value;
+      if (oldest !== undefined && oldest !== groupId) groupChatter.delete(oldest);
+    }
+  }
+
+  /**
+   * 这个群现在算不算「大家正聊着」（多人搭话）？
+   *
+   * 判据全在最近 `activeWindowMs` 这一段里：**别人**说的话够 `activeGroupLines` 条，
+   * 且来自 `activeGroupSpeakers` 个不同的人。两个条件一起卡住两类误判：一个人自己刷屏
+   * 凑不出「几个人」，而两个人半天说一句也凑不出「聊起来了」。
+   *
+   * 它是**纯查询**（不写状态）：搭话状态因此不会赖着不走 —— 大家一停，窗口自己就空了，
+   * 下一次消息重新判。这也让「插话」自然成为进入方式之一：有人接一句，人数与条数就往上走。
+   *
+   * @param groupId - 群号。
+   * @returns 现在算多人搭话时为 true。
+   */
+  function groupTalkActive(groupId) {
+    if (config.activeFollow !== true) return false;
+    const window = activeWindowMs();
+    if (window <= 0) return false;
+    const lines = activeGroupLines();
+    const speakers = activeGroupSpeakers();
+    if (lines <= 0 || speakers <= 0) return false;
+    const cutoff = Date.now() - window;
+    const recent = (groupChatter.get(groupId) ?? []).filter((entry) => entry.at >= cutoff);
+    if (recent.length < lines) return false;
+    return new Set(recent.map((entry) => entry.userId)).size >= speakers;
   }
 
   /** 「自己补一句」的静默门槛（毫秒）；0 = 不补。 */
@@ -3555,7 +3893,8 @@ export function apply(ctx, config) {
    *   1. 说话的就是**正在跟它聊的那个人**（别人插一句不该被它抢答）；
    *   2. 还在窗口内（`activeWindowMs`，每接一句往后滑）；
    *   3. 这次对话里免 @ 接的轮数还没到 `activeMaxTurns`；
-   *   4. 中间**没有别人说过话**（群里插了话，这次一对一就断了，得重新 @ 它）；
+   *   4. 中间**没有别人说过话**（群里插了话，这次一对一就断了，得重新 @ 它 —— 除非那一句
+   *      把群聊推过了 `activeGroupLines`，那时走的是多人搭话，见 `groupTalkActive`）；
    *   5. 这句没有 @ 别人（`@别人` / `@全体` 明确不是跟它说的）。
    *
    * @param conversation - 已有的会话记录。
@@ -3571,8 +3910,7 @@ export function apply(ctx, config) {
     if (conversation.type !== 'group') return false;
     if (String(conversation.activeSpeakerId ?? '') !== String(userId)) return false;
     if ((Number(conversation.activeUntil) || 0) <= Date.now()) return false;
-    const maxTurns = activeMaxTurns();
-    if (maxTurns > 0 && (conversation.activeTurns ?? 0) >= maxTurns) return false;
+    if (!activeTurnsLeft(conversation)) return false;
     // `activeSeq` 停在上一次接话那条上；这里已经比它大 1 以上就说明中间有人插过话
     // （当前这条自己会把序号 +1，所以「紧跟着的下一条」正好是 +1）。
     if ((chatterSeq.get(conversation.id) ?? 0) > (Number(conversation.activeSeq) || 0) + 1) return false;
@@ -3868,16 +4206,32 @@ export function apply(ctx, config) {
    */
   const MAX_TIMER_MS = 2 ** 31 - 1;
 
-  /** 攒批窗口（毫秒）；配置非法或为 0 时返回 0，表示关闭攒批、来一条回一条。 */
-  function batchWindow() {
-    const raw = Math.floor(Number(config.batchWindowMs));
-    return Number.isFinite(raw) && raw > 0 ? raw : 0;
+  /**
+   * 这个会话现在的「倾听时间」倍数。
+   *
+   * 只有**多人搭话**的群会放大：大家正聊着的时候它该多听几句再开口，而不是每两秒截一句
+   * 就回一轮。一对一的窗口不放大 —— 那边是「它正在跟你说话」，等太久反而像掉线。
+   * @param conversation - 目标会话。
+   * @returns 倍数（≥1）。
+   */
+  function batchScale(conversation) {
+    if (conversation?.type !== 'group') return 1;
+    if (!groupTalkActive(conversation.id)) return 1;
+    return activeGroupBatchScale();
   }
 
-  /** 一批最多等多久（毫秒）。配置比窗口还小时没有意义，按下限（= 窗口）算。 */
-  function batchCap(window) {
+  /** 攒批窗口（毫秒）；配置非法或为 0 时返回 0，表示关闭攒批、来一条回一条。 */
+  function batchWindow(scale) {
+    const raw = Math.floor(Number(config.batchWindowMs));
+    if (!(Number.isFinite(raw) && raw > 0)) return 0;
+    return Math.max(1, Math.round(raw * scale));
+  }
+
+  /** 一批最多等多久（毫秒）。配置比窗口还小时没有意义，按下限（= 窗口）算；与窗口同倍放大。 */
+  function batchCap(window, scale) {
     const raw = Math.floor(Number(config.batchMaxWaitMs));
-    return Number.isFinite(raw) && raw > window ? raw : window;
+    const scaled = Number.isFinite(raw) && raw > 0 ? Math.round(raw * scale) : 0;
+    return scaled > window ? scaled : window;
   }
 
   /**
@@ -3907,19 +4261,21 @@ export function apply(ctx, config) {
    *
    * 窗口从**最后一条**往后算（还有人接着说就再等一个窗口），但整批的等待以第一条
    * 到达时刻为起点卡一个上限（`batchMaxWaitMs`）—— 否则群里你一句我一句地 @ 下去，
-   * 机器人会永远不吭声。
+   * 机器人会永远不吭声。多人搭话时这两个值一起按 `activeGroupBatchScale` 放大，
+   * 于是它会多听几句再合成一轮（见 `batchScale`）。
    *
    * @param conversation - 目标会话。
    * @param entry - 已准入的这条消息 `{ message, name, userId, quote, at }`。
    */
   function holdForBatch(conversation, entry) {
-    const window = batchWindow();
+    const scale = batchScale(conversation);
+    const window = batchWindow(scale);
     if (window <= 0) {
       submitBatch(conversation, [entry]);
       return;
     }
     conversation.pending.push(entry);
-    const cap = batchCap(window);
+    const cap = batchCap(window, scale);
     const since = conversation.pending[0].at;
     const wait = Math.max(0, Math.min(window, since + cap - Date.now(), MAX_TIMER_MS));
     if (conversation.batchTimer !== undefined) clearTimeout(conversation.batchTimer);
@@ -4769,6 +5125,58 @@ export function apply(ctx, config) {
     report('info', `memory enabled at ${memoryLabel} (daily digest at ${hourLabel(atHour)}; a conversation needs ${Math.max(1, Math.floor(Number(config.digestMinLines) || 1))} new lines, once a day)`);
   }
 
+  // ---- 模型凭据：每天轮换的定时器 ----------------------------------------------
+  //
+  // 与摘要循环同一套托管方式（`ctx.interval` + 「跑完再排」，插件卸载即清掉），只是没有
+  // 任何预热：轮换的状态全部现算（见 rotateApiKey），重启也不会跑偏。
+  if (apiKeyRotateEnabled) {
+    const hour = apiKeyRotateHour();
+    const tick = () => {
+      // 定时器回调是同步的，而轮换要读盘 + 发探测请求：这里只负责把异常收进日志，
+      // 不让一个 rejected promise 变成 unhandled rejection 把进程带走。
+      void rotateApiKey(`daily at ${hourLabel(hour)}`).catch((error) => {
+        report('warn', `api key rotation failed: ${errorText(error)}`);
+      });
+    };
+    let rotateTimerDisposer;
+    ctx.effect(() => {
+      // 每天醒一次，醒来跑完再排下一次：每次算的都是「距离下一个整点还有多久」，
+      // 所以刚过点时会排到明天，不会在同一个点上反复醒。
+      const schedule = () => {
+        const wait = msUntilDailyHour(hour);
+        if (typeof ctx.interval === 'function') {
+          rotateTimerDisposer = ctx.interval(() => {
+            rotateTimerDisposer?.();
+            tick();
+            schedule();
+          }, wait);
+          return;
+        }
+        // 没有 timer 服务（测试桩或最小组合）时退回裸定时器：同样是「跑完再排」。
+        const handle = setTimeout(() => {
+          tick();
+          schedule();
+        }, wait);
+        handle.unref?.();
+        rotateTimerDisposer = () => clearTimeout(handle);
+      };
+      schedule();
+      return () => {
+        rotateTimerDisposer?.();
+        rotateTimerDisposer = undefined;
+      };
+    }, 'qq-bridge:api-key-rotate');
+    report(
+      'info',
+      `api key rotation: on, daily at ${hourLabel(hour)} — pool ${apiKeyPoolLabel}, ref ${apiKeyRefName}, ` +
+        `probe ${apiKeyProbeUrl().length > 0 ? apiKeyProbeUrl() : '(disabled)'}`,
+    );
+  } else if (apiKeyRotateOn) {
+    // 配置本身不合法（ref 不是变量名 / 池子在 cwd 外）：启动时已经逐条 warn 过，这里不重复。
+  } else {
+    report('info', 'api key rotation is off (apiKeyRotate is false)');
+  }
+
   // ---- 主动说话：定时器 --------------------------------------------------------
   //
   // 与摘要循环同一套托管方式（`ctx.interval`，插件卸载即清掉）。区别在于节奏：
@@ -4819,24 +5227,31 @@ export function apply(ctx, config) {
         `gap ${Math.round(proactiveMs('proactiveGapMs', 2 * 60 * 60 * 1000) / 60000)} min, ` +
         `at most ${proactiveDailyMax()}/day, ${hourLabel(fromHour)}-${hourLabel(toHour)}`,
     );
-    if (activeWindowMs() > 0 && activeChimeIdleMs() > 0 && activeChimeMax() > 0) {
-      report(
-        'info',
-        `active conversation — chime: about ${Math.round(activeChimeIdleMs() / 1000)}s after its reply, ` +
-          `at most ${activeChimeMax()}/message and ${activeChimeDailyMax() || '不限'}/day (groups and private)`,
-      );
-    } else {
-      report('info', 'active conversation — chime is off (activeWindowMs / activeChimeIdleMs / activeChimeMax)');
-    }
-    if (config.activeFollow === true && activeWindowMs() > 0) {
-      report(
-        'info',
-        `active conversation — activeFollow on: a group follow-up from the person it is talking to needs no @ ` +
-          `(window ${Math.round(activeWindowMs() / 60000)} min, at most ${activeMaxTurns() || '不限'} turns)`,
-      );
-    } else {
-      report('info', 'active conversation — activeFollow is off: group messages still need an explicit @ (or the configured prefix)');
-    }
+  }
+
+  // 活跃对话的启动自述放在 `proactive` 块**外面**：免 @ 接话（一对一与多人搭话）都不需要
+  // `proactive` —— 那是「主动找人说话」的总开关，只有「自己补一句」靠它。
+  if (proactiveEnabled && activeWindowMs() > 0 && activeChimeIdleMs() > 0 && activeChimeMax() > 0) {
+    report(
+      'info',
+      `active conversation — chime: about ${Math.round(activeChimeIdleMs() / 1000)}s after its reply, ` +
+        `at most ${activeChimeMax()}/message and ${activeChimeDailyMax() || '不限'}/day (groups and private)`,
+    );
+  } else if (proactiveEnabled) {
+    report('info', 'active conversation — chime is off (activeWindowMs / activeChimeIdleMs / activeChimeMax)');
+  } else {
+    report('info', 'active conversation — chime is off (proactive is off)');
+  }
+  if (config.activeFollow === true && activeWindowMs() > 0) {
+    report(
+      'info',
+      `active conversation — activeFollow on: a group follow-up from the person it is talking to needs no @ ` +
+        `(window ${Math.round(activeWindowMs() / 60000)} min, at most ${activeMaxTurns() || '不限'} turns); ` +
+        `group talk after ${activeGroupLines() || '关闭'} lines from ${activeGroupSpeakers()} speakers ` +
+        `(listen x${activeGroupBatchScale()})`,
+    );
+  } else {
+    report('info', 'active conversation — activeFollow is off: group messages still need an explicit @ (or the configured prefix)');
   }
 
   // 表情包目录：启动时确保它存在 —— 「往里丢几张图就能用」比「先读文档建目录」友好。

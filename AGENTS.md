@@ -23,12 +23,18 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 - **不走模型的两条旁路**：群里的**自动复读**，和 `/jm` **禁漫下载**。
 - **主动说话**（默认关）：群里安静下来之后，插件往**该群自己的会话**里伪造一条提醒，
   让它带着环境上下文与长期记忆自己想一句冒个泡（见 §4.F）。
-- **活跃对话**：聊起来之后不再是「每句都得 @ 一次」—— 免 @ 接话（`activeFollow`，默认关）
-  与「回完对方安静一会儿再补一句」（见 §4.G）。
+- **活跃对话**：聊起来之后不再是「每句都得 @ 一次」—— 一对一的免 @ 接话
+  （`activeFollow`，默认关，`activeWindowMs` 默认只买 1 分钟）、群里几个人聊热之后的
+  **多人搭话**（`activeGroup*`，谁接话都算、倾听时间变长），以及「回完对方安静一会儿再
+  补一句」；见 §4.G。
 - **长期记忆**：每条消息落盘成转录，定时由一个**独立摘要会话**照 `.dsh/skills/` 里的
   `message-digest` skill 整理成「这个群记得什么」，聊天时用 `qq_transcript` / `qq_memory`
   查；顺带用 `update-cognition` skill 学会群里的梗和表情包，看不懂的二次元梗先走
   `moegirl` skill 查萌娘百科（见 §4.E）。
+- **每天轮换模型凭据**（`apiKeyRotate`，默认开）：每天 04:00 从 `cwd/data/api-keys.txt`
+  里挑下一个**探测通过**的 key，交给 `ctx.credentials.set()` 写进
+  `$DSH_HOME/.credentials.yaml`（凭据层监听文件，当场生效、不用重启）；池子不存在、
+  没有第二个能用的 key、或者 key 本来就由启动环境提供时，什么都不做（见 §4.I）。
 
 技术约束（决定了代码的写法，别无意打破）：
 
@@ -63,7 +69,8 @@ README.md             用户文档 + 设计取舍（改行为要同步它）
 AGENTS.md             **本文件**：给改代码的智能体的说明书（DSH 会自动注入上下文）
 ```
 
-**数据目录**（全部 gitignore，运行时生成在 `cwd` 下）：`data/`（会话缓存）、`.qq-media/`
+**数据目录**（全部 gitignore，运行时生成在 `cwd` 下）：`data/`（会话缓存 + `/reset` 标记 +
+`api-keys.txt` 这个可选的 key 池）、`.qq-media/`
 （入站图片 LRU 缓存）、`.qq-stickers/`（**用户自己丢表情包进来**）、`.qq-jm/`（下载的 PDF）、
 `.qq-memory/`（长期记忆：转录 + 摘要 + 认知 + 摘要进度）。**`memoryDir` 与其它三个一样
 必须在 `cwd` 内**，否则记忆功能记一条 warn 并停用。
@@ -94,34 +101,36 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 | 区域 | 关键符号 | 说明 |
 |---|---|---|
 | 顶部常量 | `CHANNEL_SECTION_ORDER=8950`、`PRESET_NONE`、`QUOTE_TEXT_CHARS`、`STICKER_PROMPT_MAX` | 调提示词用 |
-| `Config` schema | 第 106–199 行 | **配置的唯一真相来源**，`.description()` 就是 Web UI 上给用户看的文档 |
-| 运行时状态 | 第 532–571 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / `chatterSeq`（只算别人）/ `quoteSeq`（**含机器人自己发的**，答复指向用；`noteOwnMessage` 在发出去那一刻记账）/ `repeatStates` / `mediaResolutions`，以及记忆的 `memorySlugs` / `memoryDirty` / `memoryLastDigest` / `memoryWrites` / `memoryIndexCache`；每条会话记录里还挂着 `sessionGeneration`（第几轮会话，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` 与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
+| `Config` schema | 第 125–243 行 | **配置的唯一真相来源**，`.description()` 就是 Web UI 上给用户看的文档 |
+| 运行时状态 | 第 654–714 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / `chatterSeq`（只算别人，判「有没有人插话」）/ `groupChatter`（群号 → 最近发言 `{ userId, at }`，判「最近聊得够不够热」，见 §4.G）/ `quoteSeq`（**含机器人自己发的**，答复指向用；`noteOwnMessage` 在发出去那一刻记账）/ `repeatStates` / `mediaResolutions`，以及记忆的 `memorySlugs` / `memoryDirty` / `memoryLastDigest` / `memoryWrites` / `memoryIndexCache`；每条会话记录里还挂着 `sessionGeneration`（第几轮会话，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` 与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
 | Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` | 见 §7 |
 | 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` | 串行队列保证同一会话的消息不乱序；`sendOne` 顺便记 `lastBotSpeakAt`（主动说话靠它避免独白） |
 | JM 旁路 | `readJmCommand` `runJmCommand` `sendJmFile` `downloadJm` | `/jm 422866` 不进 Agent、不建会话 |
 | 会话管理 | `resetConversation` `conversationFor` `sessionIdFor` `resetMarkerDir` `loadConversationResetCounts` `writeConversationResetCount` `refreshSessionGeneration` | `/reset` 开新一轮（**不删旧会话**，代次 +1 并落盘），以及在线会话列表（新一轮时连主动说话的节奏一起清） |
 | 准入与复读 | `admit` `noteChatter` `touchActivity` `rememberAmbient` `maybeRepeat` `repeatStep` `sketchOf` `sameCandidate` | 白名单、群触发判定、环境上下文、复读状态机（图片来源判定 = 字节相同 **或** 画面指纹相近，见 `perceptual.js`）；`admit` 里还有「活跃对话」那条免 @ 的旁路 |
 | 主动说话 | `proactiveSweep` `proactiveEligible` `proactiveSpeak` `proactiveNudge` `proactiveSkip` `busyWithTurn` `proactiveTodayCount` | 见 §4.F；定时器在生命周期那一节，`withinActiveHours` 是模块级纯函数 |
-| 活跃对话 | `noteActiveMessage` `activeFollowAllows` `scheduleChime` `cancelChime` `runChime` `chimeSpeak` `chimeNudge` `chimeTodayUsed` | 见 §4.G；A（免 @ 接话）在 `admit` 里判，B（补一句）挂在 `turn/end` 之后 |
+| 活跃对话 | `noteActiveMessage` `activeFollowAllows` `groupTalkActive` `recordGroupChatter` `batchScale` `scheduleChime` `cancelChime` `runChime` `chimeSpeak` `chimeNudge` `chimeTodayUsed` | 见 §4.G；A（一对一免 @ 接话）与 C（多人搭话）都在 `admit` 里判，倾听倍数在 `holdForBatch` 里用，B（补一句）挂在 `turn/end` 之后 |
+| 攒批 | `enqueue` `holdForBatch` `flushBatch` `submitBatch` `renderBatch` `batchWindow` `batchCap` `batchScale` | 前后脚到的消息合成一条再投给 Agent；多人搭话时窗口与上限同倍放大（见 §4.G） |
 | 媒体 | `resolveMessageMedia` `mediaFor` `resolveQuote` `hydrateAmbientMedia` | 环境上下文与复读**共用同一次下载**（`mediaResolutions` 这个 WeakMap 就是干这个的） |
-| 攒批 | `enqueue` `holdForBatch` `flushBatch` `submitBatch` `renderBatch` | 前后脚到的消息合成一条再投给 Agent |
 | 事件轮转 | `handleEvent`（约 55 行）+ 持久化事件路由 | 见 §4.A；`turn/end` 里按 `owner.proactive` 分流 |
 | 长期记忆 | `rememberTranscript` `appendTranscript`（+`writesFor`）`maybeCatchUpDigest` `readDigestState` `ensureDigestAgent` `runDigestSweep` `enqueueDigest` `memoryIndexText` `resolveMemoryConversation` | 见 §4.E |
+| 模型凭据轮换 | `rotateApiKey` `probeApiKey` `apiKeyRotateHour` `apiKeyProbeUrl` `apiKeyProbeTimeoutMs` | 见 §4.I；每天到点从 `apiKeyFile` 里挑下一个探测通过的 key，交给 `ctx.credentials.set()` 写进 `$DSH_HOME/.credentials.yaml`（**不用重启**，凭据层监听该文件） |
 | 工具注册 | `qq_send_message` / `qq_send_image` / `qq_list_conversations` / `qq_jm_pdf` / `qq_transcript` / `qq_memory` | 全局宿主平面。**这是文件里最大的一块**（6 个 `defineTool` 声明），不是函数 |
-| 生命周期 | `ctx.effect(...)` | 托管 socket、JM 的 HTTP 服务、摘要定时器、主动说话的定时器 |
+| 生命周期 | `ctx.effect(...)` | 托管 socket、JM 的 HTTP 服务、摘要定时器、API key 轮换定时器、主动说话的定时器 |
 
 **体量实况**（别被文件行数吓到）：调用链上的函数基本都在 60 行以内，纯逻辑已经拆到
 `onebot.js` / `media.js` / `image.js` / `jm.js`。注释密度 25%–45%。文件大是因为
 「一个大闭包 + 6 个大工具声明 + 大段取舍注释」，不是因为函数失控。
 
-**模块级纯函数**（在 `apply()` 外面，只有记忆与主动说话这一块有）：`sessionIdFor`（会话 key +
+**模块级纯函数**（在 `apply()` 外面，只有记忆、凭据轮换与主动说话这一块有）：`sessionIdFor`（会话 key +
 第几轮 → Session id，导出只为测「第 0 轮不变 / 第 1 轮确定」这条契约）/ `memorySlug` /
 `localDate` / `localStamp` / `msUntilDailyHour`（下一个整点还有多久）/ `withinActiveHours`
 （主动说话的时段判定，导出只为测边界）/ `memoryRelativePath`（写边界）/
+`parseApiKeyPool`（key 池的行解析，导出只为测注释 / 空行 / CRLF / 去重）/
 `readJsonl` / `writeJsonTextAtomic`。它们不碰闭包状态，改它们不影响运行时不变量 ——
 `msUntilDailyHour` 尤其值得单独测边界（刚过点要排到明天，不能原地反复醒）。
 
-## 4. 八条数据流（改任何一条先读对应的那条）
+## 4. 九条数据流（改任何一条先读对应的那条）
 
 ### A. 入站消息 → Agent → QQ（主链路）
 
@@ -268,20 +277,27 @@ ctx.interval（每 proactiveCheckMs）─▶ proactiveSweep
 - **`withinActiveHours` 是模块级纯函数**（左闭右开 / 两边相等 = 全天 / `from > to` 跨零点）。
   改时段语义就改它，并跑它的边界用例。
 
-### G. 活跃对话（`activeWindowMs` / `activeFollow` / `activeChime*`）
+### G. 活跃对话（`activeWindowMs` / `activeFollow` / `activeGroup*` / `activeChime*`）
 
-F 管的是**冷场**；这一块管「正聊着」。两者共用一个「活跃对话」窗口：
+F 管的是**冷场**；这一块管「正聊着」。三条路共用一个「活跃对话」窗口（默认
+`activeWindowMs: 60000`，即 @ 一次只买 1 分钟）：
 
 ```
 admit（群聊）
   ├─ 被叫到（@ / 前缀 / groupTrigger=all）→ noteActiveMessage(..., continued=false)
   │      重置 activeTurns、清 chime 计数、把 activeUntil 滑到 now + activeWindowMs
-  └─ 没被叫到 → activeFollowAllows？五个条件：activeFollow 开着 · 是 activeSpeakerId 本人
-        · 窗口没过期 · activeTurns < activeMaxTurns · 群里没人插过话
-        （chatterSeq == activeSeq + 1）· 这句没 @ 别人（mentionsOthers）
-        └─ 通过 → noteActiveMessage(..., continued=true)（activeTurns +1）
+  ├─ A 没被叫到 → activeFollowAllows？五个条件：activeFollow 开着 · 是 activeSpeakerId 本人
+  │     · 窗口没过期 · activeTurns < activeMaxTurns · 群里没人插过话
+  │     （chatterSeq == activeSeq + 1）· 这句没 @ 别人（mentionsOthers）
+  │     └─ 通过 → noteActiveMessage(..., continued=true)（activeTurns +1）
+  └─ C 没被叫到 → groupTalkActive(群号)？最近 activeWindowMs 的 groupChatter 里
+        ≥ activeGroupLines 条 且 来自 ≥ activeGroupSpeakers 个人（纯查询，不写状态）
+        └─ 通过 → 同样 continued=true（谁接话都算，不消耗 activeMaxTurns）
              └─ admit 返回 { continued: true }：正文**不能**再走 dropPrefix
                 （前缀模式里「然后呢」会被切成「后呢」，见 submitBatch）
+
+holdForBatch → batchScale()：C 生效时 batchWindowMs / batchMaxWaitMs 一起 ×
+   activeGroupBatchScale（「倾听时间变长，多听几句再合成一轮回复」）
 
 turn/end（正常回复发完之后）
   └─ scheduleChime：proactive 开着 + activeWindowMs/chimeIdleMs/chimeMax 都 > 0
@@ -299,27 +315,37 @@ turn/end（正常回复发完之后）
 
 - **窗口只靠别人发来的消息往后滑**（机器人自己说的话不滑）：否则它自己就能给窗口续命，
   「活跃」会变成一个永远不结束的状态。
-- **「中间有别人说话就断」靠 `chatterSeq` / `activeSeq` 比大小**，别改成时间戳：
-  它要判的是「有没有人插话」，不是「隔了多久」。当前这条消息自己已经把序号 +1，
-  所以合法值恰好是 `activeSeq + 1`。这张表**只算别人**：机器人自己的话走 `quoteSeq`
-  （回复指向用，见 `quoteHead`），别把两张表并成一张 —— 我自己说话不该把自己的一对一
-  窗口打断，但答复引用的判据要把它算进去。`quoteSeq` 里我自己的那一票是在**发出去**那一刻
-  由 `noteOwnMessage` 记的（NapCat 配的是 `reportSelfMessage: false`，自己发的消息不会回灌，
-  别指望事件）：`sendOne` + 两个发送工具 + JM 上传四处。
+- **两张表分工不同，别合并**：一对一的「有没有人插话」靠 `chatterSeq` / `activeSeq` 比大小
+  （当前这条消息自己已经把序号 +1，所以合法值恰好是 `activeSeq + 1`），判的是「隔没隔着人」；
+  多人搭话靠 `groupChatter`（群号 → 最近 `{ userId, at }`，由 `noteChatter` 进账，上限
+  `GROUP_CHATTER_MAX`）**比时间**，判的是「最近够不够热」。别把前者改成时间戳，也别拿
+  `chatterSeq` 当窗口用。两张表都**只算别人**：机器人自己的话走 `quoteSeq`（回复指向用，
+  见 `quoteHead`），我自己说话不该把自己的一对一窗口打断，但答复引用的判据要把它算进去。
+  `quoteSeq` 里我自己的那一票是在**发出去**那一刻由 `noteOwnMessage` 记的（NapCat 配的是
+  `reportSelfMessage: false`，自己发的消息不会回灌，别指望事件）：`sendOne` + 两个发送工具
+  + JM 上传四处。
+- **多人搭话是纯查询（`groupTalkActive`），不存「搭话状态」**：大家一停，窗口自己就空了，
+  它自动退出；存一个 `activeGroupUntil` 反而要处理「谁负责过期」。它也因此天然支持
+  「有人插话就升级」——插话本身就是往门槛上走。**不消耗 `activeMaxTurns`**：那个上限是防
+  一个人揪着它刷屏的，而这里的闸门是「够条数、够人数」，再叠一层只会让它在最热闹的时候哑掉。
+- **搭话状态里只放大攒批（`batchScale`），不放大打字延迟**：`holdForBatch` 拿它乘窗口与上限，
+  两处必须同倍——只放大窗口不放大上限时，`batchMaxWaitMs` 会把「多听几句」又卡回去。
 - **`continued` 一路要传到 `submitBatch`**：前缀模式下按前缀长度硬切会切掉正文首字
   （`dropPrefix` 只对**显式带前缀**的那条调用）。
 - **窗口接上的那句不是指令**：`handleEvent` 里 `commanded`（= 被叫到且不是 continued）
   挡在 `/jm` 与 `/reset` 两个旁路前面 —— 否则窗口里一句「jm 123」就绕开模型去下本子。
-- **`admit` 里先看 `conversations` 里有没有这个群**：窗口回话不能凭空创建会话记录
-  （那会让没被 @ 的闲聊把群变成「处理过」的会话，破坏长期记忆那条旧不变量）。
+- **`admit` 里先看 `conversations` 里有没有这个群**：窗口回话（A 与 C 都是）不能凭空创建会话
+  记录（那会让没被 @ 的闲聊把群变成「处理过」的会话，破坏长期记忆那条旧不变量）。
 - **补一句只在正常回复之后挂**（`turn/end` 的非 proactive 分支），而且主动搭话自己那一轮
   不再挂 —— 否则它会补一句再补一句，变成对着空气自言自语。
 - **`chimeSeq` 是防漏的保险**：任何新消息（`noteActiveMessage`）与 `/reset`、插件卸载都会
   `cancelChime`，但正确性只依赖「编号对不对得上」，不依赖每个取消点都记得 `clearTimeout`。
-- **`activeFollow` 默认关**：它放松的是「群里只在被 @ 时才说话」这条默认约定，属于安全面
-  （§5.5）。默认值、README 的配置表与「安全提醒」三处要一起改。
+- **`activeFollow` 默认关**：它放松的是「群里只在被 @ 时才说话」这条默认约定（A 与 C 一起），
+  属于安全面（§5.5）。默认值、README 的配置表与「安全提醒」三处要一起改。
+- **`/reset` 要清 `groupChatter`**：不然新一轮的第一句就可能被上一轮的热度判成多人搭话。
 - **B 需要 `proactive: true`**：`scheduleChime` 的第一行就是总开关 —— 「允许它主动发消息」
-  只有一个开关，别让补一句绕过它。
+  只有一个开关，别让补一句绕过它；A 与 C 不需要 `proactive`（启动自述因此挪到了
+  `if (proactiveEnabled)` 块外面）。
 
 ### H. 会话轮次（`/reset` 开新一轮）
 
@@ -352,6 +378,43 @@ QQ 里发 /reset ─▶ handleEvent 的旁路（先 flushBatch）─▶ resetCon
   「统一」成一样的语义。判断点在 `handleEvent` 的 `/reset` 分支里、`flushBatch` **之前**：
   挪到后面会让没权限的人也拿到「攒着的消息立刻投出去」这个副作用。没权限时静默 return
   （不回「你没有权限」），那条消息已经由 `rememberTranscript` 记进转录了，保持这个顺序。
+
+### I. 每天轮换模型凭据（`apiKeyRotate`，默认开）
+
+```
+ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateApiKey()
+   ① 读 cwd 里的 apiKeyFile（默认 data/api-keys.txt）→ parseApiKeyPool
+        文件不存在 / 一行 key 都没有 → 记 info 说「该建在哪」，到此为止
+   ② ctx.get('credentials')：拿不到 set/resolve → 记 warn，到此为止
+   ③ credentials.describe(apiKeyRef) 说 writable === false（key 来自启动环境）→ 记 warn，到此为止
+   ④ credentials.resolve(apiKeyRef) 拿当前 key → 决定候选顺序
+        从「当前 key 在池子里的下一个」开始绕圈；当前 key 不在池子里就从池首开始
+   ⑤ 逐个候选 probeApiKey(apiKeyProbeUrl)：GET，2xx 才算能用（429 = 有效但没额度）
+        第一个通过的 → credentials.set(apiKeyRef, key) → 回读确认 → 记 info
+        全都不通过 → 记 warn，**保留原来的 key**
+```
+
+不能踩的：
+
+- **必须走 `ctx.credentials`，别自己去改 `$DSH_HOME/.credentials.yaml`**：那个文档里还有
+  浏览器会话等 records，手写一份很容易弄丢；凭据层自己带文件锁与写后通知。它监听该文件，
+  所以 `set()` 之后**不用重启**，下一个模型请求就用新 key（llm-deepseek 每次请求都 resolve）。
+- **`ctx.get('credentials')` 而不是把它写进 `inject`**：cordis 的 `ctx.get()` 明确允许
+  「读一个没声明依赖的服务」，拿不到就返回 undefined。写进 `inject` 会让**没有凭据服务的
+  组合整个插件不激活**（§10 第一条那种事故），而轮换只是顺带的事。
+- **探测必须便宜且不消耗 token**：所以是 `GET /models`，不是发一次真对话。两个鉴权头
+  （`Authorization: Bearer` + `x-api-key`）一起带，是为了同时兼容同一家的 OpenAI 面与
+  Anthropic 面；别只留一个。
+- **日志里绝不能出现完整 key**：用模块级 `apiKeyFingerprint`（前 6 字符 + sha256 前 8 位）。
+  新增任何打日志的地方都走它。
+- **「当前是哪个 key」是现算的，不落盘**：靠 `credentials.resolve` + 池子里的位置决定下一个。
+  别加一个「上次换到第几个」的内存/磁盘状态 —— 重启、手工改 key、调整池子顺序都会让它跑偏。
+- **不通过探测就不写**：池子里混进坏 key 时，宁可什么都不做也不能把 bot 换成不可用的状态；
+  这也是「尝试轮换」里「尝试」二字的全部含义。
+- **key 来自环境变量时提前退场**：环境变量优先级高于凭据文件，写进去也不生效；
+  `describe()` 返回 `writable: false` 就是这个信号。
+- **池子文件必须在 `cwd` 内**（`insideDirectory` 校验，与 `mediaDir` / `memoryDir` 同套路），
+  配到外面记 warn 并整个停用；默认路径 `data/api-keys.txt` 已被 `.gitignore` 盖住。
 
 ## 5. 必须知道的硬约束
 
@@ -406,13 +469,14 @@ QQ 里发 /reset ─▶ handleEvent 的旁路（先 flushBatch）─▶ resetCon
 | 改「两张图算不算同一张」 | `perceptual.js`（指纹方案与阈值校准都写在文件头和 README「表情包那半边的账要算清」里）+ `Config.repeatImageTolerance` |
 | 改主动说话的闸门 / 文案 | index.js 的主动说话区块（`proactiveSweep` / `proactiveEligible` / `proactiveNudge`）+ `Config` 的 `proactive*` + README「偶尔主动说话」（见 §4.F） |
 | 改主动说话的时段语义 | `withinActiveHours`（**模块级纯函数**，导出给测试用）+ 它的边界用例 |
-| 改「聊起来之后保持搭话」 | index.js 的活跃对话区块（`activeFollowAllows` / `scheduleChime` / `runChime` / `chimeNudge`）+ `admit` 里那条免 @ 分支 + `Config` 的 `active*` + README「聊起来之后保持搭话」（见 §4.G） |
-| 改「谁算在跟它聊」 | `chatterSeq` / `activeSeq` 那套序号比较（`noteActiveMessage` / `activeFollowAllows` / `runChime`）—— 别改成时间戳，它判的是「有没有人插话」 |
+| 改「聊起来之后保持搭话」 | index.js 的活跃对话区块（`activeFollowAllows` / `groupTalkActive` / `recordGroupChatter` / `batchScale` / `scheduleChime` / `runChime` / `chimeNudge`）+ `admit` 里那两条免 @ 分支 + `holdForBatch` 的倾听倍数 + `Config` 的 `active*` + README「聊起来之后保持搭话」（见 §4.G） |
+| 改「谁算在跟它聊」 | 一对一：`chatterSeq` / `activeSeq` 那套序号比较（`noteActiveMessage` / `activeFollowAllows` / `runChime`）—— 别改成时间戳，它判的是「有没有人插话」；多人搭话：`groupChatter` 的时间窗口（`recordGroupChatter` / `groupTalkActive`）—— 别改成序号，它判的是「最近够不够热」 |
 | 改 `/reset` 的行为（轮次的算法 / 标记落盘 / 清哪些记账） | `sessionIdFor` + `resetConversation` + `resetMarkerDir` / `loadConversationResetCounts`（见 §4.H、§5.3、§5.4） |
 | 改「谁能重置会话」 | `Config.resetUsers` + `canReset` + `handleEvent` 里的 `/reset` 分支（**空白名单 = 谁都不能**，别改成 `allowUsers` 那种语义）+ README「新开一轮会话」 |
 | 改 QQ 会话能用哪些工具 | `cordis.patch.yml` 的 `preset-qq` + `Config.allowTools`（见 §7） |
 | 改长期记忆的行为 | `Config` 的 `memory*` / `digest*` + index.js 的记忆区块 + README「长期记忆」 |
 | 改摘要的触发时刻 | `digestAtHour` + `msUntilDailyHour`（模块级纯函数）+ `runDigestSweep` 的日期判据 |
+| 改 API key 轮换（池子格式 / 探测 / 什么时候换） | `Config` 的 `apiKeyRotate*` + index.js 的凭据轮换区块（`rotateApiKey` / `probeApiKey`）+ 模块级 `parseApiKeyPool` / `apiKeyFingerprint` + README「每天轮换 API key」（见 §4.I） |
 | 改摘要/学梗的流程（提示词） | `.dsh/skills/` 里的 SKILL.md（改完**不用重启**，watcher 会重载） |
 | 加一个 skill | 新建 `.dsh/skills/<kebab-name>/SKILL.md`（frontmatter 必填 `name` + `description`），并把 `skill` 留在 allowTools 里 |
 
@@ -454,10 +518,10 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 改完按它核对要不要补用例。
 
 - 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**
-  （当前基线：`test/` 下 155 个用例全过，约 30 秒）。
+  （当前基线：`test/` 下 171 个用例全过，约 30 秒）。
 - 加行为就加用例，并在用例名/注释里用中文写清意图。
 - 纯函数（`onebot.js` 里的拆分/延迟/采集/`mentionsOthers`、`image.js`、`media.js`、
-  `perceptual.js`、`index.js` 里导出的 `withinActiveHours`）尽量单独测边界。
+  `perceptual.js`、`index.js` 里导出的 `withinActiveHours` / `parseApiKeyPool`）尽量单独测边界。
 - 图片指纹的用例在 `test/perceptual.test.mjs`（fixture 是 `test/image-fixtures.mjs` 里的真
   编码字节）。**改 `perceptual.js` 或复读的图片判定必跑它**：那里钉住了「同一张画面的十种
   编码指纹逐位一致」「同一套画风换掉文字必须判成两张」（真实世界最容易误判的一类）以及
@@ -469,11 +533,16 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
   `timers.fireInterval()`）；它们靠把 `digestMinLines` 抬到 9999 来隔离摘要循环 ——
   假 timer 的 `fireInterval()` 会唤醒**所有**周期定时器。**改主动说话必跑它们。**
 - 活跃对话的用例在 `test/bridge.test.mjs` **最末尾**（`bootActive()` 把免 @ 接话打开、
-  把补一句的静默门槛压到几十毫秒）。**改 `admit` 的触发判定或补一句必跑它们。**
+  把补一句的静默门槛压到几十毫秒）。**改 `admit` 的触发判定、`groupTalkActive`、
+  `batchScale` 或补一句必跑它们。**
 - `/reset` 的用例（「攒批先投出去」「换成新一轮的 id 而旧会话留在磁盘上」「重开进程后
   仍停在同一轮」「轮到代次相关的记账都清干净」「只有 resetUsers 里的人能用，别人连会话
   都开不出来」）在 `test/bridge.test.mjs` 里散着几处，搜 `reset` 就能找到。
   **改 `sessionIdFor` / `resetConversation` / `canReset` 必跑它们。**
+- API key 轮换的用例在 `test/bridge.test.mjs` **最后**（`bootKeyRotation` + 假凭据服务
+  `fakeCredentials` + 假探测端点 `startProbeServer`）：跳过探测失败的候选、全失败就保留原值、
+  环境变量提供的凭据提前退场、没有凭据服务只记 warn、池子越界停用、默认开 / 显式关、
+  以及「日志里不出现完整 key」。**改 `rotateApiKey` / `probeApiKey` / `parseApiKeyPool` 必跑它们。**
 - **插件进程本身不归测试管**，改完记得重启（§5.1）再看真实效果。
 
 ## 9. 改完的检查清单
