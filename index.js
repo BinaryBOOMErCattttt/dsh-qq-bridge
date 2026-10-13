@@ -40,6 +40,17 @@ import { createJmService, parseJmRef } from './jm.js';
 import { registerQqTools } from './tools.js';
 import { createSettings, MAX_TIMER_MS } from './settings.js';
 import { createChatter } from './chatter.js';
+import {
+  activeFollowAllows as activeFollowAllowsRule,
+  activeTurnsLeft as activeTurnsLeftRule,
+  batchCap as batchCapRule,
+  batchScale as batchScaleRule,
+  batchWindow as batchWindowRule,
+  chimeAllows,
+  chimeDelay as chimeDelayRule,
+  proactiveEligible as proactiveEligibleRule,
+  proactiveSkip,
+} from './speaking-rules.js';
 import { createMemory } from './memory.js';
 import {
   apiKeyFingerprint,
@@ -2157,39 +2168,31 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 这个群现在值不值得主动搭一句话。五道闸门，缺一不可：
+   * 这个群现在值不值得主动搭一句话。
    *
-   *   1. **只群聊**（`conversation.type === 'group'`）—— 私聊不打扰；
-   *   2. **没有正在进行的对话**：攒批里有待投的消息、或者有 turn 在飞，都不插嘴；
-   *   3. **安静够久**（`proactiveIdleMs`）：群里刚才还在聊，就不该轮到它开口；
-   *   4. **不是独白**：上一次说话之后一直没人接话，就不再自说自话
-   *      （`lastBotSpeakAt >= lastActiveAt` 就是这种情况）；
-   *   5. **不算诈尸**：`proactiveFreshMs` 之内还有人说过话的群才搭；隔了好几天的
-   *      冷群突然冒一句最吓人。
-   *
-   * 外加两个节奏闸：同一个群两次主动说话至少隔 `proactiveGapMs`，一天不超过
-   * `proactiveDailyMax` 次。**时段**（`proactiveFromHour` / `proactiveToHour`）与概率
-   * 不在这里 —— 那是整轮检查的性质，在 `proactiveSweep` 里判一次。
-   *
+   * 判据本身（五道闸门 + 两个节奏闸）在 `speaking-rules.js` 的 `proactiveEligible` 里，
+   * 那里能用普通入参直接验；这里只做一件事：把会话记录与配置凑成那份入参。
    * @param conversation - 候选会话。
    * @param now - 当前时刻（毫秒）。
    * @returns 可以开口时为 true。
    */
   function proactiveEligible(conversation, now) {
-    if (conversation.type !== 'group') return false;
-    if (conversation.pending.length > 0 || conversation.batchTimer !== undefined) return false;
-    if (busyWithTurn(conversation)) return false;
-    const lastActive = Number(conversation.lastActiveAt) || 0;
-    // 从来没人在这个群说过话（例如会话是被出站工具建出来的壳）就没有可搭的话头。
-    if (lastActive <= 0 || now < lastActive) return false;
-    // 独白：上一条是我说的，之后没人接话。
-    if ((Number(conversation.lastBotSpeakAt) || 0) >= lastActive) return false;
-    if (now - lastActive < settings.proactiveIdleMs) return false;
-    const freshMs = settings.proactiveFreshMs;
-    if (freshMs > 0 && now - lastActive > freshMs) return false;
-    const gapMs = settings.proactiveGapMs;
-    if ((Number(conversation.lastProactiveAt) || 0) > 0 && now - conversation.lastProactiveAt < gapMs) return false;
-    return proactiveTodayCount(conversation) < settings.proactiveDailyMax;
+    return proactiveEligibleRule({
+      type: conversation.type,
+      hasQueuedBatch: conversation.pending.length > 0 || conversation.batchTimer !== undefined,
+      busy: busyWithTurn(conversation),
+      lastActiveAt: conversation.lastActiveAt,
+      lastBotSpeakAt: conversation.lastBotSpeakAt,
+      lastProactiveAt: conversation.lastProactiveAt,
+      // 这个读数带「跨天就地归零」的副作用，所以只有走到这里才取 —— 判据本身是纯的，
+      // 取数这一步不是。
+      todayCount: proactiveTodayCount(conversation),
+      now,
+      idleMs: settings.proactiveIdleMs,
+      freshMs: settings.proactiveFreshMs,
+      gapMs: settings.proactiveGapMs,
+      dailyMax: settings.proactiveDailyMax,
+    });
   }
 
   /**
@@ -2233,13 +2236,6 @@ export function apply(ctx, config) {
    * @param text - 这一轮的回复正文。
    * @returns 整条都不该发出去时为 true。
    */
-  function proactiveSkip(text) {
-    const first = String(text ?? '')
-      .split('\n')
-      .find((line) => line.trim().length > 0) ?? '';
-    return /^[(（[\s]*skip\b/i.test(first.trim());
-  }
-
   /**
    * 让机器人主动开口：伪造一条 user message 投进**它自己那个会话**，回复照常发回群里。
    *
@@ -2337,8 +2333,7 @@ export function apply(ctx, config) {
 
   /** 免 @ 接话的轮数还有余额吗（`activeMaxTurns` 为 0 表示不限）。 */
   function activeTurnsLeft(conversation) {
-    const maxTurns = settings.activeMaxTurns;
-    return maxTurns <= 0 || (Number(conversation.activeTurns) || 0) < maxTurns;
+    return activeTurnsLeftRule(settings.activeMaxTurns, conversation.activeTurns);
   }
 
 
@@ -2390,17 +2385,11 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 这条**没被叫到**的群消息能不能算「接着聊」（`activeFollow`）。
+   * 这条**没被叫到**的群消息能不能算「接着聊」（见 AGENTS.md §4.G 的 A 路）。
    *
-   * 四条同时成立才算，缺一条都不理它 —— 这一步放松的是「群里只在被 @ 时才说话」这条
-   * 默认约定，宁可少接一句也别抢话：
-   *   1. 说话的就是**正在跟它聊的那个人**（别人插一句不该被它抢答）；
-   *   2. 还在窗口内（`activeWindowMs`，每接一句往后滑）；
-   *   3. 这次对话里免 @ 接的轮数还没到 `activeMaxTurns`；
-   *   4. 中间**没有别人说过话**（群里插了话，这次一对一就断了，得重新 @ 它 —— 除非那一句
-   *      把群聊推过了 `activeGroupLines`，那时走的是多人搭话，见 `groupTalkActive`）；
-   *   5. 这句没有 @ 别人（`@别人` / `@全体` 明确不是跟它说的）。
-   *
+   * 七条判据在 `speaking-rules.js` 的 `activeFollowAllows` 里（那里逐条写着为什么）；
+   * 这里只把会话状态、插话序号与配置凑成那份入参。这一步放松的是「群里只在被 @ 时
+   * 才说话」这条默认约定，宁可少接一句也别抢话。
    * @param conversation - 已有的会话记录。
    * @param userId - 发消息的人。
    * @param message - OneBot 的 `message` 字段。
@@ -2408,18 +2397,19 @@ export function apply(ctx, config) {
    * @returns 可以当「接话」时为 true。
    */
   function activeFollowAllows(conversation, userId, message, selfId) {
-    if (settings.activeFollow !== true) return false;
-    if (settings.activeWindowMs <= 0) return false;
-    // 私聊不需要「免 @」：那边的每条消息本来就都是跟它说的。
-    if (conversation.type !== 'group') return false;
-    if (String(conversation.activeSpeakerId ?? '') !== String(userId)) return false;
-    if ((Number(conversation.activeUntil) || 0) <= Date.now()) return false;
-    if (!activeTurnsLeft(conversation)) return false;
-    // 快照停在上一次接话那条上；这里已经比它大 1 以上就说明中间有人插过话
-    // （当前这条自己会把序号 +1，所以「紧跟着的下一条」正好是 +1）。
-    if (chatter.others(conversation.id) > (Number(conversation.activeInterposeSeq) || 0) + 1) return false;
-    if (mentionsOthers(message, selfId)) return false;
-    return true;
+    return activeFollowAllowsRule({
+      enabled: settings.activeFollow === true,
+      windowMs: settings.activeWindowMs,
+      type: conversation.type,
+      speakerId: conversation.activeSpeakerId,
+      userId,
+      activeUntil: conversation.activeUntil,
+      turnsLeft: activeTurnsLeft(conversation),
+      interposeOthers: chatter.others(conversation.id),
+      interposeSnapshot: conversation.activeInterposeSeq,
+      mentionsOthers: mentionsOthers(message, selfId),
+      now: Date.now(),
+    });
   }
 
   /**
@@ -2443,9 +2433,7 @@ export function apply(ctx, config) {
    * 掐着表 20 秒整补一句比不补还像机器人；复用打字延迟那个抖动比例，不额外加配置。
    */
   function chimeDelay() {
-    const idle = settings.activeChimeIdleMs;
-    const jitter = Math.min(1, Math.max(0, Number(settings.delayJitter) || 0));
-    return Math.max(500, Math.round(idle * (1 + (Math.random() * 2 - 1) * jitter)));
+    return chimeDelayRule(settings.activeChimeIdleMs, settings.delayJitter, Math.random());
   }
 
   /**
@@ -2497,21 +2485,28 @@ export function apply(ctx, config) {
    * @param seq - 挂这个定时器时的编号（对不上说明已经被取代）。
    */
   function runChime(conversation, seq) {
-    if (conversation.chimeSeq !== seq) return;
-    if (!proactiveEnabled) return;
     const now = Date.now();
-    if ((Number(conversation.activeUntil) || 0) <= now) return;
-    if (conversation.pending.length > 0 || conversation.batchTimer !== undefined) return;
-    if (busyWithTurn(conversation)) return;
-    const max = settings.activeChimeMax;
-    if (max > 0 && (conversation.chimeCount ?? 0) >= max) return;
-    const dailyMax = settings.activeChimeDailyMax;
-    if (dailyMax > 0 && chimeTodayUsed(conversation) >= dailyMax) return;
-    if ((Number(conversation.lastBotSpeakAt) || 0) <= (Number(conversation.lastActiveAt) || 0)) return;
-    // 群里中间又有人说话了：那不是接在我这句后面的事，插进去就是抢话。
-    if (conversation.type === 'group' && chatter.others(conversation.id) !== (Number(conversation.activeInterposeSeq) || 0)) return;
-    const chance = Math.min(1, Math.max(0, Number(settings.proactiveChance)));
-    if (!(chance > 0) || !(Math.random() < chance)) return;
+    const allowed = chimeAllows({
+      seqMatches: conversation.chimeSeq === seq,
+      proactiveEnabled,
+      now,
+      activeUntil: conversation.activeUntil,
+      hasQueuedBatch: conversation.pending.length > 0 || conversation.batchTimer !== undefined,
+      busy: busyWithTurn(conversation),
+      chimeCount: conversation.chimeCount,
+      chimeMax: settings.activeChimeMax,
+      // 同 proactiveEligible 的 todayCount：这个读数带跨天归零的副作用，走到这里才取。
+      chimeToday: chimeTodayUsed(conversation),
+      chimeDailyMax: settings.activeChimeDailyMax,
+      lastBotSpeakAt: conversation.lastBotSpeakAt,
+      lastActiveAt: conversation.lastActiveAt,
+      type: conversation.type,
+      interposeOthers: chatter.others(conversation.id),
+      interposeSnapshot: conversation.activeInterposeSeq,
+      chance: settings.proactiveChance,
+      roll: Math.random(),
+    });
+    if (!allowed) return;
     chimeSpeak(conversation, now);
   }
 
@@ -2711,23 +2706,20 @@ export function apply(ctx, config) {
    * @returns 倍数（≥1）。
    */
   function batchScale(conversation) {
+    // 私聊一律不放大（那边是「它正在跟你说话」，等太久像掉线）；先判类型再查热度，
+    // 私聊连那次热度查询都省掉。
     if (conversation?.type !== 'group') return 1;
-    if (!groupTalkActive(conversation.id)) return 1;
-    return settings.activeGroupBatchScale;
+    return batchScaleRule('group', groupTalkActive(conversation.id), settings.activeGroupBatchScale);
   }
 
   /** 攒批窗口（毫秒）；配置非法或为 0 时返回 0，表示关闭攒批、来一条回一条。 */
   function batchWindow(scale) {
-    const raw = Math.floor(Number(settings.batchWindowMs));
-    if (!(Number.isFinite(raw) && raw > 0)) return 0;
-    return Math.max(1, Math.round(raw * scale));
+    return batchWindowRule(settings.batchWindowMs, scale);
   }
 
   /** 一批最多等多久（毫秒）。配置比窗口还小时没有意义，按下限（= 窗口）算；与窗口同倍放大。 */
   function batchCap(window, scale) {
-    const raw = Math.floor(Number(settings.batchMaxWaitMs));
-    const scaled = Number.isFinite(raw) && raw > 0 ? Math.round(raw * scale) : 0;
-    return scaled > window ? scaled : window;
+    return batchCapRule(settings.batchMaxWaitMs, window, scale);
   }
 
   /**

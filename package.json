@@ -18,6 +18,7 @@
     "filestore.js",
     "util.js",
     "chatter.js",
+    "speaking-rules.js",
     "memory.js",
     "config.js",
     "tools.js",
