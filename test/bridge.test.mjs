@@ -467,7 +467,14 @@ function privateMessageWithReply(text, quotedId) {
   };
 }
 
-/** 造一条群聊入站事件；`messageId` 用于验证引用回复。 */
+/**
+ * 造一条群聊入站事件；`messageId` 用于验证引用回复。
+ *
+ * `name`（昵称）与 `card`（群名片）**刻意给成两个不同的值**，别顺手统一：
+ * 群聊正文取的是 `sender.card ?? sender.nickname`（index.js 的 userName），
+ * 私聊取的是 `sender.nickname ?? sender.card`。两者一样的话，「群里显示名片、
+ * 私聊显示昵称」这条优先级就再也测不出来了 —— 断言依然会绿，但没在验东西。
+ */
 function groupMessage(segments, { userId = 100000003, name = 'tomori', card = 'kaguya', messageId = 7000 } = {}) {
   return {
     post_type: 'message',
@@ -1371,7 +1378,7 @@ test('the reset command only works for accounts listed in resetUsers', async () 
       post_type: 'message',
       message_type: 'private',
       user_id: 999,
-      sender: { nickname: '路人' },
+      sender: { nickname: 'soyo' },
       message: [{ type: 'text', data: { text: '/reset' } }],
     });
     await settle(600); // 超过 batchMaxWaitMs，够攒批自然投出去了
@@ -1401,7 +1408,7 @@ test('in a group the reset permission follows the speaker, not the group', async
   try {
     // 群里另一个人 @它发 /reset：不是指令（没权限），也不会被当成一句话投给模型 ——
     // 它只是被静默丢掉，所以不会凭空建出一个会话。
-    onebot.push(mention('/reset', { userId: 10001, card: '路人' }));
+    onebot.push(mention('/reset', { userId: 10001, card: 'soyo' }));
     await settle(200);
     assert.equal(onebot.calls.some((call) => call.action === 'send_group_msg'), false, 'no reply for the stranger');
     assert.equal(host.list.created.length, 0, 'the stranger must not open a session either');
@@ -1675,7 +1682,7 @@ test('the bot repeats once and then waits for a fresh pair', async () => {
     assert.deepEqual(sentTexts(onebot), ['6']);
 
     // 再来一条相同的消息才又攒够一对。
-    onebot.push(groupText('6', { userId: 5555555555, name: '路人', card: '路人', messageId: 93 }));
+    onebot.push(groupText('6', { userId: 5555555555, name: 'anon', card: 'anon', messageId: 93 }));
     await until(() => sentTexts(onebot).length === 2, 'the second repeat');
     assert.deepEqual(sentTexts(onebot), ['6', '6']);
   } finally {
@@ -1728,7 +1735,7 @@ test('the echo stays inside allowed groups and out of private chat', async () =>
       group_id: 555555555,
       user_id: userId,
       message_id: messageId,
-      sender: { nickname: '路人' },
+      sender: { nickname: 'soyo' },
       message: [{ type: 'text', data: { text: '6' } }],
     });
     onebot.push(other(110, 10001));
@@ -1834,7 +1841,7 @@ test('two different stickers do not repeat, and a sticker breaks a text chain', 
     // 「6」→ 一张图 →「6」：中间那张图让前后两个 6 不再连着。
     onebot.push(groupText('6', { messageId: 152 }));
     onebot.push(groupSticker(first.url(), { messageId: 153, userId: 4444444444, card: 'mutsumi' }));
-    onebot.push(groupText('6', { messageId: 154, userId: 5555555555, card: '路人' }));
+    onebot.push(groupText('6', { messageId: 154, userId: 5555555555, card: 'anon' }));
     await settle(200);
     assert.deepEqual(sentTexts(onebot), []);
   } finally {
@@ -3250,7 +3257,7 @@ function localDateOf(date = new Date()) {
 test('every incoming message is appended to the transcript, including ambient group chatter', async () => {
   const { onebot, host, cwd } = await bootMemory();
   onebot.push(privateMessage('第一条'));
-  onebot.push(groupMessage([{ type: 'text', data: { text: '他们聊他们的' } }], { messageId: 7001, userId: 10001, card: '路人' }));
+  onebot.push(groupMessage([{ type: 'text', data: { text: '他们聊他们的' } }], { messageId: 7001, userId: 10001, card: 'soyo' }));
   onebot.push(mention('机器人你好'));
 
   const agent = await until(() => host.list.created[0], 'the conversation Agent to be created');
@@ -3272,7 +3279,7 @@ test('every incoming message is appended to the transcript, including ambient gr
     return parsed.length >= 2 ? parsed : undefined;
   }, 'both group messages to be written to the transcript');
   assert.deepEqual(groupLines.map((line) => line.addressed), [false, true]);
-  assert.equal(groupLines[0].name, '路人');
+  assert.equal(groupLines[0].name, 'soyo');
 
   // 旧的硬约束不变量：没被 @ 的群消息不该让这个群出现在「处理过的会话」表里。
   const list = await host.tools.get('qq_list_conversations').execute({}, {});
@@ -3564,9 +3571,9 @@ async function groupWhereBotSpoke(onebot, host, botReply = '在的') {
   return agent;
 }
 
-/** 一个路人在群里说一句（没 @ 机器人）—— 「群里还有人说话」的信号。 */
+/** 另一个群友在群里说一句（没 @ 机器人）—— 「群里还有人说话」的信号。 */
 async function groupChatter(onebot, text = '今晚吃啥', { messageId = 7001 } = {}) {
-  onebot.push(groupText(text, { messageId, userId: 10001, card: '路人' }));
+  onebot.push(groupText(text, { messageId, userId: 10001, card: 'soyo' }));
   await settle(80);
 }
 
@@ -3595,7 +3602,7 @@ test('proactive: the bot speaks up once a group has gone quiet, on the humanized
   assert.equal(agent.inbox.length, 1, 'the bot must not monologue after its own reply');
   assert.equal(sentTexts(onebot).length, 1);
 
-  // 路人的一句话之后才轮到它：这一轮是插件伪造的 user message，不是谁在跟它说话。
+  // 另一个群友说了一句之后才轮到它：这一轮是插件伪造的 user message，不是谁在跟它说话。
   await groupChatter(onebot);
   host.list.timers.fireInterval();
   await until(() => agent.inbox.length >= 2, 'a proactive turn to be submitted');
@@ -3858,7 +3865,7 @@ test('activeFollow: the person it was talking to can keep talking without anothe
   assert.equal(agent.inbox[1].content[0].text, '那你说呢');
 
   // 别人插一句不算：他没在跟它聊（闲聊也不该因此进 Agent）。
-  onebot.push(groupText('我先走了', { messageId: 7002, userId: 10001, card: '路人' }));
+  onebot.push(groupText('我先走了', { messageId: 7002, userId: 10001, card: 'soyo' }));
   await settle(60);
   assert.equal(agent.inbox.length, 2, 'a different person is not part of the exchange');
 });
@@ -3887,7 +3894,7 @@ test('activeFollow: a third party speaking in between ends the exchange', async 
   completeTurn(host, agent, '在的', 1);
   await until(() => sentTexts(onebot).length === 1, 'the reply');
 
-  onebot.push(groupText('你们聊', { messageId: 7001, userId: 10001, card: '路人' }));
+  onebot.push(groupText('你们聊', { messageId: 7001, userId: 10001, card: 'soyo' }));
   await settle(60);
   onebot.push(groupText('那你说呢', { messageId: 7002 }));
   await settle(80);
@@ -3954,13 +3961,13 @@ test('activeFollow: the window follows whoever spoke to it last', async () => {
   completeTurn(host, agent, '在的', 1);
   await until(() => sentTexts(onebot).length === 1, 'the first reply');
 
-  // 路人 也 @ 它：窗口换到 路人 身上。
-  onebot.push(mention('我也问一句', { userId: 10001, card: '路人', messageId: 7001 }));
+  // 另一个群友（soyo）也 @ 它：窗口换到 soyo 身上。
+  onebot.push(mention('我也问一句', { userId: 10001, card: 'soyo', messageId: 7001 }));
   await until(() => agent.inbox.length >= 2, 'the second mention');
   completeTurn(host, agent, '你说', 2);
   await until(() => sentTexts(onebot).length === 2, 'the second reply');
 
-  onebot.push(groupText('那然后呢', { messageId: 7002, userId: 10001, card: '路人' }));
+  onebot.push(groupText('那然后呢', { messageId: 7002, userId: 10001, card: 'soyo' }));
   await until(() => agent.inbox.length >= 3, 'the new speaker may continue');
   // 最早那个人回来了，但他已经不在窗口里。
   onebot.push(groupText('（我问的）', { messageId: 7003 }));
@@ -4045,7 +4052,7 @@ test('activeChime: somebody else speaking first keeps the bot from chiming in', 
   await until(() => sentTexts(onebot).length === 1, 'the reply');
 
   // 它正准备补一句的时候，群里别人先说话了 → 不插嘴。
-  onebot.push(groupText('那我先撤了', { messageId: 7001, userId: 10001, card: '路人' }));
+  onebot.push(groupText('那我先撤了', { messageId: 7001, userId: 10001, card: 'soyo' }));
   await settle(200);
   assert.equal(agent.inbox.length, 1, 'a third party breaks the lull');
 });
@@ -4188,18 +4195,18 @@ test('group talk: once a few people have been chatting, anyone can talk without 
 
   // 别人插话：一对一窗口认的是被 @ 的那个人，所以这两句都不该进去；但它们记进了
   // 「这个群最近聊了几句、几个人」，也就是搭话状态的门槛。
-  onebot.push(groupText('这个我也想知道', { messageId: 7101, userId: 10001, card: '路人甲' }));
-  onebot.push(groupText('+1', { messageId: 7102, userId: 10002, card: '路人乙' }));
+  onebot.push(groupText('这个我也想知道', { messageId: 7101, userId: 10001, card: 'soyo' }));
+  onebot.push(groupText('+1', { messageId: 7102, userId: 10002, card: 'rana' }));
   await settle(60);
   assert.equal(agent.inbox.length, 1, 'below the threshold a stranger is still not part of the exchange');
 
   // 第 4 句（@ 的那条 + 这 3 条）踩到门槛：从这一条起群聊算「热起来了」，谁接话都算。
-  onebot.push(groupText('那到底行不行', { messageId: 7103, userId: 10001, card: '路人甲' }));
+  onebot.push(groupText('那到底行不行', { messageId: 7103, userId: 10001, card: 'soyo' }));
   await until(() => agent.inbox.length >= 2, 'the group talk message to reach the Agent');
   assert.equal(agent.inbox[1].content[0].text, '那到底行不行');
 
   // 门槛过了之后，换一个人、甚至同一个人再说，都还在搭话状态里。
-  onebot.push(groupText('我觉得行', { messageId: 7104, userId: 10002, card: '路人乙' }));
+  onebot.push(groupText('我觉得行', { messageId: 7104, userId: 10002, card: 'rana' }));
   await until(() => agent.inbox.length >= 3, 'another speaker to be admitted as well');
 });
 
@@ -4215,7 +4222,7 @@ test('group talk: one person talking a lot is not a conversation', async () => {
   // 同一个人连发 6 句：条数远超 3，但说过话的只有「@ 它的那位」和「这个人」两个人，
   // 不够 activeGroupSpeakers: 3。
   for (let i = 0; i < 6; i += 1) {
-    onebot.push(groupText(`第 ${i} 句`, { messageId: 7200 + i, userId: 10001, card: '路人甲' }));
+    onebot.push(groupText(`第 ${i} 句`, { messageId: 7200 + i, userId: 10001, card: 'soyo' }));
   }
   await settle(80);
   assert.equal(agent.inbox.length, 1, 'a single person spamming must not open group talk');
@@ -4236,10 +4243,10 @@ test('group talk: it listens longer before answering', async () => {
   completeTurn(host, agent, '在的', 1);
   await until(() => sentTexts(onebot).length === 1, 'the reply');
 
-  onebot.push(groupText('这家伙谁啊', { messageId: 7301, userId: 10001, card: '路人甲' }));
-  onebot.push(groupText('不知道', { messageId: 7302, userId: 10002, card: '路人乙' }));
+  onebot.push(groupText('这家伙谁啊', { messageId: 7301, userId: 10001, card: 'soyo' }));
+  onebot.push(groupText('不知道', { messageId: 7302, userId: 10002, card: 'rana' }));
   // 第 4 句（@ 的那条 + 这 3 条）踩到门槛：这一条起攒批窗口从 80ms 变成 80×6 = 480ms。
-  onebot.push(groupText('问问他', { messageId: 7303, userId: 10001, card: '路人甲' }));
+  onebot.push(groupText('问问他', { messageId: 7303, userId: 10001, card: 'soyo' }));
   // 200ms 早就超过不放大时的 80ms，但还不到放大后的 480ms —— 说明它还在听。
   await settle(200);
   assert.equal(agent.inbox.length, 1, 'in group talk it keeps listening instead of cutting a batch short');
@@ -4262,9 +4269,9 @@ test('group talk needs activeFollow: the default still requires a mention', asyn
   completeTurn(host, agent, '在的', 1);
   await until(() => sentTexts(onebot).length === 1, 'the reply');
 
-  onebot.push(groupText('甲', { messageId: 7401, userId: 10001, card: '路人甲' }));
-  onebot.push(groupText('乙', { messageId: 7402, userId: 10002, card: '路人乙' }));
-  onebot.push(groupText('丙', { messageId: 7403, userId: 10001, card: '路人甲' }));
+  onebot.push(groupText('甲', { messageId: 7401, userId: 10001, card: 'soyo' }));
+  onebot.push(groupText('乙', { messageId: 7402, userId: 10002, card: 'rana' }));
+  onebot.push(groupText('丙', { messageId: 7403, userId: 10001, card: 'soyo' }));
   await settle(80);
   assert.equal(agent.inbox.length, 1, 'with activeFollow off the group talk gate stays shut');
 });
@@ -4279,7 +4286,7 @@ test('/reset forgets the group talk window as well', async () => {
   await until(() => sentTexts(onebot).length === 1, 'the reply');
 
   // 别人插一句：此刻窗口里是「@ 的那条 + 这一条」= 2 条，还差一条到门槛。
-  onebot.push(groupText('插一句', { messageId: 7501, userId: 10001, card: '路人甲' }));
+  onebot.push(groupText('插一句', { messageId: 7501, userId: 10001, card: 'soyo' }));
   await settle(40);
   // 明确 @ 它发 /reset：这条自己会把窗口顶到 3 条，正因为如此才要看 /reset 有没有清掉它。
   onebot.push(mention('/reset', { messageId: 7502 }));
@@ -4291,7 +4298,7 @@ test('/reset forgets the group talk window as well', async () => {
 
   // 若窗口没被清掉，这一条就是第 4 条（够条数、够人数），会开一个新 Agent 去接；
   // 「没有第二个 Agent」就是「群聊热度确实忘了」的证据。
-  onebot.push(groupText('还在吗', { messageId: 7503, userId: 10001, card: '路人甲' }));
+  onebot.push(groupText('还在吗', { messageId: 7503, userId: 10001, card: 'soyo' }));
   await settle(80);
   assert.equal(host.list.created.length, 1, 'the old heat must not carry into the new round');
 });
