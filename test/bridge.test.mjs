@@ -19,7 +19,7 @@ import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import yaml from 'js-yaml';
 import { Config, apply, inject, parseApiKeyPool, sessionIdFor, withinActiveHours } from '../index.js';
-import { collectMedia, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
+import { blankMessageLabel, collectMedia, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
 import { OTHER_PNG, PIC_JPEG, PIC_PNG } from './image-fixtures.mjs';
@@ -710,6 +710,97 @@ test('a group message only reaches the Agent when the bot is mentioned', async (
     const sent = await until(() => onebot.calls.find((call) => call.action === 'send_group_msg'), 'the group reply');
     assert.equal(sent.params.group_id, '100000001');
     assert.equal(sent.params.message, '在的');
+  } finally {
+    await onebot.close();
+  }
+});
+
+// ---- 空消息（单纯的 @ / 一个空格）-----------------------------------------------------
+//
+// 这一组的前提是「没有正文不等于没有说话」：`@bot` 一下、或者私聊发一个空格，都是明确
+// 点了它却又什么都没写。旧行为是 `admit` 直接丢掉，现在照常投给模型、只在正文位置放一句
+// 说明，由它看着上下文决定回「？」、发张表情还是接上一句（`blankReply: false` 可关回旧行为）。
+
+/** 空消息的替身文案是模块级纯函数，先钉住三种情形的措辞。 */
+test('blankMessageLabel：群里被 @ / 群里没被 @ / 私聊，三种情形分开说', () => {
+  assert.equal(blankMessageLabel({ group: true, mentionedMe: true }), '（@了你一下，没有说别的）');
+  assert.equal(blankMessageLabel({ group: true, mentionedMe: false }), '（一条空消息，没有正文）');
+  assert.equal(blankMessageLabel({ group: false }), '（对方发来一条空消息，什么都没写）');
+  // 缺省/非法入参按「私聊的普通空消息」处理，不能抛错也不能给出空串（那等于没兜住）。
+  assert.equal(blankMessageLabel(), '（对方发来一条空消息，什么都没写）');
+  assert.equal(blankMessageLabel({ group: true }), '（一条空消息，没有正文）');
+});
+
+/** 群里单纯 @ 一下：照常开一轮，模型看到的是「@ 了你一下，没有说别的」。 */
+test('a bare @ still reaches the Agent with a note instead of being dropped', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(mention(''));
+    const agent = await until(() => host.list.created[0], 'the bare mention to create the Agent');
+    assert.equal(agent.inbox[0].content[0].text, '（@了你一下，没有说别的）');
+
+    // 一轮正常的回复照常发得出去（模型回个「？」是最自然的反应）。
+    completeTurn(host, agent, '？', 1);
+    assert.equal(await until(() => sentTexts(onebot)[0], 'the reply to a bare mention'), '？');
+  } finally {
+    await onebot.close();
+  }
+});
+
+/** 只有空白字符（或者只有 @ + 空格）同样算空消息：`trim` 之后什么都不剩。 */
+test('whitespace-only group messages count as blank, and groupTrigger: all says so plainly', async () => {
+  const { onebot, host } = await boot({ groupTrigger: 'all' });
+  try {
+    // `all` 模式没有 @ 这回事，替身不该说「@ 了你一下」。
+    onebot.push(groupText('   '));
+    const agent = await until(() => host.list.created[0], 'the blank message to create the Agent');
+    assert.equal(agent.inbox[0].content[0].text, '（一条空消息，没有正文）');
+  } finally {
+    await onebot.close();
+  }
+});
+
+/** 私聊发一个空格：以前静默丢弃，现在交给模型（私聊的措辞与群聊不同）。 */
+test('a whitespace-only private message is answered instead of ignored', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(privateMessage('  '));
+    const agent = await until(() => host.list.created[0], 'the blank private message to create the Agent');
+    assert.equal(agent.inbox[0].content[0].text, '（对方发来一条空消息，什么都没写）');
+
+    completeTurn(host, agent, '？', 1);
+    const sent = await until(() => sentTexts(onebot, 'send_private_msg')[0], 'the private reply');
+    assert.equal(sent, '？');
+  } finally {
+    await onebot.close();
+  }
+});
+
+/** `blankReply: false` 回到旧行为：空消息一律静默丢弃，连会话都不建。 */
+test('blankReply: false restores dropping messages that have no text', async () => {
+  const { onebot, host } = await boot({ blankReply: false });
+  try {
+    onebot.push(mention(''));
+    onebot.push(privateMessage('   '));
+    await settle(150);
+    assert.equal(host.list.created.length, 0, '空消息不该建会话');
+    assert.deepEqual(sentTexts(onebot), []);
+    assert.deepEqual(sentTexts(onebot, 'send_private_msg'), []);
+  } finally {
+    await onebot.close();
+  }
+});
+
+/** 空消息不能被当成指令：`@bot` + `/jm …` 是两回事，空 @ 永远只走模型。 */
+test('a bare @ never reaches the /jm bypass', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(mention(''));
+    const agent = await until(() => host.list.created[0], 'the bare mention to create the Agent');
+    await settle(60);
+    assert.equal(agent.inbox[0].content[0].text, '（@了你一下，没有说别的）');
+    // 旁路会直接回一句「用法：…」并发文件；这里既没有那条回复，也没有任何 send_*。
+    assert.deepEqual(sentTexts(onebot), []);
   } finally {
     await onebot.close();
   }
@@ -3732,6 +3823,21 @@ test('mentionsOthers sees at-segments aimed at somebody else', () => {
   assert.equal(mentionsOthers([at('all'), text('大家看')], SELF_ID), true);
   assert.equal(mentionsOthers([at(''), text('空')], SELF_ID), false);
   assert.equal(mentionsOthers('纯字符串没有段', SELF_ID), false);
+});
+
+/** 活跃对话窗口里的空消息不算「接话」：那只是「他说了句话，正好没内容」，不能抢答。 */
+test('a blank message inside the active window does not count as a follow-up', async () => {
+  const { onebot, host } = await bootActive();
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+  await until(() => agent.inbox.length >= 1, 'the mention to reach the Agent');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply to go out');
+
+  // 同一个人接着发一个空格：窗口虽然热，但这句没有点它，不算接话。
+  onebot.push(groupText('   ', { messageId: 7001 }));
+  await settle(120);
+  assert.equal(agent.inbox.length, 1, '空白的「接话」不该被当成在跟它说话');
 });
 
 /** A：跟它聊的那个人接着说的话，不用再 @ 一次。 */

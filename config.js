@@ -24,6 +24,7 @@ export const Config = z.object({
   groupChat: z.boolean().default(true).description('是否响应 QQ 群消息'),
   groupTrigger: z.union(['mention', 'prefix', 'all']).default('mention').description('群消息触发方式：@机器人 / 前缀 / 全部消息（另外：被叫到之后的 activeWindowMs 内，同一个人接着说的话可以算作还在跟你聊，见 activeFollow）'),
   prefix: z.string().default('/').description('groupTrigger=prefix 时使用的前缀'),
+  blankReply: z.boolean().default(true).description('是否理会「没有正文」的消息：群里单纯 @ 它一下、或者私聊发一个空格 —— 这类消息照常交给模型（正文位置写明「@了你一下，没有说别的」/「发来一条空消息」），由它看着这段聊天的上下文决定回一句「？」、发张表情包、还是接上一句；false = 和以前一样静默丢弃（群里被人反复空 @ 时可以一键关掉）'),
   allowUsers: z.array(z.string()).default([]).description('私聊白名单（QQ 号）；留空表示不限制'),
   allowGroups: z.array(z.string()).default([]).description('群白名单（群号）；留空表示不限制'),
   provider: z.string().default('').description('QQ 会话使用的模型服务商；留空使用默认'),

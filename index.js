@@ -32,7 +32,7 @@ import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdir, readFile } from 'node:fs/promises';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { OneBotClient, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from './onebot.js';
+import { OneBotClient, blankMessageLabel, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from './onebot.js';
 import { createMediaStore } from './media.js';
 import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
@@ -1003,6 +1003,15 @@ export function apply(ctx, config) {
       '- 是 / 否题就回一个是 / 否：有人问「知不知道 / 会不会 / 有没有 / 是不是 / 能不能 / 行不行」这类是非题时，整条回复只写肯定或否定本身（「是」/「否」，口语就是「知道」「不知道」「会」「不会」，可以带点语气），**不要再接一句解释**；对方追问了再展开。',
       burstRule,
     );
+    // 空消息（单纯的 @、或者一个空格）现在也会走到这里，正文位置就是这么一句说明 ——
+    // 不解释的话模型会把它当成对方真的发了这串字，回一句「我没发这个啊」。同时点明
+    // 「怎么翻上下文」：群里看得到「群里最近的消息」，更早的用 qq_transcript 查，
+    // 只想表示「看到了 / 无语」时「？」或者一张表情就够了 —— 空 @ 不该换来一篇小作文。
+    if (settings.blankReply === true) {
+      lines.push(
+        '- 正文里出现 `（@了你一下，没有说别的）` / `（一条空消息，没有正文）` / `（对方发来一条空消息，什么都没写）` 时，说明对方**没有打字**，只是叫了你一声：别把这句说明当成对方说的话、也别反问「你发了什么」。想接就按上面的聊天记录（群里看「群里最近的消息」，更早的用 qq_transcript 查）接上一句或者回个「？」；也可以只发一张表情（见下），或者干脆想不出接什么。空 @ 不值得写一段话。',
+      );
+    }
     // 被白名单挡住的工具不能在提示里推荐，否则模型会去调用一个它根本看不见的工具。
     const recommended = ['qq_send_message', 'qq_list_conversations'].filter(
       (tool) => allowTools.length === 0 || allowTools.includes(tool),
@@ -1674,11 +1683,12 @@ export function apply(ctx, config) {
    * 网络：媒体落盘发生在 `handleEvent` 把它收进攒批队列之后。返回的 `message` 是原始
    * 消息段数组，真正的正文由调用方在媒体落盘后用 `messageToText(message, selfId, media)`
    * 再渲染一次；`preview` 是此刻（媒体还没落盘、只有占位符）的正文，只用来同步判定
-   * `/reset` 这类指令。
+   * `/reset` 这类指令，以及在「一条空消息」时给出那句说明（见 `blankReply`）。
    * @param event - 已解码的 OneBot 事件。
    * @param selfId - 机器人自己的 QQ 号。
-   * @returns `{ conversation, message, preview, quote, continued }`；该丢弃时为 undefined。
+   * @returns `{ conversation, message, preview, blankBody, quote, continued }`；该丢弃时为 undefined。
    *   `continued` 表示这条不是「被叫到」而是「活跃对话里接上的一句」（正文没有前缀可去）。
+   *   `blankBody` 只在「没有正文」时为那句说明（见 `blankReply`），否则为空串。
    */
   function admit(event, selfId) {
     if (event?.post_type !== 'message') return undefined;
@@ -1693,10 +1703,12 @@ export function apply(ctx, config) {
       const groupId = String(event.group_id);
       if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(groupId)) return undefined;
       const userId = String(event.user_id ?? '');
-      const at = mentions(message, selfId);
+      // 这一句有没有 @ 机器人，后面两处都要用：判显式触发，以及空消息的替身该写成
+      // 「@ 了你一下」还是「一条空消息」。
+      const mentionedMe = mentions(message, selfId);
       const prefixed = settings.groupTrigger === 'prefix' && messageToText(message).trimStart().startsWith(settings.prefix);
       // 显式触发：@ 了机器人、按配置用了前缀、或者 groupTrigger 本来就允许所有消息。
-      const explicit = settings.groupTrigger === 'all' || at || prefixed;
+      const explicit = settings.groupTrigger === 'all' || mentionedMe || prefixed;
       // 这里只用**占位符**版本判定「这条消息有没有内容」：媒体下载是异步的，此刻还没
       // 落盘，而 `[图片]` 这样的占位符已经足够说明「他发了点东西」。真正的正文在
       // handleEvent 里等媒体落盘后再渲染一次。
@@ -1706,7 +1718,6 @@ export function apply(ctx, config) {
       // 前缀只在**显式带前缀**的那条上剥掉：活跃对话里接上的那句本来就没有前缀，
       // 按前缀长度硬切会把「然后呢」切成「后呢」（见 dropPrefix）。
       const preview = prefixed ? dropPrefix(rawText) : rawText;
-      if (preview.length === 0) return undefined;
       // 活跃对话：没被叫到，但同一个人正在跟它聊，接着说的这句也算。（只认**已经存在**
       // 的会话 —— 闲聊不该因为「窗口」把某个群变成「处理过」的群。）
       const existing = conversations.get(`group:${groupId}`);
@@ -1721,6 +1732,21 @@ export function apply(ctx, config) {
       const followed = !explicit && existing !== undefined && activeFollowAllows(existing, userId, message, selfId);
       const continued = groupTalk || followed;
       if (!explicit && !continued) return undefined;
+      // 没有正文：单纯的 @、或者就是一个空格。这和「被叫到之后闲聊」是两回事 —— 对方
+      // 明确点了名却什么都没说，本身就是一种信号（想让它接上一句、或者就是想看它反应）。
+      // 所以显式的空消息照常放行，只把正文位置换成一句说明，由模型接着上下文决定回
+      // 「？」、发张表情、还是接上一句（`blankReply` 关掉时回到「静默丢弃」）。
+      //
+      // 两处刻意收紧：活跃对话窗口里接上的空消息不算（那只是「他说了句话，正好没内容」，
+      // 不是点名，接上去就成了抢答）；前缀模式下按前缀长度硬切出空串也不算（那不是空消息，
+      // 是没内容可切，别硬凑一句话回）。
+      const blank = preview.length === 0 && explicit && !prefixed;
+      if (preview.length === 0 && !blank) return undefined;
+      if (blank && settings.blankReply !== true) return undefined;
+      // 空消息的说明在这里算**一次**、往下传给 `submitBatch`：那边是媒体落盘后重新渲染
+      // 的正文（`at` 段同样会被剔掉，仍然是空），若让它自己再拼一句，就得把「有没有 @」
+      // 这件事也带下去，多一份要同步维护的状态（第一版正是这么写的，@ 与空消息的措辞串了）。
+      const blankBody = blank ? blankMessageLabel({ group: true, mentionedMe }) : '';
       const conversation = conversationFor('group', groupId, {
         groupName: '',
         userId: event.user_id,
@@ -1730,7 +1756,8 @@ export function apply(ctx, config) {
       return {
         conversation,
         message,
-        preview,
+        preview: blank ? blankBody : preview,
+        blankBody,
         continued,
         // 回复指向：引用被回复的那条消息（`reply` 段要 message_id），或 @ 回提问者（要 QQ 号）。
         // `seq` 是这条消息在群里的进度，供 `auto` 判断「等我回话时有没有人（包括我自己）
@@ -1742,7 +1769,14 @@ export function apply(ctx, config) {
     const userId = String(event.user_id);
     if (settings.allowUsers.length > 0 && !settings.allowUsers.includes(userId)) return undefined;
     const text = messageToText(message, selfId).trim();
-    if (text.length === 0) return undefined;
+    // 私聊本来就不需要 @，所以「空消息」在这里是明摆着的「跟你打个招呼但没写事」——
+    // 同样交给模型看着上下文决定回什么（`blankReply` 关掉时照旧丢弃）。用占位符当
+    // preview，既让模型看得懂，也让下面 `submitBatch` 那条「整批都是空的就什么都不发」
+    // 的兜底对得上（否则查询类工具会看到一条空正文）。
+    const blank = text.length === 0;
+    if (blank && settings.blankReply !== true) return undefined;
+    const blankBody = blank ? blankMessageLabel({ group: false }) : '';
+    const preview = blank ? blankBody : dropPrefix(text);
     const conversation = conversationFor('private', userId, {
       userId,
       userName: sender.nickname ?? sender.card ?? userId,
@@ -1753,7 +1787,8 @@ export function apply(ctx, config) {
     return {
       conversation,
       message,
-      preview: dropPrefix(text),
+      preview,
+      blankBody,
       continued: false,
       // 私聊始终是 plain，`seq` 只是让 quote 的字段形状保持一致。
       quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: 0 },
@@ -2787,7 +2822,9 @@ export function apply(ctx, config) {
    * 把一批消息渲染成一条 user message 交给会话的 Agent。
    *
    * 媒体在这里才落盘（在队列上串行），一条里的图和话都按原样呈现给模型。
-   * 只带 @ 没有正文的消息会被丢掉；整批都不剩东西时什么都不发。
+   * 只带 @、没有正文的消息在这里也**不丢**：正文换成一句「他 @ 了你一下，没说什么」
+   * —— 模型得知道轮到自己说话了，才能决定回一句「？」、发张表情，还是接上一句
+   * （见 `blankReply`）。只有在引用也没取到、整批确实什么都没有时才什么都不发。
    */
   function submitBatch(conversation, batch) {
     enqueue(conversation, async () => {
@@ -2803,13 +2840,16 @@ export function apply(ctx, config) {
         // 活跃对话里接上的那句没有前缀可去：按前缀长度硬切会把「然后呢」切成「后呢」。
         const raw = messageToText(item.message, selfId, rendered.size > 0 ? rendered : undefined).trim();
         const body = item.continued === true ? raw : dropPrefix(raw);
-        if (body.length === 0 && quote === undefined) continue;
         const composed = quote === undefined
           ? body
           : body.length > 0
             ? `${quotePrefix(quote)}\n${body}`
             : quotePrefix(quote);
-        entries.push({ name: item.name, id: item.userId, body: composed });
+        // 正文与引用都是空的（`admit` 里的空消息通常已经给了 `blankBody`，这里只是最后
+        // 一道防线）：绝不能给模型递一条空消息 —— 它会以为出了一条没有内容的消息。
+        const text = composed.length > 0 ? composed : (item.blankBody ?? '');
+        if (text.length === 0) continue;
+        entries.push({ name: item.name, id: item.userId, body: text });
       }
       if (entries.length === 0) return;
       const text = renderBatch(entries);
@@ -2935,6 +2975,8 @@ export function apply(ctx, config) {
       quote,
       // 「活跃对话里接上的一句」正文里没有前缀可去（见 admit / dropPrefix）。
       continued: admitted.continued === true,
+      // 空消息（单纯 @ / 一个空格）的那句说明：媒体落盘后正文还是空的，用它兜底。
+      blankBody: admitted.blankBody ?? '',
       userId: String(event.user_id ?? ''),
       name: String(sender.card ?? sender.nickname ?? event.user_id ?? '某人'),
       at: Date.now(),
