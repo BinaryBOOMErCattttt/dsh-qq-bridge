@@ -48,7 +48,9 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 ## 2. 文件地图
 
 ```
-index.js      4601 行  插件本体：全部运行时状态、事件路由、发送/准入/复读/记忆/主动说话/活跃对话、连接生命周期
+index.js      4337 行  插件本体：全部运行时状态、事件路由、发送/准入/复读/记忆/主动说话/活跃对话、连接生命周期
+util.js        233 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 记忆路径边界 / key 池解析与打码 / withinActiveHours
+filestore.js    78 行  几个「原子写 / 尽力而为读」的小工具（读不到返回空而不是抛错），记忆与转录都走它
 config.js      137 行  配置 schema（**配置的唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段
 settings.js    238 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
 tools.js       569 行  6 个宿主平面工具的**声明**（qq_send_message / qq_send_image / qq_list_conversations / qq_jm_pdf / qq_transcript / qq_memory），依赖由 index.js 显式传入
@@ -85,6 +87,7 @@ AGENTS.md             **本文件**：给改代码的智能体的说明书（DSH
 index.js ──▶ config.js（schema，纯数据）
          ──▶ settings.js ──▶ image.js（只借 DEFAULT_IMAGE_MAX_BYTES）
          ──▶ tools.js ──▶ onebot.js / image.js / jm.js（工具只用这三个的纯函数）
+         ──▶ util.js（纯函数，无 IO）/ filestore.js（原子读写）
          ──▶ onebot.js / media.js / image.js / jm.js / perceptual.js
                       └── media.js 用到 onebot.js 的占位符/嗅探约定
 test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.test.mjs 只 import index.js
@@ -143,12 +146,17 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 2. `index.js` 里**保留再导出**（`export { Config } from './config.js'`）—— `bridge.test.mjs`
    只 import `index.js`，Loader 也只认插件入口，搬走的东西必须在入口处仍然拿得到。
 
-**模块级纯函数**（在 `apply()` 外面，只有记忆、凭据轮换与主动说话这一块有）：`sessionIdFor`（会话 key +
-第几轮 → Session id，导出只为测「第 0 轮不变 / 第 1 轮确定」这条契约）/ `memorySlug` /
-`localDate` / `localStamp` / `msUntilDailyHour`（下一个整点还有多久）/ `withinActiveHours`
-（主动说话的时段判定，导出只为测边界）/ `memoryRelativePath`（写边界）/
-`parseApiKeyPool`（key 池的行解析，导出只为测注释 / 空行 / CRLF / 去重）/
-`readJsonl` / `writeJsonTextAtomic`。它们不碰闭包状态，改它们不影响运行时不变量 ——
+**模块级纯函数都不在本文件里**：`util.js` 放「同样的输入永远同样的输出」的那批
+（`sessionIdFor` 会话 id 派生 / `memorySlug` / `localDate` / `localStamp` /
+`msUntilDailyHour` / `hourLabel` / `withinActiveHours` / `memoryRelativePath` 写边界 /
+`parseApiKeyPool` / `apiKeyFingerprint` / `visibleText` / `errorText` / `memoryOneLine`），
+`filestore.js` 放碰磁盘的那几个（`writeJsonAtomic` / `writeTextAtomic` /
+`readTextOrUndefined` / `readJsonl` / `readdirOrEmpty`）。
+
+判断一个新函数该放哪：**碰闭包状态就留 `index.js`，碰磁盘去 `filestore.js`，其余去 `util.js`。**
+`util.js` 里不许引入闭包状态 —— 它保持纯粹才可能被单测，也才敢在任意上下文里调。
+`sessionIdFor` / `parseApiKeyPool` / `withinActiveHours` 的契约由 `bridge.test.mjs` 从
+**插件入口**验，所以 `index.js` 里对这三个保留再导出（见上面的两条纪律）。
 `msUntilDailyHour` 尤其值得单独测边界（刚过点要排到明天，不能原地反复醒）。
 
 ## 4. 九条数据流（改任何一条先读对应的那条）
@@ -479,6 +487,7 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
 
 | 想做的事 | 动哪里 |
 |---|---|
+| 加一个不碰状态的纯函数 | `util.js`（碰磁盘的放 `filestore.js`）；**别 import `index.js`**，也别让它读闭包状态 |
 | 加一个配置项 | `config.js` 的 schema + （需要兜底/夹紧时）`settings.js` 加一行 + README 配置表 + `test/settings.test.mjs` 补边界 |
 | 改提示词 / 人设 | `DEFAULT_PERSONA`、`channelPrompt`、`Config.persona` / `.instructions` |
 | 加一个 Agent 工具 | 在 `tools.js` 里照 `qqSendMessage` 抄结构（`defineTool` + `output.schema` + `render` + 中文报错），再在 `registerQqTools` 里注册、在 `index.js` 的 `deps` 里补上它需要的能力；**别 import `index.js`** |

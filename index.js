@@ -26,11 +26,10 @@
  *
  * @module @qqbot/dsh-plugin-qq
  */
-import crypto from 'node:crypto';
 import { readdirSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { appendFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { OneBotClient, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from './onebot.js';
 import { createMediaStore } from './media.js';
@@ -39,6 +38,26 @@ import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingIma
 import { createJmService, parseJmRef } from './jm.js';
 import { registerQqTools } from './tools.js';
 import { createSettings, MAX_TIMER_MS } from './settings.js';
+import {
+  apiKeyFingerprint,
+  errorText,
+  hourLabel,
+  localDate,
+  localStamp,
+  memoryOneLine,
+  memoryRelativePath,
+  memorySlug,
+  msUntilDailyHour,
+  parseApiKeyPool,
+  sessionIdFor,
+  visibleText,
+  withinActiveHours,
+} from './util.js';
+import { readJsonl, readTextOrUndefined, readdirOrEmpty, writeJsonAtomic, writeTextAtomic } from './filestore.js';
+
+// 这三个的契约由 test/bridge.test.mjs 直接从插件入口验，所以在这里再导出一次
+// （Loader 也只认 index.js 这个入口，搬走的东西必须在入口处仍然拿得到）。
+export { parseApiKeyPool, sessionIdFor, withinActiveHours } from './util.js';
 
 /** 插件在 Loader 中的稳定标识（改名会导致配置/状态对不上）。 */
 export const name = 'qq-bridge';
@@ -124,68 +143,11 @@ const DEFAULT_PERSONA = [
 // 配置 schema 是纯数据，单独放在 config.js；这里再导出一次，Loader 与测试都从 index.js 取。
 export { Config } from './config.js';
 
-/**
- * 由会话 key 派生出稳定的、UUID 形状的 Session id。
- *
- * 确定性正是关键：同一个 QQ 会话在 Harness 反复重启后仍然得到同一个
- * Session id，因此可以 resume 历史会话，聊天记忆不会丢。
- * 做法是把 SHA-256 摘要裁剪成 UUID 形状，并把版本位/变体位写成固定值，
- * 以便通过 Harness 对 session id 的格式校验。
- *
- * `generation` 是「这是这个会话的第几轮」：0 是第一轮，`/reset` 每按一次 +1。
- * 它只参与摘要，不改变派生算法本身 —— 于是**第 0 轮永远是过去那个 id**
- * （已有会话的记忆不会因为这次改动被隔断），而第 1 轮起又是确定性的：
- * 重启、换进程、重新算，都还是同一个 id，该 resume 的就 resume。
- *
- * 为什么不是「删掉旧会话、原地重建」：`/reset` 的语义已经改成
- * **新开一轮会话**（见 `resetConversation`）。旧会话的记录留在磁盘上
- * 当作这段聊天的存档，不再被带进新一轮的上下文，也不再被删掉。
- *
- * 导出只为让测试能直接验「第 0 轮的 id 与改动前一致、第 1 轮换新且跨进程稳定」
- * 这条契约：它不碰任何闭包状态。
- *
- * @param key - 会话 key，例如 `group:100000001`。
- * @param generation - 第几轮会话（非负整数，0 = 第一轮）；非法值按 0 处理。
- * @returns 版本 5 形状的 UUID 字符串。
- */
-export function sessionIdFor(key, generation = 0) {
-  const round = Number.isSafeInteger(generation) && generation > 0 ? generation : 0;
-  // 第 0 轮刻意用**和改动前一模一样**的输入串：历史会话的 id 不能变。
-  const seed = round === 0 ? `dsh-qq-bridge:${key}` : `dsh-qq-bridge:${key}:reset:${round}`;
-  const hex = crypto.createHash('sha256').update(seed).digest('hex');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
-}
-
-/**
- * 把一条 assistant 消息里可见的文本块拼起来。
- * 工具调用、思考等非 text 块都会被忽略。
- * @param content - 持久化消息的 content 块数组。
- * @returns 拼接后的可见文本（已 trim）。
- */
-function visibleText(content) {
-  if (!Array.isArray(content)) return '';
-  return content
-    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text)
-    .join('\n')
-    .trim();
-}
-
-/**
- * 把任意异常压成一行短文本：日志与 QQ 回复都用它，避免把多行堆栈糊进聊天。
- * @param error - 任意抛出物。
- * @returns 单行、最多 200 字的说明。
- */
-function errorText(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/\s+/g, ' ').trim().slice(0, 200) || 'unknown error';
-}
-
-// ---- 长期记忆：纯函数工具 ---------------------------------------------------------
+// ---- 长期记忆：留在运行时的几个上限 -----------------------------------------------
 //
-// 这一层刻意不碰任何闭包状态（不认 cwd、不认配置），只做「把会话 key 变成目录名」
-// 「把一行记忆安全地拼进一个文件」「读写一个文件」这几件纯事：记忆的边界检查、
-// 摘要的触发条件都留在 apply() 里对着配置算。
+// 「把会话 key 变成目录名」「读写记忆文件」那些**纯事**已经搬去 `util.js`（不碰 IO）
+// 与 `filestore.js`（原子读写）；这里剩下的是这个子系统自己的三个取值上限，跟用法
+// 放在一起更好找。记忆目录的越界校验、摘要的触发条件本来就对着配置算，留在 apply() 里。
 
 /** 索引片段（INDEX.md）最多这么大：它每次提示词装配都会被读一遍，不能无节制地长。 */
 const MEMORY_INDEX_MAX_CHARS = 4096;
@@ -201,233 +163,6 @@ const MEMORY_LINE_MAX_CHARS = 500;
  */
 const MEMORY_FILE_RETURN_CHARS = 12000;
 
-/**
- * 会话 key 里所有会被当成路径分隔符或非法文件名的字符。
- *
- * 冒号在 `group:123` 里是分隔符，但在 Windows 上不能出现在文件名里，也会让
- * `.qq-memory/conversations/group:123/` 这种路径在所有平台上都难读 —— 所以它
- * 和空格、斜杠一样折成 `-`（`MEMORY_SLUG_UNSAFE` 之外的字符才原样保留）。
- */
-const MEMORY_SLUG_UNSAFE = /[^A-Za-z0-9._-]+/g;
-
-/**
- * 把会话 key（`group:100000001` / `private:100000002`）变成安全的目录名。
- *
- * 只做「可逆地可读」：`group:` 换成 `group-`（冒号在部分文件系统上不合法），
- * 其余非法字符一律折成 `-`。真正的稳定性靠 key 本身而不是这个变换 —— 调用方
- * 每个进程只算一次并存进 `memorySlugs`，同一个会话永远只有一个目录。
- * @param key - 会话 key。
- * @returns 目录名，例如 `group-100000001`。
- */
-function memorySlug(key) {
-  const slug = String(key ?? '').replace(MEMORY_SLUG_UNSAFE, '-').replace(/^[.-]+/, '');
-  return slug.length > 0 ? slug.slice(0, 120) : 'unknown';
-}
-
-/** 本地日期（`YYYY-MM-DD`）：聊天记录按人所在地的日期切分，不用 UTC。 */
-function localDate(at = Date.now()) {
-  const date = new Date(at);
-  const pad = (value) => String(value).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-}
-
-/**
- * 本地日期时间（`YYYY-MM-DD HH:MM:SS`）：转录输出与日志里统一用它。
- *
- * 与 {@link localDate} 一样刻意用**本地时间** —— 「上一次摘要是昨天还是今天」这件事
- * 必须按人所在地的日界线算，否则东八区的凌晨 4 点会被算成前一天的 UTC。
- * @param at - 毫秒时间戳。
- * @returns 本地时间戳字符串。
- */
-function localStamp(at) {
-  const date = new Date(Number(at) || Date.now());
-  const pad = (value) => String(value).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-}
-
-/**
- * 计算「下一个每天 `hour` 点」距今多少毫秒。
- *
- * 定时摘要只在每天固定的一个时刻醒来，所以间隔不是常数：醒来一次之后必须重新算到
- * 明天的那个点。跨过夏令时/时区变更时以本地时间为准（差一小时无所谓，摘要不是列车
- * 时刻表），但**刚过点时必须排到明天**，否则会在同一个点上反复醒来。
- * @param hour - 本地小时（0~23）。
- * @param now - 当前时刻（毫秒），测试里可注入。
- * @returns 距下一次触发点的毫秒数，至少 1 秒。
- */
-function msUntilDailyHour(hour, now = Date.now()) {
-  const next = new Date(now);
-  next.setHours(hour, 0, 0, 0);
-  if (next.getTime() <= now) next.setDate(next.getDate() + 1);
-  return Math.max(1000, next.getTime() - now);
-}
-
-/** 本地 `HH:00`：日志与报错里描述触发点的写法。 */
-function hourLabel(hour) {
-  return `${String(hour).padStart(2, '0')}:00`;
-}
-
-/**
- * 解析 API key 池文件（一行一个 key）。
- *
- * 规则刻意只有三条：空行跳过、`#` 开头的整行是注释、重复的 key 只留第一条。
- * 不做「行内注释」也不做 `KEY=value` —— key 自身可能含 `=` 之外的符号，多一种语法就多
- * 一种「为什么我的 key 没被认出来」；想给某个 key 写备注就单独一行 `#`。
- *
- * 导出只为让测试直接验这几条边界（注释 / 空行 / CRLF / 重复）：它不碰任何闭包状态。
- * @param text - 池子文件的正文。
- * @returns 按出现顺序去重后的 key 数组。
- */
-export function parseApiKeyPool(text) {
-  const out = [];
-  const seen = new Set();
-  for (const raw of String(text ?? '').split('\n')) {
-    const line = raw.trim();
-    if (line.length === 0 || line.startsWith('#')) continue;
-    if (seen.has(line)) continue;
-    seen.add(line);
-    out.push(line);
-  }
-  return out;
-}
-
-/**
- * 日志里给一个 key 打码：露前 6 个字符 + 内容摘要的前 8 位十六进制。
- *
- * 日志会进 journal、也可能被贴到别处，所以**绝不能**整条打出来。留前 6 位是为了让
- * 「换成了哪个」在池子里一眼可辨（`sk-` 之后还有三个随机字符），摘要则用来确认
- * 「池子里两行是不是同一个 key」—— 两者都不足以还原出一个可用的 key。
- * @param key - 原始 key。
- * @returns 形如 `sk-ab1…#1a2b3c4d` 的短标识。
- */
-function apiKeyFingerprint(key) {
-  const text = String(key ?? '');
-  const digest = crypto.createHash('sha256').update(text).digest('hex').slice(0, 8);
-  const head = text.length > 8 ? `${text.slice(0, 6)}…` : '';
-  return `${head}#${digest}`;
-}
-
-/**
- * 某个本地小时在不在「可以主动说话」的时段里。
- *
- * 真人半夜不会突然在群里冒泡，所以主动说话只发生在配置的时段内。取值一律按本地小时
- * （与摘要的 `digestAtHour` 同一个口径：东八区的晚上十点就是 22，不是 UTC 的 14）。
- * 三条规则：
- *   - `from` 到 `to` **左闭右开**：9 → 23 是 09:00~22:59；
- *   - 两边相等表示「全天」（`from = to = 0` 时不必写成 0 → 24）；
- *   - `from > to` 表示跨零点，例如 22 → 3 = 22:00 到次日 02:59。
- * 非法值按「不设限」处理（from 兜底 0、to 兜底 23），因为这里的目标是别让一个配错的
- * 小时数把功能整体打死 —— 真要收紧该由 `proactive` 开关负责。
- *
- * 导出只为让测试能直接验边界（跨零点、左闭右开、全天）：它不碰任何闭包状态。
- *
- * @param from - 起始本地小时（0~23）。
- * @param to - 结束本地小时（0~23，不含）。
- * @param hour - 要判断的本地小时（0~23）。
- * @returns 可以说话时为 true。
- */
-export function withinActiveHours(from, to, hour) {
-  const start = Number.isFinite(Number(from)) ? Math.min(23, Math.max(0, Math.floor(Number(from)))) : 0;
-  const end = Number.isFinite(Number(to)) ? Math.min(23, Math.max(0, Math.floor(Number(to)))) : 23;
-  const at = Number.isFinite(Number(hour)) ? Math.min(23, Math.max(0, Math.floor(Number(hour)))) : 0;
-  if (start === end) return true;
-  return start < end ? at >= start && at < end : at >= start || at < end;
-}
-
-/** 把一行记忆里的换行折掉：记忆是「一行一条事实」，格式被换行破坏就没法读了。 */
-function memoryOneLine(text) {
-  return String(text ?? '').replace(/\s+/g, ' ').trim();
-}
-
-/**
- * 把模型给的路径解析成记忆目录内的相对路径；越界（`../`、绝对路径）时返回 undefined。
- *
- * 这是 qq_memory 的写边界：模型只能动 `.qq-memory/` 里的东西。故意不做 glob、
- * 不跟随符号链接 —— 这里的目标是「模型不会因为一次幻觉把仓库写坏」，不是完整的
- * 沙箱（真正的沙箱在 Harness 的 fs 工具那一侧）。
- * @param base - 记忆目录的绝对路径（以分隔符结尾）。
- * @param raw - 模型给的路径。
- * @returns 规范化后的相对路径（正斜杠）；越界或为空时 undefined。
- */
-function memoryRelativePath(base, raw) {
-  const text = String(raw ?? '').trim().replace(/\\/g, '/');
-  if (text.length === 0) return undefined;
-  const trimmed = text.replace(/^\.\/+/, '');
-  if (trimmed.startsWith('/')) return undefined;
-  const segments = trimmed.split('/').filter((segment) => segment.length > 0 && segment !== '.');
-  if (segments.length === 0 || segments.includes('..')) return undefined;
-  const absolute = resolve(base, ...segments);
-  if (absolute !== resolve(base) && !absolute.startsWith(base)) return undefined;
-  return segments.join('/');
-}
-
-/**
- * 把一个 JSON 对象原子地写进文件：先写同目录的临时文件再 rename。
- *
- * 记忆文件很小、写得也少，但「写到一半进程被杀」会留下一个半截 JSON —— 而它正是
- * 摘要 Agent 每次开工都要读的东西。rename 在同一个文件系统内是原子的。
- * @param absolute - 目标绝对路径。
- * @param payload - 可 JSON 序列化的值。
- */
-async function writeJsonAtomic(absolute, payload) {
-  const temp = `${absolute}.tmp`;
-  await writeFile(temp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-  await rename(temp, absolute);
-}
-
-/**
- * 把一段文本原子地写进文件（同上，用于 Markdown 记忆文件）。
- * @param absolute - 目标绝对路径。
- * @param text - 文件正文。
- */
-async function writeTextAtomic(absolute, text) {
-  const temp = `${absolute}.tmp`;
-  await writeFile(temp, text, 'utf8');
-  await rename(temp, absolute);
-}
-
-/** 读取一个文本文件；不存在时返回 undefined（而不是抛错）。 */
-async function readTextOrUndefined(absolute) {
-  try {
-    return await readFile(absolute, 'utf8');
-  } catch (error) {
-    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return undefined;
-    throw error;
-  }
-}
-
-/**
- * 读一个 JSONL 转录文件；单行坏掉（写到一半被杀、手工编辑出错）时跳过那一行，
- * 不让一条坏记录把整个会话的历史变成读不出来。
- * @param absolute - 转录文件的绝对路径。
- * @returns 解析成功的记录数组。
- */
-async function readJsonl(absolute) {
-  const text = await readTextOrUndefined(absolute);
-  if (text === undefined) return [];
-  const out = [];
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0) continue;
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (parsed !== null && typeof parsed === 'object') out.push(parsed);
-    } catch {
-      // 坏行直接跳过：转录是「尽力而为」的历史，不是账本。
-    }
-  }
-  return out;
-}
-
-/** 列出一个目录下的文件名；目录不存在时返回空数组。 */
-async function readdirOrEmpty(absolute) {
-  try {
-    return await readdir(absolute);
-  } catch (error) {
-    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return [];
-    throw error;
-  }
-}
 
 /**
  * 在一个 Harness Host 组合上注册 QQ 桥接。
