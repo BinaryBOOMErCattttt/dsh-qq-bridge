@@ -48,18 +48,19 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 ## 2. 文件地图
 
 ```
-index.js      4255 行  插件本体：全部运行时状态、事件路由、发送/准入/复读/记忆/主动说话/活跃对话、连接生命周期
-chatter.js      214 行  群里「谁在说话」的三本账（插话序号 / 回答指向 / 热度窗口）：只暴露语义动作，不暴露 Map
+index.js      3243 行  插件本体：全部运行时状态、事件路由、发送/准入/复读/主动说话/活跃对话、连接生命周期
+chatter.js      171 行  群里「谁在说话」的三本账（插话序号 / 回答指向 / 热度窗口）：只暴露语义动作，不暴露 Map
 util.js        233 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 记忆路径边界 / key 池解析与打码 / withinActiveHours
 filestore.js    78 行  几个「原子写 / 尽力而为读」的小工具（读不到返回空而不是抛错），记忆与转录都走它
 config.js      137 行  配置 schema（**配置的唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段
 settings.js    238 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
 tools.js       569 行  6 个宿主平面工具的**声明**（qq_send_message / qq_send_image / qq_list_conversations / qq_jm_pdf / qq_transcript / qq_memory），依赖由 index.js 显式传入
+memory.js     1144 行  长期记忆子系统：转录落盘、记忆文件读写（那两个记忆工具的能力来源）、每日摘要循环；依赖由 index.js 显式传入
 onebot.js      639 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/文本化）
 media.js       327 行  入站媒体：QQ 的图/表情包 → 按内容哈希落盘 → 给模型 read_image 的本地路径
 image.js       135 行  出站图片：本地路径 / URL → 校验（大小、格式、目录越界）→ base64:// 段
 jm.js          490 行  禁漫下载服务：spawn python、一次性 URL、给 NapCat 的小 HTTP 文件服务
-perceptual.js 约 1060 行  图片指纹：JPEG(DC)/PNG/GIF → 16×16 灰度 → dHash，复读判「同一张画面」用
+perceptual.js 约 1080 行  图片指纹：JPEG(DC)/PNG/GIF → 16×16 灰度 → dHash，复读判「同一张画面」用
 scripts/jm_download.py  禁漫下载的 python 实现（jmcomic + img2pdf），唯一非 JS 的逻辑
 .dsh/skills/message-digest/SKILL.md    聊天记录 → 长期记忆的流程（定时摘要与「以前说过什么」用它）
 .dsh/skills/update-cognition/SKILL.md  学梗 / 表情包含义 → COGNITION.md 的流程
@@ -90,14 +91,15 @@ index.js ──▶ config.js（schema，纯数据）
          ──▶ settings.js ──▶ image.js（只借 DEFAULT_IMAGE_MAX_BYTES）
          ──▶ tools.js ──▶ onebot.js / image.js / jm.js（工具只用这三个的纯函数）
          ──▶ chatter.js（谁在说话的三本账，纯内存结构）
+         ──▶ memory.js ──▶ util.js / filestore.js（长期记忆子系统，纯文件 IO）
          ──▶ util.js（纯函数，无 IO）/ filestore.js（原子读写）
          ──▶ onebot.js / media.js / image.js / jm.js / perceptual.js
                       └── media.js 用到 onebot.js 的占位符/嗅探约定
 test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.test.mjs 只 import index.js
 ```
 
-**没有环**，这条要守住：`tools.js` / `settings.js` **都不 import `index.js`** —— 它们需要
-的东西一律由 `index.js` 在装配时显式传进去（见 §3）。反过来的话就是循环依赖，
+**没有环**，这条要守住：`tools.js` / `settings.js` / `memory.js` **都不 import `index.js`** ——
+它们需要的东西一律由 `index.js` 在装配时显式传进去（见 §3）。反过来的话就是循环依赖，
 ESM 下会在加载期炸成 `Cannot access before initialization`。
 
 被 Harness 注入的只有三样：`@deepseek-ai/schemastery`（配置校验）、
@@ -118,9 +120,9 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 | 区域 | 关键符号 | 说明 |
 |---|---|---|
 | 顶部常量 | `CHANNEL_SECTION_ORDER=8950`、`PRESET_NONE`、`QUOTE_TEXT_CHARS`、`STICKER_PROMPT_MAX` | 调提示词用 |
-| 配置 schema | **不在这里**：在 `config.js`（第 125 行只是 `export { Config } from './config.js'`） | 唯一真相来源，`.description()` 就是 Web UI 上给用户看的文档 |
-| 配置的取值 | **不在这里**：`settings = createSettings(config, process.cwd())`（第 465 行）之后一律读 `settings.*` | 取默认值/夹紧/去空白都在 `settings.js`；`index.js` 里**没有一处**直接读 `config.xxx` |
-| 运行时状态 | 第 536–671 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / **`chatter`**（谁在说话的三本账，见 `chatter.js`；`chatterSeq` / `groupChatter` / `quoteSeq` 是它搬出去之前的名字）/ `repeatStates` / `mediaResolutions`，以及记忆的 `memorySlugs` / `memoryDirty` / `memoryLastDigest` / `memoryWrites` / `memoryIndexCache`；每条会话记录里还挂着 `sessionGeneration`（第几轮会话，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` / `activeInterposeSeq`（那条消息那一刻的插话序号快照）与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
+| 配置 schema | **不在这里**：在 `config.js`（第 136 行只是 `export { Config } from './config.js'`） | 唯一真相来源，`.description()` 就是 Web UI 上给用户看的文档 |
+| 配置的取值 | **不在这里**：`settings = createSettings(config, process.cwd())`（第 172 行）之后一律读 `settings.*` | 取默认值/夹紧/去空白都在 `settings.js`；`index.js` 里**没有一处**直接读 `config.xxx` |
+| 运行时状态 | 第 243–384 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / **`chatter`**（谁在说话的三本账，见 `chatter.js`；`chatterSeq` / `groupChatter` / `quoteSeq` 是它搬出去之前的名字）/ `repeatStates` / `mediaResolutions`（记忆的五张账已经跟着子系统搬去 `memory.js`）；每条会话记录里还挂着 `sessionGeneration`（第几轮会话，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` / `activeInterposeSeq`（那条消息那一刻的插话序号快照）与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
 | Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` | 见 §7 |
 | 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` | 串行队列保证同一会话的消息不乱序；`sendOne` 顺便记 `lastBotSpeakAt`（主动说话靠它避免独白） |
 | JM 旁路 | `readJmCommand` `runJmCommand` `sendJmFile` `downloadJm` | `/jm 422866` 不进 Agent、不建会话 |
@@ -131,19 +133,20 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 | 攒批 | `enqueue` `holdForBatch` `flushBatch` `submitBatch` `renderBatch` `batchWindow` `batchCap` `batchScale` | 前后脚到的消息合成一条再投给 Agent；多人搭话时窗口与上限同倍放大（见 §4.G） |
 | 媒体 | `resolveMessageMedia` `mediaFor` `resolveQuote` `hydrateAmbientMedia` | 环境上下文与复读**共用同一次下载**（`mediaResolutions` 这个 WeakMap 就是干这个的） |
 | 事件轮转 | `handleEvent`（约 77 行）+ 持久化事件路由 | 见 §4.A；`turn/end` 里按 `owner.proactive` 分流 |
-| 长期记忆 | `rememberTranscript` `appendTranscript`（+`writesFor`）`maybeCatchUpDigest` `readDigestState` `ensureDigestAgent` `runDigestSweep` `enqueueDigest` `memoryIndexText` `resolveMemoryConversation` | 见 §4.E |
+| 长期记忆 | 只剩一行装配（`const memory = createMemory({ … })`）与三个调用点（`handleEvent` / `channelPrompt` / 生命周期） | 整个子系统在 `memory.js`（见 §4.E）；依赖表就在那一行里 |
 | 模型凭据轮换 | `rotateApiKey` `probeApiKey` | 见 §4.I；每天到点从 `apiKeyFile` 里挑下一个探测通过的 key，交给 `ctx.credentials.set()` 写进 `$DSH_HOME/.credentials.yaml`（**不用重启**，凭据层监听该文件）。时段/超时/探测地址这些取值在 `settings` 上 |
-| 工具装配 | `registerQqTools(ctx, { … })`（第 4323 行起，约 35 行） | 只剩一张**依赖表**：把上面那些函数递给 `tools.js`。工具声明本身在 `tools.js`，不在这里 |
-| 生命周期 | `ctx.effect(...)` | 托管 socket、JM 的 HTTP 服务、摘要定时器、API key 轮换定时器、主动说话的定时器 |
+| 工具装配 | `registerQqTools(ctx, { … })`（第 3032 行起，约 25 行） | 只剩一张**依赖表**：把上面那些函数递给 `tools.js`（记忆那一格就是 `memory.tools`）。工具声明本身在 `tools.js`，不在这里 |
+| 生命周期 | `ctx.effect(...)` | 托管 socket、JM 的 HTTP 服务、API key 轮换定时器、主动说话的定时器；摘要定时器由 `memory.startDigestTimer()` 挂 |
 
-**体量实况**（别被文件行数吓到）：闭包里 135 个函数，**中位数 9 行**、均值 16.6 行，
-超过 60 行的只有 8 个（最长的是 `channelPrompt` 118 行，大半是提示词模板）。纯逻辑已经拆到
-`onebot.js` / `media.js` / `image.js` / `jm.js` / `perceptual.js` / `settings.js`。
+**体量实况**（别被文件行数吓到）：闭包里 87 个函数，**中位数 10 行**、均值 18.7 行，
+超过 60 行的只有 7 个（最长的是 `channelPrompt` 119 行，大半是提示词模板）。纯逻辑已经拆到
+`onebot.js` / `media.js` / `image.js` / `jm.js` / `perceptual.js` / `settings.js`，
+长期记忆整块搬去了 `memory.js`。
 注释密度 25%–45%。文件大是因为「一个大闭包 + 大段取舍注释」，**不是因为函数失控** ——
 所以别把「拆函数」当成这里的重构方向，这里的边界问题是**模块级**的（见下）。
 
 **往外搬的两条纪律**（`tools.js` / `config.js` / `settings.js` / `util.js` / `filestore.js` /
-`chatter.js` 都是这么搬的，后续按同样方式拆记忆与主动说话）：
+`chatter.js` / `memory.js` 都是这么搬的，后续按同样方式拆主动说话）：
 
 1. 被搬出去的模块**不 import `index.js`**，需要什么由 `index.js` 显式传（`tools.js` 的
    `deps` 对象就是样例）。这样依赖方向永远是单向的，也一眼看得出那个模块能碰什么状态。
@@ -233,6 +236,9 @@ spawn `.venv/bin/python scripts/jm_download.py`（JSON Lines 协议，先 `meta`
 （`jmFileHost` 默认 docker 网桥 `172.17.0.1`）。
 
 ### E. 长期记忆（转录 → 定时摘要 → 认知）
+
+实现全在 `memory.js`（`createMemory(deps)`，index.js 只装配并在三个点调用）；下面这张图是
+**行为规格**，改任何一处先对着它读。
 
 ```
 handleEvent ─▶ rememberTranscript ─▶ .qq-memory/conversations/<slug>/log/YYYY-MM-DD.jsonl
@@ -511,8 +517,8 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
 | 改 `/reset` 的行为（轮次的算法 / 标记落盘 / 清哪些记账） | `sessionIdFor` + `resetConversation` + `resetMarkerDir` / `loadConversationResetCounts`（见 §4.H、§5.3、§5.4） |
 | 改「谁能重置会话」 | `Config.resetUsers` + `canReset` + `handleEvent` 里的 `/reset` 分支（**空白名单 = 谁都不能**，别改成 `allowUsers` 那种语义）+ README「新开一轮会话」 |
 | 改 QQ 会话能用哪些工具 | `cordis.patch.yml` 的 `preset-qq` + `Config.allowTools`（见 §7） |
-| 改长期记忆的行为 | `Config` 的 `memory*` / `digest*` + index.js 的记忆区块 + README「长期记忆」 |
-| 改摘要的触发时刻 | `digestAtHour` + `msUntilDailyHour`（模块级纯函数）+ `runDigestSweep` 的日期判据 |
+| 改长期记忆的行为 | `Config` 的 `memory*` / `digest*` + `memory.js`（整个子系统）+ README「长期记忆」（见 §4.E） |
+| 改摘要的触发时刻 | `digestAtHour` + `msUntilDailyHour`（模块级纯函数）+ `memory.js` 里 `runDigestSweep` 的日期判据 |
 | 改 API key 轮换（池子格式 / 探测 / 什么时候换） | `Config` 的 `apiKeyRotate*` + index.js 的凭据轮换区块（`rotateApiKey` / `probeApiKey`）+ 模块级 `parseApiKeyPool` / `apiKeyFingerprint` + README「每天轮换 API key」（见 §4.I） |
 | 改摘要/学梗的流程（提示词） | `.dsh/skills/` 里的 SKILL.md（改完**不用重启**，watcher 会重载） |
 | 加一个 skill | 新建 `.dsh/skills/<kebab-name>/SKILL.md`（frontmatter 必填 `name` + `description`），并把 `skill` 留在 allowTools 里 |
@@ -542,7 +548,7 @@ subagent 会绕过 `allowTools` 出现在 QQ 会话里。改预设前先读那�
 ## 8. 测试与验证
 
 ```bash
-node --test test/                      # 全部（bridge + jm + perceptual + settings + chatter）
+node --test test/                      # 全部（bridge + jm + perceptual + settings + chatter + util/filestore）
 node --test test/settings.test.mjs     # 只跑配置取值口径（最快，0.2 秒）
 node --test test/chatter.test.mjs      # 只跑「谁在说话」的三本账
 node --test test/jm.test.mjs           # 只跑下载链路
@@ -557,8 +563,8 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 改完按它核对要不要补用例。
 
 - 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**
-  （当前基线：`test/` 下 198 个用例全过，约 30 秒；其中 27 个是 `settings.test.mjs` + `chatter.test.mjs`
-  的纯函数用例，不用假 Host、三百毫秒就跑完）。
+  （当前基线：`test/` 下 214 个用例全过，约 30 秒；其中 `settings.test.mjs` / `chatter.test.mjs` /
+  `util.test.mjs` / `filestore.test.mjs` 是不用假 Host 的纯函数用例，几百毫秒就跑完）。
 - 加行为就加用例，并在用例名/注释里用中文写清意图。
 - 纯函数（`onebot.js` 里的拆分/延迟/采集/`mentionsOthers`、`image.js`、`media.js`、
   `perceptual.js`、`index.js` 里导出的 `withinActiveHours` / `parseApiKeyPool`）尽量单独测边界。
