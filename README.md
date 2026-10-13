@@ -24,6 +24,8 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 - 一个 QQ 会话（一个私聊对象 / 一个群）= 一个持久化 Session。
 - Session id 由会话 key 经 SHA-256 派生，是**确定性**的：Harness 重启后
   同一个人再发消息，插件会 `resume` 原有会话，聊天记忆不会丢。
+  `/reset` 不改这个算法，只是把「第几轮」也算进摘要：第 0 轮永远是原来那个 id，
+  第 1 轮起各是另一个确定性 id（见[新开一轮会话](#新开一轮会话reset)）。
 - Agent 的回复取该 turn 里**最后一条有文本的 assistant 消息**；中间步骤的
   工具调用不会发给 QQ。
 - 群消息默认只在被 @ 时触发。
@@ -55,7 +57,8 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | `provider` / `model` | `''` | QQ 会话使用的模型；空 = 用默认 |
 | `approvalPolicy` | `never` | `never` = 无人值守时一律拒绝需要审批的操作 |
 | `allowTools` | `[]` | QQ 会话可用的工具白名单；空 = 不限制 |
-| `resetCommand` | `/reset` | 清空当前会话记忆的指令；空 = 禁用 |
+| `resetCommand` | `/reset` | 新开一轮会话（旧会话留在磁盘上当存档）的指令；空 = 禁用 |
+| `resetUsers` | `[]` | 允许用 `resetCommand` 的 QQ 号；**留空 = 谁都不能重置**（与 `allowUsers` 反过来，见[新开一轮会话](#新开一轮会话reset)） |
 | `maxReplyChars` | `1500` | 单条 QQ 消息最大字符数（协议上限），超出自动分段 |
 | `mediaDownload` | `true` | 是否把消息里的图片/表情包下载到本地（模型只能读本地文件，不下载就只看到占位符） |
 | `mediaDir` | `.qq-media` | 媒体缓存目录，相对 `cwd`；必须落在 `cwd` 内，否则自动停用下载 |
@@ -147,7 +150,7 @@ mutsumi: 我也想问
 - 一批都是**同一个人连着发的**时，回复仍然指向他最后那条；一批里**有好几个人**时
   不挂任何指向 —— 引用谁的截图都像是只在回他。
 - 私聊同样适用：一个人连发几句，本来也常常是同一个意思。
-- `/reset` 会先把攒着的那批投出去再清空（那些话是清空前说的）；`/jm` 这类旁路同理。
+- `/reset` 会先把攒着的那批投出去再开新一轮（那些话是重置前说的）；`/jm` 这类旁路同理。
 - `batchWindowMs: 0` 关掉攒批，回到「来一条回一条」。
 
 **2. 它看得到群里在聊什么（`ambientMessages`）**
@@ -168,7 +171,7 @@ mutsumi: 我也想问
 - 缓冲在**内存**里（进程重启即空），且不会因为一条没人 @ 的消息就凭空建出会话。
 - 只对**允许的群**记账（`allowGroups` / `groupChat` 同样适用），机器人自己的消息不进缓冲。
 - 被 @ 的那条不进缓冲 —— 否则同一句话在 user message 和上下文里各出现一次。
-- `/reset` 会连带清掉该群的上下文缓冲。
+- `/reset` 会连带清掉该群的上下文缓冲（也不带进新一轮）。
 
 **3. 它分开几条、按打字节奏发（`humanize` / `burst*` / `*Delay*`）**
 
@@ -361,7 +364,7 @@ iroha: [同一张表情包]
 > 其它文件；系统表情只认纯数字 id，不把 OneBot 给的字段原样转发出去。
 
 相关配置：`repeat` / `repeatMedia` / `repeatCount` / `repeatDistinct` / `repeatWindowMs` /
-`repeatMaxChars` / `repeatChance` / `repeatImageTolerance`；`/reset` 会连同该群的复读链一起清掉。
+`repeatMaxChars` / `repeatChance` / `repeatImageTolerance`；`/reset` 会连同该群的复读链一起清掉（那是「刚才」的事，不属于哪一轮会话）。
 
 ## 偶尔主动说话（`proactive`）
 
@@ -471,7 +474,7 @@ config:
 - **私聊也补，但冷场不主动**：私聊里窗口照样滑，所以它会在你回完、安静一会儿之后追一句；
   而「主动找人聊天」（冷场开口）仍然只在群里发生。这就是[偶尔主动说话](#偶尔主动说话proactive)
   里那句「私聊永远不主动打扰」的边界 —— **聊着的时候可以补，没人理的时候不会去戳你**。
-- **`/reset` 把「还聊着」也一起忘掉**，挂着的补一句随之作废。
+- **`/reset` 把「还聊着」也一起忘掉**，挂着的补一句随之作废（新开的那一轮不带这段窗口）。
 - 日志里补的那句标 `（主动）`，并且前面会有一条 `... 对话还热着（对方安静了约 N 秒），主动补一句`。
 
 > 为什么「中间有别人说话就断」这么保守：群聊是公开的，别人一插话，你接着说的一句很可能
@@ -575,7 +578,7 @@ Agent 调 read_image(".qq-media/6ab290670daf12d2688c6364efca45d5.jpg")
   图也就只能停在占位符上。
 - 关掉整个功能：`mediaDownload: false`。此时一条网络请求都不会发，正文里只有朴素占位符。
 
-排查用 `/reset` 一样清不掉的东西就是缓存本身（它按内容去重，与某个会话无关）；想手动清：
+排查用 `/reset` 一样清不掉的东西就是缓存本身（它按内容去重，与哪个会话、哪一轮都无关）；想手动清：
 
 ```bash
 rm -rf ~/Projects/qqbot/.qq-media
@@ -943,6 +946,14 @@ agentPreset: qq   # 留空 = 用部署默认预设；none = 不挂
 `skill-filesystem` + `tool-skill`（发现并加载 `.dsh/skills` 下的 skill）、以及压缩
 （compaction / tool-result-pruner）。没有 shell、没有子代理、没有 workflow、没有计划模式。
 
+预设里的 `compaction-basic` **显式钉了压缩门槛**（`thresholdRatio: 0.06` /
+`retainRatio: 0.02`：上下文到约 6 万 token 就把最老的一段压成 checkpoint，逐字保留
+最近约 1.5 万）。不配的话，默认门槛是 `min(上下文×0.8, 上下文−请求 maxTokens−headroom)`
+—— deepseek-flash 声明 100 万上下文，算下来约 **67.8 万 token** 才会触发，而 QQ 会话
+是长驻的（一个群一个会话，重启还在，只有 `/reset` 才开新一轮），永远到不了那个量级。于是历史
+只增不减，**每一轮都把整段历史重发一遍**，上下文越大每轮越贵。压到 6 万之后单轮上下文
+才有上限；觉得它记事不够就往上调，想更省就往下调（`retainRatio` 必须小于 `thresholdRatio`）。
+
 **为什么不直接挂 `standard`**（踩过的坑）：
 
 - `standard` 的 `subagent` 行开了 `modelSelectionSettings: true`。这个模式下
@@ -1017,18 +1028,36 @@ allowTools:
 留在白名单之外。同理，`run_code` 是 PTC 模式（`tools.mode: ptc/both`）自带的
 传输工具、无法被列进白名单，但它能调到的子工具仍然受白名单约束。
 
-## 清空会话（`/reset`）
+## 新开一轮会话（`/reset`）
 
-在 QQ 里**单独发送** `resetCommand`（默认 `/reset`）即可清空**当前这个会话**的记忆：
+在 QQ 里**单独发送** `resetCommand`（默认 `/reset`）即可给**当前这个会话**开新的一轮：
 
 - 只影响发指令的那个会话（私聊对象 / 群），别的会话不受影响；
   群聊的上下文缓冲（`ambientMessages`）也一起清掉。
 - 整条消息恰好等于指令才触发；`/reset 你好` 这种带内容的消息会照常交给 Agent。
-- 生效方式是两步：先销毁活着的 Agent（连同它的 Session 与写出句柄），再删掉
-  磁盘上的会话记录，然后回一句「已清空本会话记忆。」。少了任何一步，下一条消息
-  都会把旧记忆带回来。
-- 之后的消息会新建一个空会话，`qq_list_conversations` 里的 Session id 不变
-  （id 由会话 key 派生，与记忆无关）。
+- **只有 `resetUsers` 里的 QQ 号能重置**，而且这一项**默认是空的 —— 也就是谁都不能**。
+  这一条与 `allowUsers` 的「留空 = 不限制」刻意相反：群消息是不可信输入，一个「没配就等于
+  人人可用」的重置指令意味着群里任何一个人都能悄悄把会话重开一轮，而且默认没人会去配它。
+  所以想用这个指令必须显式写号：`resetUsers: ['你的QQ号']`。
+  群里看的是**发言者**的 QQ 号（不是群号）；私聊看的是对方。
+- **没权限的人发 `/reset` 会被静默忽略**：不重置，也不回一句「你没有权限」—— 回话等于告诉
+  全群这里有这么个指令、还激人去试。这条消息仍然照常记进转录（留痕在长期记忆里），但不会
+  交给模型，也不会把当时攒着的那批消息提前投出去。
+- 启动日志里会明说权限状态（`reset command "/reset" is allowed for 1 account(s): …` /
+  `… is disabled for everyone: resetUsers is empty`）—— 配错了不用猜。
+- **`/reset` 不是「删掉会话」，而是「换一个会话重新开始」**：先销毁活着的 Agent
+  （连同它内存里的上下文与 Session 写出句柄），再把「这个会话开到了第几轮」+1
+  并落盘。下一条消息据此算出一个**新的** Session id，于是从头开始。
+- 上一轮的 Session 记录**留在磁盘上**当那段聊天的存档，不会被删；只是不再被带进
+  新一轮的上下文里。想真删掉它是运维动作（删 `$DSH_HOME/sessions/<项目>/<会话 id>/`），
+  不是聊天指令 —— 聊天里没有「把说过的话抹掉」这种能力。
+- 「第几轮」是落盘的，所以**重启不会把上一轮 resume 回来** —— 否则 `/reset` 等于白按。
+  标记文件在会话根目录下的 `reset/<会话>.json`（拿不到会话根时退回 `cwd` 下的
+  `data/reset/`）。
+- `qq_list_conversations` 里报的 `session_id` 会换成新一轮的 id，`session_round`
+  是当前轮次（0 = 从没 `/reset` 过）。
+- 长期记忆（`.qq-memory/`）**不受影响**：转录、`MEMORY.md` 是按会话 key 落的，
+  与轮次无关 —— 「上一轮聊过什么」仍然记得，只是不再占着上下文。
 - 把 `resetCommand` 设为空串即可禁用该指令。
 
 ## 工具
@@ -1037,7 +1066,7 @@ allowTools:
 |---|---|
 | `qq_send_message` | 向指定 QQ 号（私聊）或群号（群）发送文本，超长自动分段 |
 | `qq_send_image` | 向指定 QQ 号或群发一张图 / 表情包：来源是 `cwd` 里的图片路径（含 `.qq-stickers/…`、`.qq-media/…`）或一个 http(s) 图片链接；从 QQ 会话里调用时默认发回当前会话 |
-| `qq_list_conversations` | 列出在线群/好友列表，以及本 Harness 已处理过的 QQ 会话及其 Session id |
+| `qq_list_conversations` | 列出在线群/好友列表，以及本 Harness 已处理过的 QQ 会话、当前 Session id 与轮次（`session_round`） |
 | `qq_jm_pdf` | 下载禁漫（JM）整本/单话 → 合并成一个 PDF → 发到 QQ（从 QQ 会话里调用时默认发回当前会话） |
 | `qq_transcript` | 读某个 QQ 会话的聊天记录：`list` / `read` / `search`（长期记忆的原料，见[长期记忆](#长期记忆聊天记录--摘要--认知)） |
 | `qq_memory` | 读 / 追加 / 覆盖 / 搜索长期记忆文件：`conversations/<slug>/MEMORY.md`、`COGNITION.md`、`INDEX.md`；写被限制在 `memoryDir` 之内 |
@@ -1278,7 +1307,9 @@ write / search / list 与「路径写出记忆目录一律被拒」、每天一�
 回完之后对方安静一小会儿它真的补一句（私聊与群聊各一条通路，提醒里点明「你已经回过话」）、
 判成 `SKIP` 一个字都不发、没有 `proactive` 总开关就不补、群里中间有人插话不补、
 对方再说一句会把挂着的补一句作废（不会攒出一堆）、`activeChimeDailyMax` 用完了不再补、
-`/reset` 把「还聊着」与挂着的补一句一起忘掉，外加 `mentionsOthers` 的纯函数用例。
+`/reset` 把「还聊着」与挂着的补一句一起忘掉、以及「`/reset` 换成新一轮的 Session id
+而旧会话留在磁盘上」「重开进程后仍然停在同一轮」「只有 `resetUsers` 里的人能重置，别人
+连会话都开不出来」，外加 `mentionsOthers` 的纯函数用例。
 窗口里接上的那句**不会**触发 `/jm` / `/reset` 这类旁路（它只是闲聊，指令要明确叫它）。
 
 ## 安全提醒

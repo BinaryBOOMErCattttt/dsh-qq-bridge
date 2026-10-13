@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import yaml from 'js-yaml';
-import { Config, apply, inject, withinActiveHours } from '../index.js';
+import { Config, apply, inject, sessionIdFor, withinActiveHours } from '../index.js';
 import { collectMedia, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
@@ -26,6 +26,10 @@ import { OTHER_PNG, PIC_JPEG, PIC_PNG } from './image-fixtures.mjs';
 
 /** 测试用机器人自己的 QQ 号。 */
 const SELF_ID = 100000000;
+/** 私聊测试里的发送者（`privateMessage` 用的就是它）。 */
+const PRIVATE_USER_ID = 100000002;
+/** 群聊测试里的默认发言者（`groupMessage` 用的就是它）。 */
+const GROUP_USER_ID = 100000003;
 
 /**
  * 一个真的 1×1 PNG（67 字节，8bit RGBA）。
@@ -813,18 +817,18 @@ test('the batch wait is capped even while people keep talking', async () => {
   }
 });
 
-// 用例：/reset 之前攒着的那批话要先投出去 —— 它们是清空前说的，不能被一起忘掉。
-test('the reset command delivers a pending batch before it wipes the conversation', async () => {
-  const { onebot, host } = await boot({ batchWindowMs: 200, batchMaxWaitMs: 400 });
+// 用例：/reset 之前攒着的那批话要先投出去 —— 它们是重置前说的，不能被新一轮忘掉。
+test('the reset command delivers a pending batch before it starts the next round', async () => {
+  const { onebot, host } = await boot({ batchWindowMs: 200, batchMaxWaitMs: 400, resetUsers: [String(PRIVATE_USER_ID)] });
   try {
     onebot.push(privateMessage('你好'));
     onebot.push(privateMessage('/reset'));
     const confirmation = await until(
-      () => onebot.calls.find((call) => call.action === 'send_private_msg' && call.params.message.includes('已清空')),
+      () => onebot.calls.find((call) => call.action === 'send_private_msg' && call.params.message.includes('已开始新会话')),
       'the reset confirmation to reach QQ',
     );
     assert.equal(confirmation.params.user_id, '100000002');
-    // 攒着的那条消息在清空之前投了出去，Agent 随后才被销毁。
+    // 攒着的那条消息在开始新一轮之前投了出去，Agent 随后才被销毁。
     const first = host.list.created[0];
     assert.ok(first, 'the pending batch should reach the Agent before the reset');
     assert.equal(first.inbox[0].content[0].text, '你好');
@@ -1158,10 +1162,10 @@ test('plugin logs are mirrored to stderr in a real host', async () => {
   assert.deepEqual(await capture({}), []);
 });
 
-// 用例十：/reset 清空当前会话 —— 销毁活着的 Agent、删掉磁盘记录，且指令本身
-// 不会被投递给 Agent；之后再来一条消息必须是全新的 Agent（旧记忆不回流）。
-test('the reset command clears the conversation it was sent from', async () => {
-  const { onebot, host, sessionsRoot } = await boot();
+// 用例十：/reset 新开一轮会话 —— 销毁活着的 Agent、换一个 Session id 重新开始，
+// 而**旧会话的记录留在磁盘上**（不删）。指令本身不会被投递给 Agent。
+test('the reset command opens a new session instead of deleting the old one', async () => {
+  const { onebot, host, sessionsRoot } = await boot({ resetUsers: [String(PRIVATE_USER_ID)] });
   try {
     onebot.push(privateMessage('你好'));
     const first = await until(() => host.list.created[0], 'the Agent to be created');
@@ -1171,26 +1175,140 @@ test('the reset command clears the conversation it was sent from', async () => {
 
     onebot.push(privateMessage('/reset'));
     const confirmation = await until(
-      () => onebot.calls.find((call) => call.action === 'send_private_msg' && call.params.message.includes('已清空')),
+      () => onebot.calls.find((call) => call.action === 'send_private_msg' && call.params.message.includes('已开始新会话')),
       'the reset confirmation to reach QQ',
     );
     assert.equal(confirmation.params.user_id, '100000002');
 
-    // Agent 被销毁、磁盘记录被删除。
+    // 旧 Agent 被销毁，但旧会话的磁盘记录**保留**下来当存档。
     await until(() => host.list.disposed.includes(first.id), 'the Agent to be disposed');
-    assert.equal(existsSync(storedDir), false);
+    assert.ok(existsSync(storedDir), 'the old session must be kept on disk, not deleted');
     // 指令没有进 Agent 的收件箱（只有最开始那条「你好」）。
     assert.equal(first.inbox.length, 1);
 
-    // 再来一条消息：必须是新的 Agent（新对象），证明记忆没有回流。
+    // 再来一条消息：必须是新的 Agent（新对象）**并且换了 Session id**，
+    // 证明新一轮既没有复用旧 Agent，也没有 resume 旧会话。
     onebot.push(privateMessage('还记得我刚才说什么吗'));
     const second = await until(() => host.list.created[1], 'a fresh Agent after the reset');
     assert.notEqual(second, first);
+    assert.notEqual(second.id, first.id, 'the new round must use a different session id');
     assert.equal(second.inbox.length, 1);
     assert.equal(second.inbox[0].content[0].text, '还记得我刚才说什么吗');
+    // 会话列表里报的也是新一轮的 id。
+    const listed = await host.tools.get('qq_list_conversations').execute({}, {});
+    assert.equal(listed.sessions[0].session_id, second.id);
+    assert.equal(listed.sessions[0].session_round, 1);
   } finally {
     await onebot.close();
     await rm(sessionsRoot, { recursive: true, force: true });
+  }
+});
+
+// 用例：/reset 开到了第几轮是**落盘**的 —— 插件重启后不该把 reset 之前那段会话
+// resume 回来（那等于 /reset 白按了）。两个实例共用一个会话根目录模拟同一个部署重启。
+test('the session round survives a plugin restart', async () => {
+  const sessionsRoot = await mkdtemp(join(tmpdir(), 'qq-bridge-restart-'));
+  // 其余节奏参数压到 0：这个用例关心的是「跨进程还在不在第 1 轮」，不是时序。
+  // endpoint 必须留给 boot 自己填（假 OneBot 服务端的地址）。
+  const config = { cwd: '/tmp', readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, batchWindowMs: 0, resetUsers: [String(PRIVATE_USER_ID)] };
+  let first;
+  let second;
+  let before;
+  try {
+    // 第一段：说一句 → /reset（第 1 轮）。
+    first = await boot({ ...config }, { sessionsRoot });
+    first.onebot.push(privateMessage('你好'));
+    before = await until(() => first.host.list.created[0], 'the first Agent');
+    assert.equal(before.id, sessionIdFor('private:100000002', 0));
+    first.onebot.push(privateMessage('/reset'));
+    await until(
+      () => first.onebot.calls.find((call) => call.action === 'send_private_msg' && call.params.message.includes('已开始新会话')),
+      'the reset confirmation to reach QQ',
+    );
+    // 标记是在确认发出**之前**就写完的（`resetConversation` 会 await 它）：所以这里
+    // 直接就能看到它，这正是「说完就重启也不会退回第 0 轮」的保证。
+    const marker = join(sessionsRoot, 'reset', 'private-100000002.json');
+    await until(() => existsSync(marker), 'the session round marker on disk');
+  } finally {
+    await first?.onebot.close();
+  }
+  try {
+    // 第二段：同一个会话根目录重新起一个插件（进程重启），再来一条消息。
+    second = await boot({ ...config }, { sessionsRoot });
+    second.onebot.push(privateMessage('重启之后呢'));
+    const after = await until(() => second.host.list.created[0], 'the Agent after the restart');
+    // 重启后仍然在第 1 轮：既不是第 0 轮那个 id（那会把 reset 前的会话 resume 回来），
+    // 也不是新一轮新算出来的另一个 id —— 第 1 轮的 id 是确定性的、跨进程一致的。
+    assert.notEqual(after.id, sessionIdFor('private:100000002', 0));
+    assert.equal(after.id, sessionIdFor('private:100000002', 1));
+    assert.notEqual(after.id, before.id);
+  } finally {
+    await second?.onebot.close();
+    await rm(sessionsRoot, { recursive: true, force: true });
+  }
+});
+
+// 用例：只有 resetUsers 里的人能重置。
+//
+// 默认是**空白名单 = 谁都不能**（与 allowUsers 的「空 = 不限制」相反）：群消息是不可信
+// 输入，一个「没配就等于人人可用」的重置指令，等于让群里任何一个人都能悄悄把会话记忆
+// 重开一轮。没权限的人**静默忽略**：不重置、也不告诉它「你没有权限」。
+test('the reset command only works for accounts listed in resetUsers', async () => {
+  const { onebot, host, sessionsRoot } = await boot({
+    resetUsers: [String(PRIVATE_USER_ID)],
+    batchWindowMs: 200,
+    batchMaxWaitMs: 400,
+  });
+  try {
+    // ① 没权限的人发 /reset：连攒批都不该被它提前投出去（权限判断在 flushBatch 之前），
+    //    也不该有任何回复。
+    onebot.push({
+      post_type: 'message',
+      message_type: 'private',
+      user_id: 999,
+      sender: { nickname: '路人' },
+      message: [{ type: 'text', data: { text: '/reset' } }],
+    });
+    await settle(600); // 超过 batchMaxWaitMs，够攒批自然投出去了
+    assert.equal(host.list.created.length, 0, 'a stranger must not be able to open a session at all');
+    assert.equal(onebot.calls.some((call) => call.action === 'send_private_msg'), false, 'and must get no reply');
+
+    // ② 权限里的人发 /reset：照常开新一轮。
+    onebot.push(privateMessage('/reset'));
+    const confirmation = await until(
+      () => onebot.calls.find((call) => call.action === 'send_private_msg' && call.params.message.includes('已开始新会话')),
+      'the reset confirmation for the allowed account',
+    );
+    assert.equal(confirmation.params.user_id, String(PRIVATE_USER_ID));
+    // 真的换了轮次：磁盘上落下了第 1 轮的标记（0 轮那个会话还没被创建过，所以用文件名断言）。
+    const marker = join(sessionsRoot, 'reset', 'private-100000002.json');
+    await until(() => existsSync(marker), 'the round marker for private:100000002');
+    assert.equal(JSON.parse(await readFile(marker, 'utf8')).count, 1);
+  } finally {
+    await onebot.close();
+    await rm(sessionsRoot, { recursive: true, force: true });
+  }
+});
+
+// 用例：群里重置看的是**发言者**的 QQ 号，不是群号；而没权限的人那条连模型都进不去。
+test('in a group the reset permission follows the speaker, not the group', async () => {
+  const { onebot, host } = await boot({ resetUsers: [String(GROUP_USER_ID)] });
+  try {
+    // 群里另一个人 @它发 /reset：不是指令（没权限），也不会被当成一句话投给模型 ——
+    // 它只是被静默丢掉，所以不会凭空建出一个会话。
+    onebot.push(mention('/reset', { userId: 10001, card: '路人' }));
+    await settle(200);
+    assert.equal(onebot.calls.some((call) => call.action === 'send_group_msg'), false, 'no reply for the stranger');
+    assert.equal(host.list.created.length, 0, 'the stranger must not open a session either');
+
+    // 权限里的那个人 @它发 /reset：生效。
+    onebot.push(mention('/reset'));
+    await until(
+      () => onebot.calls.some((call) => call.action === 'send_group_msg' && String(call.params.message).includes('已开始新会话')),
+      'the reset confirmation from the allowed speaker',
+    );
+  } finally {
+    await onebot.close();
   }
 });
 
@@ -1203,7 +1321,7 @@ test('an empty resetCommand disables the reset handling', async () => {
     assert.equal(agent.inbox.length, 1);
     assert.equal(agent.inbox[0].content[0].text, '/reset');
     assert.deepEqual(host.list.disposed, []);
-    // 没有任何「已清空」的回复发出。
+    // 没有任何「已开始新会话」的回复发出。
     assert.equal(onebot.calls.some((call) => call.action === 'send_private_msg'), false);
   } finally {
     await onebot.close();
@@ -3301,6 +3419,8 @@ async function bootProactive(config = {}, hostOptions = {}, onebotOptions = {}) 
   return boot(
     {
       proactive: true,
+      // 重置权限默认全关（见 Config.resetUsers），这组用例里有 /reset 的场景。
+      resetUsers: [String(PRIVATE_USER_ID), String(GROUP_USER_ID)],
       proactiveChance: 1,
       proactiveIdleMs: 0,
       proactiveFreshMs: 0,
@@ -3539,10 +3659,10 @@ test('proactive forgets its own pacing when the conversation is reset', async ()
   await settle(150);
   assert.equal(agent.inbox.length, 2, 'the gap should hold before the reset');
 
-  // 清空会话：确认消息也是一句「机器人说的话」，于是还得等群里有人接一句才轮到它。
+  // 新开一轮会话：确认消息也是一句「机器人说的话」，于是还得等群里有人接一句才轮到它。
   // 群聊的 /reset 得 @ 它（默认 groupTrigger: mention），所以这里用 mention。
   onebot.push(mention('/reset'));
-  await until(() => sentTexts(onebot).some((text) => String(text).includes('已清空')), 'the reset confirmation');
+  await until(() => sentTexts(onebot).some((text) => String(text).includes('已开始新会话')), 'the reset confirmation');
   await groupChatter(onebot, '那继续吧', { messageId: 7004 });
   host.list.timers.fireInterval();
   // 会话真的被重建了：旧 Agent 被销毁，主动搭话投给了新造的那个 Agent。
@@ -3568,6 +3688,8 @@ async function bootActive(config = {}, hostOptions = {}, onebotOptions = {}) {
   return boot(
     {
       activeFollow: true,
+      // 同上：默认谁都不能 /reset，这里按用例需要显式放开。
+      resetUsers: [String(PRIVATE_USER_ID), String(GROUP_USER_ID)],
       activeChimeIdleMs: 0,
       delayJitter: 0,
       // 冷场主动开口那一套在这里没有意义（用例不会去 fireInterval），但把概率钉成 1
@@ -3866,7 +3988,7 @@ test('activeChime: activeChimeDailyMax caps the day', async () => {
   assert.equal(agent.inbox.length, 3, 'the daily chime budget is spent');
 });
 
-/** `/reset` 会把「还聊着」也忘掉：清空之后不会再补一句。 */
+/** `/reset` 会把「还聊着」也忘掉：新开一轮之后不会再补一句。 */
 test('/reset forgets the active exchange as well', async () => {
   const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 40 });
   onebot.push(privateMessage('在吗'));
@@ -3877,7 +3999,7 @@ test('/reset forgets the active exchange as well', async () => {
 
   // 补一句还没醒就 /reset：窗口与定时器一起没了。
   onebot.push(privateMessage('/reset'));
-  await until(() => sentTexts(onebot, 'send_private_msg').some((text) => String(text).includes('已清空')), 'the reset confirmation');
+  await until(() => sentTexts(onebot, 'send_private_msg').some((text) => String(text).includes('已开始新会话')), 'the reset confirmation');
   await settle(200);
   // 补一句若真的醒了，它会开一轮新 turn —— 那必然要新建一个 Agent（旧的刚被销毁）。
   // 所以「没有第二个 Agent」就是「那个定时器确实被作废了」的最强证据。
@@ -3898,7 +4020,7 @@ test('activeFollow: a followed message never triggers a command bypass', async (
   await until(() => agent.inbox.length >= 2, 'the followed message to reach the Agent');
   assert.equal(agent.inbox[1].content[0].text, '/reset');
   await settle(80);
-  assert.ok(!sentTexts(onebot).some((text) => String(text).includes('已清空')), 'the window must not run commands');
+  assert.ok(!sentTexts(onebot).some((text) => String(text).includes('已开始新会话')), 'the window must not run commands');
 });
 
 // 用例：`.dsh/skills/` 下的每个 skill 都必须是**能被发现**的文件。

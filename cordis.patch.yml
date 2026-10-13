@@ -68,6 +68,17 @@
             config:
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
+                # 上下文上限：QQ 会话是**长驻**的（一个群一个会话，重启还在，只有 /reset 才清），
+                # 而压缩默认几乎不可能触发 —— deepseek-flash 声明 1M 上下文，默认 thresholdRatio
+                # 0.8，实际门槛是 min(1M×0.8, 1M−请求 maxTokens 256k−headroom 64k) ≈ 678k token。
+                # 群的聊天历史到不了那个量级，于是历史只增不减：**每一轮都把整段历史重发一遍**，
+                # 上下文越大每轮越贵（缓存命中也按缓存价计费），token 就是这么烧掉的。
+                # 0.06 把门槛压到 60k：到了就把最老的一段历史压成 checkpoint，只留最近约
+                # 0.02×(1M−256k) ≈ 15k 逐字保留。群里再能聊，单轮上下文也就 60k 上下。
+                # （想更省就往小调，想让它记得更多原话就往大调；retainRatio 必须小于 thresholdRatio。）
+                config:
+                  thresholdRatio: 0.06
+                  retainRatio: 0.02
               - id: tool-result-pruner
                 name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
                 config:

@@ -25,10 +25,9 @@
  */
 import crypto from 'node:crypto';
 import { readdirSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -130,7 +129,8 @@ export const Config = z.object({
   approvalPolicy: z.union(['never', 'inherit']).default('never').description('QQ 会话的工具审批策略：never 表示无人值守时一律拒绝需要审批的操作'),
   agentPreset: z.string().default('').description('QQ 会话 Agent 挂载的 Agent 预设 id（本 bundle 自带 qq：只读文件 + 检索 + 联网）；留空表示用部署的默认预设；填 none 表示不挂载预设（QQ 会话将只有宿主平面的全局工具）'),
   allowTools: z.array(z.string()).default([]).description('QQ 会话 Agent 可用的工具白名单（工具名）；留空表示不限制，非空时未列出的工具一律对 QQ 会话隐藏'),
-  resetCommand: z.string().default('/reset').description('清空当前 QQ 会话记忆的指令：在 QQ 里单独发送该指令即生效；留空表示禁用'),
+  resetCommand: z.string().default('/reset').description('新开一轮会话的指令：在 QQ 里单独发送该指令即生效（旧的会话留在磁盘上当存档，新的一轮从零开始）；留空表示禁用'),
+  resetUsers: z.array(z.string()).default([]).description('允许使用 resetCommand 的 QQ 号白名单；留空表示**谁都不能**重置（群里任何一个人都能把会话记忆重置掉显然不合适，所以这一项默认就是关的）'),
   maxReplyChars: z.number().default(1500).description('单条 QQ 消息的最大字符数（协议上限），超出自动分段'),
   // ---- 图片/表情包：下载到本地，让 Agent 能用 read_image 真的看见 ----
   mediaDownload: z.boolean().default(true).description('是否把 QQ 消息里的图片/表情包下载到本地（模型只能读本地文件，不下载就只看到一句占位符）'),
@@ -230,11 +230,27 @@ export const Config = z.object({
  * 做法是把 SHA-256 摘要裁剪成 UUID 形状，并把版本位/变体位写成固定值，
  * 以便通过 Harness 对 session id 的格式校验。
  *
+ * `generation` 是「这是这个会话的第几轮」：0 是第一轮，`/reset` 每按一次 +1。
+ * 它只参与摘要，不改变派生算法本身 —— 于是**第 0 轮永远是过去那个 id**
+ * （已有会话的记忆不会因为这次改动被隔断），而第 1 轮起又是确定性的：
+ * 重启、换进程、重新算，都还是同一个 id，该 resume 的就 resume。
+ *
+ * 为什么不是「删掉旧会话、原地重建」：`/reset` 的语义已经改成
+ * **新开一轮会话**（见 `resetConversation`）。旧会话的记录留在磁盘上
+ * 当作这段聊天的存档，不再被带进新一轮的上下文，也不再被删掉。
+ *
+ * 导出只为让测试能直接验「第 0 轮的 id 与改动前一致、第 1 轮换新且跨进程稳定」
+ * 这条契约：它不碰任何闭包状态。
+ *
  * @param key - 会话 key，例如 `group:100000001`。
+ * @param generation - 第几轮会话（非负整数，0 = 第一轮）；非法值按 0 处理。
  * @returns 版本 5 形状的 UUID 字符串。
  */
-function sessionIdFor(key) {
-  const hex = crypto.createHash('sha256').update(`dsh-qq-bridge:${key}`).digest('hex');
+export function sessionIdFor(key, generation = 0) {
+  const round = Number.isSafeInteger(generation) && generation > 0 ? generation : 0;
+  // 第 0 轮刻意用**和改动前一模一样**的输入串：历史会话的 id 不能变。
+  const seed = round === 0 ? `dsh-qq-bridge:${key}` : `dsh-qq-bridge:${key}:reset:${round}`;
+  const hex = crypto.createHash('sha256').update(seed).digest('hex');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
@@ -508,6 +524,25 @@ export function apply(ctx, config) {
   const allowTools = [...new Set(config.allowTools.map((name) => name.trim()).filter((name) => name.length > 0))];
   // 会话重置指令：大小写不敏感，空串表示禁用。
   const resetCommand = config.resetCommand.trim().toLowerCase();
+  // 谁能重置会话：同样是「去掉空白项与重复项」，**空数组表示谁都不能**（与
+  // allowUsers / allowGroups 的「空 = 不限制」相反，理由见下面的 canReset）。
+  const resetUsers = [...new Set(config.resetUsers.map((id) => String(id).trim()).filter((id) => id.length > 0))];
+
+  /**
+   * 这个人可不可以重置会话。
+   *
+   * 语义刻意**与 allowUsers / allowGroups 相反**：白名单为空 = **谁都不能**，而不是
+   * 「谁都能」。allowUsers 那种「空 = 不限制」放在准入上是合理的（不配就别用这个功能），
+   * 放在重置上是危险的 —— 群消息是不可信输入，一个「空白名单等于人人可用」的默认值
+   * 意味着群里任何一个人都能悄悄把会话记忆重置掉，而且默认没人会去配它。
+   *
+   * 比较时两边都折成字符串：OneBot 的 user_id 可能是数字，配置里写的是文本。
+   * @param userId - 发消息的人（私聊是对方，群聊是发言者，不是群号）。
+   * @returns 允许重置时为 true。
+   */
+  function canReset(userId) {
+    return resetUsers.includes(String(userId ?? ''));
+  }
   // 部署 persona 里的 `{{model}}` 取的是 `agent.options.model`，请求路由读的也是
   // 同一组字段，所以程序化创建的 Agent 必须显式带上模型选择：否则提示词装配会
   // 失败，turn 在消息被 claim 之前就死掉。下面的 route 记录当前生效的选择，
@@ -741,6 +776,105 @@ export function apply(ctx, config) {
   let digestChain = Promise.resolve();
   /** 已经排进队列、还没跑完的会话 key，避免同一个会话被重复排队。 */
   const digestQueued = new Set();
+
+  // ---- 会话代次（`/reset` 开新一轮会话的记账）------------------------------------
+  //
+  // `/reset` 的语义是「新开一轮会话」而不是「删掉会话记录」：旧的 Harness Session
+  // 留在磁盘上当存档，插件换一个 session id 开始新一轮。所以需要记住「这个会话已经
+  // reset 过几次」—— 它决定当前这一轮用哪个 id（见 sessionIdFor）。
+  //
+  // 为什么要落盘：`conversations` 是运行时状态，重启就没了。如果代次只存在内存里，
+  // 重启后就会算出第 0 轮的 id、把 reset **之前**那段会话 resume 回来 —— 那等于
+  // `/reset` 没生效。标记文件放在会话根目录下的 `reset/`，与它标记的会话记录同处
+  // 一个存储（`sessionPersistence.root` 或 `$DSH_HOME/sessions`）。
+  //
+  // 拿不到会话根（headless 组合、测试桩没给服务）时退回 `data/`：那也在 cwd 内，
+  // 不会往进程 cwd 乱写文件，也不会污染记忆目录（记忆关掉时记忆目录可能根本不存在）。
+
+  /** 会话 key → 已经 reset 过几次（= 当前是第几轮会话）。 */
+  const conversationResetCounts = new Map();
+  /** 这次启动是否已经有过一次 reset —— 有，就别再用更旧的磁盘扫描结果覆盖它。 */
+  let conversationResetDirty = false;
+
+  /** 会话代次标记所在的目录：拿不到会话根时退回 `data/`。 */
+  function resetMarkerDir() {
+    const service = ctx.get('sessionPersistence');
+    if (typeof service?.root === 'string' && service.root.length > 0) return join(service.root, 'reset');
+    return join(cwd, 'data', 'reset');
+  }
+
+  /**
+   * 读回磁盘上的会话代次标记（启动时一次，之后走内存）。
+   *
+   * 只能**按目录扫**：标记是按会话 slug 命名的一个个小文件，没有字典索引 ——
+   * 会话根目录本来就只是「一堆会话目录」，这里不去动它的结构，另建一个平铺的
+   * `reset/` 子目录，一个会话一个文件，看文件名就知道是哪个会话。
+   *
+   * 刻意不删标记：删了就得记住「哪些已经迁移进内存」，而扫描与 reset 可能交错，
+   * 交错时删除会丢代次。留着的代价只是几个几字节的小文件。
+   */
+  async function loadConversationResetCounts() {
+    const dir = resetMarkerDir();
+    let names;
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return; // 没扫过任何 reset（或目录还不存在）：全部按第 0 轮算。
+    }
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue;
+      try {
+        const parsed = JSON.parse(await readFile(join(dir, name), 'utf8'));
+        const key = typeof parsed?.key === 'string' ? parsed.key : '';
+        const count = parsed?.count;
+        if (key.length === 0 || !Number.isSafeInteger(count) || count < 0) continue;
+        // 这次启动已经 reset 过的会话，内存里那份更新，别被磁盘上的旧值盖回去。
+        if (conversationResetDirty && conversationResetCounts.has(key)) continue;
+        conversationResetCounts.set(key, count);
+      } catch {
+        // 单个标记坏了（写到一半被杀、手工编辑出错）就跳过它：那个会话退回第 0 轮，
+        // 但不该把别的会话的代次一起丢掉 —— 每个标记是独立的，各管各的。
+        report('warn', `reset marker ${name} is unreadable; that conversation falls back to the first round`);
+      }
+    }
+  }
+
+  /**
+   * 把某个会话当前在第几轮写进标记文件（原子写）。
+   *
+   * 这里**等它写完**（与转录那种后台追加不同）：`/reset` 的确认是在这次写入之后才
+   * 发出去的，也就是说「机器人说已经开了新一轮」与「磁盘上真的记着第 N 轮」同时成立。
+   * 不等的话，确认刚发出就重启会把第 0 轮的会话 resume 回来 —— 那是最难查的一类
+   * 「reset 好像没生效」。代价只是一次几字节的小文件写入。
+   *
+   * 写不进去（磁盘满、会话根只读）时只记一条 warn：内存里的代次已经生效，本次进程
+   * 里 `/reset` 仍然是对的，只是重启后会退回第 0 轮 —— 这比让整条指令失败要好。
+   * @param key - 会话 key。
+   * @param count - 已经 reset 过几次。
+   */
+  async function writeConversationResetCount(key, count) {
+    try {
+      const dir = resetMarkerDir();
+      await mkdir(dir, { recursive: true });
+      await writeJsonAtomic(join(dir, `${memorySlug(key)}.json`), { key, count });
+    } catch (error) {
+      report('warn', `could not persist the session round for ${key} (a restart would rewind it): ${errorText(error)}`);
+    }
+  }
+
+  /**
+   * 把磁盘上的代次读进一条会话记录。
+   *
+   * 只在**新建会话记录**时调用（`conversationFor`）：记录一旦存在，代次就由那次
+   * reset 当场更新，不需要再读盘。启动时的扫描可能还没跑完，所以这里命中了就顺手
+   * 标脏，免得扫描的最后一步把它盖回旧值。
+   * @param conversation - 刚建出来的会话记录。
+   */
+  function refreshSessionGeneration(conversation) {
+    if (!conversationResetCounts.has(conversation.key)) return;
+    conversation.sessionGeneration = conversationResetCounts.get(conversation.key);
+    conversationResetDirty = true;
+  }
 
   /**
    * 取一个会话在记忆目录下的安全目录名（每个进程只算一次，保证稳定）。
@@ -1671,7 +1805,7 @@ export function apply(ctx, config) {
    * @returns 存活的 Agent。
    */
   async function ensureAgent(conversation) {
-    const sessionId = sessionIdFor(conversation.key);
+    const sessionId = sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0);
     const live = ctx.agents.get(sessionId);
     if (live !== undefined) {
       conversation.agent = live;
@@ -2470,59 +2604,21 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 找出并删除某个 Session 在磁盘上的持久化记录。
+   * 让一个 QQ 会话**新开一轮**：`/reset` 的实际动作。
    *
-   * 位置来自 sessionPersistence 服务自己解析出的 `root`（jsonl 后端把 root 作为
-   * 公开字段暴露出来），布局是 `<root>/<项目目录>/<会话 id>/`；这里按「项目目录」
-   * 通配一层，而不是自己重算项目目录的编码规则，避免和宿主的命名逻辑绑死。
-   * 只用服务给出的这一个根目录：多扫一个候选根目录意味着可能碰到不属于本进程的
-   * 数据（测试里就出现过「按真实 ~/.dsh 路径删掉线上会话」的危险），所以拿不到
-   * `root` 时才退回 `$DSH_HOME/sessions`（默认 `~/.dsh/sessions`）。
-   * @param sessionId - 要清除的 Session id。
-   * @returns 实际删掉的会话目录数（0 表示磁盘上本来就没有）。
-   */
-  async function deleteStoredSession(sessionId) {
-    const service = ctx.get('sessionPersistence');
-    const envHome = process.env.DSH_HOME?.trim();
-    const fallback = join(envHome && envHome.length > 0 ? envHome : join(homedir(), '.dsh'), 'sessions');
-    const root = typeof service?.root === 'string' && service.root.length > 0 ? service.root : fallback;
-    let projects;
-    try {
-      projects = await readdir(root, { withFileTypes: true });
-    } catch {
-      return 0; // 根目录不存在（或没有权限）：磁盘上就是没有记录。
-    }
-    let removed = 0;
-    for (const project of projects) {
-      if (!project.isDirectory()) continue;
-      const dir = join(root, project.name, sessionId);
-      try {
-        if (!(await stat(dir)).isDirectory()) continue;
-      } catch {
-        continue; // 这个项目目录下没有该会话。
-      }
-      try {
-        await rm(dir, { recursive: true, force: true });
-        removed += 1;
-        report('info', `removed stored session at ${dir}`);
-      } catch (error) {
-        report('warn', `could not remove ${dir}: ${error?.message ?? error}`);
-      }
-    }
-    return removed;
-  }
-
-  /**
-   * 清空一个 QQ 会话的记忆：`/reset` 的实际动作。
+   * 「开新一轮」而不是「删掉旧的」是刻意的：旧 Session 连同它的对话记录留在磁盘上
+   * 当这段聊天的存档（`/reset` 不等于「假装没发生过」），插件只是换一个 session id
+   * 从头开始 —— 新一轮的上下文里不会再有旧会话的任何东西。
    *
-   * 两步缺一不可 —— 先销毁活着的 Agent（内存里的对话历史、以及它持有的 Session
-   * 写出句柄都随之释放），再删掉磁盘上的会话记录。只做前者，下一条消息会 resume
-   * 出旧记录；只做后者，活着的 Agent 会把文件写回来且记忆仍在。
+   * 两步缺一不可：先销毁活着的 Agent（内存里的对话历史、以及它持有的 Session 写出
+   * 句柄都随之释放），再把代次 +1 并落盘（下一条消息据此算出新的 session id）。
+   * 只做前者，下一条消息会用同一个 id 把旧会话 resume 回来；只做后者，活着的 Agent
+   * 仍挂在这个会话上，`ensureAgent` 的第一行就会把旧的那个直接复用。
    * @param conversation - 要重置的会话记录。
-   * @returns 是否成功清空（false 表示磁盘记录还在，调用方据此回复）。
+   * @returns 是否成功开始新一轮（false 表示没能销毁旧 Agent，调用方据此回复）。
    */
   async function resetConversation(conversation) {
-    const sessionId = sessionIdFor(conversation.key);
+    const sessionId = sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0);
     // 1) 销毁 Agent（handle.dispose() 是幂等的）。
     const live = conversation.agent ?? ctx.agents.get(sessionId);
     if (live !== undefined) {
@@ -2533,14 +2629,21 @@ export function apply(ctx, config) {
         else if (typeof live.scope?.dispose === 'function') await live.scope.dispose();
         else throw new Error('no disposer available for the live agent');
       } catch (error) {
-        // 销毁失败就必须保留磁盘记录：半清状态下记忆会以更隐蔽的方式回来。
+        // 销毁失败就什么都别动：新旧两个 Agent 同时挂在同一个会话上，回复会串。
         report('warn', `could not dispose ${sessionId}: ${error?.message ?? error}`);
         return false;
       }
     }
-    // 2) 删掉磁盘记录，让下一条消息 resume 失败、走 create 新建空会话。
-    const removed = await deleteStoredSession(sessionId);
-    // 3) 清掉插件自己的记账，避免旧会话的 turn 结果串到新会话上。
+    // 2) 代次 +1 并落盘：下一条消息算出**另一个** session id，于是 resume 失败、
+    //    走 create 新建一个空会话。旧会话的磁盘记录原样留着。
+    const round = (conversation.sessionGeneration ?? 0) + 1;
+    conversation.sessionGeneration = round;
+    conversationResetCounts.set(conversation.key, round);
+    conversationResetDirty = true;
+    await writeConversationResetCount(conversation.key, round);
+    const nextSessionId = sessionIdFor(conversation.key, round);
+    // 3) 清掉插件自己的记账，避免旧会话的 turn 结果串到新会话上（`sessionIndex` 里
+    //    还挂着旧 id 的话，旧 Agent 迟到的 turn/end 会被当成这个会话的回复发出去）。
     conversation.agent = undefined;
     conversation.handle = undefined;
     sessionIndex.delete(sessionId);
@@ -2553,7 +2656,7 @@ export function apply(ctx, config) {
     for (const slot of [...transcripts.keys()]) {
       if (slot.startsWith(`${sessionId}:`)) transcripts.delete(slot);
     }
-    // 群聊上下文也算「刚才那些话」，一起忘掉；否则重置后模型还知道群里之前聊了什么。
+    // 群聊上下文也算「刚才那些话」，一起忘掉；否则新一轮的模型还知道群里之前聊了什么。
     if (conversation.type === 'group') {
       ambient.delete(conversation.id);
       repeatStates.delete(conversation.id);
@@ -2564,7 +2667,7 @@ export function apply(ctx, config) {
       conversation.proactiveDay = '';
       conversation.proactiveCount = 0;
     }
-    // 活跃对话（私聊也有）：清空会话就该把「还聊着」这件事也忘掉，并撤掉挂着的补一句。
+    // 活跃对话（私聊也有）：新开一轮就该把「还聊着」这件事也忘掉，并撤掉挂着的补一句。
     cancelChime(conversation);
     conversation.activeUntil = 0;
     conversation.activeSpeakerId = '';
@@ -2573,7 +2676,7 @@ export function apply(ctx, config) {
     conversation.chimeCount = 0;
     conversation.chimeDay = '';
     conversation.chimeToday = 0;
-    report('info', `reset ${conversation.key} (${sessionId}), removed ${removed} stored log(s)`);
+    report('info', `started round ${round} for ${conversation.key} (${sessionId} → ${nextSessionId}); the old session is kept on disk`);
     return true;
   }
 
@@ -2603,6 +2706,14 @@ export function apply(ctx, config) {
       speakers: [],
       /** 记忆元信息（群名等）是否已经写过一次，避免每条消息都重写一遍 meta.json。 */
       metaWritten: false,
+      /**
+       * 这是这个会话的第几轮（0 = 第一轮，`/reset` 每按一次 +1）。
+       *
+       * 唯一的用途是派生当前这一轮的 Session id（见 sessionIdFor）：`/reset` 不删旧会话，
+       * 只是换一个 id 重新开始。新建记录时由 `refreshSessionGeneration` 从 reset 标记
+       * 里带上，`resetConversation` 当场 +1。
+       */
+      sessionGeneration: 0,
       /**
        * 「群里最后一条**别人的**消息」是什么时候到的（含没 @ 机器人的闲聊）。
        *
@@ -2662,6 +2773,9 @@ export function apply(ctx, config) {
     let conversation = conversations.get(key);
     if (conversation === undefined) {
       conversation = blankConversation(key, type, id);
+      // 磁盘上说这个会话已经 reset 过几次，就从那一轮开始 —— 重启不该把
+      // reset 之前那段会话 resume 回来。
+      refreshSessionGeneration(conversation);
       conversations.set(key, conversation);
     }
     if (type === 'group') {
@@ -3203,7 +3317,7 @@ export function apply(ctx, config) {
    * @returns 有在飞的 turn 时为 true。
    */
   function busyWithTurn(conversation) {
-    const prefix = `${sessionIdFor(conversation.key)}:`;
+    const prefix = `${sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0)}:`;
     for (const slot of turnOwners.keys()) {
       if (slot.startsWith(prefix)) return true;
     }
@@ -3950,13 +4064,23 @@ export function apply(ctx, config) {
       }
       return;
     }
-    // 会话重置指令：整条消息恰好等于指令才触发，且只清空「发指令的这个会话」。
-    // 攒着的那批是在清空之前收到的，必须先投出去，否则那几句话会被一起忘掉。
+    // 会话重置指令：整条消息恰好等于指令才触发，且只对「发指令的这个会话」生效。
+    // 它开的是**新一轮**会话（旧会话留在磁盘上当存档），而不是把记录删掉。
+    // 攒着的那批是在重置之前收到的，必须先投出去，否则那几句话会被一起忘掉。
     if (commanded && resetCommand.length > 0 && preview.toLowerCase() === resetCommand) {
+      // 权限：只有 resetUsers 里的人能用（默认空白名单 = 谁都不能）。没权限的**静默忽略**，
+      // 既不重置也不回「你没有权限」—— 回一句等于告诉全群这里有这么个指令、还激人去试；
+      // 这一条仍然照常记进转录（rememberTranscript 在前面已经跑过），留痕在记忆里。
+      // 注意这个判断必须在 flushBatch / enqueue **之前**：那样没有权限的人连「让攒着的
+      // 那批提前投出去」都做不到。
+      if (!canReset(event.user_id)) {
+        report('info', `ignored ${resetCommand} from ${conversation.key} by ${event.user_id}: not in resetUsers`);
+        return;
+      }
       flushBatch(conversation);
       enqueue(conversation, async () => {
-        const cleared = await resetConversation(conversation);
-        await sendToConversation(conversation, cleared ? '已清空本会话记忆。' : '（清空失败：没能删掉会话记录，请查看机器人日志）');
+        const started = await resetConversation(conversation);
+        await sendToConversation(conversation, started ? '已开始新会话（上一轮的记忆留在磁盘上，不再带进这一轮）。' : '（没能开始新会话：旧会话还活着，请查看机器人日志）');
       });
       return;
     }
@@ -4226,6 +4350,7 @@ export function apply(ctx, config) {
                   type: { type: 'string', required: true },
                   name: { type: 'string', required: true },
                   session_id: { type: 'string', required: true },
+                  session_round: { type: 'number', required: true },
                 },
               },
             },
@@ -4249,7 +4374,8 @@ export function apply(ctx, config) {
           if (value.groups.length > 0) lines.push('', 'Groups:', ...value.groups.map((g) => `  ${g.id} ${g.name}`));
           if (value.friends.length > 0) lines.push('', 'Friends:', ...value.friends.map((f) => `  ${f.id} ${f.name}`));
           if (value.sessions.length > 0) {
-            lines.push('', 'Handled conversations:', ...value.sessions.map((s) => `  ${s.conversation} (${s.name}) → session ${s.session_id}`));
+            // 轮次只在 /reset 过之后才标出来：没 reset 过的会话保持原来的输出形状。
+            lines.push('', 'Handled conversations:', ...value.sessions.map((s) => `  ${s.conversation} (${s.name}) → session ${s.session_id}${s.session_round > 0 ? ` (round ${s.session_round})` : ''}`));
           }
           return [{ type: 'text', text: lines.join('\n') }];
         },
@@ -4281,12 +4407,14 @@ export function apply(ctx, config) {
           groups,
           friends,
           route: { provider: chosen.provider, model: chosen.model, source: chosen.source, error: chosen.error },
-          // sessions 来自已处理过的会话表；session_id 现场派生，因此与 QQ 号一一对应且稳定。
+          // sessions 来自已处理过的会话表；session_id 现场派生，因此与 QQ 号一一对应
+          // 且稳定 —— 同一个会话每 /reset 一次换一个新 id（旧的留在磁盘上当存档）。
           sessions: [...conversations.values()].map((conversation) => ({
             conversation: conversation.key,
             type: conversation.type,
             name: conversation.name || conversation.senderName,
-            session_id: sessionIdFor(conversation.key),
+            session_id: sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0),
+            session_round: conversation.sessionGeneration ?? 0,
           })),
         };
       },
@@ -4717,5 +4845,22 @@ export function apply(ctx, config) {
     void mkdir(stickerRoot, { recursive: true }).catch((error) => {
       report('warn', `could not create stickerDir ${stickerRoot}: ${errorText(error)}`);
     });
+  }
+
+  // 会话代次（`/reset` 开到了第几轮）预热：不读回来的话，重启后所有会话都会退回第 0 轮，
+  // 把 reset 之前那段会话 resume 回来。这里**可以**在启动时一次性扫完 —— 与摘要不同，
+  // 它不依赖 `conversations`（那张表此刻还是空的），磁盘上有什么就是什么。
+  void loadConversationResetCounts().catch((error) => {
+    report('warn', `could not load the session rounds: ${errorText(error)}`);
+  });
+
+  // 重置权限的启动自述：这是唯一一个「白名单为空 = 全都不能用」的配置项，很容易
+  // 配好了没生效（写错 QQ 号、忘了重启）却看不出来 —— 日志里明说一遍，排查时一眼就懂。
+  if (resetCommand.length === 0) {
+    report('info', 'reset command is disabled (resetCommand is empty)');
+  } else if (resetUsers.length === 0) {
+    report('info', `reset command "${resetCommand}" is disabled for everyone: resetUsers is empty`);
+  } else {
+    report('info', `reset command "${resetCommand}" is allowed for ${resetUsers.length} account(s): ${resetUsers.join(', ')}`);
   }
 }

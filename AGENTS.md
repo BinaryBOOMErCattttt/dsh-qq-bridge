@@ -95,11 +95,11 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 |---|---|---|
 | 顶部常量 | `CHANNEL_SECTION_ORDER=8950`、`PRESET_NONE`、`QUOTE_TEXT_CHARS`、`STICKER_PROMPT_MAX` | 调提示词用 |
 | `Config` schema | 第 106–199 行 | **配置的唯一真相来源**，`.description()` 就是 Web UI 上给用户看的文档 |
-| 运行时状态 | 第 532–571 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / `chatterSeq`（只算别人）/ `quoteSeq`（**含机器人自己发的**，答复指向用；`noteOwnMessage` 在发出去那一刻记账）/ `repeatStates` / `mediaResolutions`，以及记忆的 `memorySlugs` / `memoryDirty` / `memoryLastDigest` / `memoryWrites` / `memoryIndexCache`；每条会话记录里还挂着 `lastActiveAt` / `lastBotSpeakAt` 与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
+| 运行时状态 | 第 532–571 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / `chatterSeq`（只算别人）/ `quoteSeq`（**含机器人自己发的**，答复指向用；`noteOwnMessage` 在发出去那一刻记账）/ `repeatStates` / `mediaResolutions`，以及记忆的 `memorySlugs` / `memoryDirty` / `memoryLastDigest` / `memoryWrites` / `memoryIndexCache`；每条会话记录里还挂着 `sessionGeneration`（第几轮会话，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` 与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
 | Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` | 见 §7 |
 | 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` | 串行队列保证同一会话的消息不乱序；`sendOne` 顺便记 `lastBotSpeakAt`（主动说话靠它避免独白） |
 | JM 旁路 | `readJmCommand` `runJmCommand` `sendJmFile` `downloadJm` | `/jm 422866` 不进 Agent、不建会话 |
-| 会话管理 | `resetConversation` `deleteStoredSession` `conversationFor` | `/reset`，以及在线会话列表（群重置时连主动说话的节奏一起清） |
+| 会话管理 | `resetConversation` `conversationFor` `sessionIdFor` `resetMarkerDir` `loadConversationResetCounts` `writeConversationResetCount` `refreshSessionGeneration` | `/reset` 开新一轮（**不删旧会话**，代次 +1 并落盘），以及在线会话列表（新一轮时连主动说话的节奏一起清） |
 | 准入与复读 | `admit` `noteChatter` `touchActivity` `rememberAmbient` `maybeRepeat` `repeatStep` `sketchOf` `sameCandidate` | 白名单、群触发判定、环境上下文、复读状态机（图片来源判定 = 字节相同 **或** 画面指纹相近，见 `perceptual.js`）；`admit` 里还有「活跃对话」那条免 @ 的旁路 |
 | 主动说话 | `proactiveSweep` `proactiveEligible` `proactiveSpeak` `proactiveNudge` `proactiveSkip` `busyWithTurn` `proactiveTodayCount` | 见 §4.F；定时器在生命周期那一节，`withinActiveHours` 是模块级纯函数 |
 | 活跃对话 | `noteActiveMessage` `activeFollowAllows` `scheduleChime` `cancelChime` `runChime` `chimeSpeak` `chimeNudge` `chimeTodayUsed` | 见 §4.G；A（免 @ 接话）在 `admit` 里判，B（补一句）挂在 `turn/end` 之后 |
@@ -114,13 +114,14 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 `onebot.js` / `media.js` / `image.js` / `jm.js`。注释密度 25%–45%。文件大是因为
 「一个大闭包 + 6 个大工具声明 + 大段取舍注释」，不是因为函数失控。
 
-**模块级纯函数**（在 `apply()` 外面，只有记忆与主动说话这一块有）：`memorySlug` / `localDate` /
-`localStamp` / `msUntilDailyHour`（下一个整点还有多久）/ `withinActiveHours`（主动说话的
-时段判定，导出只为测边界）/ `memoryRelativePath`（写边界）/
+**模块级纯函数**（在 `apply()` 外面，只有记忆与主动说话这一块有）：`sessionIdFor`（会话 key +
+第几轮 → Session id，导出只为测「第 0 轮不变 / 第 1 轮确定」这条契约）/ `memorySlug` /
+`localDate` / `localStamp` / `msUntilDailyHour`（下一个整点还有多久）/ `withinActiveHours`
+（主动说话的时段判定，导出只为测边界）/ `memoryRelativePath`（写边界）/
 `readJsonl` / `writeJsonTextAtomic`。它们不碰闭包状态，改它们不影响运行时不变量 ——
 `msUntilDailyHour` 尤其值得单独测边界（刚过点要排到明天，不能原地反复醒）。
 
-## 4. 七条数据流（改任何一条先读对应的那条）
+## 4. 八条数据流（改任何一条先读对应的那条）
 
 ### A. 入站消息 → Agent → QQ（主链路）
 
@@ -320,6 +321,38 @@ turn/end（正常回复发完之后）
 - **B 需要 `proactive: true`**：`scheduleChime` 的第一行就是总开关 —— 「允许它主动发消息」
   只有一个开关，别让补一句绕过它。
 
+### H. 会话轮次（`/reset` 开新一轮）
+
+`/reset` 不删旧会话，而是**换一个 Session id 从头开始**。代次（第几轮）是这套东西的全部状态：
+
+```
+conversationFor ──▶ refreshSessionGeneration：新建会话记录时从内存代次表里带上
+                     （内存代次表由启动时的 loadConversationResetCounts 从磁盘扫进来）
+ensureAgent     ──▶ sessionIdFor(key, conversation.sessionGeneration ?? 0)
+                     → 该 id 的 Session 不在就 resume（第 0 轮的老会话），失败则 create
+
+QQ 里发 /reset ─▶ handleEvent 的旁路（先 flushBatch）─▶ resetConversation
+   ① 销毁活着的 Agent（句柄没了就退 scope.dispose）；销毁失败 → 整件事放弃、回一句失败
+   ② 代次 +1，写进内存表 + 标记文件（`<会话根>/reset/<slug>.json`，**await 落盘成功**）
+   ③ 清记账：sessionIndex / turnOwners / submitted / transcripts / ambient / repeatStates /
+      主动说话计数 / 活跃对话窗口与 chime
+   ④ 下一句消息算出**新的** id → resume 不到 → create 一个空会话（第 N 轮）
+```
+
+不能踩的：
+
+- **代次必须落盘**（见 §5.4）：只在内存里的话，重启会把第 0 轮的会话 resume 回来。
+- **`/reset` 之后旧会话仍在磁盘上**，这是刻意的：它是那段聊天的存档。别顺手「清理」它，
+  也别把它重新注册进 `sessionIndex`（那会让旧 Agent 迟到的 turn/end 当成这个会话的回复发出去）。
+- **长期记忆与轮次无关**：转录 / `MEMORY.md` 都按会话 key（`memorySlug`）落，`/reset` 不动它们 ——
+  「上一轮聊过什么」仍然查得到，只是不再占着上下文。
+- **第 0 轮的 id 是历史契约**（见 §5.3）：`sessionIdFor(key, 0)` 必须与改动前逐位相同。
+- **重置要过权限**（`canReset` / `Config.resetUsers`）：这是全项目唯一一个「白名单为空 =
+  谁都不能」的配置项，与 `allowUsers` / `allowGroups` 的「空 = 不限制」**相反**，别顺手
+  「统一」成一样的语义。判断点在 `handleEvent` 的 `/reset` 分支里、`flushBatch` **之前**：
+  挪到后面会让没权限的人也拿到「攒着的消息立刻投出去」这个副作用。没权限时静默 return
+  （不回「你没有权限」），那条消息已经由 `rememberTranscript` 记进转录了，保持这个顺序。
+
 ## 5. 必须知道的硬约束
 
 1. **改源码必须重启 Harness，停用/启用插件没用。**
@@ -333,22 +366,28 @@ turn/end（正常回复发完之后）
 2. **不要用 agent 的后台任务跑常驻进程。** DSH 的 bash 工具跑在
    `bwrap --die-with-parent` 沙箱里，沙箱一销毁子进程就死。常驻走 systemd user unit
    （`deploy/qqbot.service`，`Restart=always`）或 tmux。
-3. **Session id 是确定性的，不许改算法。** `sessionIdFor(key)` = SHA-256 裁成 UUID 形状
-   （固定版本位/变体位过格式校验），key 形如 `group:100000001` / `private:<QQ号>`。
-   改了它 = 所有人的聊天记忆全部丢失。
-4. **`cwd` 既是 Agent 工作目录也是沙箱根。** `mediaDir` / `stickerDir` / `jmDir` /
+3. **Session id 是确定性的，不许改算法。** `sessionIdFor(key, generation)` = SHA-256 裁成
+   UUID 形状（固定版本位/变体位过格式校验），key 形如 `group:100000001` / `private:<QQ号>`。
+   `generation` 是「第几轮会话」：**`generation === 0` 的输入串必须保持原样**
+   （`dsh-qq-bridge:<key>`），改了它 = 所有人的聊天记忆全部丢失；≥1 时在 key 后面缀
+   `:reset:<n>`，同样确定性。`/reset` 就是把这个数 +1（见 §4.H）。
+4. **会话代次要落盘**（`<会话根>/reset/<slug>.json`，拿不到会话根时 `cwd/data/reset/`）：
+   它只在内存里的话，重启会算出第 0 轮的 id、把 reset 之前的会话 resume 回来 —— 等于
+   `/reset` 白按。标记按会话独立，一个坏了只影响那一个（别「一个都读不出来就全清空」）。
+5. **`cwd` 既是 Agent 工作目录也是沙箱根。** `mediaDir` / `stickerDir` / `jmDir` /
    `memoryDir` 必须在 `cwd` 内，配到外面代码会**记 warn 并自动停用**该功能
    （`insideDirectory` 校验），这是有意设计，别改成抛错。
-5. **QQ 消息是不可信输入。** 默认 `approvalPolicy: 'never'`（需要审批的操作直接拒绝）、
-   群消息默认只在被 @ 时触发（`activeFollow` 会在有窗口时放开这一点，所以它默认关）。
+6. **QQ 消息是不可信输入。** 默认 `approvalPolicy: 'never'`（需要审批的操作直接拒绝）、
+   群消息默认只在被 @ 时触发（`activeFollow` 会在有窗口时放开这一点，所以它默认关）、
+   `/reset` 默认**谁都不能用**（`resetUsers` 空 = 全关，见 §4.H）。
    任何扩大 QQ 侧能力的改动都要重新想一遍这一点。
-6. **`Config` schema 是配置的唯一真相。** 加配置项 = 在 schema 里加字段（带**中文**
+7. **`Config` schema 是配置的唯一真相。** 加配置项 = 在 schema 里加字段（带**中文**
    `.description()`），index.js 里读数，README 表格里同步一行。已有 60+ 字段，
    §3 的表格只是导览，别照抄。
-7. **日志要同时写 logger 和 stderr。** 这个部署没把 cordis logger 接到 stdout，
+8. **日志要同时写 logger 和 stderr。** 这个部署没把 cordis logger 接到 stdout，
    `ctx.logger.warn()` 在 journal 里一个字都看不到。用 `report(level, msg)`，
    它靠 `logger.exporter` 是否存在来避免污染测试输出。
-8. **同一会话的消息必须串行**（`enqueueSend` / `enqueue`）。QQ 消息到达顺序和异步
+9. **同一会话的消息必须串行**（`enqueueSend` / `enqueue`）。QQ 消息到达顺序和异步
    IO 完成顺序不一致，绕过队列会串话/乱序。
 
 ## 6. 怎么改：任务 → 动哪里
@@ -369,6 +408,8 @@ turn/end（正常回复发完之后）
 | 改主动说话的时段语义 | `withinActiveHours`（**模块级纯函数**，导出给测试用）+ 它的边界用例 |
 | 改「聊起来之后保持搭话」 | index.js 的活跃对话区块（`activeFollowAllows` / `scheduleChime` / `runChime` / `chimeNudge`）+ `admit` 里那条免 @ 分支 + `Config` 的 `active*` + README「聊起来之后保持搭话」（见 §4.G） |
 | 改「谁算在跟它聊」 | `chatterSeq` / `activeSeq` 那套序号比较（`noteActiveMessage` / `activeFollowAllows` / `runChime`）—— 别改成时间戳，它判的是「有没有人插话」 |
+| 改 `/reset` 的行为（轮次的算法 / 标记落盘 / 清哪些记账） | `sessionIdFor` + `resetConversation` + `resetMarkerDir` / `loadConversationResetCounts`（见 §4.H、§5.3、§5.4） |
+| 改「谁能重置会话」 | `Config.resetUsers` + `canReset` + `handleEvent` 里的 `/reset` 分支（**空白名单 = 谁都不能**，别改成 `allowUsers` 那种语义）+ README「新开一轮会话」 |
 | 改 QQ 会话能用哪些工具 | `cordis.patch.yml` 的 `preset-qq` + `Config.allowTools`（见 §7） |
 | 改长期记忆的行为 | `Config` 的 `memory*` / `digest*` + index.js 的记忆区块 + README「长期记忆」 |
 | 改摘要的触发时刻 | `digestAtHour` + `msUntilDailyHour`（模块级纯函数）+ `runDigestSweep` 的日期判据 |
@@ -413,7 +454,7 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 改完按它核对要不要补用例。
 
 - 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**
-  （当前基线：`test/` 下 152 个用例全过，约 26 秒）。
+  （当前基线：`test/` 下 155 个用例全过，约 30 秒）。
 - 加行为就加用例，并在用例名/注释里用中文写清意图。
 - 纯函数（`onebot.js` 里的拆分/延迟/采集/`mentionsOthers`、`image.js`、`media.js`、
   `perceptual.js`、`index.js` 里导出的 `withinActiveHours`）尽量单独测边界。
@@ -429,6 +470,10 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
   假 timer 的 `fireInterval()` 会唤醒**所有**周期定时器。**改主动说话必跑它们。**
 - 活跃对话的用例在 `test/bridge.test.mjs` **最末尾**（`bootActive()` 把免 @ 接话打开、
   把补一句的静默门槛压到几十毫秒）。**改 `admit` 的触发判定或补一句必跑它们。**
+- `/reset` 的用例（「攒批先投出去」「换成新一轮的 id 而旧会话留在磁盘上」「重开进程后
+  仍停在同一轮」「轮到代次相关的记账都清干净」「只有 resetUsers 里的人能用，别人连会话
+  都开不出来」）在 `test/bridge.test.mjs` 里散着几处，搜 `reset` 就能找到。
+  **改 `sessionIdFor` / `resetConversation` / `canReset` 必跑它们。**
 - **插件进程本身不归测试管**，改完记得重启（§5.1）再看真实效果。
 
 ## 9. 改完的检查清单
@@ -439,6 +484,8 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 - [ ] 行为变了 → README 对应小节 + `Config.description` 同步
 - [ ] 没有引入任何 `dependencies`，没有删 `node_modules` 软链
 - [ ] 改的是运行时代码 → 提醒用户重启 `qqbot` profile（systemd 或 tmux）
+- [ ] 动过 `sessionIdFor` / 会话代次 → 确认「第 0 轮的 id 逐位没变」，且代次仍然落盘
+- [ ] 动过权限判断（`resetUsers` 之类）→ 确认「不配 = 全关」，而不是「不配 = 人人可用」
 - [ ] 涉及安全面（审批策略、白名单、`cwd` 越界校验）的改动单独复核过
 
 ## 10. 常见坑速查
@@ -449,7 +496,7 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 | **bot 完全不回复**，但 `systemctl --user is-active qqbot` 显示 active | `inject` 漏声明了代码里用到的服务：`ctx.interval` / `ctx.timeout` 属于 `timer`，cordis 不允许访问未声明的服务，`apply()` 当场抛错 → 插件整体不激活（journal 里是 `cannot get property "timer" without inject` + `dsh: warning: 1 entry did not activate`）。代码里用到的每个服务都要进 `inject` |
 | 测试全绿但真宿主上插件不激活 | 假 Host 桩比真宿主宽松（例如无条件提供 `ctx.interval`）；改桩时要连 cordis 的 inject 检查一起复现（见 `test/bridge.test.mjs` 的 `requireTimerService`） |
 | `failed to import @deepseek-ai/*` | `node_modules` 软链被删了 |
-| journal 里没有任何插件日志 | 用了 `ctx.logger` 而不是 `report()`（§5.7） |
+| journal 里没有任何插件日志 | 用了 `ctx.logger` 而不是 `report()`（§5.8） |
 | 群里回复乱序 / 串话 | 绕过了 `enqueueSend` / `enqueue` 串行队列 |
 | NapCat 报 `识别URL失败` | 给 `upload_*_file` 传了本地路径；必须走一次性 URL |
 | 表情包/图片功能静默失效 | `mediaDir`/`stickerDir`/`jmDir` 被配到 `cwd` 外，代码只记 warn 并停用 |
