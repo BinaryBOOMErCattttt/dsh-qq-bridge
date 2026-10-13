@@ -1,0 +1,162 @@
+/**
+ * `settings.js` 的契约测试。
+ *
+ * 这一层是**唯一的**「取默认值 / 强制类型 / 夹紧」的地方，`index.js` 只管读结果，
+ * 所以它错了没有任何下游会兜住 —— 每条规则都得在这里钉死。
+ *
+ * 用例分两类，都重要：
+ *   1. 正常值原样通过（别把好配置改坏）；
+ *   2. **非法值**（NaN / 负数 / 越界）退到哪 —— 这是重构时最容易搬错、且真宿主上
+ *      很难触发的一类分支。
+ *
+ * 不经过 Harness：`createSettings` 是纯函数，只需要配置对象。
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import { Config } from '../config.js';
+import { createSettings, MAX_TIMER_MS } from '../settings.js';
+
+/** 用真 schema 铺一层默认值，再按需覆盖 —— 覆盖的可以是 schema 不会产出的非法值。 */
+function settings(overrides = {}, cwd = '/tmp') {
+  return createSettings({ ...Config({}), ...overrides }, cwd);
+}
+
+test('默认配置原样落到 settings 上', () => {
+  const s = settings();
+  assert.equal(s.batchWindowMs, 1200);
+  assert.equal(s.batchMaxWaitMs, 5000);
+  assert.equal(s.maxReplyChars, 1500);
+  assert.equal(s.activeWindowMs, 60 * 1000);
+  assert.equal(s.activeGroupLines, 6);
+  assert.equal(s.activeGroupSpeakers, 2);
+  assert.equal(s.activeGroupBatchScale, 2);
+  assert.equal(s.proactiveIdleMs, 45 * 60 * 1000);
+  assert.equal(s.proactiveDailyMax, 4);
+  assert.equal(s.digestAtHour, 4);
+  assert.equal(s.memorySearchHits, 40);
+  assert.equal(s.repeatCount, 2);
+});
+
+test('攒批的 0 = 关闭（与「非法值退回默认」不是一回事）', () => {
+  assert.equal(settings({ batchWindowMs: 0 }).batchWindowMs, 0);
+  assert.equal(settings({ batchWindowMs: -5 }).batchWindowMs, 0);
+  // 负数与 NaN 都退到 0（关闭），**不是**退到默认的 1200：把「乱配」当成「关掉」
+  // 比当成「每 1.2 秒回一条」安全。
+  assert.equal(settings({ batchWindowMs: NaN }).batchWindowMs, 0);
+  assert.equal(settings({ batchMaxWaitMs: NaN }).batchMaxWaitMs, 0);
+});
+
+test('活下来的一批毫秒项：非法退回默认，负数按 0', () => {
+  // 这几项和攒批不同：默认值是「一个合理的等待」，所以非法时该回到默认而不是关闭。
+  assert.equal(settings({ proactiveIdleMs: 'nonsense' }).proactiveIdleMs, 45 * 60 * 1000);
+  assert.equal(settings({ proactiveIdleMs: -1 }).proactiveIdleMs, 0);
+  assert.equal(settings({ activeWindowMs: -1 }).activeWindowMs, 0);
+  assert.equal(settings({ activeWindowMs: 1234.7 }).activeWindowMs, 1234);
+  assert.equal(settings({ activeChimeMax: 3 }).activeChimeMax, 3);
+});
+
+test('有明确上下界的整数项被夹紧', () => {
+  assert.equal(settings({ digestAtHour: 25 }).digestAtHour, 23);
+  assert.equal(settings({ digestAtHour: -1 }).digestAtHour, 0);
+  assert.equal(settings({ digestAtHour: NaN }).digestAtHour, 4);
+  assert.equal(settings({ apiKeyRotateHour: 99 }).apiKeyRotateHour, 23);
+});
+
+test('凭据探测超时：低于 1 秒一律退回 15 秒', () => {
+  // 500ms 这种值看着「更积极」，实际会把每次探测变成一次高频请求，所以直接不认。
+  assert.equal(settings({ apiKeyProbeTimeoutMs: 500 }).apiKeyProbeTimeoutMs, 15000);
+  assert.equal(settings({ apiKeyProbeTimeoutMs: 2000 }).apiKeyProbeTimeoutMs, 2000);
+});
+
+test('主动说话的检查间隔有 1 秒下限与定时器上限', () => {
+  assert.equal(settings({ proactiveCheckMs: 10 }).proactiveCheckMs, 1000);
+  assert.equal(settings({ proactiveCheckMs: 10 ** 12 }).proactiveCheckMs, MAX_TIMER_MS);
+});
+
+test('复读门槛至少是 2（1 条相同的消息不算「连着出现」）', () => {
+  assert.equal(settings({ repeatCount: 1 }).repeatCount, 2);
+  assert.equal(settings({ repeatCount: 0 }).repeatCount, 2);
+  assert.equal(settings({ repeatCount: 5 }).repeatCount, 5);
+  assert.equal(settings({ repeatChance: 5 }).repeatChance, 1);
+  assert.equal(settings({ repeatChance: -1 }).repeatChance, 0);
+  // 0 = 不限长度的那个含义要保住（不能被当成「非法」清掉）。
+  assert.equal(settings({ repeatMaxChars: 0 }).repeatMaxChars, 0);
+  assert.equal(settings({ repeatMaxChars: 30 }).repeatMaxChars, 30);
+});
+
+test('画面指纹的宽松度夹在 0~0.3', () => {
+  assert.equal(settings({ repeatImageTolerance: -1 }).repeatImageTolerance, 0);
+  assert.equal(settings({ repeatImageTolerance: 1 }).repeatImageTolerance, 0.3);
+  assert.equal(settings({ repeatImageTolerance: 0.08 }).repeatImageTolerance, 0.08);
+});
+
+test('多人搭话的倾听倍数只在 > 1 时生效', () => {
+  assert.equal(settings({ activeGroupBatchScale: 0.5 }).activeGroupBatchScale, 1);
+  assert.equal(settings({ activeGroupBatchScale: NaN }).activeGroupBatchScale, 1);
+  assert.equal(settings({ activeGroupBatchScale: 3 }).activeGroupBatchScale, 3);
+});
+
+test('拆条相关的 0 都得保住「不限」的含义', () => {
+  assert.equal(settings({ maxReplyChars: 0 }).maxReplyChars, 1500);
+  assert.equal(settings({ burstMaxMessages: -1 }).burstMaxMessages, 0);
+  assert.equal(settings({ burstMaxMessages: 1 }).burstMaxMessages, 1);
+  assert.equal(settings({ burstMaxChars: 0 }).burstMaxChars, 0);
+  assert.equal(settings({ burstSingleMaxChars: 0 }).burstSingleMaxChars, 0);
+  assert.equal(settings({ burstMaxParts: 0 }).burstMaxParts, 1);
+});
+
+test('记忆的字节上限有 256 的地板（否则一个记忆文件都写不进去）', () => {
+  assert.equal(settings({ memoryFileMaxBytes: 0 }).memoryFileMaxBytes, 256);
+  assert.equal(settings({ memoryFileMaxBytes: 1024 }).memoryFileMaxBytes, 1024);
+  assert.equal(settings({ digestMinLines: 0 }).digestMinLines, 1);
+  assert.equal(settings({ memorySearchHits: 0 }).memorySearchHits, 40);
+});
+
+test('白名单去重去空白，但 allowUsers / allowGroups 保持逐字比较', () => {
+  // 这两个列表原本就会被去重 + 去空白。
+  assert.deepEqual(settings({ allowTools: [' read ', 'read', '', 'qq_send_message'] }).allowTools, ['read', 'qq_send_message']);
+  assert.deepEqual(settings({ resetUsers: [' 123 ', '123'] }).resetUsers, ['123']);
+  // 而这两个是**逐字**和消息里的 QQ 号比的：顺手 trim 会把「配了带空格的号」
+  // 从「不匹配」变成「匹配」，那是放开白名单，属于安全面改动。这里钉住不做。
+  assert.deepEqual(settings({ allowUsers: [' 123 '], allowGroups: [' 456 '] }).allowUsers, [' 123 ']);
+  assert.deepEqual(settings({ allowGroups: [' 456 '] }).allowGroups, [' 456 ']);
+});
+
+test('cwd 留空时用传入的进程目录；非空时原样保留（含前后空白）', () => {
+  assert.equal(settings({ cwd: '' }, '/work').cwd, '/work');
+  assert.equal(settings({ cwd: '/srv/qq' }, '/work').cwd, '/srv/qq');
+  // 非空即用，不去空白 —— 与旧行为一致（只判断「空不空」）。
+  assert.equal(settings({ cwd: ' /srv/qq ' }, '/work').cwd, ' /srv/qq ');
+});
+
+test('主动说话的时段不做夹紧，交给 withinActiveHours 归一化', () => {
+  // 这里刻意保持原样：`withinActiveHours` 对 NaN 的 to 会退化成 23（= 全天），
+  // 若在这里先夹成 0，就变成「start === end」另一条分支了。两处口径必须一致。
+  const shown = settings({ proactiveFromHour: 9, proactiveToHour: 23 });
+  assert.equal(shown.proactiveFromHour, 9);
+  assert.equal(shown.proactiveToHour, 23);
+  const broken = settings({ proactiveFromHour: NaN, proactiveToHour: NaN });
+  assert.ok(Number.isNaN(broken.proactiveFromHour));
+  assert.ok(Number.isNaN(broken.proactiveToHour));
+});
+
+test('字符串项去空白，禁漫脚本留空时补上插件自带的绝对路径', () => {
+  assert.equal(settings({ resetCommand: ' /RESET ' }).resetCommand, '/reset');
+  assert.equal(settings({ agentPreset: ' qq ' }).agentPreset, 'qq');
+  assert.equal(settings({ persona: '   ' }).persona, '');
+  assert.equal(settings({ jmCommand: ' /jm ' }).jmCommand, '/jm');
+  assert.ok(settings({ jmScript: '' }).jmScript.endsWith('scripts/jm_download.py'));
+  assert.equal(settings({ jmScript: '/opt/custom.py' }).jmScript, '/opt/custom.py');
+});
+
+test('未再加工的字段原样透传（schema 已经保证类型与默认值）', () => {
+  const s = settings({ groupTrigger: 'prefix', replyStyle: 'quote', humanize: false, jmMaxJobs: 3 });
+  assert.equal(s.groupTrigger, 'prefix');
+  assert.equal(s.replyStyle, 'quote');
+  assert.equal(s.humanize, false);
+  assert.equal(s.jmMaxJobs, 3);
+  // memory !== false 这个口径（而不是直接取 memory）也要保住。
+  assert.equal(settings({ memory: false }).memoryOn, false);
+  assert.equal(settings({ memory: true }).memoryOn, true);
+});

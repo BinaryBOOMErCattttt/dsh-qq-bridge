@@ -13,13 +13,16 @@
  * 等模型想一句俏皮话早就过去了。
  *
  * 文件结构（自上而下）：
- *   1. 插件身份与配置 schema（name / inject / Config）
+ *   1. 插件身份与 `inject`；配置 schema 在 `config.js`（这里只再导出一次）
  *   2. 纯函数工具（sessionIdFor / visibleText）
- *   3. apply()：闭包内维护全部运行时状态、事件路由与工具注册
+ *   3. apply()：闭包内维护全部运行时状态、事件路由与工具装配
  *
- * 媒体分两边：**入站**（QQ 的图 → 本地文件，给模型 read_image 看）在 `media.js`；
+ * 媒体的**入站**（QQ 的图 → 本地文件，给模型 read_image 看）在 `media.js`；
  * **出站**（本地文件 / URL → QQ 的 image 段）在 `image.js`。这里只负责路由、
- * 提示词与工具：什么时候该发、发给谁。
+ * 提示词与工具装配：什么时候该发、发给谁。
+ *
+ * 六个宿主平面工具的**声明**在 `tools.js`（依赖由这里显式传进去，那边不持有状态）；
+ * 本文件留的是它们的**能力来源**——收件人解析、发送队列、记忆读写这些真正有状态的东西。
  *
  * @module @qqbot/dsh-plugin-qq
  */
@@ -28,14 +31,14 @@ import { readdirSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appendFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
-import z from '@deepseek-ai/schemastery';
-import { defineTool } from '@deepseek-ai/dsh-tools';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { OneBotClient, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from './onebot.js';
 import { createMediaStore } from './media.js';
 import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
 import { createJmService, parseJmRef } from './jm.js';
+import { registerQqTools } from './tools.js';
+import { createSettings, MAX_TIMER_MS } from './settings.js';
 
 /** 插件在 Loader 中的稳定标识（改名会导致配置/状态对不上）。 */
 export const name = 'qq-bridge';
@@ -118,129 +121,8 @@ const DEFAULT_PERSONA = [
   '- 别复述对方的话，别用「关于你提到的问题」这种书面腔。',
 ].join('\n');
 
-/**
- * 插件配置的校验 schema（bundle 的 config: 段或 Web UI 插件设置里填写）。
- * 这里同时充当配置文档：每个字段的 .description 会显示在界面上给使用者看。
- */
-export const Config = z.object({
-  endpoint: z.string().default('ws://127.0.0.1:3001').description('OneBot v11 正向 WebSocket 地址（NapCat 的 websocketServers 端口）'),
-  accessToken: z.string().default('').description('OneBot access_token；NapCat 未设置 token 时留空'),
-  cwd: z.string().default('').description('QQ 会话 Agent 的工作目录；留空则使用 Harness 进程的当前目录'),
-  privateChat: z.boolean().default(true).description('是否响应 QQ 私聊消息'),
-  groupChat: z.boolean().default(true).description('是否响应 QQ 群消息'),
-  groupTrigger: z.union(['mention', 'prefix', 'all']).default('mention').description('群消息触发方式：@机器人 / 前缀 / 全部消息（另外：被叫到之后的 activeWindowMs 内，同一个人接着说的话可以算作还在跟你聊，见 activeFollow）'),
-  prefix: z.string().default('/').description('groupTrigger=prefix 时使用的前缀'),
-  allowUsers: z.array(z.string()).default([]).description('私聊白名单（QQ 号）；留空表示不限制'),
-  allowGroups: z.array(z.string()).default([]).description('群白名单（群号）；留空表示不限制'),
-  provider: z.string().default('').description('QQ 会话使用的模型服务商；留空使用默认'),
-  model: z.string().default('').description('QQ 会话使用的模型；留空使用默认'),
-  approvalPolicy: z.union(['never', 'inherit']).default('never').description('QQ 会话的工具审批策略：never 表示无人值守时一律拒绝需要审批的操作'),
-  agentPreset: z.string().default('').description('QQ 会话 Agent 挂载的 Agent 预设 id（本 bundle 自带 qq：只读文件 + 检索 + 联网）；留空表示用部署的默认预设；填 none 表示不挂载预设（QQ 会话将只有宿主平面的全局工具）'),
-  allowTools: z.array(z.string()).default([]).description('QQ 会话 Agent 可用的工具白名单（工具名）；留空表示不限制，非空时未列出的工具一律对 QQ 会话隐藏'),
-  resetCommand: z.string().default('/reset').description('新开一轮会话的指令：在 QQ 里单独发送该指令即生效（旧的会话留在磁盘上当存档，新的一轮从零开始）；留空表示禁用'),
-  resetUsers: z.array(z.string()).default([]).description('允许使用 resetCommand 的 QQ 号白名单；留空表示**谁都不能**重置（群里任何一个人都能把会话记忆重置掉显然不合适，所以这一项默认就是关的）'),
-  maxReplyChars: z.number().default(1500).description('单条 QQ 消息的最大字符数（协议上限），超出自动分段'),
-  // ---- 图片/表情包：下载到本地，让 Agent 能用 read_image 真的看见 ----
-  mediaDownload: z.boolean().default(true).description('是否把 QQ 消息里的图片/表情包下载到本地（模型只能读本地文件，不下载就只看到一句占位符）'),
-  mediaDir: z.string().default('.qq-media').description('媒体缓存目录，相对 cwd（必须落在 cwd 内，否则自动停用下载）'),
-  mediaMaxBytes: z.number().default(8 * 1024 * 1024).description('单个图片/表情包的字节上限，超过就不下载（只留占位符）'),
-  mediaCacheFiles: z.number().default(200).description('媒体缓存最多保留多少个文件，超出按最近使用时间淘汰最旧的'),
-  mediaTimeoutMs: z.number().default(15000).description('单个媒体的下载超时（毫秒）'),
-  quoteMedia: z.boolean().default(true).description('是否把「被引用（回复）的那条消息」也取回来一起看：图片/表情包照常落盘，正文里给出「（引用 某某: …）」前缀；false = 引用段仍是 `[回复]`，什么也看不到'),
-  ambientMedia: z.boolean().default(true).description('群聊环境上下文（没 @ 机器人的那几条）里的图片/表情包是否也落盘：开着时「群里最近的消息」里也带可 read_image 的路径（同一张表情包按内容哈希去重，磁盘只存一份，但每次发仍会重新下载一遍字节）'),
-  // ---- 表情包 / 图片：反过来，让 Agent 能主动往 QQ 发图 ----
-  imageSend: z.boolean().default(true).description('是否允许 Agent 主动往 QQ 发图片/表情包：qq_send_image 工具 + 回复正文里的 `[[图片: 路径]]` 标记（整条回复只写这一行就是「只发一张表情、一个字都不说」）；关掉后两个都不可用，提示词里也不再提'),
-  stickerDir: z.string().default('.qq-stickers').description('表情包目录，相对 cwd（必须落在 cwd 内）：放你给它的表情包，文件名会列进渠道提示，模型据此挑选或用 read_image 先看一眼；留空 = 不提示表情包目录（照样能发工作目录里的其它图）'),
-  imageMaxBytes: z.number().default(8 * 1024 * 1024).description('单张出站图片的字节上限：超过直接报错，不做静默压缩（默认 8MB，体积会按 base64 膨胀约 4/3）'),
-  // ---- 一次只回一轮：前后脚到的消息先攒一攒，再合成一条交给 Agent ----
-  batchWindowMs: z.number().default(1200).description('收到一条要回的消息后，先等这么久（毫秒）看还有没有下一条：群里几个人同时 @、或者一个人连发几句，都会攒成一条消息只回一轮；0 = 关闭（来一条回一条）'),
-  batchMaxWaitMs: z.number().default(5000).description('一直有人接着说时，一批最多攒这么久（毫秒）就必须发出去，避免机器人一直不吭声；小于 batchWindowMs 时按 batchWindowMs 算'),
-  // ---- 以下为「像真人一样在群里说话」的开关，默认全部开启 ----
-  ambientMessages: z.number().default(12).description('群聊里注入给 Agent 的最近消息条数（让它知道大家在聊什么，不只是被 @ 的那一句）；0 = 关闭'),
-  ambientLineChars: z.number().default(120).description('群聊上下文里每条消息最多保留的字符数'),
-  // ---- 自动复读：群里连着出现同一条消息时，跟着复读一句（不经过模型）----
-  repeat: z.boolean().default(true).description('是否自动复读：群里连着出现相同的消息时跟着复读一句；复读不经过模型（直接发原文/原图），只认没 @ 机器人的群消息（纯文字，或整条就是一张表情包）'),
-  repeatMedia: z.boolean().default(true).description('是否连表情包一起复读：整条消息就是一张图或一个系统表情时，连着出现两个一样的就跟着发第三个（图片按内容哈希判断是不是同一张）。它不额外下载：用的是环境上下文那次落盘，所以 ambientMedia: false 或 ambientMessages: 0 时自动退化成只复读文字，imageSend: false 时同样不发图'),
-  repeatCount: z.number().default(2).description('连着几条相同的消息之后跟着复读；2 = 有人接了一句就跟（至少 2）'),
-  repeatDistinct: z.boolean().default(true).description('是否要求这些相同的消息来自至少两个不同的人：true = 一个人自己连发两遍只是手滑，算不上复读；false = 连发两遍也跟'),
-  repeatWindowMs: z.number().default(300000).description('间隔超过这么久就不算「连着」了，重新开始数（毫秒）：免得早上有人说过的一句，晚上再被跟一遍；0 = 不限间隔'),
-  repeatMaxChars: z.number().default(100).description('纯文字复读的长度上限：只复读不超过这么多字的短消息（复读机跟的是「6」「草」这种短句，不是一整段话）；0 = 不限'),
-  repeatChance: z.number().default(1).description('真要复读时的概率（0~1）：1 = 每次都跟，调小可以让它偶尔不跟（下一条相同的消息会再掷一次）'),
-  repeatImageTolerance: z.number().default(0.08).description('表情包「算是同一张」的宽松度：QQ 会把同一张表情包按发送者重新编码（字节不同、画面一样），所以字节不同时还会比一次缩略图指纹（16×16 dHash）—— 位差比例不超过这个值就算同一张，跟着复读。0 = 只认字节完全相同的图（关掉画面比对）；默认 0.08（实测同一张重新编码差 0%~2%，同一套画风只换了字的差 16%~23%）'),
-  // ---- 主动说话：不等别人 @，自己偶尔在群里开个话头 ----
-  // 这一组默认**关闭**：它会主动给真人发消息，开不开、开给哪些群该由使用者决定。
-  // 只对已经聊过的群生效（`conversations` 里有的群），私聊永远不会被主动打扰。
-  proactive: z.boolean().default(false).description('是否让机器人偶尔主动在群里说话（不等别人 @ 它）：默认关闭。只对**已经聊过的群**生效（有人 @ 过它、或它回过话的群），私聊永远不主动打扰；开了之后还要过「时段 / 安静够久 / 不是自言自语 / 群还活跃 / 距上次够久 / 当天没超次数 / 概率」这一串闸，详见 README「偶尔主动说话」'),
-  proactiveCheckMs: z.number().default(10 * 60 * 1000).description('每隔多久看一次「有没有群值得主动搭句话」（毫秒）：这是「考虑」的节奏，不是说话频率 —— 每次醒来还要过一遍所有条件、再掷一次概率'),
-  proactiveChance: z.number().default(0.35).description('每次检查时真的开口的概率（0~1）：0.35 ≈ 三次考虑里说一次，让开口的时刻不可预测；0 = 永不主动说话，1 = 一有机会就说'),
-  proactiveIdleMs: z.number().default(45 * 60 * 1000).description('群里安静至少这么久才考虑搭话（毫秒）：正在聊的群不插嘴，等大家停了它才冒泡；0 = 不用等（一般只用于测试）'),
-  proactiveFreshMs: z.number().default(24 * 60 * 60 * 1000).description('群最近活跃过才值得搭话（毫秒）：超过这么久没动静的群不会突然诈尸；0 = 不限制'),
-  proactiveGapMs: z.number().default(2 * 60 * 60 * 1000).description('同一个群两次主动说话之间至少隔这么久（毫秒）'),
-  proactiveDailyMax: z.number().default(4).description('同一个群一天最多主动说几次（本地日界线；计数在内存里，重启后清零）'),
-  proactiveFromHour: z.number().default(9).description('只在本地时间的这个小时之后主动说话（0~23）：真人凌晨不会突然在群里冒泡'),
-  proactiveToHour: z.number().default(23).description('只在这个小时之前主动说话（0~23，不含该点）：与 proactiveFromHour 相同表示全天都可以；跨零点（如 22 → 3）也认'),
-  // ---- 活跃对话：聊起来之后保持搭话（见 README「聊起来之后保持搭话」）----
-  // 上面的 proactive* 只在**冷场**时开口；这一组管的是「正聊着」的时候：被叫到之后
-  // 接着说的话也算在跟它聊（activeFollow），以及它自己回完隔一会儿再补一句（activeChime*）。
-  activeWindowMs: z.number().default(60 * 1000).description('「活跃对话」窗口（毫秒）：被 @ 到之后这么久之内，同一个人接着说的话算还在跟它聊；「多人搭话」也用它 —— 最近这么久里累计够 activeGroupLines 条、activeGroupSpeakers 个人说过话就进入搭话状态，之后群里谁接话都算。0 = 整套关闭（既不免 @ 接话，也不补一句、不搭话）'),
-  activeFollow: z.boolean().default(false).description('活跃对话里**免 @ 接话**：被叫到之后的窗口内同一个人接着说的话也当成在跟它聊；群里聊热了（见 activeGroupLines）还会进入**多人搭话** —— 那时候谁接话都免 @，直到最近这段时间里凑不齐 activeGroupSpeakers 个人（默认关闭 —— 它放松了「群里只在被 @ 时才说话」这条默认约定，想更像真人再打开）；只在群聊生效，私聊本来就不需要 @'),
-  activeMaxTurns: z.number().default(10).description('一次一对一的活跃对话里最多免 @ 接几轮（按免 @ 进来的消息条数算）：接够这么多就要重新 @ 它一次；多人搭话不看这个，它的闸门是「够条数、够人数」。0 = 不限'),
-  activeGroupLines: z.number().default(6).description('「多人搭话」的进入门槛：最近 activeWindowMs 里群里（除它以外）累计说了这么多条话，就说明大家聊起来了；0 = 关掉多人搭话（只保留一对一的免 @ 接话）'),
-  activeGroupSpeakers: z.number().default(2).description('「多人搭话」还要求最近窗口里至少有这么多**不同的人**说过话：两个人有来有回才算聊起来，一个人自己刷屏不算（与 activeGroupLines 同时满足才进入）'),
-  activeGroupBatchScale: z.number().default(2).description('搭话状态里的「倾听时间」倍数：攒批窗口与整批等待上限都乘上它，于是它会多听几句、再合成一轮回复（1 = 不放大，只在群聊的搭话状态里生效）'),
-  activeChimeIdleMs: z.number().default(20 * 1000).description('它回完话、对方安静这么久之后，它可能自己再补一句（毫秒，实际会按 delayJitter 抖动）；0 = 不补。需要 proactive: true 才会补'),
-  activeChimeMax: z.number().default(1).description('对方每说一句之后，它最多自己补几句：1 = 顶多追一句「啊对了…」，想让它更黏就调大；0 = 不补'),
-  activeChimeDailyMax: z.number().default(12).description('同一个会话一天最多自己补几句（本地日界线，与 proactiveDailyMax 分开算；重启后计数清零）；0 = 不限'),
-  humanize: z.boolean().default(true).description('自动回复是否像真人：按换行/短句拆成几条独立消息并加入打字延迟（换行 = 分条）；false = 一条整段直接发出（旧行为）'),
-  burstMaxChars: z.number().default(60).description('把一行长句拆开时的单条目标长度；0 = 不按长度拆（换行仍然分条）'),
-  burstMaxParts: z.number().default(3).description('单行长句最多拆成几条；超出部分并进该行最后一条，避免刷屏'),
-  burstMaxMessages: z.number().default(0).description('一轮回复最多发几条消息（连换行分出来的那些一起算）：1 = 永远只发一条（换行与长句都并进这一条，超出的用一个空格接上）；0 = 不限（默认，换行 = 分条）。注意「不超过 burstSingleMaxChars 字的短回复」优先级更高：那种回复无论这里填几都只发一条'),
-  burstSingleMaxChars: z.number().default(0).description('「日常闲聊并成一条」的字数门槛（去掉空白后算）：整轮回复不超过这么多字时并成一条发出去（模型爱写成「短句 + 长句」两拍，这个门槛保证闲聊永远只有一个气泡）；超过门槛就按换行 / burstMaxChars / burstMaxParts / burstMaxMessages 正常拆成多条短句（需要展开讲的时候用）；0 = 关掉这条豁免（完全按 burstMaxMessages 走）'),
-  readDelayMs: z.number().default(800).description('发出第一条前的「读消息」基础延迟（毫秒）'),
-  charsPerSecond: z.number().default(15).description('模拟打字速度（字符/秒），用于按字数计算每条消息发出前的延迟'),
-  minDelayMs: z.number().default(300).description('单条消息前延迟的下限（毫秒）'),
-  maxDelayMs: z.number().default(5000).description('单条消息前延迟的上限（毫秒）'),
-  delayJitter: z.number().default(0.4).description('延迟的随机抖动比例（0 = 固定延迟，0.4 = 上下浮动 40%）'),
-  replyStyle: z.union(['auto', 'plain', 'quote', 'at']).default('auto').description('群聊回复的指向方式：auto = 只在「回的那条后面又出现了消息（包括我自己发的）」时才引用（默认），quote = 引用被回复的那条消息，at = @ 对方，plain = 直接发；指向只挂在第一条上，私聊始终为 plain'),
-  persona: z.string().default('').description('替换默认的「群友口吻」段落；留空使用插件内置的那份'),
-  instructions: z.string().default('').description('追加到 QQ 会话系统提示的额外要求'),
-  // ---- 禁漫（JM / 18comic）下载 → PDF → 发到 QQ ----
-  // 依赖外部 python：见 README「禁漫下载」。关掉 jmDownload 后一条网络请求都不会发。
-  jmDownload: z.boolean().default(true).description('是否启用禁漫（JM）下载：把整本/单话合并成 PDF 并发到 QQ'),
-  jmCommand: z.string().default('/jm').description('QQ 里直接触发下载的指令（如 `/jm 422866`，也接受 18comic 链接）；留空表示禁用该指令，只保留 Agent 工具'),
-  jmDir: z.string().default('.qq-jm').description('禁漫 PDF 的存放目录，相对 cwd（必须落在 cwd 内，否则自动停用）'),
-  jmPython: z.string().default('.venv/bin/python').description('跑 jmcomic 的 python 解释器：绝对路径，或相对 cwd（仓库自带 .venv）'),
-  jmScript: z.string().default('').description('下载脚本路径；留空使用插件自带的 scripts/jm_download.py'),
-  jmMaxChapters: z.number().default(0).description('整本下载的话数上限；0 = 不限制（超出时回一句提示而不是闷头下几百话）'),
-  jmMaxPages: z.number().default(0).description('单次下载的总页数上限；0 = 不限制'),
-  jmTimeoutMs: z.number().default(15 * 60 * 1000).description('单次下载的硬超时（毫秒），到点强杀 python 子进程'),
-  jmRequestTimeoutMs: z.number().default(30000).description('jmcomic 单次 HTTP 请求超时（毫秒）'),
-  jmUploadTimeoutMs: z.number().default(10 * 60 * 1000).description('把 PDF 交给 NapCat 上传的超时（毫秒）；NapCat 拉完文件才回响应，大文件要慢慢等'),
-  jmMaxFiles: z.number().default(20).description('PDF 目录最多保留几个文件，超出按最近使用时间淘汰最旧的'),
-  jmMaxJobs: z.number().default(1).description('同时进行的下载数上限（多个会话同时点车时排队，而不是一起压到禁漫）'),
-  jmFileHost: z.string().default('172.17.0.1').description('NapCat 取 PDF 时访问的地址：容器里要能连到宿主机，默认 docker 网桥 172.17.0.1（只在本机容器网段可达）'),
-  jmFilePort: z.number().default(0).description('给 NapCat 用的 HTTP 文件服务端口；0 = 由系统分配'),
-  jmUrlTtlMs: z.number().default(10 * 60 * 1000).description('交给 NapCat 的一次性下载 URL 有效期（毫秒）'),
-  // ---- 长期记忆：聊天记录落盘 + 定时摘要 + 认知库（见 README「长期记忆」）----
-  memory: z.boolean().default(true).description('是否启用长期记忆：把聊天记录写进 memoryDir、每天在 digestAtHour 点让一个专用「摘要 Agent」写成摘要与认知，并提供 qq_transcript / qq_memory 工具（配套 skill 在 .dsh/skills/ 里）'),
-  memoryDir: z.string().default('.qq-memory').description('长期记忆目录，相对 cwd（必须落在 cwd 内）：聊天记录、摘要、认知库都在这里；同时充当 qq_memory / qq_transcript 的写入边界'),
-  memoryFileMaxBytes: z.number().default(32768).description('单个记忆文件的字节上限：超过时 qq_memory 的 write 会报错，append 也只按剩余空间写入，逼着摘要 Agent 保持精炼'),
-  memorySearchHits: z.number().default(40).description('qq_transcript / qq_memory 一次 search 最多返回多少条命中'),
-  digestAtHour: z.number().default(4).description('每天几点做长期记忆的摘要（本地时间，0~23）：默认凌晨 4 点，群里没人说话的时候。同一个会话**一天至多摘要一次**（靠记忆目录里记的日期，重启也不会重复）；没有新消息的会话直接跳过'),
-  digestMinLines: z.number().default(20).description('当天攒够多少条新消息才值得为这个会话跑一次摘要：不够就留到明天，避免为零星几句花费一次模型调用（首次摘要不受此限）'),
-  digestMaxChars: z.number().default(24000).description('一次摘要最多把多少字符的聊天记录喂给摘要 Agent：超出部分按最近优先截断（更早的内容留给上一次摘要）'),
-  digestTimeoutMs: z.number().default(10 * 60 * 1000).description('单次摘要的硬超时（毫秒）：超时就把摘要 Agent 销毁（下次重开一个），避免一个卡住的 turn 让摘要永远不再发生'),
-  digestCatchUp: z.boolean().default(true).description('是否补课：如果今天的摘要点已经过了、而某个会话在重启之后才有人说话（或者摘要那一刻进程正在重启），它一开口就补一次摘要，不用等到明天；关掉则只在 digestAtHour 点摘要'),
-  // ---- 每天轮换模型凭据（见 README「每天轮换 API key」）----
-  // 池子是一个 cwd 里的纯文本文件而不是配置项：配置会显示在 Web UI 上、也会被复制粘贴到
-  // 别处，key 不该走那条路（见 README「安全提醒」）。
-  apiKeyRotate: z.boolean().default(true).description('是否每天在 apiKeyRotateHour 点尝试把 apiKeyRef 指向的模型凭据换成 apiKeyFile 里的下一个 key：只在池子里还有「另一个探测通过的 key」时才真的改写凭据，池子文件不存在 / 只写了当前这一个 key 时什么都不做'),
-  apiKeyRotateHour: z.number().default(4).description('每天几点尝试轮换模型凭据（本地时间，0~23）：默认凌晨 4 点，与长期记忆的摘要同一个时刻'),
-  apiKeyFile: z.string().default('data/api-keys.txt').description('候选 API key 池：一行一个 key，`#` 开头的行是注释；相对 cwd（必须落在 cwd 内，否则整个轮换记 warn 并停用）。当前生效的 key 在池子里的下一个就是第一个候选'),
-  apiKeyRef: z.string().default('DEEPSEEK_API_KEY').description('要轮换的那个凭据引用名：写进 $DSH_HOME/.credentials.yaml 的就是它（必须是 A-Za-z_ 开头的变量名写法）'),
-  apiKeyProbeUrl: z.string().default('https://api.deepseek.com/models').description('切换前先 GET 一下候选 key 是否可用（2xx 才算可用，不消耗 token）；留空 = 不探测、直接按顺序换下一个。DeepSeek 的 OpenAI 兼容面用 Authorization 头、Anthropic 面用 x-api-key，插件两个头一起带'),
-  apiKeyProbeTimeoutMs: z.number().default(15000).description('探测单个候选 key 的超时（毫秒）；网络不通时按「这个候选不可用」处理，继续试下一个'),
-});
+// 配置 schema 是纯数据，单独放在 config.js；这里再导出一次，Loader 与测试都从 index.js 取。
+export { Config } from './config.js';
 
 /**
  * 由会话 key 派生出稳定的、UUID 形状的 Session id。
@@ -578,15 +460,18 @@ export function apply(ctx, config) {
     if (mirrorToStderr) process.stderr.write(`qq-bridge: ${message}\n`);
   }
   // cwd 留空时退回 Harness 进程当前目录；它既是 Agent 工作目录，也是沙箱根。
-  const cwd = config.cwd.trim().length > 0 ? config.cwd : process.cwd();
-  const approvalPolicy = config.approvalPolicy;
+  // 配置的运行时视图：所有「取默认值 / 夹紧 / 去空白」都在 settings.js 里做完，
+  // 下面一律读 `settings.*`，不再直接读 `config`（改默认值只需改一处）。
+  const settings = createSettings(config, process.cwd());
+  const cwd = settings.cwd;
+  const approvalPolicy = settings.approvalPolicy;
   // 工具白名单：去掉空白项与重复项。空数组 = 不限制，与 allowUsers / allowGroups 语义一致。
-  const allowTools = [...new Set(config.allowTools.map((name) => name.trim()).filter((name) => name.length > 0))];
+  const allowTools = settings.allowTools;
   // 会话重置指令：大小写不敏感，空串表示禁用。
-  const resetCommand = config.resetCommand.trim().toLowerCase();
+  const resetCommand = settings.resetCommand;
   // 谁能重置会话：同样是「去掉空白项与重复项」，**空数组表示谁都不能**（与
   // allowUsers / allowGroups 的「空 = 不限制」相反，理由见下面的 canReset）。
-  const resetUsers = [...new Set(config.resetUsers.map((id) => String(id).trim()).filter((id) => id.length > 0))];
+  const resetUsers = settings.resetUsers;
 
   /**
    * 这个人可不可以重置会话。
@@ -616,8 +501,8 @@ export function apply(ctx, config) {
    * @returns 实时更新的 route 记录，也可从 qq_list_conversations 读到。
    */
   function resolveRoute() {
-    const configuredProvider = config.provider.trim();
-    const configuredModel = config.model.trim();
+    const configuredProvider = settings.provider.trim();
+    const configuredModel = settings.model.trim();
     if (configuredProvider.length > 0 && configuredModel.length > 0) {
       Object.assign(route, {
         provider: configuredProvider,
@@ -715,8 +600,8 @@ export function apply(ctx, config) {
 
   // OneBot 客户端：事件回调统一 try/catch，保证单个消息处理失败不会打穿 socket 回调。
   const client = new OneBotClient({
-    endpoint: config.endpoint,
-    accessToken: config.accessToken,
+    endpoint: settings.endpoint,
+    accessToken: settings.accessToken,
     // onEvent：OneBot 主动推送的事件（含消息、心跳、通知等），这里只关心 message。
     onEvent: (event) => {
       try {
@@ -729,8 +614,8 @@ export function apply(ctx, config) {
     onError: (error) => report('warn', `${error.message}`),
     // onStateChange：连接建立/断开，用于日志与（未来）状态展示。
     onStateChange: (connected, selfId) => {
-      if (connected) report('info', `connected to ${config.endpoint}${selfId ? ` as ${selfId}` : ''}`);
-      else report('info', `disconnected from ${config.endpoint}`);
+      if (connected) report('info', `connected to ${settings.endpoint}${selfId ? ` as ${selfId}` : ''}`);
+      else report('info', `disconnected from ${settings.endpoint}`);
     },
   });
 
@@ -746,11 +631,11 @@ export function apply(ctx, config) {
    */
   const mediaStore = createMediaStore({
     cwd,
-    dir: config.mediaDir,
-    maxBytes: config.mediaMaxBytes,
-    maxFiles: config.mediaCacheFiles,
-    timeoutMs: config.mediaTimeoutMs,
-    enabled: config.mediaDownload,
+    dir: settings.mediaDir,
+    maxBytes: settings.mediaMaxBytes,
+    maxFiles: settings.mediaCacheFiles,
+    timeoutMs: settings.mediaTimeoutMs,
+    enabled: settings.mediaDownload,
     report,
     resolveViaOneBot: (item) => client.call('get_image', { file: item.file }),
   });
@@ -765,11 +650,11 @@ export function apply(ctx, config) {
    * 文件名，模型据此挑一张。它必须在 `cwd` 内（否则模型的 read_image / glob 够不到，
    * 列出来只会让它去调一个读不到的工具），配到外面就只记一条 warn、不提示。
    */
-  const imageSend = config.imageSend !== false;
-  const imageMaxBytes = Number.isFinite(config.imageMaxBytes) && config.imageMaxBytes > 0
-    ? Math.floor(config.imageMaxBytes)
+  const imageSend = settings.imageSend !== false;
+  const imageMaxBytes = Number.isFinite(settings.imageMaxBytes) && settings.imageMaxBytes > 0
+    ? Math.floor(settings.imageMaxBytes)
     : DEFAULT_IMAGE_MAX_BYTES;
-  const stickerRoot = config.stickerDir.trim().length > 0 ? resolve(cwd, config.stickerDir.trim()) : undefined;
+  const stickerRoot = settings.stickerDir.trim().length > 0 ? resolve(cwd, settings.stickerDir.trim()) : undefined;
   const stickerInside = stickerRoot !== undefined && insideDirectory(resolve(cwd), stickerRoot);
   /**
    * 表情包复读里「算同一张画面」的位差上限（0 = 只认字节完全相同）。
@@ -777,9 +662,9 @@ export function apply(ctx, config) {
    * 上限夹到 0.3：这个值放大到 1 就等于「任何两张图都算同一张」，那是配置事故而不是
    * 功能 —— 真想要那种效果该关掉复读的图（`repeatMedia: false`），而不是让它乱跟。
    */
-  const repeatImageTolerance = Math.min(0.3, Math.max(0, Number(config.repeatImageTolerance) || 0));
+  const repeatImageTolerance = Math.min(0.3, Math.max(0, Number(settings.repeatImageTolerance) || 0));
   if (stickerRoot !== undefined && !stickerInside) {
-    report('warn', `stickerDir "${config.stickerDir.trim()}" resolves outside cwd (${cwd}); the sticker pack will not be advertised`);
+    report('warn', `stickerDir "${settings.stickerDir.trim()}" resolves outside cwd (${cwd}); the sticker pack will not be advertised`);
   }
   /** 表情包目录的展示路径（相对 cwd、正斜杠），就是模型该写进 qq_send_image 的那种写法。 */
   const stickerLabel = stickerInside ? relative(resolve(cwd), stickerRoot).split(sep).join('/') : undefined;
@@ -797,8 +682,8 @@ export function apply(ctx, config) {
   // 插件只负责**记**（每条入站消息同步落一行），**读/写**交给模型通过
   // qq_transcript / qq_memory 两个工具做 —— 好处是纯宿主平面工具，QQ 会话不用为了
   // 记忆拿到 write / bash；摘要则由下面的定时器驱动一个独立会话跑 message-digest skill。
-  const memoryOn = config.memory !== false;
-  const memoryCfg = typeof config.memoryDir === 'string' ? config.memoryDir.trim() : '';
+  const memoryOn = settings.memory !== false;
+  const memoryCfg = typeof settings.memoryDir === 'string' ? settings.memoryDir.trim() : '';
   const memoryRoot = memoryCfg.length > 0 ? resolve(cwd, memoryCfg) : undefined;
   const memoryInside = memoryRoot !== undefined && insideDirectory(resolve(cwd), memoryRoot);
   if (memoryOn && memoryRoot !== undefined && !memoryInside) {
@@ -817,7 +702,7 @@ export function apply(ctx, config) {
    * 说明 stderr 上确实出现过「相对进程 cwd」的写法，两种都认。
    */
   const memoryBase = memoryEnabled
-    ? (stickerRoot !== undefined && memoryCfg === config.stickerDir.trim()
+    ? (stickerRoot !== undefined && memoryCfg === settings.stickerDir.trim()
         ? `${stickerRoot}${sep}`
         : `${memoryRoot}${sep}`)
     : undefined;
@@ -838,11 +723,6 @@ export function apply(ctx, config) {
   /** 这次启动是否已经跑过一轮「补课」摘要（见 maybeCatchUpDigest）。 */
   let digestCatchUpKicked = false;
 
-  /** 摘要点（本地小时，0~23）：配置非法时退回 4 点。 */
-  function digestAtHour() {
-    const raw = Math.floor(Number(config.digestAtHour));
-    return Number.isFinite(raw) ? Math.min(23, Math.max(0, raw)) : 4;
-  }
   /** 摘要 Agent 的会话 id（确定性派生，重启后 resume，摘要历史不会断）。 */
   const digestSessionId = sessionIdFor('bridge:digest');
   /** 摘要任务的串行链：一次只跑一个会话，也不与自己的下一轮重叠。 */
@@ -860,12 +740,12 @@ export function apply(ctx, config) {
   //
   // 池子是 cwd 里的一个纯文本文件，而不是配置项：配置会显示在 Web UI 上、也会被复制粘贴
   // 到别处，key 不该走那条路。它同时也必须在 cwd 内（与该目录的其它约定一致）。
-  const apiKeyRotateOn = config.apiKeyRotate !== false;
-  const apiKeyRefName = typeof config.apiKeyRef === 'string' ? config.apiKeyRef.trim() : '';
+  const apiKeyRotateOn = settings.apiKeyRotate !== false;
+  const apiKeyRefName = typeof settings.apiKeyRef === 'string' ? settings.apiKeyRef.trim() : '';
   // 凭据引用名与凭据层自身的语法一致（也是 POSIX 环境变量名）：不合法就整个停用，
   // 而不是每天写一个语法都不对的 ref 进去。
   const apiKeyRefValid = /^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyRefName);
-  const apiKeyPoolCfg = typeof config.apiKeyFile === 'string' ? config.apiKeyFile.trim() : '';
+  const apiKeyPoolCfg = typeof settings.apiKeyFile === 'string' ? settings.apiKeyFile.trim() : '';
   const apiKeyPoolPath = apiKeyPoolCfg.length > 0 ? resolve(cwd, apiKeyPoolCfg) : undefined;
   const apiKeyPoolInside = apiKeyPoolPath !== undefined && insideDirectory(resolve(cwd), apiKeyPoolPath);
   /** 池子的展示路径（相对 cwd、正斜杠），日志与「怎么配」的提示里都用它。 */
@@ -877,22 +757,8 @@ export function apply(ctx, config) {
     report('warn', `apiKeyFile "${apiKeyPoolCfg}" resolves outside cwd (${cwd}); api key rotation is disabled`);
   }
 
-  /** 轮换点（本地小时，0~23）：配错时退回 4 点，不因为一个数字把功能整晚挂掉。 */
-  function apiKeyRotateHour() {
-    const raw = Math.floor(Number(config.apiKeyRotateHour));
-    return Number.isFinite(raw) ? Math.min(23, Math.max(0, raw)) : 4;
-  }
 
-  /** 探测超时（毫秒）：低于 1 秒一律按默认 15 秒算，免得配成 0 之后每次探测都瞬时失败。 */
-  function apiKeyProbeTimeoutMs() {
-    const raw = Math.floor(Number(config.apiKeyProbeTimeoutMs));
-    return Number.isFinite(raw) && raw >= 1000 ? raw : 15000;
-  }
 
-  /** 探测地址：留空 = 不探测（直接按池子顺序换下一个），这是唯一的「关掉探测」开关。 */
-  function apiKeyProbeUrl() {
-    return typeof config.apiKeyProbeUrl === 'string' ? config.apiKeyProbeUrl.trim() : '';
-  }
 
   /**
    * 探测一个候选 key 现在能不能用。
@@ -908,13 +774,13 @@ export function apply(ctx, config) {
    * @returns `{ ok, detail }`：detail 是可以直接写进日志的一句话。
    */
   async function probeApiKey(key) {
-    const url = apiKeyProbeUrl();
+    const url = settings.apiKeyProbeUrl;
     if (url.length === 0) return { ok: true, detail: 'probe disabled' };
     try {
       const response = await fetch(url, {
         method: 'GET',
         headers: { authorization: `Bearer ${key}`, 'x-api-key': key },
-        signal: AbortSignal.timeout(apiKeyProbeTimeoutMs()),
+        signal: AbortSignal.timeout(settings.apiKeyProbeTimeoutMs),
       });
       // 响应体一律不要（`/models` 的列表又长又没用），但也不能让连接挂着不给个交代。
       if (response.body !== null) {
@@ -1231,13 +1097,13 @@ export function apply(ctx, config) {
     if (selfId === '' || String(event.user_id ?? '') === String(selfId)) return;
     const isGroup = event.message_type === 'group';
     if (isGroup) {
-      if (!config.groupChat) return;
+      if (!settings.groupChat) return;
       const groupId = String(event.group_id);
-      if (config.allowGroups.length > 0 && !config.allowGroups.includes(groupId)) return;
+      if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(groupId)) return;
     } else {
-      if (!config.privateChat) return;
+      if (!settings.privateChat) return;
       const userId = String(event.user_id);
-      if (config.allowUsers.length > 0 && !config.allowUsers.includes(userId)) return;
+      if (settings.allowUsers.length > 0 && !settings.allowUsers.includes(userId)) return;
     }
     const message = event.message ?? event.raw_message;
     const text = memoryOneLine(messageToText(message, selfId)).slice(0, MEMORY_LINE_MAX_CHARS);
@@ -1288,8 +1154,8 @@ export function apply(ctx, config) {
    * @param conversation - 刚收到消息的会话。
    */
   function maybeCatchUpDigest(conversation) {
-    if (!memoryEnabled || config.digestCatchUp === false) return;
-    const atHour = digestAtHour();
+    if (!memoryEnabled || settings.digestCatchUp === false) return;
+    const atHour = settings.digestAtHour;
     const now = new Date();
     if (now.getHours() < atHour) return; // 今天还没到点，等定时器
     const last = memoryLastDigest.get(conversation.key) ?? 0;
@@ -1559,7 +1425,7 @@ export function apply(ctx, config) {
     if (text !== undefined) {
       const lines = text.split('\n');
       const needle = query.trim().toLowerCase();
-      const max = Math.max(1, Math.floor(Number(limit) || Number(config.memorySearchHits) || 40));
+      const max = Math.max(1, Math.floor(Number(limit) || Number(settings.memorySearchHits) || 40));
       for (let index = 0; index < lines.length && hits.length < max; index += 1) {
         if (!lines[index].toLowerCase().includes(needle)) continue;
         const from = Math.max(0, index - 2);
@@ -1571,7 +1437,7 @@ export function apply(ctx, config) {
       action: 'search',
       path: `${memoryLabel}/${relative}`,
       returned: hits.length,
-      truncated: hits.length >= Math.max(1, Math.floor(Number(limit) || Number(config.memorySearchHits) || 40)),
+      truncated: hits.length >= Math.max(1, Math.floor(Number(limit) || Number(settings.memorySearchHits) || 40)),
       text: hits.length > 0 ? hits.join('\n---\n') : '(no match)',
       bytes: text === undefined ? 0 : Buffer.byteLength(text, 'utf8'),
     };
@@ -1590,7 +1456,7 @@ export function apply(ctx, config) {
    */
   async function writeMemoryFile(relative, text, append) {
     const absolute = join(memoryBase, relative);
-    const maxBytes = Math.max(256, Math.floor(Number(config.memoryFileMaxBytes) || 0));
+    const maxBytes = Math.max(256, Math.floor(Number(settings.memoryFileMaxBytes) || 0));
     const body = append ? `\n${text.replace(/\s+$/, '')}\n` : `${text.replace(/\s+$/, '')}\n`;
     const previousRaw = (await readTextOrUndefined(absolute)) ?? '';
     const previousBytes = Buffer.byteLength(previousRaw, 'utf8');
@@ -1735,7 +1601,7 @@ export function apply(ctx, config) {
    */
   async function searchTranscript(target, args) {
     const dir = join(memoryBase, 'conversations', target.slug, 'log');
-    const limit = transcriptLimit(args.limit, Math.max(1, Math.floor(Number(config.memorySearchHits) || 40)));
+    const limit = transcriptLimit(args.limit, Math.max(1, Math.floor(Number(settings.memorySearchHits) || 40)));
     const needle = String(args.query).trim().toLowerCase();
     const hits = [];
     for (const name of (await readdirOrEmpty(dir)).filter((file) => file.endsWith('.jsonl')).sort().reverse()) {
@@ -1881,7 +1747,7 @@ export function apply(ctx, config) {
       source: { kind: 'user' },
     });
     agent.followup(message);
-    const timeoutMs = Math.max(1000, Math.floor(Number(config.digestTimeoutMs) || 0));
+    const timeoutMs = Math.max(1000, Math.floor(Number(settings.digestTimeoutMs) || 0));
     let timer;
     const timeout = new Promise((resolve) => {
       // ctx.timeout 把定时器挂在当前 fiber 上，插件卸载时自动清掉；它返回 disposer。
@@ -1919,7 +1785,7 @@ export function apply(ctx, config) {
         // 状态都不必现读磁盘：`memoryLastDigest` 在启动时从 `digest.json` 预热、每次
         // 摘要成功后就地更新；`memoryDirty` 是本进程攒的计数（重启归零，靠日期重新算）。
         const today = localDate();
-        const minLines = Math.max(1, Math.floor(Number(config.digestMinLines) || 1));
+        const minLines = Math.max(1, Math.floor(Number(settings.digestMinLines) || 1));
         const queue = [];
         for (const conversation of conversations.values()) {
           if (digestQueued.has(conversation.key)) continue;
@@ -1970,7 +1836,7 @@ export function apply(ctx, config) {
         lines.sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0));
         const window = lines.filter((line) => (Number(line.at) || 0) > since);
         if (window.length === 0) return;
-        const budget = Math.max(1000, Math.floor(Number(config.digestMaxChars) || 0));
+        const budget = Math.max(1000, Math.floor(Number(settings.digestMaxChars) || 0));
         const rendered = renderTranscriptWindow(window, budget);
         if (rendered.included === 0) return;
         const until = new Date().toLocaleString('zh-CN', { hour12: false });
@@ -2024,19 +1890,19 @@ export function apply(ctx, config) {
    */
   const jmService = createJmService({
     cwd,
-    dir: config.jmDir,
-    python: config.jmPython,
-    script: config.jmScript.trim().length > 0 ? config.jmScript : fileURLToPath(new URL('./scripts/jm_download.py', import.meta.url)),
-    enabled: config.jmDownload,
-    maxChapters: config.jmMaxChapters,
-    maxPages: config.jmMaxPages,
-    timeoutMs: config.jmTimeoutMs,
-    requestTimeoutMs: config.jmRequestTimeoutMs,
-    maxFiles: config.jmMaxFiles,
-    maxJobs: config.jmMaxJobs,
-    fileHost: config.jmFileHost,
-    filePort: config.jmFilePort,
-    urlTtlMs: config.jmUrlTtlMs,
+    dir: settings.jmDir,
+    python: settings.jmPython,
+    script: settings.jmScript.trim().length > 0 ? settings.jmScript : fileURLToPath(new URL('./scripts/jm_download.py', import.meta.url)),
+    enabled: settings.jmDownload,
+    maxChapters: settings.jmMaxChapters,
+    maxPages: settings.jmMaxPages,
+    timeoutMs: settings.jmTimeoutMs,
+    requestTimeoutMs: settings.jmRequestTimeoutMs,
+    maxFiles: settings.jmMaxFiles,
+    maxJobs: settings.jmMaxJobs,
+    fileHost: settings.jmFileHost,
+    filePort: settings.jmFilePort,
+    urlTtlMs: settings.jmUrlTtlMs,
     report,
   });
 
@@ -2143,7 +2009,7 @@ export function apply(ctx, config) {
    * @returns 预设 id；不需要/无法挂载时为空串。
    */
   async function resolveAgentPreset() {
-    const wanted = config.agentPreset.trim();
+    const wanted = settings.agentPreset.trim();
     if (wanted.toLowerCase() === PRESET_NONE) return '';
     const presets = ctx.get('agentPresets');
     // 没有预设平面：工具仍按老样子在宿主上，照常走白名单收窄即可。
@@ -2336,7 +2202,7 @@ export function apply(ctx, config) {
       ...(isGroup
         ? [speakerLine(conversation), '', ...ambientPrompt(conversation)]
         : []),
-      (config.persona.trim().length > 0 ? config.persona.trim() : DEFAULT_PERSONA),
+      (settings.persona.trim().length > 0 ? settings.persona.trim() : DEFAULT_PERSONA),
       '',
     ];
     // 长期记忆：把「已记住的东西」摆到眼前，模型才不会每次都从零开始 —— 并明确
@@ -2352,14 +2218,14 @@ export function apply(ctx, config) {
     // 「一轮发几条」这条规则必须跟当前配置一致：设了 burstMaxMessages: 1 之后还告诉模型
     // 「想连说几句就直接换行」，就是一条它照做也做不到的指示（换行会被并回同一条）。
     // 混合模式（burstSingleMaxChars > 0）则要同时说清「闲聊别拆」和「展开就分条」。
-    const messageCap = burstMessageCap();
-    const singleUnder = burstSingleUnder();
-    const burstRule = !config.humanize
+    const messageCap = settings.burstMaxMessages;
+    const singleUnder = settings.burstSingleMaxChars;
+    const burstRule = !settings.humanize
       ? '- 你的整轮回复会作为一条消息直接发出去（换行也留在同一条里），直接写要说的话，别把它当文档排版。'
       : singleUnder > 0
         ? `- 闲聊归闲聊：去掉空白不超过 ${singleUnder} 字的回复会被并成**一条**发出去，所以平时就一两句话、一行写完，别把一句能说完的话拆成两拍。真要展开讲（对方要你详细说、贴代码 / 列步骤 / 解释清楚）就换行，一行一条短句，插件会照发${messageCap > 0 ? `（一轮最多 ${messageCap} 条）` : '（但别超过三四条）'}；内容不多就别硬拆。`
         : messageCap === 1
-          ? `- 一次只说一句：你的整轮回复会被并成**一条**消息发出去（写换行也只是同一条里的换行），所以别把话拆成几条短句，就把那一两句直接写出来，别没事写小作文。对方明确要你详细讲、或者要贴代码 / 步骤 / 清单时，就正常写完整 —— 长内容也还是这**一条**（超过 ${protocolLimit()} 字才会被协议上限切成两段），只是别把短回复硬拉长。`
+          ? `- 一次只说一句：你的整轮回复会被并成**一条**消息发出去（写换行也只是同一条里的换行），所以别把话拆成几条短句，就把那一两句直接写出来，别没事写小作文。对方明确要你详细讲、或者要贴代码 / 步骤 / 清单时，就正常写完整 —— 长内容也还是这**一条**（超过 ${settings.maxReplyChars} 字才会被协议上限切成两段），只是别把短回复硬拉长。`
           : messageCap > 1
             ? `- 想连说几句就直接换行，每一行都会作为单独的一条消息发出去，但一轮最多发 ${messageCap} 条（超出的部分并进最后一条）。`
             : '- 想连说几句就直接换行，每一行都会作为单独的一条消息发出去；反过来，别用换行给一段话排版（那会变成连着刷好几条）。';
@@ -2425,7 +2291,7 @@ export function apply(ctx, config) {
     }
     // 引用前缀是插件加上去的，得告诉模型它是什么，否则会被当成对方原话的一部分。
     // 它同时也带正文，所以不依赖 read_image 是否可用。
-    if (config.quoteMedia) {
+    if (settings.quoteMedia) {
       lines.push(
         '- 正文开头的 `（引用 某某: …）` 表示对方是在**回复那条消息**：内容是插件替你取回来的（里面可能带图片路径），别当成对方又重复说了一遍，也别再问「你说的是哪条」。',
       );
@@ -2436,16 +2302,12 @@ export function apply(ctx, config) {
         '- 有人甩过来禁漫（JM / 18comic）的车号或 album / photo 链接让你下载时，用 qq_jm_pdf 工具：它会把整本合并成一个 PDF 并直接把文件发到这个会话。别自己复述车号或链接，也别承诺页数，下完说一句「下好了」之类的就行（下不动就把原因说清楚）。',
       );
     }
-    if (config.instructions.trim().length > 0) {
-      lines.push('', config.instructions.trim());
+    if (settings.instructions.trim().length > 0) {
+      lines.push('', settings.instructions.trim());
     }
     return lines.join('\n');
   }
 
-  /** 协议允许的单条消息长度上限（`maxReplyChars` 非法时回退 1500）。 */
-  function protocolLimit() {
-    return Number.isSafeInteger(config.maxReplyChars) && config.maxReplyChars > 0 ? config.maxReplyChars : 1500;
-  }
 
   /**
    * 这个 Agent 能不能往 QQ 发图。
@@ -2464,20 +2326,12 @@ export function apply(ctx, config) {
    * 提示词与拆条都要读它：提示词在「一次只发一条」时不能再说「想连说几句就换行」，
    * 否则模型会照着一条它做不到的规则写。
    */
-  function burstMessageCap() {
-    return Number.isFinite(config.burstMaxMessages) ? Math.max(0, Math.floor(config.burstMaxMessages)) : 0;
-  }
 
   /**
    * 「日常闲聊并成一条」的字数门槛（`burstSingleMaxChars`；非正数 = 关掉）。
    *
    * 按去掉空白后的字数算：换行、缩进这些排版字符不该把一条闲聊顶过门槛。
    */
-  function burstSingleUnder() {
-    return Number.isFinite(config.burstSingleMaxChars) && config.burstSingleMaxChars > 0
-      ? Math.floor(config.burstSingleMaxChars)
-      : 0;
-  }
 
   /**
    * 把一段回复拆成「像真人连着发的」几条消息。
@@ -2499,15 +2353,15 @@ export function apply(ctx, config) {
    * @returns 按发送顺序排列的分段。
    */
   function burstParts(text) {
-    const limit = protocolLimit();
-    if (!config.humanize) return chunkText(text, limit);
-    const burst = Number.isSafeInteger(config.burstMaxChars) && config.burstMaxChars > 0
-      ? Math.min(config.burstMaxChars, limit)
+    const limit = settings.maxReplyChars;
+    if (!settings.humanize) return chunkText(text, limit);
+    const burst = Number.isSafeInteger(settings.burstMaxChars) && settings.burstMaxChars > 0
+      ? Math.min(settings.burstMaxChars, limit)
       : limit;
-    const maxParts = Number.isFinite(config.burstMaxParts) ? Math.max(1, Math.floor(config.burstMaxParts)) : 3;
-    const singleUnder = burstSingleUnder();
+    const maxParts = Number.isFinite(settings.burstMaxParts) ? Math.max(1, Math.floor(settings.burstMaxParts)) : 3;
+    const singleUnder = settings.burstSingleMaxChars;
     const short = singleUnder > 0 && text.replace(/\s+/g, '').length <= singleUnder;
-    const maxMessages = short ? 1 : burstMessageCap();
+    const maxMessages = short ? 1 : settings.burstMaxMessages;
     return splitBurst(text, burst, maxParts, maxMessages).flatMap((part) => chunkText(part, limit));
   }
 
@@ -2569,7 +2423,7 @@ export function apply(ctx, config) {
    */
   function sendLiteral(conversation, text) {
     return enqueueSend(conversation, async () => {
-      for (const part of chunkText(text, protocolLimit())) {
+      for (const part of chunkText(text, settings.maxReplyChars)) {
         if (!(await sendOne(conversation, part))) return;
       }
     });
@@ -2588,7 +2442,7 @@ export function apply(ctx, config) {
    * @returns `{ kind: 'text', text }` 或 `{ kind: 'image', source, raw }` 的数组。
    */
   function replyPieces(text, human) {
-    const asText = (value) => (human ? burstParts(value) : chunkText(value, protocolLimit())).map((part) => ({ kind: 'text', text: part }));
+    const asText = (value) => (human ? burstParts(value) : chunkText(value, settings.maxReplyChars)).map((part) => ({ kind: 'text', text: part }));
     return splitStickerLines(text).flatMap((piece) => {
       if (piece.kind === 'text') return asText(piece.text);
       if (!imageAllowed()) return asText(piece.raw); // 没允许发图时标记只是普通文字
@@ -2629,11 +2483,11 @@ export function apply(ctx, config) {
         // 表情包没有字数可算，等一个下限就够（第一张仍然算「读消息」那一段时间）。
         // 字段逐个显式传：`delayJitter` 与纯函数的 `jitter` 不同名，整包展开会静默丢掉抖动。
         await sleep(typingDelayMs(piece.kind === 'text' ? piece.text.length : 0, {
-          charsPerSecond: config.charsPerSecond,
-          minDelayMs: config.minDelayMs,
-          maxDelayMs: config.maxDelayMs,
-          jitter: config.delayJitter,
-          baseMs: index === 0 ? config.readDelayMs : 0,
+          charsPerSecond: settings.charsPerSecond,
+          minDelayMs: settings.minDelayMs,
+          maxDelayMs: settings.maxDelayMs,
+          jitter: settings.delayJitter,
+          baseMs: index === 0 ? settings.readDelayMs : 0,
         }));
       }
       const head = quoteHead(conversation, index, quote);
@@ -2668,7 +2522,7 @@ export function apply(ctx, config) {
    */
   function quoteHead(conversation, index, quote) {
     if (index !== 0 || conversation.type !== 'group') return undefined;
-    const style = config.replyStyle;
+    const style = settings.replyStyle;
     if (style === 'auto') {
       // 只在「我回的那条后面又出现了消息」时才引用 —— **包括我自己刚发出去的话**
       // （上一轮的回复、复读、主动搭话）：紧挨着回时引用是纯噪音，一轮问答本来就看得出来
@@ -2692,7 +2546,7 @@ export function apply(ctx, config) {
    * 开头的 `/` 当触发前缀吃掉，两种写法都得认识）。
    */
   const jmCommandPattern = (() => {
-    const command = config.jmCommand.trim();
+    const command = settings.jmCommand.trim();
     if (command.length === 0) return undefined;
     const bare = command.replace(/^\/+/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return new RegExp(`^/?${bare}(?:\\s+|$)`, 'i');
@@ -2780,7 +2634,7 @@ export function apply(ctx, config) {
       ? { group_id: conversation.id, file: url, name: job.name, folder: '' }
       : { user_id: conversation.id, file: url, name: job.name };
     try {
-      await client.call(action, params, config.jmUploadTimeoutMs);
+      await client.call(action, params, settings.jmUploadTimeoutMs);
       // 传进群里的这份 PDF 也是一条「我自己发的消息」（见 `noteOwnMessage`）。
       noteOwnMessage(conversation.type, conversation.id);
       report('info', `jm: uploaded ${job.name} (${job.bytes} bytes) to ${conversation.key}`);
@@ -3048,7 +2902,7 @@ export function apply(ctx, config) {
    * @returns 去掉前缀后的正文。
    */
   function dropPrefix(text) {
-    return config.groupTrigger === 'prefix' ? text.slice(config.prefix.length).trim() : text;
+    return settings.groupTrigger === 'prefix' ? text.slice(settings.prefix.length).trim() : text;
   }
 
   /**
@@ -3073,14 +2927,14 @@ export function apply(ctx, config) {
     const isGroup = event.message_type === 'group';
     const sender = event.sender ?? {};
     if (isGroup) {
-      if (!config.groupChat) return undefined;
+      if (!settings.groupChat) return undefined;
       const groupId = String(event.group_id);
-      if (config.allowGroups.length > 0 && !config.allowGroups.includes(groupId)) return undefined;
+      if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(groupId)) return undefined;
       const userId = String(event.user_id ?? '');
       const at = mentions(message, selfId);
-      const prefixed = config.groupTrigger === 'prefix' && messageToText(message).trimStart().startsWith(config.prefix);
+      const prefixed = settings.groupTrigger === 'prefix' && messageToText(message).trimStart().startsWith(settings.prefix);
       // 显式触发：@ 了机器人、按配置用了前缀、或者 groupTrigger 本来就允许所有消息。
-      const explicit = config.groupTrigger === 'all' || at || prefixed;
+      const explicit = settings.groupTrigger === 'all' || at || prefixed;
       // 这里只用**占位符**版本判定「这条消息有没有内容」：媒体下载是异步的，此刻还没
       // 落盘，而 `[图片]` 这样的占位符已经足够说明「他发了点东西」。真正的正文在
       // handleEvent 里等媒体落盘后再渲染一次。
@@ -3122,9 +2976,9 @@ export function apply(ctx, config) {
         quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: quoteSeq.get(groupId) ?? 0 },
       };
     }
-    if (!config.privateChat) return undefined;
+    if (!settings.privateChat) return undefined;
     const userId = String(event.user_id);
-    if (config.allowUsers.length > 0 && !config.allowUsers.includes(userId)) return undefined;
+    if (settings.allowUsers.length > 0 && !settings.allowUsers.includes(userId)) return undefined;
     const text = messageToText(message, selfId).trim();
     if (text.length === 0) return undefined;
     const conversation = conversationFor('private', userId, {
@@ -3235,12 +3089,12 @@ export function apply(ctx, config) {
    * @param selfId - 机器人自己的 QQ 号（机器人自己的消息不进缓冲）。
    */
   function rememberAmbient(event, selfId) {
-    const limit = Math.floor(Number(config.ambientMessages) || 0);
+    const limit = Math.floor(Number(settings.ambientMessages) || 0);
     if (limit <= 0) return;
-    if (!config.groupChat || event?.message_type !== 'group') return;
+    if (!settings.groupChat || event?.message_type !== 'group') return;
     if (String(event.user_id ?? '') === String(selfId)) return;
     const groupId = String(event.group_id);
-    if (config.allowGroups.length > 0 && !config.allowGroups.includes(groupId)) return;
+    if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(groupId)) return;
     // 折掉换行：多行消息会破坏「昵称: 内容」一行一条的版式。
     // 媒体默认**也**落盘（`ambientMedia`），这样「有人刚才发了张表情包」之后被 @ 时它真的
     // 看得见；关掉这个开关就退回成「只留一句占位符」，不为闲聊花带宽和磁盘。
@@ -3249,14 +3103,14 @@ export function apply(ctx, config) {
     if (text.length === 0) return;
     const sender = event.sender ?? {};
     const name = String(sender.card ?? sender.nickname ?? event.user_id ?? '某人');
-    const lineChars = Math.max(1, Math.floor(Number(config.ambientLineChars) || 120));
+    const lineChars = Math.max(1, Math.floor(Number(settings.ambientLineChars) || 120));
     const list = ambient.get(groupId) ?? [];
     const entry = { name, text: text.slice(0, lineChars) };
     list.push(entry);
     while (list.length > limit) list.shift();
     ambient.set(groupId, list);
     // 先按占位符入缓冲（提示词立刻可用），下载完成后再就地改写成带路径的版本。
-    if (config.ambientMedia) void hydrateAmbientMedia(raw, entry, lineChars);
+    if (settings.ambientMedia) void hydrateAmbientMedia(raw, entry, lineChars);
   }
 
   /**
@@ -3286,10 +3140,10 @@ export function apply(ctx, config) {
    * @param canAct - 这条消息能不能触发复读（被 @ 的那条只能记账，不能跟）。
    */
   function maybeRepeat(event, selfId, canAct) {
-    if (!config.repeat) return;
-    if (!config.groupChat || event?.message_type !== 'group') return;
+    if (!settings.repeat) return;
+    if (!settings.groupChat || event?.message_type !== 'group') return;
     const groupId = String(event.group_id);
-    if (config.allowGroups.length > 0 && !config.allowGroups.includes(groupId)) return;
+    if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(groupId)) return;
     const userId = String(event.user_id ?? '');
     if (userId === String(selfId)) return;
     const message = event.message ?? event.raw_message;
@@ -3341,21 +3195,21 @@ export function apply(ctx, config) {
       state.chain = undefined;
       return;
     }
-    const windowMs = Math.max(0, Math.floor(Number(config.repeatWindowMs) || 0));
+    const windowMs = Math.max(0, Math.floor(Number(settings.repeatWindowMs) || 0));
     const chained =
       previous !== undefined &&
       (windowMs <= 0 || arrivedAt - previous.at <= windowMs) &&
       (await sameCandidate(previous, candidate));
     const senders = chained ? [...new Set([...previous.senders, userId])] : [userId];
     const count = chained ? previous.count + 1 : 1;
-    const threshold = Math.max(2, Math.floor(Number(config.repeatCount) || 0));
-    const distinct = config.repeatDistinct ? senders.length >= 2 : true;
+    const threshold = Math.max(2, Math.floor(Number(settings.repeatCount) || 0));
+    const distinct = settings.repeatDistinct ? senders.length >= 2 : true;
     const entry = { ...candidate, count, senders, at: arrivedAt };
     if (!canAct || count < threshold || !distinct) {
       state.chain = entry;
       return;
     }
-    const chance = Math.min(1, Math.max(0, Number(config.repeatChance)));
+    const chance = Math.min(1, Math.max(0, Number(settings.repeatChance)));
     if (!(Math.random() < chance)) {
       // 这次没跟：链留着，下一条相同的消息再掷一次，而不是重新攒人数。
       state.chain = entry;
@@ -3391,7 +3245,7 @@ export function apply(ctx, config) {
     if (text !== undefined) {
       const raw = text.trim();
       if (raw.length === 0) return undefined;
-      const maxChars = Math.floor(Number(config.repeatMaxChars));
+      const maxChars = Math.floor(Number(settings.repeatMaxChars));
       if (Number.isFinite(maxChars) && maxChars > 0 && raw.length > maxChars) return undefined;
       return { kind: 'text', key: `text:${raw.replace(/\s+/g, ' ')}`, raw };
     }
@@ -3399,8 +3253,8 @@ export function apply(ctx, config) {
     // 落盘时留下的（`mediaFor` 按消息对象共用同一次下载，所以默认配置下它一次带宽都不多花）。
     // 于是关掉 `ambientMedia`、或者把 `ambientMessages` 设成 0（群聊上下文整个关掉）时，
     // 群里的图根本不会被取下来 —— 表情包复读自动退化成「只复读文字」，不会偷偷花带宽。
-    const ambientDownloads = config.ambientMedia && Math.floor(Number(config.ambientMessages) || 0) > 0;
-    if (!config.repeatMedia || !imageSend || !ambientDownloads) return undefined;
+    const ambientDownloads = settings.ambientMedia && Math.floor(Number(settings.ambientMessages) || 0) > 0;
+    if (!settings.repeatMedia || !imageSend || !ambientDownloads) return undefined;
     if (!Array.isArray(message) || message.length !== 1) return undefined;
     const only = message[0];
     if (only?.type === 'face') {
@@ -3529,24 +3383,10 @@ export function apply(ctx, config) {
    * 开着时也只在**群**里说话 —— 私聊对象是具体的人，被机器人无端戳一下更冒犯，
    * 而且私聊会话一多，主动搭话很容易变成骚扰。
    */
-  const proactiveEnabled = config.proactive === true;
+  const proactiveEnabled = settings.proactive === true;
 
-  /** 一个毫秒配置项：非法值退回 `fallback`，负数按 0 算。 */
-  function proactiveMs(name, fallback) {
-    const raw = Math.floor(Number(config[name]));
-    return Number.isFinite(raw) ? Math.max(0, raw) : fallback;
-  }
 
-  /** 每群每天最多主动说几次；非法或负数按 0（= 不说）算。 */
-  function proactiveDailyMax() {
-    const raw = Math.floor(Number(config.proactiveDailyMax));
-    return Number.isFinite(raw) ? Math.max(0, raw) : 4;
-  }
 
-  /** 主动说话的检查间隔（毫秒）：下限 1 秒，上限受 Node 定时器能表达的范围约束。 */
-  function proactiveCheckMs() {
-    return Math.min(MAX_TIMER_MS, Math.max(1000, proactiveMs('proactiveCheckMs', 10 * 60 * 1000)));
-  }
 
   /**
    * 这个会话的「今天」计数（跨天就地归零），返回今天已经主动说过几次。
@@ -3614,12 +3454,12 @@ export function apply(ctx, config) {
     if (lastActive <= 0 || now < lastActive) return false;
     // 独白：上一条是我说的，之后没人接话。
     if ((Number(conversation.lastBotSpeakAt) || 0) >= lastActive) return false;
-    if (now - lastActive < proactiveMs('proactiveIdleMs', 45 * 60 * 1000)) return false;
-    const freshMs = proactiveMs('proactiveFreshMs', 24 * 60 * 60 * 1000);
+    if (now - lastActive < settings.proactiveIdleMs) return false;
+    const freshMs = settings.proactiveFreshMs;
     if (freshMs > 0 && now - lastActive > freshMs) return false;
-    const gapMs = proactiveMs('proactiveGapMs', 2 * 60 * 60 * 1000);
+    const gapMs = settings.proactiveGapMs;
     if ((Number(conversation.lastProactiveAt) || 0) > 0 && now - conversation.lastProactiveAt < gapMs) return false;
-    return proactiveTodayCount(conversation) < proactiveDailyMax();
+    return proactiveTodayCount(conversation) < settings.proactiveDailyMax;
   }
 
   /**
@@ -3722,10 +3562,10 @@ export function apply(ctx, config) {
     if (!proactiveEnabled) return;
     // 还没连上 OneBot（selfId 未知）时发不出去，也认不出自己的消息。
     if (client.selfId === '') return;
-    const from = Number(config.proactiveFromHour);
-    const to = Number(config.proactiveToHour);
+    const from = Number(settings.proactiveFromHour);
+    const to = Number(settings.proactiveToHour);
     if (!withinActiveHours(from, to, new Date().getHours())) return;
-    const chance = Math.min(1, Math.max(0, Number(config.proactiveChance)));
+    const chance = Math.min(1, Math.max(0, Number(settings.proactiveChance)));
     if (!(chance > 0)) return;
     const now = Date.now();
     const candidates = [];
@@ -3763,37 +3603,16 @@ export function apply(ctx, config) {
   // `groupChatter`，大家一起说的话够多、够热闹时，走的就是 C 而不是 A 了（这就是
   // 「有人插话就考虑进入多人搭话」的落点）。
 
-  /** 活跃对话窗口（毫秒）：0 表示整套关闭（免 @ 接话、自己补一句、多人搭话都不做）。 */
-  function activeWindowMs() {
-    return proactiveMs('activeWindowMs', 60 * 1000);
-  }
 
-  /** 一次**一对一**的活跃对话里最多免 @ 接几轮；0 = 不限。多人搭话不看它（见 `admit`）。 */
-  function activeMaxTurns() {
-    return proactiveMs('activeMaxTurns', 10);
-  }
 
   /** 免 @ 接话的轮数还有余额吗（`activeMaxTurns` 为 0 表示不限）。 */
   function activeTurnsLeft(conversation) {
-    const maxTurns = activeMaxTurns();
+    const maxTurns = settings.activeMaxTurns;
     return maxTurns <= 0 || (Number(conversation.activeTurns) || 0) < maxTurns;
   }
 
-  /** 「多人搭话」的进入门槛：最近窗口里至少这么多条别人说的话；0 = 关掉多人搭话。 */
-  function activeGroupLines() {
-    return proactiveMs('activeGroupLines', 6);
-  }
 
-  /** 「多人搭话」还要求最近窗口里至少这么多**不同的人**说过话。 */
-  function activeGroupSpeakers() {
-    return proactiveMs('activeGroupSpeakers', 2);
-  }
 
-  /** 搭话状态里的攒批倍数（倾听时间）：小于 1 的一律按 1（不放大）算。 */
-  function activeGroupBatchScale() {
-    const raw = Number(config.activeGroupBatchScale);
-    return Number.isFinite(raw) && raw > 1 ? raw : 1;
-  }
 
   /**
    * 把「这个群里又有人说话」记进多人搭话的时间窗口（由 `noteChatter` 调用）。
@@ -3808,10 +3627,10 @@ export function apply(ctx, config) {
   function recordGroupChatter(groupId, userId, at) {
     const list = groupChatter.get(groupId) ?? [];
     list.push({ userId, at });
-    const cutoff = at - Math.max(1, activeWindowMs());
+    const cutoff = at - Math.max(1, settings.activeWindowMs);
     // 条数上限取「默认上限」与「配置的门槛」的较大者：有人把 activeGroupLines 配到 64 以上时，
     // 不能因为这份缓冲只留 64 条就永远凑不够。真正的边界还是上面那个时间窗口。
-    const keep = Math.max(GROUP_CHATTER_MAX, activeGroupLines());
+    const keep = Math.max(GROUP_CHATTER_MAX, settings.activeGroupLines);
     while (list.length > keep || (list.length > 0 && list[0].at < cutoff)) list.shift();
     groupChatter.set(groupId, list);
     if (groupChatter.size > 512) {
@@ -3834,11 +3653,11 @@ export function apply(ctx, config) {
    * @returns 现在算多人搭话时为 true。
    */
   function groupTalkActive(groupId) {
-    if (config.activeFollow !== true) return false;
-    const window = activeWindowMs();
+    if (settings.activeFollow !== true) return false;
+    const window = settings.activeWindowMs;
     if (window <= 0) return false;
-    const lines = activeGroupLines();
-    const speakers = activeGroupSpeakers();
+    const lines = settings.activeGroupLines;
+    const speakers = settings.activeGroupSpeakers;
     if (lines <= 0 || speakers <= 0) return false;
     const cutoff = Date.now() - window;
     const recent = (groupChatter.get(groupId) ?? []).filter((entry) => entry.at >= cutoff);
@@ -3846,20 +3665,8 @@ export function apply(ctx, config) {
     return new Set(recent.map((entry) => entry.userId)).size >= speakers;
   }
 
-  /** 「自己补一句」的静默门槛（毫秒）；0 = 不补。 */
-  function activeChimeIdleMs() {
-    return proactiveMs('activeChimeIdleMs', 20 * 1000);
-  }
 
-  /** 对方每说一句之后最多自己补几句；0 = 不补。 */
-  function activeChimeMax() {
-    return proactiveMs('activeChimeMax', 1);
-  }
 
-  /** 同一个会话一天最多自己补几句；0 = 不限。 */
-  function activeChimeDailyMax() {
-    return proactiveMs('activeChimeDailyMax', 12);
-  }
 
   /**
    * 记一次「这个会话正聊着」，把活跃窗口往后滑。
@@ -3876,7 +3683,7 @@ export function apply(ctx, config) {
    * @param continued - 这条是不是「窗口内接上的」（而不是被叫到）。
    */
   function noteActiveMessage(conversation, userId, continued) {
-    conversation.activeUntil = Date.now() + activeWindowMs();
+    conversation.activeUntil = Date.now() + settings.activeWindowMs;
     conversation.activeSpeakerId = userId;
     conversation.activeTurns = continued ? (conversation.activeTurns ?? 0) + 1 : 0;
     if (conversation.type === 'group') conversation.activeSeq = chatterSeq.get(conversation.id) ?? 0;
@@ -3904,8 +3711,8 @@ export function apply(ctx, config) {
    * @returns 可以当「接话」时为 true。
    */
   function activeFollowAllows(conversation, userId, message, selfId) {
-    if (config.activeFollow !== true) return false;
-    if (activeWindowMs() <= 0) return false;
+    if (settings.activeFollow !== true) return false;
+    if (settings.activeWindowMs <= 0) return false;
     // 私聊不需要「免 @」：那边的每条消息本来就都是跟它说的。
     if (conversation.type !== 'group') return false;
     if (String(conversation.activeSpeakerId ?? '') !== String(userId)) return false;
@@ -3939,8 +3746,8 @@ export function apply(ctx, config) {
    * 掐着表 20 秒整补一句比不补还像机器人；复用打字延迟那个抖动比例，不额外加配置。
    */
   function chimeDelay() {
-    const idle = activeChimeIdleMs();
-    const jitter = Math.min(1, Math.max(0, Number(config.delayJitter) || 0));
+    const idle = settings.activeChimeIdleMs;
+    const jitter = Math.min(1, Math.max(0, Number(settings.delayJitter) || 0));
     return Math.max(500, Math.round(idle * (1 + (Math.random() * 2 - 1) * jitter)));
   }
 
@@ -3957,7 +3764,7 @@ export function apply(ctx, config) {
    */
   function scheduleChime(conversation) {
     if (!proactiveEnabled) return; // 总开关：不允许主动发消息就什么都不挂
-    if (activeWindowMs() <= 0 || activeChimeIdleMs() <= 0 || activeChimeMax() <= 0) return;
+    if (settings.activeWindowMs <= 0 || settings.activeChimeIdleMs <= 0 || settings.activeChimeMax <= 0) return;
     cancelChime(conversation);
     // 先取消（编号 +1）再抓编号：这条定时器因此是「目前唯一有效」的那一个。
     const seq = conversation.chimeSeq;
@@ -3999,14 +3806,14 @@ export function apply(ctx, config) {
     if ((Number(conversation.activeUntil) || 0) <= now) return;
     if (conversation.pending.length > 0 || conversation.batchTimer !== undefined) return;
     if (busyWithTurn(conversation)) return;
-    const max = activeChimeMax();
+    const max = settings.activeChimeMax;
     if (max > 0 && (conversation.chimeCount ?? 0) >= max) return;
-    const dailyMax = activeChimeDailyMax();
+    const dailyMax = settings.activeChimeDailyMax;
     if (dailyMax > 0 && chimeTodayUsed(conversation) >= dailyMax) return;
     if ((Number(conversation.lastBotSpeakAt) || 0) <= (Number(conversation.lastActiveAt) || 0)) return;
     // 群里中间又有人说话了：那不是接在我这句后面的事，插进去就是抢话。
     if (conversation.type === 'group' && (chatterSeq.get(conversation.id) ?? 0) !== (Number(conversation.activeSeq) || 0)) return;
-    const chance = Math.min(1, Math.max(0, Number(config.proactiveChance)));
+    const chance = Math.min(1, Math.max(0, Number(settings.proactiveChance)));
     if (!(chance > 0) || !(Math.random() < chance)) return;
     chimeSpeak(conversation, now);
   }
@@ -4142,7 +3949,7 @@ export function apply(ctx, config) {
    *   没有信息量的 `[回复]` 占位符）；没有引用段、取不到、或 `quoteMedia` 关着时 undefined。
    */
   async function resolveQuote(message) {
-    if (!config.quoteMedia) return undefined;
+    if (!settings.quoteMedia) return undefined;
     const reply = findReply(message);
     if (reply === undefined) return undefined;
     const { id, index } = reply;
@@ -4199,14 +4006,6 @@ export function apply(ctx, config) {
   // ---- 攒批：几个人同时 @ 时只回一轮 -----------------------------------------
 
   /**
-   * `setTimeout` 能表达的最大延迟。
-   *
-   * 配置写成天文数字时不能让 Node 的定时器溢出 —— 那会退化成「1 毫秒后立刻醒」，
-   * 也就是把「几乎无限地等」变成「立刻发出去」，方向完全反了。
-   */
-  const MAX_TIMER_MS = 2 ** 31 - 1;
-
-  /**
    * 这个会话现在的「倾听时间」倍数。
    *
    * 只有**多人搭话**的群会放大：大家正聊着的时候它该多听几句再开口，而不是每两秒截一句
@@ -4217,19 +4016,19 @@ export function apply(ctx, config) {
   function batchScale(conversation) {
     if (conversation?.type !== 'group') return 1;
     if (!groupTalkActive(conversation.id)) return 1;
-    return activeGroupBatchScale();
+    return settings.activeGroupBatchScale;
   }
 
   /** 攒批窗口（毫秒）；配置非法或为 0 时返回 0，表示关闭攒批、来一条回一条。 */
   function batchWindow(scale) {
-    const raw = Math.floor(Number(config.batchWindowMs));
+    const raw = Math.floor(Number(settings.batchWindowMs));
     if (!(Number.isFinite(raw) && raw > 0)) return 0;
     return Math.max(1, Math.round(raw * scale));
   }
 
   /** 一批最多等多久（毫秒）。配置比窗口还小时没有意义，按下限（= 窗口）算；与窗口同倍放大。 */
   function batchCap(window, scale) {
-    const raw = Math.floor(Number(config.batchMaxWaitMs));
+    const raw = Math.floor(Number(settings.batchMaxWaitMs));
     const scaled = Number.isFinite(raw) && raw > 0 ? Math.round(raw * scale) : 0;
     return scaled > window ? scaled : window;
   }
@@ -4414,7 +4213,7 @@ export function apply(ctx, config) {
       flushBatch(conversation);
       report('info', `← ${who} ${sender.nickname ?? ''}: ${jmCommand.ref === undefined ? '（/jm 缺车号）' : `jm ${jmCommand.ref.id}`}`);
       if (jmCommand.ref === undefined) {
-        void sendToConversation(conversation, `用法：${config.jmCommand.trim() || '/jm'} <车号 或 18comic 链接>`, { quote });
+        void sendToConversation(conversation, `用法：${settings.jmCommand.trim() || '/jm'} <车号 或 18comic 链接>`, { quote });
       } else {
         void runJmCommand(conversation, jmCommand.ref, quote);
       }
@@ -4522,521 +4321,43 @@ export function apply(ctx, config) {
   });
 
   // ---- 工具注册 --------------------------------------------------------------
-
-  /**
-   * 工具一：qq_send_message —— 主动向某个 QQ 号或群号发文本（超长自动分段）。
-   * 面向所有 Harness Agent 全局可用，包括 Web UI 里的主会话。
-   */
-  ctx.tools.register(
-    defineTool({
-      name: 'qq_send_message',
-      description:
-        'Send a text message through the connected QQ (OneBot) account to one QQ contact or group. Requires the QQ bridge plugin to be connected; use qq_list_conversations first when the target id is unknown.',
-      parameters: {
-        target_type: {
-          type: 'string',
-          enum: ['private', 'group'],
-          required: true,
-          description: 'Whether the target id is a QQ number (private) or a group number (group).',
-        },
-        target_id: {
-          type: 'string',
-          required: true,
-          description: 'The QQ number for private targets, or the group number for group targets.',
-        },
-        message: {
-          type: 'string',
-          required: true,
-          description: 'The plain-text message body to send. Long text is split automatically.',
-        },
-      },
-      // 输出结构：回显目标与实际发送的段数，便于模型确认「发了几条」。
-      output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            target_type: { type: 'string', required: true },
-            target_id: { type: 'string', required: true },
-            parts: { type: 'integer', required: true },
-          },
-        },
-        // render 决定这条工具结果如何呈现给调用它的 Agent（人可读的摘要）。
-        render: (_args, value) => [
-          { type: 'text', text: `Sent ${value.parts} QQ message part(s) to ${value.target_type} ${value.target_id}.` },
-        ],
-      },
-      async execute(args) {
-        // 未连接时直接报错，而不是静默丢弃消息。
-        if (!client.connected) throw new Error(`QQ bridge is not connected to ${config.endpoint}; start NapCat or check the endpoint.`);
-        const targetType = args.target_type;
-        const targetId = String(args.target_id).trim();
-        const body = String(args.message ?? '').trim();
-        if (targetId.length === 0) throw new Error('qq_send_message requires a non-empty target_id');
-        if (body.length === 0) throw new Error('qq_send_message requires a non-empty message');
-        const action = targetType === 'group' ? 'send_group_msg' : 'send_private_msg';
-        const idKey = targetType === 'group' ? 'group_id' : 'user_id';
-        // 这是 Agent 的显式动作（「就发这段」），所以只按协议上限分段：
-        // 不做拆句、不加打字延迟 —— 拟人节奏只加在 QQ 会话的自动回复上。
-        const parts = chunkText(body, protocolLimit());
-        for (const part of parts) await client.call(action, { [idKey]: targetId, message: part });
-        // 发进群里的工具消息也是「我自己说的话」，回复指向的进度要跟着走（见 `noteOwnMessage`）。
-        noteOwnMessage(targetType, targetId);
-        return { target_type: targetType, target_id: targetId, parts: parts.length };
-      },
-    }),
-  );
-
-  /**
-   * 工具二：qq_send_image —— 主动往 QQ 发一张图 / 一个表情包。
-   *
-   * 传输走 OneBot image 段的 `base64://`（见 `image.js` 里的取舍说明）：NapCat 在
-   * 容器里，本地路径它读不到，而 base64 不依赖任何网络可达性假设。
-   *
-   * 从 QQ 会话里调用可以不给目标（默认发回当前会话）—— 「回一张表情包」不该先让
-   * 模型去查自己在哪个群。
-   */
-  ctx.tools.register(
-    defineTool({
-      name: 'qq_send_image',
-      description:
-        'Send one image (a picture or a meme/sticker, PNG/JPEG/WebP/GIF) through the connected QQ (OneBot) account to one QQ contact or group. The image source is either a path inside the working directory (such as a sticker under the sticker directory, or a picture the conversation already downloaded into the media cache) or an http(s) image URL. Called from inside a QQ conversation, the current conversation is the default recipient.',
-      parameters: {
-        image: {
-          type: 'string',
-          required: true,
-          description: 'The image to send: a path relative to the working directory (e.g. ".qq-stickers/笑死.gif" or ".qq-media/ab12….jpg"), an absolute path inside the working directory, an http(s) image URL, or just the file name of a sticker from the sticker directory (with or without its extension).',
-        },
-        target_type: {
-          type: 'string',
-          enum: ['private', 'group'],
-          description: 'Where to send the image. Defaults to the QQ conversation this tool was called from.',
-        },
-        target_id: {
-          type: 'string',
-          description: 'QQ number (private) or group number (group) to send the image to. Defaults to the current QQ conversation.',
-        },
-      },
-      output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            target_type: { type: 'string', required: true },
-            target_id: { type: 'string', required: true },
-            bytes: { type: 'integer', required: true },
-            format: { type: 'string', required: true },
-            source: { type: 'string', required: true },
-          },
-        },
-        render: (_args, value) => [
-          {
-            type: 'text',
-            text: `Sent a ${value.format} image (${value.bytes} bytes) from ${value.source} to ${value.target_type} ${value.target_id}.`,
-          },
-        ],
-      },
-      async execute(args, exec) {
-        if (!imageSend) throw new Error('sending images is disabled (qq-bridge config imageSend: false)');
-        if (!client.connected) throw new Error(`QQ bridge is not connected to ${config.endpoint}; start NapCat or check the endpoint.`);
-        const { type, id } = resolveTarget(args, exec, 'qq_send_image');
-        // 先取字节、先校验：任一步失败都在发消息之前报错，不会给 QQ 留下半张图。
-        const image = await loadOutgoingImage({ source: resolveStickerSource(args.image), cwd, maxBytes: imageMaxBytes });
-        const action = type === 'group' ? 'send_group_msg' : 'send_private_msg';
-        const idKey = type === 'group' ? 'group_id' : 'user_id';
-        await client.call(action, { [idKey]: id, message: [imageSegment(image.bytes)] });
-        // 同 `qq_send_message`：我发进群的图也要算进回复指向的进度。
-        noteOwnMessage(type, id);
-        report('info', `→ ${type === 'group' ? '群' : '私聊'} ${id}: ${image.format} 图 ${image.bytes.length} bytes（来源 ${image.label}）`);
-        return { target_type: type, target_id: id, bytes: image.bytes.length, format: image.format, source: image.label };
-      },
-    }),
-  );
-
-  /**
-   * 工具三：qq_list_conversations —— 列出在线群/好友，以及本 Harness 已处理过的
-   * QQ 会话及其 Session id，同时附带当前生效的模型路由（便于排查 MISSING_CREDENTIAL
-   * 之类的模型问题）。
-   */
-  ctx.tools.register(
-    defineTool({
-      name: 'qq_list_conversations',
-      description:
-        'List QQ contacts reachable through the connected OneBot account: the live group and friend lists, plus every QQ conversation this Harness has already handled and its Session id.',
-      parameters: {},
-      output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            connected: { type: 'boolean', required: true },
-            self_id: { type: 'string' },
-            groups: {
-              type: 'array',
-              required: true,
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  id: { type: 'string', required: true },
-                  name: { type: 'string', required: true },
-                },
-              },
-            },
-            friends: {
-              type: 'array',
-              required: true,
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  id: { type: 'string', required: true },
-                  name: { type: 'string', required: true },
-                },
-              },
-            },
-            sessions: {
-              type: 'array',
-              required: true,
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  conversation: { type: 'string', required: true },
-                  type: { type: 'string', required: true },
-                  name: { type: 'string', required: true },
-                  session_id: { type: 'string', required: true },
-                  session_round: { type: 'number', required: true },
-                },
-              },
-            },
-            route: {
-              type: 'object',
-              required: true,
-              additionalProperties: false,
-              properties: {
-                provider: { type: 'string', required: true },
-                model: { type: 'string', required: true },
-                source: { type: 'string', required: true },
-                error: { type: 'string', required: true },
-              },
-            },
-          },
-        },
-        render: (_args, value) => {
-          const lines = [`QQ bridge connected: ${value.connected}${value.self_id ? ` (account ${value.self_id})` : ''}`];
-          lines.push(`QQ session model: ${value.route.model || '(none)'} via ${value.route.provider || '(none)'} [${value.route.source}]`);
-          if (value.route.error.length > 0) lines.push(`Route warning: ${value.route.error}`);
-          if (value.groups.length > 0) lines.push('', 'Groups:', ...value.groups.map((g) => `  ${g.id} ${g.name}`));
-          if (value.friends.length > 0) lines.push('', 'Friends:', ...value.friends.map((f) => `  ${f.id} ${f.name}`));
-          if (value.sessions.length > 0) {
-            // 轮次只在 /reset 过之后才标出来：没 reset 过的会话保持原来的输出形状。
-            lines.push('', 'Handled conversations:', ...value.sessions.map((s) => `  ${s.conversation} (${s.name}) → session ${s.session_id}${s.session_round > 0 ? ` (round ${s.session_round})` : ''}`));
-          }
-          return [{ type: 'text', text: lines.join('\n') }];
-        },
-      },
-      async execute() {
-        const groups = [];
-        const friends = [];
-        // 未连接时这两项为空数组（而不是报错），其余信息照常返回，方便定位问题。
-        if (client.connected) {
-          try {
-            for (const group of (await client.call('get_group_list')) ?? []) {
-              groups.push({ id: String(group.group_id), name: String(group.group_name ?? '') });
-            }
-          } catch (error) {
-            report('warn', `get_group_list failed: ${error?.message ?? error}`);
-          }
-          try {
-            for (const friend of (await client.call('get_friend_list')) ?? []) {
-              friends.push({ id: String(friend.user_id), name: String(friend.nickname ?? '') });
-            }
-          } catch (error) {
-            report('warn', `get_friend_list failed: ${error?.message ?? error}`);
-          }
-        }
-        const chosen = resolveRoute();
-        return {
-          connected: client.connected,
-          self_id: client.selfId,
-          groups,
-          friends,
-          route: { provider: chosen.provider, model: chosen.model, source: chosen.source, error: chosen.error },
-          // sessions 来自已处理过的会话表；session_id 现场派生，因此与 QQ 号一一对应
-          // 且稳定 —— 同一个会话每 /reset 一次换一个新 id（旧的留在磁盘上当存档）。
-          sessions: [...conversations.values()].map((conversation) => ({
-            conversation: conversation.key,
-            type: conversation.type,
-            name: conversation.name || conversation.senderName,
-            session_id: sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0),
-            session_round: conversation.sessionGeneration ?? 0,
-          })),
-        };
-      },
-    }),
-  );
-
-  /**
-   * 工具四：qq_jm_pdf —— 下载禁漫（JM）本子/单话，合并成 PDF，并发到 QQ。
-   *
-   * 从 QQ 会话里调用时可以不填目标：调用它的那个 Agent 对应的会话就是收件人
-   * （`exec.agent.id` → 会话 key）。Web UI 里的主会话调用时必须显式给目标。
-   */
-  ctx.tools.register(
-    defineTool({
-      name: 'qq_jm_pdf',
-      description:
-        'Download a JM (18comic) album or chapter, merge every page into one PDF, and send that PDF to a QQ contact or group through the OneBot bridge. Accepts a bare JM id, "JM123456", or an 18comic album/photo URL. Called from inside a QQ conversation, the current conversation is the default recipient. Long: a whole multi-chapter album can take minutes, and the file upload itself is slow.',
-      parameters: {
-        id: {
-          type: 'string',
-          required: true,
-          description: 'JM album id or chapter id (digits), "JM123456", or a full 18comic album/photo URL.',
-        },
-        kind: {
-          type: 'string',
-          enum: ['auto', 'album', 'chapter'],
-          description: 'auto (default): the whole album when the id is an album id, otherwise just that chapter. album = every chapter merged into one PDF. chapter = only the chapter with this id.',
-        },
-        target_type: {
-          type: 'string',
-          enum: ['private', 'group'],
-          description: 'Where to send the PDF. Defaults to the QQ conversation this tool was called from.',
-        },
-        target_id: {
-          type: 'string',
-          description: 'QQ number (private) or group number (group) to send the PDF to. Defaults to the current QQ conversation.',
-        },
-      },
-      output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            file_name: { type: 'string', required: true },
-            path: { type: 'string', required: true },
-            title: { type: 'string', required: true },
-            pages: { type: 'integer', required: true },
-            bytes: { type: 'integer', required: true },
-            chapters: { type: 'integer', required: true },
-            target_type: { type: 'string', required: true },
-            target_id: { type: 'string', required: true },
-          },
-        },
-        render: (_args, value) => [
-          {
-            type: 'text',
-            text:
-              `Downloaded ${value.title || value.file_name} (${value.chapters} chapter(s), ${value.pages} page(s), ${value.bytes} bytes) ` +
-              `into ${value.path} and sent ${value.file_name} to ${value.target_type} ${value.target_id}.`,
-          },
-        ],
-      },
-      async execute(args, exec) {
-        const ref = parseJmRef(args.id);
-        if (ref === undefined) throw new Error(`qq_jm_pdf could not find a JM id in "${args.id}"`);
-        const kind = args.kind ?? ref.kind;
-        // 收件人：显式给的优先；否则是调用它的那个 QQ 会话。
-        const { conversation, type: targetType, id: targetId } = resolveTarget(args, exec, 'qq_jm_pdf');
-        const job = await downloadJm({ conversation, ref: { id: ref.id, kind } });
-        const sent = await sendJmFile(conversation, job);
-        if (!sent.ok) throw new Error(`downloaded ${job.name} but could not send it to QQ: ${sent.error}`);
-        return {
-          file_name: job.name,
-          path: job.path,
-          title: job.title,
-          pages: job.pages,
-          bytes: job.bytes,
-          chapters: job.chapters,
-          target_type: targetType,
-          target_id: String(targetId),
-        };
-      },
-    }),
-  );
-
-  // ---- 长期记忆：两个宿主平面的工具 ------------------------------------------
   //
-  // 都注册在宿主平面上（和 qq_send_message 一样），因此**任何** Agent 都能用：QQ 会话
-  // 的 Agent 用它查/记，摘要会话用它读写记忆文件。好处是 QQ 会话不必为了「记忆」拿到
-  // write / edit / bash —— 写只发生在 memoryDir 之内，边界由插件自己守。
-  if (memoryEnabled) {
-    /**
-     * 工具五：qq_transcript —— 查某个 QQ 会话的聊天记录（长期记忆的原料）。
-     *
-     * 这是「想不起来就去查」的那条路：`ambientMessages` 只喂最近十来条，一旦真需要
-     * 「上周三讨论的那个链接是什么」就必须能翻到更早的记录，而不是靠模型编。
-     */
-    ctx.tools.register(
-      defineTool({
-        name: 'qq_transcript',
-        description:
-          'Read the recorded chat transcript of a QQ conversation (long-term memory raw material). Use it when you need details of what was said earlier — who said what, when, and what was shared — instead of guessing from the short recent-message context. Actions: "list" (which conversations have records, with message counts and the newest time), "read" (messages, oldest first, optionally limited to a date range), "search" (substring match across the records).',
-        parameters: {
-          action: {
-            type: 'string',
-            enum: ['list', 'read', 'search'],
-            description: 'list = the conversations on disk with counts; read = messages of one conversation; search = find a keyword across a conversation\'s records.',
-          },
-          conversation: {
-            type: 'string',
-            description: 'Conversation key such as "group:100000001" or "private:100000002". Defaults to the QQ conversation this tool was called from. Not needed for "list".',
-          },
-          query: {
-            type: 'string',
-            description: 'The text to look for (action: search). Matched case-insensitively as a substring of the message text, sender name, or date.',
-          },
-          date: {
-            type: 'string',
-            description: 'Local date to read, "YYYY-MM-DD" (action: read). Defaults to today.',
-          },
-          since: {
-            type: 'string',
-            description: 'Earliest date to include, "YYYY-MM-DD" (action: read). Use with until.',
-          },
-          until: {
-            type: 'string',
-            description: 'Latest date to include, "YYYY-MM-DD" (action: read).',
-          },
-          limit: {
-            type: 'integer',
-            description: 'Maximum messages/hits to return (default 200 for read, memorySearchHits for search).',
-          },
-        },
-        output: {
-          schema: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              action: { type: 'string', required: true },
-              conversation: { type: 'string' },
-              lines: {
-                type: 'array',
-                required: true,
-                items: {
-                  type: 'object',
-                  additionalProperties: false,
-                  properties: {
-                    conversation: { type: 'string' },
-                    name: { type: 'string' },
-                    date: { type: 'string' },
-                    messages: { type: 'integer' },
-                    last_at: { type: 'string' },
-                    last_text: { type: 'string' },
-                    at: { type: 'string' },
-                    time: { type: 'string' },
-                    user: { type: 'string' },
-                    text: { type: 'string' },
-                    kind: { type: 'string' },
-                    addressed: { type: 'boolean' },
-                    command: { type: 'string' },
-                    media: { type: 'boolean' },
-                  },
-                },
-              },
-              returned: { type: 'integer', required: true },
-              truncated: { type: 'boolean', required: true },
-              note: { type: 'string' },
-            },
-          },
-          render: (_args, value) => {
-            const head = value.action === 'list'
-              ? `${value.lines.length} conversation(s) with recorded transcripts.`
-              : `${value.returned} line(s)${value.truncated ? ' (truncated)' : ''}${value.conversation !== undefined ? ` for ${value.conversation}` : ''}.`;
-            return [{ type: 'text', text: [head, value.note ?? '', ...value.lines.map((line) => describeTranscriptLine(line))].filter((part) => part.length > 0).join('\n') }];
-          },
-        },
-        async execute(args, exec) {
-          if (args.action === 'list') return listTranscripts();
-          const target = resolveMemoryConversation(args, exec, 'qq_transcript');
-          if (args.action === 'search') {
-            if (typeof args.query !== 'string' || args.query.trim().length === 0) throw new Error('qq_transcript: "query" is required for action "search"');
-            return searchTranscript(target, args);
-          }
-          return readTranscript(target, args);
-        },
-      }),
-    );
-
-    /**
-     * 工具六：qq_memory —— 读/追加/覆盖记忆文件（`MEMORY.md` / `COGNITION.md` / `INDEX.md`）。
-     *
-     * 写路径被限制在 memoryDir 之内（`memoryRelativePath`），单个文件也有字节上限：
-     * 记忆的价值在「精炼且总是被读到」，一个无限增长的文件只会把提示词撑爆。
-     * 读不设上限（要翻就翻个够），只按 `memorySearchHits` 限制搜索命中数。
-     */
-    ctx.tools.register(
-      defineTool({
-        name: 'qq_memory',
-        description:
-          'Read, append to, search, or overwrite a long-term memory file for the QQ bridge. All paths live under the memory directory and are relative to it, for example "conversations/group-100000001/MEMORY.md" (one conversation\'s memory, "write"/"append" create it if missing), "COGNITION.md" (shared knowledge about memes, slang, emoji and sticker meanings), or "INDEX.md" (the short index that is injected into every QQ agent\'s prompt — keep it to a handful of lines). Paths outside the memory directory are rejected.',
-        parameters: {
-          action: {
-            type: 'string',
-            enum: ['read', 'append', 'write', 'search', 'list'],
-            description: 'read = full file (with line numbers); append = add text at the end (the normal way to record something new); write = replace the whole file (only when reorganising); search = substring match with context lines; list = the files that already exist.',
-          },
-          path: {
-            type: 'string',
-            description: 'Memory-relative file path, e.g. "conversations/group-100000001/MEMORY.md", "COGNITION.md", "INDEX.md". For read/write/append it defaults to this conversation\'s MEMORY.md when a conversation is known.',
-          },
-          conversation: {
-            type: 'string',
-            description: 'Conversation key such as "group:100000001". Defaults to the QQ conversation this tool was called from; the digest session must pass it.',
-          },
-          text: {
-            type: 'string',
-            description: 'The markdown to append or write (action: append / write).',
-          },
-          query: {
-            type: 'string',
-            description: 'The text to look for (action: search).',
-          },
-          limit: {
-            type: 'integer',
-            description: 'Maximum hits to return (action: search; default memorySearchHits).',
-          },
-        },
-        output: {
-          schema: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              action: { type: 'string', required: true },
-              path: { type: 'string' },
-              bytes: { type: 'integer' },
-              lines_total: { type: 'integer' },
-              returned: { type: 'integer', required: true },
-              truncated: { type: 'boolean', required: true },
-              files: { type: 'array', items: { type: 'string' } },
-              text: { type: 'string' },
-              note: { type: 'string' },
-            },
-          },
-          render: (_args, value) => {
-            if (value.action === 'list') {
-              return [{ type: 'text', text: `memory files:\n${(value.files ?? []).join('\n') || '(none yet)'}` }];
-            }
-            const head = `${value.action} ${value.path ?? ''} (${value.bytes ?? 0} bytes)${value.truncated ? ', truncated' : ''}`;
-            return [{ type: 'text', text: [head, value.note ?? '', value.text ?? ''].filter((part) => part.length > 0).join('\n') }];
-          },
-        },
-        async execute(args, exec) {
-          if (args.action === 'list') return listMemoryFiles();
-          const path = resolveMemoryPath(args, 'qq_memory', exec);
-          if (args.action === 'read') return readMemoryFile(path);
-          if (args.action === 'search') {
-            if (typeof args.query !== 'string' || args.query.trim().length === 0) throw new Error('qq_memory: "query" is required for action "search"');
-            return searchMemoryFile(path, args.query, args.limit);
-          }
-          if (typeof args.text !== 'string' || args.text.trim().length === 0) throw new Error(`qq_memory: "text" is required for action "${args.action}"`);
-          return writeMemoryFile(path, args.text, args.action === 'append');
-        },
-      }),
-    );
-  }
-
+  // 六份 `defineTool` 声明本身没有策略（校验参数 → 调一个函数 → 拼一段 render），却占了
+  // 五百多行、最深处缩进到 20 层，所以整块搬去了 `tools.js`。这里只做装配：把闭包里那
+  // 几个函数显式递过去 —— 工具能碰到哪些状态，看这份依赖表就够了，不用去翻闭包。
+  registerQqTools(ctx, {
+    client,
+    cwd,
+    endpoint: settings.endpoint,
+    report,
+    // 工具只按协议上限分段（不加拟人节奏），所以直接给这个数，不必再包一层函数。
+    protocolLimit: settings.maxReplyChars,
+    noteOwnMessage,
+    resolveTarget,
+    resolveStickerSource,
+    imageSend,
+    imageMaxBytes,
+    resolveRoute,
+    conversations,
+    sessionIdFor,
+    downloadJm,
+    sendJmFile,
+    // 记忆停用时整块不给：`registerQqTools` 会连那两个工具一起跳过，不留「一调就报错」的壳。
+    memory: memoryEnabled
+      ? {
+          describeLine: describeTranscriptLine,
+          listTranscripts,
+          resolveConversation: resolveMemoryConversation,
+          searchTranscript,
+          readTranscript,
+          listFiles: listMemoryFiles,
+          resolvePath: resolveMemoryPath,
+          readFile: readMemoryFile,
+          searchFile: searchMemoryFile,
+          writeFile: writeMemoryFile,
+        }
+      : undefined,
+  });
   // ---- 连接生命周期 ----------------------------------------------------------
 
   // 用 ctx.effect 托管连接：插件卸载/停用时自动 dispose，不留悬挂的定时器与 socket。
@@ -5070,7 +4391,7 @@ export function apply(ctx, config) {
   // fiber 上，插件卸载时自动清掉，不会留下一个还在跑的摘要循环。测试用的 Host 桩
   // 没有 timer 服务，所以有裸 setInterval 的退路。
   if (memoryEnabled) {
-    const atHour = digestAtHour();
+    const atHour = settings.digestAtHour;
     const tick = () => {
       try {
         runDigestSweep();
@@ -5122,7 +4443,7 @@ export function apply(ctx, config) {
         digestTimerDisposer = undefined;
       };
     }, 'qq-bridge:memory-digest');
-    report('info', `memory enabled at ${memoryLabel} (daily digest at ${hourLabel(atHour)}; a conversation needs ${Math.max(1, Math.floor(Number(config.digestMinLines) || 1))} new lines, once a day)`);
+    report('info', `memory enabled at ${memoryLabel} (daily digest at ${hourLabel(atHour)}; a conversation needs ${Math.max(1, Math.floor(Number(settings.digestMinLines) || 1))} new lines, once a day)`);
   }
 
   // ---- 模型凭据：每天轮换的定时器 ----------------------------------------------
@@ -5130,7 +4451,7 @@ export function apply(ctx, config) {
   // 与摘要循环同一套托管方式（`ctx.interval` + 「跑完再排」，插件卸载即清掉），只是没有
   // 任何预热：轮换的状态全部现算（见 rotateApiKey），重启也不会跑偏。
   if (apiKeyRotateEnabled) {
-    const hour = apiKeyRotateHour();
+    const hour = settings.apiKeyRotateHour;
     const tick = () => {
       // 定时器回调是同步的，而轮换要读盘 + 发探测请求：这里只负责把异常收进日志，
       // 不让一个 rejected promise 变成 unhandled rejection 把进程带走。
@@ -5169,7 +4490,7 @@ export function apply(ctx, config) {
     report(
       'info',
       `api key rotation: on, daily at ${hourLabel(hour)} — pool ${apiKeyPoolLabel}, ref ${apiKeyRefName}, ` +
-        `probe ${apiKeyProbeUrl().length > 0 ? apiKeyProbeUrl() : '(disabled)'}`,
+        `probe ${settings.apiKeyProbeUrl.length > 0 ? settings.apiKeyProbeUrl : '(disabled)'}`,
     );
   } else if (apiKeyRotateOn) {
     // 配置本身不合法（ref 不是变量名 / 池子在 cwd 外）：启动时已经逐条 warn 过，这里不重复。
@@ -5183,7 +4504,7 @@ export function apply(ctx, config) {
   // 摘要是「每天一个整点」，主动说话是「每隔一会儿看一眼」—— 醒来不一定开口，
   // 说不说交给 `proactiveSweep` 的条件与概率决定（这样开口的时刻才是不可预测的）。
   if (proactiveEnabled) {
-    const checkMs = proactiveCheckMs();
+    const checkMs = settings.proactiveCheckMs;
     const tick = () => {
       try {
         proactiveSweep();
@@ -5218,37 +4539,37 @@ export function apply(ctx, config) {
     }, 'qq-bridge:proactive');
     // 启动自述：把「哪几个开关真的生效了」写清楚 —— 排查「它怎么不主动说话」时，
     // 第一件事就是看这几行里有没有你配的那一项，而不是去猜配置有没有读进去。
-    const fromHour = Math.min(23, Math.max(0, Math.floor(Number(config.proactiveFromHour)) || 0));
-    const toHour = Math.min(23, Math.max(0, Math.floor(Number(config.proactiveToHour)) || 0));
+    const fromHour = Math.min(23, Math.max(0, Math.floor(Number(settings.proactiveFromHour)) || 0));
+    const toHour = Math.min(23, Math.max(0, Math.floor(Number(settings.proactiveToHour)) || 0));
     report(
       'info',
       `proactive on — cold openers in groups only: check every ${Math.round(checkMs / 60000)} min, ` +
-        `quiet for ${Math.round(proactiveMs('proactiveIdleMs', 45 * 60 * 1000) / 60000)} min, ` +
-        `gap ${Math.round(proactiveMs('proactiveGapMs', 2 * 60 * 60 * 1000) / 60000)} min, ` +
-        `at most ${proactiveDailyMax()}/day, ${hourLabel(fromHour)}-${hourLabel(toHour)}`,
+        `quiet for ${Math.round(settings.proactiveIdleMs / 60000)} min, ` +
+        `gap ${Math.round(settings.proactiveGapMs / 60000)} min, ` +
+        `at most ${settings.proactiveDailyMax}/day, ${hourLabel(fromHour)}-${hourLabel(toHour)}`,
     );
   }
 
   // 活跃对话的启动自述放在 `proactive` 块**外面**：免 @ 接话（一对一与多人搭话）都不需要
   // `proactive` —— 那是「主动找人说话」的总开关，只有「自己补一句」靠它。
-  if (proactiveEnabled && activeWindowMs() > 0 && activeChimeIdleMs() > 0 && activeChimeMax() > 0) {
+  if (proactiveEnabled && settings.activeWindowMs > 0 && settings.activeChimeIdleMs > 0 && settings.activeChimeMax > 0) {
     report(
       'info',
-      `active conversation — chime: about ${Math.round(activeChimeIdleMs() / 1000)}s after its reply, ` +
-        `at most ${activeChimeMax()}/message and ${activeChimeDailyMax() || '不限'}/day (groups and private)`,
+      `active conversation — chime: about ${Math.round(settings.activeChimeIdleMs / 1000)}s after its reply, ` +
+        `at most ${settings.activeChimeMax}/message and ${settings.activeChimeDailyMax || '不限'}/day (groups and private)`,
     );
   } else if (proactiveEnabled) {
     report('info', 'active conversation — chime is off (activeWindowMs / activeChimeIdleMs / activeChimeMax)');
   } else {
     report('info', 'active conversation — chime is off (proactive is off)');
   }
-  if (config.activeFollow === true && activeWindowMs() > 0) {
+  if (settings.activeFollow === true && settings.activeWindowMs > 0) {
     report(
       'info',
       `active conversation — activeFollow on: a group follow-up from the person it is talking to needs no @ ` +
-        `(window ${Math.round(activeWindowMs() / 60000)} min, at most ${activeMaxTurns() || '不限'} turns); ` +
-        `group talk after ${activeGroupLines() || '关闭'} lines from ${activeGroupSpeakers()} speakers ` +
-        `(listen x${activeGroupBatchScale()})`,
+        `(window ${Math.round(settings.activeWindowMs / 60000)} min, at most ${settings.activeMaxTurns || '不限'} turns); ` +
+        `group talk after ${settings.activeGroupLines || '关闭'} lines from ${settings.activeGroupSpeakers} speakers ` +
+        `(listen x${settings.activeGroupBatchScale})`,
     );
   } else {
     report('info', 'active conversation — activeFollow is off: group messages still need an explicit @ (or the configured prefix)');

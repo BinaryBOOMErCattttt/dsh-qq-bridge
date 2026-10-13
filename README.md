@@ -1284,8 +1284,8 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 
 Loader 在进程内按 URL 缓存插件模块，**停用/启用插件不会重新加载代码**
 （已验证：`set_plugin` 会注销并重新注册工具，但模块仍是第一代；改入口文件名、
-`remove_bundle` + `install_bundle` 同样无效）。改了 `index.js` / `onebot.js`
-之后必须重启 `dsh --profile qqbot` 进程：
+`remove_bundle` + `install_bundle` 同样无效）。改了 `index.js` / `config.js` /
+`settings.js` / `tools.js` / `onebot.js` 这些模块之后必须重启 `dsh --profile qqbot` 进程：
 
 ```bash
 # Ctrl-C 后重新执行
@@ -1296,7 +1296,7 @@ dsh --profile qqbot --port 3081 --no-open
 
 （禁漫下载是**例外**：下载逻辑在 `scripts/jm_download.py` 里，插件每次下载都重新
 spawn 它，所以改这个脚本不用重启，下一条 `/jm` 就生效。改了 `jm.js` / `index.js`
-仍然要重启。）
+或上面那几个模块仍然要重启。）
 
 ### 跑测试
 
