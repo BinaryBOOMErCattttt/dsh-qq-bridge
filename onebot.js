@@ -186,6 +186,27 @@ export function mentions(message, selfId) {
 }
 
 /**
+ * 这条消息是不是明确在 @ **别人**（而不是机器人自己）。
+ *
+ * 只有一个用途：活跃对话里判断「他这一句还是跟我说吗」—— 群里的人一旦 @ 了别人
+ * （`at` 的 qq 是 `all` 也算，那是喊所有人），这句就明确是冲着别人去的，不该被当成
+ * 接话抢答。与 `mentions` 一样按**消息段**判定，而不是在扁平文本里找 `@`：
+ * `messageToText` 会把 `@某人` 渲染成文本，从正文里猜很容易误伤普通内容。
+ *
+ * @param message - OneBot 的 `message` 字段。
+ * @param selfId - 机器人自己的 QQ 号（字符串）。
+ * @returns 存在指向别人的 `at` 段时为 true。
+ */
+export function mentionsOthers(message, selfId) {
+  if (!Array.isArray(message)) return false;
+  return message.some((segment) => {
+    if (segment?.type !== 'at') return false;
+    const qq = String(segment?.data?.qq ?? '');
+    return qq.length > 0 && qq !== String(selfId);
+  });
+}
+
+/**
  * 找出「这条消息在回复哪一条」：`reply` 段的下标与它指向的 message_id。
  *
  * `reply` 段里只有 id —— OneBot v11 不带被引用消息的任何内容（没有正文、没有

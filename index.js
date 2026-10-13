@@ -32,16 +32,26 @@ import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } fro
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { OneBotClient, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from './onebot.js';
+import { OneBotClient, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from './onebot.js';
 import { createMediaStore } from './media.js';
+import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
 import { createJmService, parseJmRef } from './jm.js';
 
 /** 插件在 Loader 中的稳定标识（改名会导致配置/状态对不上）。 */
 export const name = 'qq-bridge';
 
-/** 激活前必须就绪的 Host 服务：注册工具需要 tools，创建会话需要 agents。 */
-export const inject = ['tools', 'agents'];
+/**
+ * 激活前必须就绪的 Host 服务：注册工具需要 `tools`，创建会话需要 `agents`，
+ * 摘要与主动说话的循环需要 `timer`。
+ *
+ * `timer` 必须在列：`ctx.interval` / `ctx.timeout` 不是 ctx 上的普通方法，而是
+ * `@deepseek-ai/cordis-plugin-timer` 的服务通过 `ctx.mixin('timer', [...])` 挂上来的，
+ * 而 cordis **只允许插件访问 inject 里声明过的服务**。少写它，`ctx.interval` 一取就抛
+ * `cannot get property "timer" without inject`，`apply()` 当场失败、插件不激活 ——
+ * 外面看到的现象是「bot 完全不回复」（进程还活着，所以 systemd 显示 active）。
+ */
+export const inject = ['tools', 'agents', 'timer'];
 
 /**
  * 系统提示中「QQ 渠道」小节的排序值：靠后，但仍排在交付物/Web 相关小节之前。
@@ -109,7 +119,7 @@ export const Config = z.object({
   cwd: z.string().default('').description('QQ 会话 Agent 的工作目录；留空则使用 Harness 进程的当前目录'),
   privateChat: z.boolean().default(true).description('是否响应 QQ 私聊消息'),
   groupChat: z.boolean().default(true).description('是否响应 QQ 群消息'),
-  groupTrigger: z.union(['mention', 'prefix', 'all']).default('mention').description('群消息触发方式：@机器人 / 前缀 / 全部消息'),
+  groupTrigger: z.union(['mention', 'prefix', 'all']).default('mention').description('群消息触发方式：@机器人 / 前缀 / 全部消息（另外：被叫到之后的 activeWindowMs 内，同一个人接着说的话可以算作还在跟你聊，见 activeFollow）'),
   prefix: z.string().default('/').description('groupTrigger=prefix 时使用的前缀'),
   allowUsers: z.array(z.string()).default([]).description('私聊白名单（QQ 号）；留空表示不限制'),
   allowGroups: z.array(z.string()).default([]).description('群白名单（群号）；留空表示不限制'),
@@ -146,6 +156,28 @@ export const Config = z.object({
   repeatWindowMs: z.number().default(300000).description('间隔超过这么久就不算「连着」了，重新开始数（毫秒）：免得早上有人说过的一句，晚上再被跟一遍；0 = 不限间隔'),
   repeatMaxChars: z.number().default(100).description('纯文字复读的长度上限：只复读不超过这么多字的短消息（复读机跟的是「6」「草」这种短句，不是一整段话）；0 = 不限'),
   repeatChance: z.number().default(1).description('真要复读时的概率（0~1）：1 = 每次都跟，调小可以让它偶尔不跟（下一条相同的消息会再掷一次）'),
+  repeatImageTolerance: z.number().default(0.08).description('表情包「算是同一张」的宽松度：QQ 会把同一张表情包按发送者重新编码（字节不同、画面一样），所以字节不同时还会比一次缩略图指纹（16×16 dHash）—— 位差比例不超过这个值就算同一张，跟着复读。0 = 只认字节完全相同的图（关掉画面比对）；默认 0.08（实测同一张重新编码差 0%~2%，同一套画风只换了字的差 16%~23%）'),
+  // ---- 主动说话：不等别人 @，自己偶尔在群里开个话头 ----
+  // 这一组默认**关闭**：它会主动给真人发消息，开不开、开给哪些群该由使用者决定。
+  // 只对已经聊过的群生效（`conversations` 里有的群），私聊永远不会被主动打扰。
+  proactive: z.boolean().default(false).description('是否让机器人偶尔主动在群里说话（不等别人 @ 它）：默认关闭。只对**已经聊过的群**生效（有人 @ 过它、或它回过话的群），私聊永远不主动打扰；开了之后还要过「时段 / 安静够久 / 不是自言自语 / 群还活跃 / 距上次够久 / 当天没超次数 / 概率」这一串闸，详见 README「偶尔主动说话」'),
+  proactiveCheckMs: z.number().default(10 * 60 * 1000).description('每隔多久看一次「有没有群值得主动搭句话」（毫秒）：这是「考虑」的节奏，不是说话频率 —— 每次醒来还要过一遍所有条件、再掷一次概率'),
+  proactiveChance: z.number().default(0.35).description('每次检查时真的开口的概率（0~1）：0.35 ≈ 三次考虑里说一次，让开口的时刻不可预测；0 = 永不主动说话，1 = 一有机会就说'),
+  proactiveIdleMs: z.number().default(45 * 60 * 1000).description('群里安静至少这么久才考虑搭话（毫秒）：正在聊的群不插嘴，等大家停了它才冒泡；0 = 不用等（一般只用于测试）'),
+  proactiveFreshMs: z.number().default(24 * 60 * 60 * 1000).description('群最近活跃过才值得搭话（毫秒）：超过这么久没动静的群不会突然诈尸；0 = 不限制'),
+  proactiveGapMs: z.number().default(2 * 60 * 60 * 1000).description('同一个群两次主动说话之间至少隔这么久（毫秒）'),
+  proactiveDailyMax: z.number().default(4).description('同一个群一天最多主动说几次（本地日界线；计数在内存里，重启后清零）'),
+  proactiveFromHour: z.number().default(9).description('只在本地时间的这个小时之后主动说话（0~23）：真人凌晨不会突然在群里冒泡'),
+  proactiveToHour: z.number().default(23).description('只在这个小时之前主动说话（0~23，不含该点）：与 proactiveFromHour 相同表示全天都可以；跨零点（如 22 → 3）也认'),
+  // ---- 活跃对话：聊起来之后保持搭话（见 README「聊起来之后保持搭话」）----
+  // 上面的 proactive* 只在**冷场**时开口；这一组管的是「正聊着」的时候：被叫到之后
+  // 接着说的话也算在跟它聊（activeFollow），以及它自己回完隔一会儿再补一句（activeChime*）。
+  activeWindowMs: z.number().default(10 * 60 * 1000).description('「活跃对话」窗口（毫秒）：被叫到 / 接上话之后这么久之内算还在跟它聊；群里中间有别人插话就不算了。0 = 整套关闭（既不免 @ 接话，也不补一句）'),
+  activeFollow: z.boolean().default(false).description('活跃对话里**免 @ 接话**：窗口内同一个人接着说的话也当成在跟它聊（默认关闭 —— 它放松了「群里只在被 @ 时才说话」这条默认约定，想更像真人再打开）；只在群聊生效，私聊本来就不需要 @'),
+  activeMaxTurns: z.number().default(10).description('一次「活跃对话」里最多免 @ 接几轮：接够这么多轮就要重新 @ 它；0 = 不限'),
+  activeChimeIdleMs: z.number().default(20 * 1000).description('它回完话、对方安静这么久之后，它可能自己再补一句（毫秒，实际会按 delayJitter 抖动）；0 = 不补。需要 proactive: true 才会补'),
+  activeChimeMax: z.number().default(1).description('对方每说一句之后，它最多自己补几句：1 = 顶多追一句「啊对了…」，想让它更黏就调大；0 = 不补'),
+  activeChimeDailyMax: z.number().default(12).description('同一个会话一天最多自己补几句（本地日界线，与 proactiveDailyMax 分开算；重启后计数清零）；0 = 不限'),
   humanize: z.boolean().default(true).description('自动回复是否像真人：按换行/短句拆成几条独立消息并加入打字延迟（换行 = 分条）；false = 一条整段直接发出（旧行为）'),
   burstMaxChars: z.number().default(60).description('把一行长句拆开时的单条目标长度；0 = 不按长度拆（换行仍然分条）'),
   burstMaxParts: z.number().default(3).description('单行长句最多拆成几条；超出部分并进该行最后一条，避免刷屏'),
@@ -311,6 +343,33 @@ function msUntilDailyHour(hour, now = Date.now()) {
 /** 本地 `HH:00`：日志与报错里描述触发点的写法。 */
 function hourLabel(hour) {
   return `${String(hour).padStart(2, '0')}:00`;
+}
+
+/**
+ * 某个本地小时在不在「可以主动说话」的时段里。
+ *
+ * 真人半夜不会突然在群里冒泡，所以主动说话只发生在配置的时段内。取值一律按本地小时
+ * （与摘要的 `digestAtHour` 同一个口径：东八区的晚上十点就是 22，不是 UTC 的 14）。
+ * 三条规则：
+ *   - `from` 到 `to` **左闭右开**：9 → 23 是 09:00~22:59；
+ *   - 两边相等表示「全天」（`from = to = 0` 时不必写成 0 → 24）；
+ *   - `from > to` 表示跨零点，例如 22 → 3 = 22:00 到次日 02:59。
+ * 非法值按「不设限」处理（from 兜底 0、to 兜底 23），因为这里的目标是别让一个配错的
+ * 小时数把功能整体打死 —— 真要收紧该由 `proactive` 开关负责。
+ *
+ * 导出只为让测试能直接验边界（跨零点、左闭右开、全天）：它不碰任何闭包状态。
+ *
+ * @param from - 起始本地小时（0~23）。
+ * @param to - 结束本地小时（0~23，不含）。
+ * @param hour - 要判断的本地小时（0~23）。
+ * @returns 可以说话时为 true。
+ */
+export function withinActiveHours(from, to, hour) {
+  const start = Number.isFinite(Number(from)) ? Math.min(23, Math.max(0, Math.floor(Number(from)))) : 0;
+  const end = Number.isFinite(Number(to)) ? Math.min(23, Math.max(0, Math.floor(Number(to)))) : 23;
+  const at = Number.isFinite(Number(hour)) ? Math.min(23, Math.max(0, Math.floor(Number(hour)))) : 0;
+  if (start === end) return true;
+  return start < end ? at >= start && at < end : at >= start || at < end;
 }
 
 /** 把一行记忆里的换行折掉：记忆是「一行一条事实」，格式被换行破坏就没法读了。 */
@@ -529,6 +588,8 @@ export function apply(ctx, config) {
   const repeatStates = new Map();
   /** 消息对象 → 这条消息的媒体解析 Promise（见 `mediaFor`）：环境上下文与表情包复读共用一次下载。 */
   const mediaResolutions = new WeakMap();
+  /** `.qq-media/…` 路径 → 画面指纹（见 `sketchOf`）：只在真要比较两条图时才算，算过就留着。 */
+  const sketches = new Map();
 
   // OneBot 客户端：事件回调统一 try/catch，保证单个消息处理失败不会打穿 socket 回调。
   const client = new OneBotClient({
@@ -588,6 +649,13 @@ export function apply(ctx, config) {
     : DEFAULT_IMAGE_MAX_BYTES;
   const stickerRoot = config.stickerDir.trim().length > 0 ? resolve(cwd, config.stickerDir.trim()) : undefined;
   const stickerInside = stickerRoot !== undefined && insideDirectory(resolve(cwd), stickerRoot);
+  /**
+   * 表情包复读里「算同一张画面」的位差上限（0 = 只认字节完全相同）。
+   *
+   * 上限夹到 0.3：这个值放大到 1 就等于「任何两张图都算同一张」，那是配置事故而不是
+   * 功能 —— 真想要那种效果该关掉复读的图（`repeatMedia: false`），而不是让它乱跟。
+   */
+  const repeatImageTolerance = Math.min(0.3, Math.max(0, Number(config.repeatImageTolerance) || 0));
   if (stickerRoot !== undefined && !stickerInside) {
     report('warn', `stickerDir "${config.stickerDir.trim()}" resolves outside cwd (${cwd}); the sticker pack will not be advertised`);
   }
@@ -2098,6 +2166,10 @@ export function apply(ctx, config) {
     const idKey = conversation.type === 'group' ? 'group_id' : 'user_id';
     try {
       await client.call(action, { [idKey]: conversation.id, message });
+      // 记下「我最后在这里说话是什么时候」：主动说话靠它避免对着没人的群自说自话
+      // （见 proactiveEligible）。所有真正发出去的消息都走这个函数，所以自动回复、
+      // 复读、主动搭话都会被记上；出站工具那条路自己发，不计也无关紧要。
+      conversation.lastBotSpeakAt = Date.now();
       return true;
     } catch (error) {
       report('warn', `could not send to ${conversation.key}: ${error?.message ?? error}`);
@@ -2418,7 +2490,22 @@ export function apply(ctx, config) {
     if (conversation.type === 'group') {
       ambient.delete(conversation.id);
       repeatStates.delete(conversation.id);
+      // 主动说话的节奏也跟着忘掉：刚 /reset 完不该还被「两小时前主动说过」挡着。
+      // 只清计时与计数，不动 `lastActiveAt` / `lastBotSpeakAt` —— 那两个描述的是群里
+      // 真实发生过什么（谁最后说的话），不是这个会话的记忆。
+      conversation.lastProactiveAt = 0;
+      conversation.proactiveDay = '';
+      conversation.proactiveCount = 0;
     }
+    // 活跃对话（私聊也有）：清空会话就该把「还聊着」这件事也忘掉，并撤掉挂着的补一句。
+    cancelChime(conversation);
+    conversation.activeUntil = 0;
+    conversation.activeSpeakerId = '';
+    conversation.activeSeq = 0;
+    conversation.activeTurns = 0;
+    conversation.chimeCount = 0;
+    conversation.chimeDay = '';
+    conversation.chimeToday = 0;
     report('info', `reset ${conversation.key} (${sessionId}), removed ${removed} stored log(s)`);
     return true;
   }
@@ -2449,6 +2536,51 @@ export function apply(ctx, config) {
       speakers: [],
       /** 记忆元信息（群名等）是否已经写过一次，避免每条消息都重写一遍 meta.json。 */
       metaWritten: false,
+      /**
+       * 「群里最后一条**别人的**消息」是什么时候到的（含没 @ 机器人的闲聊）。
+       *
+       * 主动说话靠它判断「这个群现在是不是没人说话了」：只有安静下来才轮到它开口，
+       * 正在聊的时候插嘴是最不像人的地方。机器人自己的消息不算（见 `touchActivity`）。
+       */
+      lastActiveAt: 0,
+      /**
+       * 机器人自己最后一次在这个会话里说话的时刻。
+       *
+       * 用来**避免独白**：如果上一条是我说的、之后一直没人接话，就不该再自己开口
+       * （真人也不会对着没人的群一句接一句）。它由 `sendOne` 在所有真正发出去的
+       * 消息上更新 —— 自动回复、复读、主动搭话都算。
+       */
+      lastBotSpeakAt: 0,
+      /** 上一次主动说话的时刻（间隔闸）；重启归零。 */
+      lastProactiveAt: 0,
+      /** 主动说话的当日计数：`{ 日期, 次数 }`，跨天就地重置。 */
+      proactiveDay: '',
+      proactiveCount: 0,
+      /**
+       * 「活跃对话」状态：这个会话是不是正跟人聊着（见 README「聊起来之后保持搭话」）。
+       *
+       * `activeUntil` 是这次聊天的截止时刻（每接一句就往后滑），`activeSpeakerId` 是正在
+       * 跟它聊的那个人 —— 群里只有这个人接着说的话才可能免 @ 算进来（别人插话就另说了）。
+       * `activeSeq` 是那条消息在群里的进度序号，用来判断「中间有没有别人说过话」；
+       * `activeTurns` 是这次活跃对话里已经免 @ 接了几轮（受 activeMaxTurns 约束）。
+       */
+      activeUntil: 0,
+      activeSpeakerId: '',
+      activeSeq: 0,
+      activeTurns: 0,
+      /**
+       * 「自己补一句」的定时器与记账（见 scheduleChime）。
+       *
+       * `chimeSeq` 是「现在这条消息对应的补一句」的编号：新消息一来就 +1，旧定时器醒来
+       * 发现编号对不上就什么都不做 —— 比到处记得 clearTimeout 更不容易漏。
+       * `chimeCount` 是对方这一句之后已经补了几句（受 activeChimeMax 约束，收到新消息归零）；
+       * `chimeDay` / `chimeToday` 是当天的补一句计数（受 activeChimeDailyMax 约束）。
+       */
+      chimeTimer: undefined,
+      chimeSeq: 0,
+      chimeCount: 0,
+      chimeDay: '',
+      chimeToday: 0,
     };
   }
 
@@ -2494,13 +2626,15 @@ export function apply(ctx, config) {
   /**
    * 准入判断：这条入站消息该不该送到它的 Agent。
    *
-   * 只做**同步**判定（渠道开关、白名单、@/前缀触发、正文非空），绝不碰网络：媒体落盘
-   * 发生在 `handleEvent` 把它收进攒批队列之后。返回的 `message` 是原始消息段数组，
-   * 真正的正文由调用方在媒体落盘后用 `messageToText(message, selfId, media)` 再渲染一次；
-   * `preview` 是此刻（媒体还没落盘、只有占位符）的正文，只用来同步判定 `/reset` 这类指令。
+   * 只做**同步**判定（渠道开关、白名单、@/前缀触发、活跃对话窗口、正文非空），绝不碰
+   * 网络：媒体落盘发生在 `handleEvent` 把它收进攒批队列之后。返回的 `message` 是原始
+   * 消息段数组，真正的正文由调用方在媒体落盘后用 `messageToText(message, selfId, media)`
+   * 再渲染一次；`preview` 是此刻（媒体还没落盘、只有占位符）的正文，只用来同步判定
+   * `/reset` 这类指令。
    * @param event - 已解码的 OneBot 事件。
    * @param selfId - 机器人自己的 QQ 号。
-   * @returns `{ conversation, message, preview, quote }`；该丢弃时为 undefined。
+   * @returns `{ conversation, message, preview, quote, continued }`；该丢弃时为 undefined。
+   *   `continued` 表示这条不是「被叫到」而是「活跃对话里接上的一句」（正文没有前缀可去）。
    */
   function admit(event, selfId) {
     if (event?.post_type !== 'message') return undefined;
@@ -2513,24 +2647,37 @@ export function apply(ctx, config) {
       if (!config.groupChat) return undefined;
       const groupId = String(event.group_id);
       if (config.allowGroups.length > 0 && !config.allowGroups.includes(groupId)) return undefined;
+      const userId = String(event.user_id ?? '');
       const at = mentions(message, selfId);
-      if (config.groupTrigger === 'mention' && !at) return undefined;
-      if (config.groupTrigger === 'prefix' && !messageToText(message).trimStart().startsWith(config.prefix)) return undefined;
+      const prefixed = config.groupTrigger === 'prefix' && messageToText(message).trimStart().startsWith(config.prefix);
+      // 显式触发：@ 了机器人、按配置用了前缀、或者 groupTrigger 本来就允许所有消息。
+      const explicit = config.groupTrigger === 'all' || at || prefixed;
       // 这里只用**占位符**版本判定「这条消息有没有内容」：媒体下载是异步的，此刻还没
       // 落盘，而 `[图片]` 这样的占位符已经足够说明「他发了点东西」。真正的正文在
       // handleEvent 里等媒体落盘后再渲染一次。
       // 传入 selfId 是为了按 account 精确剔除 @机器人 段，而不是事后从扁平文本里砍掉
       // 开头的 `@…` —— 这样 `@bot你好` 才能完整保留成 `你好`（昵称含空格也不会被误删）。
-      const preview = dropPrefix(messageToText(message, selfId).trim());
+      const rawText = messageToText(message, selfId).trim();
+      // 前缀只在**显式带前缀**的那条上剥掉：活跃对话里接上的那句本来就没有前缀，
+      // 按前缀长度硬切会把「然后呢」切成「后呢」（见 dropPrefix）。
+      const preview = prefixed ? dropPrefix(rawText) : rawText;
       if (preview.length === 0) return undefined;
+      // 活跃对话：没被叫到，但同一个人正在跟它聊，接着说的这句也算。（只认**已经存在**
+      // 的会话 —— 闲聊不该因为「窗口」把某个群变成「处理过」的群。）
+      const existing = conversations.get(`group:${groupId}`);
+      const continued = !explicit && existing !== undefined && activeFollowAllows(existing, userId, message, selfId);
+      if (!explicit && !continued) return undefined;
+      const conversation = conversationFor('group', groupId, {
+        groupName: '',
+        userId: event.user_id,
+        userName: sender.card ?? sender.nickname ?? String(event.user_id),
+      });
+      noteActiveMessage(conversation, userId, continued);
       return {
-        conversation: conversationFor('group', groupId, {
-          groupName: '',
-          userId: event.user_id,
-          userName: sender.card ?? sender.nickname ?? String(event.user_id),
-        }),
+        conversation,
         message,
         preview,
+        continued,
         // 回复指向：引用被回复的那条消息（`reply` 段要 message_id），或 @ 回提问者（要 QQ 号）。
         // `seq` 是这条消息在群里的进度，供 `auto` 判断「等我回话时有没有人插话」。三样都
         // 在这里一次性快照：发送在几秒后，那时会话记录和群里的进度都可能已经变了。
@@ -2542,13 +2689,18 @@ export function apply(ctx, config) {
     if (config.allowUsers.length > 0 && !config.allowUsers.includes(userId)) return undefined;
     const text = messageToText(message, selfId).trim();
     if (text.length === 0) return undefined;
+    const conversation = conversationFor('private', userId, {
+      userId,
+      userName: sender.nickname ?? sender.card ?? userId,
+    });
+    // 私聊的每条消息本来就都是「跟它说的」，所以活跃对话在私聊里不需要额外判定 ——
+    // 只要把这个窗口往后滑，它回完之后才可能自己补一句（见 scheduleChime）。
+    noteActiveMessage(conversation, userId, false);
     return {
-      conversation: conversationFor('private', userId, {
-        userId,
-        userName: sender.nickname ?? sender.card ?? userId,
-      }),
+      conversation,
       message,
       preview: dropPrefix(text),
+      continued: false,
       // 私聊始终是 plain，`seq` 只是让 quote 的字段形状保持一致。
       quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: 0 },
     };
@@ -2576,6 +2728,28 @@ export function apply(ctx, config) {
       if (oldest !== undefined && oldest !== groupId) chatterSeq.delete(oldest);
     }
     return next;
+  }
+
+  /**
+   * 记一次「这个会话刚才有人在说话」，供主动说话判断群是不是安静了。
+   *
+   * 与 `noteChatter` 的区别：那个记的是「群里的进度序号」（回复指向用），只对群有效；
+   * 这个记的是「时间」，而且**含没 @ 机器人的闲聊** —— 群里正聊得热火朝天时，
+   * 主动搭话恰恰最不该发生，所以那些没人理机器人的消息也必须算作活跃。
+   *
+   * 只更新**已经存在**的会话记录：没聊过的群不该因为一条闲聊就变成候选（这也是
+   * 「主动说话只对已经聊过的群生效」的落点）。机器人自己的消息会回灌，按 selfId 排除。
+   * @param event - 已解码的 OneBot 事件。
+   * @param selfId - 机器人自己的 QQ 号。
+   */
+  function touchActivity(event, selfId) {
+    if (event?.post_type !== 'message') return;
+    if (selfId === '' || String(event.user_id ?? '') === String(selfId)) return;
+    const type = event.message_type === 'group' ? 'group' : 'private';
+    const id = type === 'group' ? String(event.group_id ?? '') : String(event.user_id ?? '');
+    const conversation = conversations.get(`${type}:${id}`);
+    if (conversation === undefined) return;
+    conversation.lastActiveAt = Date.now();
   }
 
   /**
@@ -2623,7 +2797,8 @@ export function apply(ctx, config) {
    *   - 只有**没 @ 机器人**的那条才跟：被 @ 的会走 Agent 去回答，再复读一遍等于
    *     同一句话回两遍（`groupTrigger: all` 时每条都算被 @，于是复读不会触发）；
    *   - 只有两种消息跟得动：**纯文字**（trim + 折叠空白后一样，`6` 和 `6 ` 算同一句）
-   *     与**整条就是一张表情包**（图片按落盘后的内容哈希认同一张，见 `repeatCandidate`）；
+   *     与**整条就是一张表情包**（图片来源判定分两层：字节完全相同，或画面指纹足够近 ——
+   *     QQ 会把同一张表情包按发送者重新编码，只看字节永远认不出「同一张」，见 `sketchOf`）；
    *   - 中间有任何人说了别的话就重新数（认不出的消息也一样打断：群里插了别的话，
    *     前后两条就不再是「连着」的）；
    *   - 间隔超过 `repeatWindowMs` 也不续链；默认还要至少两个不同的人说过
@@ -2696,8 +2871,8 @@ export function apply(ctx, config) {
     const windowMs = Math.max(0, Math.floor(Number(config.repeatWindowMs) || 0));
     const chained =
       previous !== undefined &&
-      previous.key === candidate.key &&
-      (windowMs <= 0 || arrivedAt - previous.at <= windowMs);
+      (windowMs <= 0 || arrivedAt - previous.at <= windowMs) &&
+      (await sameCandidate(previous, candidate));
     const senders = chained ? [...new Set([...previous.senders, userId])] : [userId];
     const count = chained ? previous.count + 1 : 1;
     const threshold = Math.max(2, Math.floor(Number(config.repeatCount) || 0));
@@ -2729,7 +2904,8 @@ export function apply(ctx, config) {
    *      `key` 归一化空白，真正发出去的是原样正文（`raw`）—— 复读机不该改人家的字。
    *   2. **整条就是一张表情包**：只有一个 `image` / `mface` 段，或只有一个系统表情
    *      （`face`）段。图片得先落盘，`key` 就是内容哈希路径 —— 同一张图重新上传会拿到
-   *      不同的 `file` / URL，只有字节哈希说了算。系统表情不用下载，`id` 就是它的身份。
+   *      不同的 `file` / URL；画面指纹（{@link sketchOf}）只在真要比两条字节不同的图时
+   *      才懒算。系统表情不用下载，`id` 就是它的身份。
    *
    * 图 + 文字、两张图、@ 别人的消息都不算候选：复读要的是「原样接上一句/一张」，把图
    * 和话拆开复读、或者把 @ 段再发一遍都不是那回事。它们照样会打断链（调用方的处理）。
@@ -2771,6 +2947,60 @@ export function apply(ctx, config) {
     return { kind: 'image', key: `image:${outcome.path}`, path: outcome.path };
   }
 
+  /**
+   * 一张已落盘表情包的**画面指纹**（见 perceptual.js），按路径缓存。
+   *
+   * 为什么要多这一步：QQ 会把同一张表情包按发送者重新编码 —— 实测同一张「寿来」在群里
+   * 出现过 94657B(progressive) / 131307B(baseline) / 79284B 三种字节，画面 SSIM ≥ 0.985
+   * 却没有两份字节相同。只比内容哈希的话，群里连着发同一张表情包时复读**永远**不触发
+   * （2026-10-13 那天就是：12:30:47 与 12:31:12 两个人发了同一张「寿来」，机器人一声不吭）。
+   *
+   * 为什么是**懒算 + 缓存**：绝大多数表情包消息都不参与复读（链是空的、旁边没人接），
+   * 每条都解码一遍纯属浪费；只有在真的要拿两条**字节不同**的图比画面时才读盘解一次。
+   * 缓存按路径（内容哈希命名，同一张图就是同一个路径），只存指纹字符串，上限 64 条。
+   *
+   * 失败一律返回 undefined —— 那张图仍然能靠「字节完全相同」复读，只是不参与画面比对
+   * （文件已被 LRU 淘汰、格式不支持、画面太小太素都是这种）。`repeatImageTolerance: 0`
+   * 时连读盘都不做。
+   *
+   * @param path - `.qq-media/…` 这样的相对路径（内容哈希命名）。
+   * @returns 十六进制指纹串或 undefined。
+   */
+  async function sketchOf(path) {
+    if (repeatImageTolerance <= 0 || path === undefined) return undefined;
+    if (sketches.has(path)) return sketches.get(path);
+    let sketch;
+    try {
+      sketch = perceptualHash(await readFile(resolve(cwd, path)));
+    } catch (error) {
+      report('warn', `could not fingerprint the sticker ${path}: ${errorText(error)}`);
+      sketch = undefined;
+    }
+    sketches.set(path, sketch);
+    if (sketches.size > 64) sketches.delete(sketches.keys().next().value);
+    return sketch;
+  }
+
+  /**
+   * 复读链上的「这跟刚才那条算不算同一个」。
+   *
+   * 文字与系统表情只能靠 `key` 完全相等（它们本来就是确定的字符串/编号）；图片多一层：
+   * 字节不同但画面指纹足够近也算同一张（QQ 重新编码过的同一张表情包），阈值就是
+   * `repeatImageTolerance`，两侧任一没有指纹时退回字节判定。
+   *
+   * @param left - 链上留下的候选。
+   * @param right - 这一条的候选。
+   * @returns 视为同一个时 true（可能要读盘解一次指纹，所以是异步的）。
+   */
+  async function sameCandidate(left, right) {
+    if (left.kind !== right.kind) return false;
+    if (left.key === right.key) return true;
+    if (left.kind !== 'image') return false;
+    const [leftSketch, rightSketch] = [await sketchOf(left.path), await sketchOf(right.path)];
+    if (leftSketch === undefined || rightSketch === undefined) return false;
+    return hashDistance(leftSketch, rightSketch) <= repeatImageTolerance;
+  }
+
   /** 复读的日志措辞：文字给正文，表情包给一张「占位符」。 */
   function describeRepeat(candidate) {
     if (candidate.kind === 'text') return candidate.raw.slice(0, 120);
@@ -2807,6 +3037,483 @@ export function apply(ctx, config) {
       }
       await sendOne(conversation, [imageSegment(bytes)]);
     });
+  }
+
+  // ---- 主动说话：不等 @，自己偶尔在群里开个话头 ---------------------------------
+  //
+  // 复读是「跟着别人说」，这一块是反过来：群里安静下来之后，机器人**自己**想一句
+  // 冒个泡。它走完整的 Agent 链路（同一张会话、同一套提示词、同一份长期记忆），
+  // 只是那条 user message 是插件伪造的「提醒」而不是真人说的话。
+  //
+  // 为什么值得这么绕：不经过模型的主动消息只能靠模板（「在吗」「大家好啊」），
+  // 一开口就露馅；让它带着群里的上下文（环境缓冲 + 长期记忆）自己想一句，
+  // 才可能真的像群友。代价是每次搭话都有一次模型调用，所以下面那一堆闸门是必须的。
+
+  /**
+   * 主动说话总开关。
+   *
+   * 默认**关**：它会主动给真人发消息，这种事不该由「升级插件」替使用者决定。
+   * 开着时也只在**群**里说话 —— 私聊对象是具体的人，被机器人无端戳一下更冒犯，
+   * 而且私聊会话一多，主动搭话很容易变成骚扰。
+   */
+  const proactiveEnabled = config.proactive === true;
+
+  /** 一个毫秒配置项：非法值退回 `fallback`，负数按 0 算。 */
+  function proactiveMs(name, fallback) {
+    const raw = Math.floor(Number(config[name]));
+    return Number.isFinite(raw) ? Math.max(0, raw) : fallback;
+  }
+
+  /** 每群每天最多主动说几次；非法或负数按 0（= 不说）算。 */
+  function proactiveDailyMax() {
+    const raw = Math.floor(Number(config.proactiveDailyMax));
+    return Number.isFinite(raw) ? Math.max(0, raw) : 4;
+  }
+
+  /** 主动说话的检查间隔（毫秒）：下限 1 秒，上限受 Node 定时器能表达的范围约束。 */
+  function proactiveCheckMs() {
+    return Math.min(MAX_TIMER_MS, Math.max(1000, proactiveMs('proactiveCheckMs', 10 * 60 * 1000)));
+  }
+
+  /**
+   * 这个会话的「今天」计数（跨天就地归零），返回今天已经主动说过几次。
+   *
+   * 计数刻意放在**内存**里：重启后归零是可以接受的（重启本身很稀有，而且重启后
+   * 至少要等 `proactiveIdleMs` 才可能开口），换成落盘状态得多维护一个文件，
+   * 与 `ambient` / `chatterSeq` / 复读链这些运行时状态的口径也一致。
+   * @param conversation - 目标会话。
+   * @returns 今天已主动说话的次数。
+   */
+  function proactiveTodayCount(conversation) {
+    const today = localDate();
+    if (conversation.proactiveDay !== today) {
+      conversation.proactiveDay = today;
+      conversation.proactiveCount = 0;
+    }
+    return conversation.proactiveCount ?? 0;
+  }
+
+  /**
+   * 这个会话此刻是不是正欠着 QQ 一轮回复（包括主动搭话自己那一轮）。
+   *
+   * 主动搭话要挑**没人说话、也没在等回复**的时刻：上一轮还没结束就再塞一条，
+   * 群里会看到它自问自答；而且 `submitted` / `turnOwners` 是靠 turn 号记账的，
+   * 两个 turn 交错时回复归属也可能串。
+   * @param conversation - 目标会话。
+   * @returns 有在飞的 turn 时为 true。
+   */
+  function busyWithTurn(conversation) {
+    const prefix = `${sessionIdFor(conversation.key)}:`;
+    for (const slot of turnOwners.keys()) {
+      if (slot.startsWith(prefix)) return true;
+    }
+    for (const owner of submitted.values()) {
+      if (owner.key === conversation.key) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 这个群现在值不值得主动搭一句话。五道闸门，缺一不可：
+   *
+   *   1. **只群聊**（`conversation.type === 'group'`）—— 私聊不打扰；
+   *   2. **没有正在进行的对话**：攒批里有待投的消息、或者有 turn 在飞，都不插嘴；
+   *   3. **安静够久**（`proactiveIdleMs`）：群里刚才还在聊，就不该轮到它开口；
+   *   4. **不是独白**：上一次说话之后一直没人接话，就不再自说自话
+   *      （`lastBotSpeakAt >= lastActiveAt` 就是这种情况）；
+   *   5. **不算诈尸**：`proactiveFreshMs` 之内还有人说过话的群才搭；隔了好几天的
+   *      冷群突然冒一句最吓人。
+   *
+   * 外加两个节奏闸：同一个群两次主动说话至少隔 `proactiveGapMs`，一天不超过
+   * `proactiveDailyMax` 次。**时段**（`proactiveFromHour` / `proactiveToHour`）与概率
+   * 不在这里 —— 那是整轮检查的性质，在 `proactiveSweep` 里判一次。
+   *
+   * @param conversation - 候选会话。
+   * @param now - 当前时刻（毫秒）。
+   * @returns 可以开口时为 true。
+   */
+  function proactiveEligible(conversation, now) {
+    if (conversation.type !== 'group') return false;
+    if (conversation.pending.length > 0 || conversation.batchTimer !== undefined) return false;
+    if (busyWithTurn(conversation)) return false;
+    const lastActive = Number(conversation.lastActiveAt) || 0;
+    // 从来没人在这个群说过话（例如会话是被出站工具建出来的壳）就没有可搭的话头。
+    if (lastActive <= 0 || now < lastActive) return false;
+    // 独白：上一条是我说的，之后没人接话。
+    if ((Number(conversation.lastBotSpeakAt) || 0) >= lastActive) return false;
+    if (now - lastActive < proactiveMs('proactiveIdleMs', 45 * 60 * 1000)) return false;
+    const freshMs = proactiveMs('proactiveFreshMs', 24 * 60 * 60 * 1000);
+    if (freshMs > 0 && now - lastActive > freshMs) return false;
+    const gapMs = proactiveMs('proactiveGapMs', 2 * 60 * 60 * 1000);
+    if ((Number(conversation.lastProactiveAt) || 0) > 0 && now - conversation.lastProactiveAt < gapMs) return false;
+    return proactiveTodayCount(conversation) < proactiveDailyMax();
+  }
+
+  /**
+   * 主动搭话时那条「伪造的 user message」。
+   *
+   * 它必须同时说清三件事，否则模型很容易答非所问：
+   *   - **这条不是谁发来的消息**（否则它会当成一个人在跟它说话，回一句「怎么了」）；
+   *   - **可以什么都不说**（给一个 `SKIP` 出口。不给出路时，模型面对「没话找话」的
+   *     场景会硬编一句，那正是最像机器人的地方）；
+   *   - **别暴露机制**（不能说「我注意到好久没人说话了」，也不能提这条提醒本身）。
+   *
+   * 只提真的能用的表达方式：`imageSend` 关着时不说 `[[图片: …]]`，否则模型会把标记
+   * 当正文写出去（与 `channelPrompt` 的处理一致）。
+   * @param quietMs - 这个群已经安静了多久（毫秒）。
+   * @returns user message 正文。
+   */
+  function proactiveNudge(quietMs) {
+    const minutes = Math.max(1, Math.round(quietMs / 60000));
+    return [
+      `（这条不是谁发给你的消息，是插件在提醒你：这个群已经安静了大约 ${minutes} 分钟，你可以自己冒个泡。）`,
+      '',
+      '要不要说话、说什么都由你定：',
+      imageAllowed()
+        ? '- 想接一句之前的话题、吐槽一句、问一句，或者甩一张合适的表情包（正文只写 `[[图片: 路径]]`），都行；'
+        : '- 想接一句之前的话题、吐槽一句、问一句，都行；',
+      '- 觉得没什么可说的、或者刚说过话不想重复，就整条回复只写 `SKIP` —— 那样一个字都不会发出去，这是很正常的选择。',
+      '',
+      '注意：',
+      '- 别提前面这条提醒，也别说「好久没人说话了」这种旁白；就当自己突然想冒个泡。',
+      '- 别重复你刚说过的话，也别每次都问「在吗」。',
+      '- 一条就够，别刷屏。',
+    ].join('\n');
+  }
+
+  /**
+   * 主动搭话的「我不说话」信号：第一行以 `SKIP` 开头（容忍各种括号与前后空白）。
+   *
+   * 宽松一点是有意的：模型经常顺手把自己的决定解释一下（`SKIP（没什么可说的）`），
+   * 那半句同样不该发到群里 —— 它是在解释内部决定，不是群友会说的话。只看第一行，
+   * 后面的解释直接丢掉。`skip` 后面要求一个词边界，免得把 `skipping` 这类正文吞掉。
+   * @param text - 这一轮的回复正文。
+   * @returns 整条都不该发出去时为 true。
+   */
+  function proactiveSkip(text) {
+    const first = String(text ?? '')
+      .split('\n')
+      .find((line) => line.trim().length > 0) ?? '';
+    return /^[(（[\s]*skip\b/i.test(first.trim());
+  }
+
+  /**
+   * 让机器人主动开口：伪造一条 user message 投进**它自己那个会话**，回复照常发回群里。
+   *
+   * 走同一条会话而不是另开一个（与摘要 Agent 相反）：主动搭话必须看得见这段聊天
+   * 本身的历史与环境上下文，否则它说的那句和刚刚聊的内容接不上。
+   *
+   * 记账刻意是**先记后说**：模型可能判成 `SKIP`、这一轮也可能失败，但「这次掷中了」
+   * 本身就该消耗掉当天的一次机会与 `proactiveGapMs` —— 否则每次检查都会重新掷骰子，
+   * 开口频率会失控（`SKIP` 反而变成「再来一次」）。
+   *
+   * @param conversation - 目标群会话。
+   * @param now - 判定通过的时刻（毫秒）。
+   */
+  function proactiveSpeak(conversation, now) {
+    conversation.proactiveCount = proactiveTodayCount(conversation) + 1;
+    conversation.lastProactiveAt = now;
+    const quietMs = Math.max(0, now - (Number(conversation.lastActiveAt) || now));
+    report('info', `${describeConversation(conversation)} 已经安静 ${Math.round(quietMs / 60000)} 分钟，主动开个话头`);
+    enqueue(conversation, async () => {
+      try {
+        const text = proactiveNudge(quietMs);
+        const agent = await ensureAgent(conversation);
+        const userMessage = createUserMessage({
+          content: [{ type: 'text', text }],
+          source: { kind: 'user' },
+        });
+        // `proactive: true` 是本轮唯一的身份标记：turn 结束时靠它区分「主动搭话」
+        // 与「回别人的话」—— 前者判成 SKIP 要静默丢弃，出错也不该在群里道歉。
+        submitted.set(userMessage.id, {
+          key: conversation.key,
+          quote: { messageId: '', userId: '', seq: 0 },
+          proactive: true,
+        });
+        agent.followup(userMessage);
+      } catch (error) {
+        // 主动搭话起不来就安静算了：`enqueue` 的兜底会在群里发一句「我这边出错了」，
+        // 而这次根本没人问它，平白多一条噪音。
+        report('warn', `proactive turn for ${conversation.key} could not start: ${errorText(error)}`);
+      }
+    });
+  }
+
+  /**
+   * 主动说话的定时轮：醒来只是「看一眼」，说不说还要过条件与概率。
+   *
+   * 每次最多只有一个群开口（先洗牌、再逐个掷概率、掷中就结束）—— 一次醒来在好几个
+   * 群里同时冒泡，比不说话更像机器人。
+   */
+  function proactiveSweep() {
+    if (!proactiveEnabled) return;
+    // 还没连上 OneBot（selfId 未知）时发不出去，也认不出自己的消息。
+    if (client.selfId === '') return;
+    const from = Number(config.proactiveFromHour);
+    const to = Number(config.proactiveToHour);
+    if (!withinActiveHours(from, to, new Date().getHours())) return;
+    const chance = Math.min(1, Math.max(0, Number(config.proactiveChance)));
+    if (!(chance > 0)) return;
+    const now = Date.now();
+    const candidates = [];
+    for (const conversation of conversations.values()) {
+      if (proactiveEligible(conversation, now)) candidates.push(conversation);
+    }
+    if (candidates.length === 0) return;
+    // 洗牌只是为了「多个群都满足条件时挑哪个」也随机 —— 否则永远是 Map 里最早的那个。
+    for (let index = candidates.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(Math.random() * (index + 1));
+      [candidates[index], candidates[swap]] = [candidates[swap], candidates[index]];
+    }
+    for (const conversation of candidates) {
+      if (!(Math.random() < chance)) continue;
+      proactiveSpeak(conversation, now);
+      return;
+    }
+  }
+
+  // ---- 活跃对话：聊起来之后保持搭话 ---------------------------------------------
+  //
+  // 上面那块 `proactive` 管的是**冷场**（群里安静 45 分钟之后自己开个话头）；这一块管
+  // 「正聊着」的时候。真人不会让对方每句都叫一遍自己的名字，也不会在对方安静十秒之后
+  // 就把话题掐掉。两件事共用一个「活跃对话」窗口（`activeUntil`）：
+  //
+  //   A. 免 @ 接话（`activeFollow`）：窗口内、正在跟它聊的那个人接着说的话也算在跟它聊；
+  //   B. 自己补一句（`activeChime*`）：它回完之后对方安静了一小会儿，它可能再追一句。
+  //
+  // 窗口只靠**别人发来的消息**往后滑（机器人自己说的话不算，否则它自己就能给窗口续命）；
+  // 群里中间有别人插话，这次「你跟我聊」就算断了，要重新叫它一次。
+
+  /** 活跃对话窗口（毫秒）：0 表示整套关闭（免 @ 接话与自己补一句都不做）。 */
+  function activeWindowMs() {
+    return proactiveMs('activeWindowMs', 10 * 60 * 1000);
+  }
+
+  /** 一次活跃对话里最多免 @ 接几轮；0 = 不限。 */
+  function activeMaxTurns() {
+    return proactiveMs('activeMaxTurns', 10);
+  }
+
+  /** 「自己补一句」的静默门槛（毫秒）；0 = 不补。 */
+  function activeChimeIdleMs() {
+    return proactiveMs('activeChimeIdleMs', 20 * 1000);
+  }
+
+  /** 对方每说一句之后最多自己补几句；0 = 不补。 */
+  function activeChimeMax() {
+    return proactiveMs('activeChimeMax', 1);
+  }
+
+  /** 同一个会话一天最多自己补几句；0 = 不限。 */
+  function activeChimeDailyMax() {
+    return proactiveMs('activeChimeDailyMax', 12);
+  }
+
+  /**
+   * 记一次「这个会话正聊着」，把活跃窗口往后滑。
+   *
+   * 由 `admit` 在两条路上调用：**被叫到**（`continued === false`，会重置免 @ 接话的轮数）
+   * 与**窗口内接上话**（`continued === true`，轮数 +1）。私聊的每条消息都算「被叫到」，
+   * 所以私聊不需要 `activeFollow` 也能有「补一句」——窗口照样在滑。
+   *
+   * `activeSeq` 记的是这条消息在群里的进度序号：用来判断「这条之后有没有别人说过话」，
+   * 见 `activeFollowAllows` 与 `runChime`。
+   *
+   * @param conversation - 这条消息所属的会话。
+   * @param userId - 发消息的人（群里只有他接着说的话才可能免 @ 算进来）。
+   * @param continued - 这条是不是「窗口内接上的」（而不是被叫到）。
+   */
+  function noteActiveMessage(conversation, userId, continued) {
+    conversation.activeUntil = Date.now() + activeWindowMs();
+    conversation.activeSpeakerId = userId;
+    conversation.activeTurns = continued ? (conversation.activeTurns ?? 0) + 1 : 0;
+    if (conversation.type === 'group') conversation.activeSeq = chatterSeq.get(conversation.id) ?? 0;
+    // 对方又说话了：这一句对应的「补一句」额度重新算，旧的那个定时器也就作废了。
+    conversation.chimeCount = 0;
+    cancelChime(conversation);
+  }
+
+  /**
+   * 这条**没被叫到**的群消息能不能算「接着聊」（`activeFollow`）。
+   *
+   * 四条同时成立才算，缺一条都不理它 —— 这一步放松的是「群里只在被 @ 时才说话」这条
+   * 默认约定，宁可少接一句也别抢话：
+   *   1. 说话的就是**正在跟它聊的那个人**（别人插一句不该被它抢答）；
+   *   2. 还在窗口内（`activeWindowMs`，每接一句往后滑）；
+   *   3. 这次对话里免 @ 接的轮数还没到 `activeMaxTurns`；
+   *   4. 中间**没有别人说过话**（群里插了话，这次一对一就断了，得重新 @ 它）；
+   *   5. 这句没有 @ 别人（`@别人` / `@全体` 明确不是跟它说的）。
+   *
+   * @param conversation - 已有的会话记录。
+   * @param userId - 发消息的人。
+   * @param message - OneBot 的 `message` 字段。
+   * @param selfId - 机器人自己的 QQ 号。
+   * @returns 可以当「接话」时为 true。
+   */
+  function activeFollowAllows(conversation, userId, message, selfId) {
+    if (config.activeFollow !== true) return false;
+    if (activeWindowMs() <= 0) return false;
+    // 私聊不需要「免 @」：那边的每条消息本来就都是跟它说的。
+    if (conversation.type !== 'group') return false;
+    if (String(conversation.activeSpeakerId ?? '') !== String(userId)) return false;
+    if ((Number(conversation.activeUntil) || 0) <= Date.now()) return false;
+    const maxTurns = activeMaxTurns();
+    if (maxTurns > 0 && (conversation.activeTurns ?? 0) >= maxTurns) return false;
+    // `activeSeq` 停在上一次接话那条上；这里已经比它大 1 以上就说明中间有人插过话
+    // （当前这条自己会把序号 +1，所以「紧跟着的下一条」正好是 +1）。
+    if ((chatterSeq.get(conversation.id) ?? 0) > (Number(conversation.activeSeq) || 0) + 1) return false;
+    if (mentionsOthers(message, selfId)) return false;
+    return true;
+  }
+
+  /**
+   * 取消这个会话挂着的「补一句」定时器。
+   *
+   * 做法是把 `chimeSeq` 加一：旧回调醒来发现编号对不上就什么都不做。比在每个可能的
+   * 取消点都记得 `clearTimeout` 更省心（`clearTimeout` 照样调，只是不作为正确性的依赖）。
+   * @param conversation - 目标会话。
+   */
+  function cancelChime(conversation) {
+    conversation.chimeSeq = (conversation.chimeSeq ?? 0) + 1;
+    if (conversation.chimeTimer !== undefined) {
+      clearTimeout(conversation.chimeTimer);
+      conversation.chimeTimer = undefined;
+    }
+  }
+
+  /**
+   * 「自己补一句」的延迟（毫秒）：在 `activeChimeIdleMs` 上按 `delayJitter` 抖动。
+   *
+   * 掐着表 20 秒整补一句比不补还像机器人；复用打字延迟那个抖动比例，不额外加配置。
+   */
+  function chimeDelay() {
+    const idle = activeChimeIdleMs();
+    const jitter = Math.min(1, Math.max(0, Number(config.delayJitter) || 0));
+    return Math.max(500, Math.round(idle * (1 + (Math.random() * 2 - 1) * jitter)));
+  }
+
+  /**
+   * 挂一个「过一会儿也许补一句」的定时器。
+   *
+   * 只在**正常回完一轮**之后挂（见 turn/end 那条路）：这样「补一句」一定发生在它已经
+   * 说过话之后，而不是抢在自己回复前面。主动搭话自己的那一轮不再挂（`owner.proactive`
+   * 那条路直接 return）—— 否则它补一句、再补一句，就成了自言自语。
+   *
+   * 用裸 `setTimeout` 而不是 `ctx.interval`：这是**每条消息一次**的短定时器（和攒批那个
+   * 同一性质），生命周期由 `ctx.effect` 的收尾统一清掉，不需要额外的调度框架。
+   * @param conversation - 刚回完话的会话。
+   */
+  function scheduleChime(conversation) {
+    if (!proactiveEnabled) return; // 总开关：不允许主动发消息就什么都不挂
+    if (activeWindowMs() <= 0 || activeChimeIdleMs() <= 0 || activeChimeMax() <= 0) return;
+    cancelChime(conversation);
+    // 先取消（编号 +1）再抓编号：这条定时器因此是「目前唯一有效」的那一个。
+    const seq = conversation.chimeSeq;
+    const timer = setTimeout(() => {
+      conversation.chimeTimer = undefined;
+      try {
+        runChime(conversation, seq);
+      } catch (error) {
+        report('warn', `chime check failed: ${errorText(error)}`);
+      }
+    }, chimeDelay());
+    timer.unref?.();
+    conversation.chimeTimer = timer;
+  }
+
+  /** 这个会话今天已经自己补了几句（跨天就地归零）。 */
+  function chimeTodayUsed(conversation) {
+    const today = localDate();
+    if (conversation.chimeDay !== today) {
+      conversation.chimeDay = today;
+      conversation.chimeToday = 0;
+    }
+    return conversation.chimeToday ?? 0;
+  }
+
+  /**
+   * 「补一句」的正题（定时器醒来时再判一遍 —— 这一小会儿里什么都可能变了）。
+   *
+   * 判据一条都不能少：窗口还热着、没有被后来的消息取代、没有正在飞的回复、这一句之后
+   * 还没补够、今天还没超量、**我回过之后确实没人接话**（有人接的话那条消息自己会走
+   * 正常回复，而它一到就会把这个定时器作废）、群里中间也没别人插话。
+   * @param conversation - 目标会话。
+   * @param seq - 挂这个定时器时的编号（对不上说明已经被取代）。
+   */
+  function runChime(conversation, seq) {
+    if (conversation.chimeSeq !== seq) return;
+    if (!proactiveEnabled) return;
+    const now = Date.now();
+    if ((Number(conversation.activeUntil) || 0) <= now) return;
+    if (conversation.pending.length > 0 || conversation.batchTimer !== undefined) return;
+    if (busyWithTurn(conversation)) return;
+    const max = activeChimeMax();
+    if (max > 0 && (conversation.chimeCount ?? 0) >= max) return;
+    const dailyMax = activeChimeDailyMax();
+    if (dailyMax > 0 && chimeTodayUsed(conversation) >= dailyMax) return;
+    if ((Number(conversation.lastBotSpeakAt) || 0) <= (Number(conversation.lastActiveAt) || 0)) return;
+    // 群里中间又有人说话了：那不是接在我这句后面的事，插进去就是抢话。
+    if (conversation.type === 'group' && (chatterSeq.get(conversation.id) ?? 0) !== (Number(conversation.activeSeq) || 0)) return;
+    const chance = Math.min(1, Math.max(0, Number(config.proactiveChance)));
+    if (!(chance > 0) || !(Math.random() < chance)) return;
+    chimeSpeak(conversation, now);
+  }
+
+  /**
+   * 真的补一句：和 `proactiveSpeak` 一样伪造一条提醒投进这个会话，只是说的事情不同 ——
+   * 那边是「群里没人说话了」，这边是「你已经回过他了，还有想说的吗」。
+   *
+   * 记账先记后说（同 `proactiveSpeak`）：模型判成 `SKIP`、或者这一轮失败，这次机会
+   * 照样用掉 —— 否则它会一直重试同一句「再补一句」。
+   * @param conversation - 目标会话。
+   * @param now - 定时器醒来的时刻（毫秒）。
+   */
+  function chimeSpeak(conversation, now) {
+    conversation.chimeCount = (conversation.chimeCount ?? 0) + 1;
+    conversation.chimeToday = chimeTodayUsed(conversation) + 1;
+    const silenceSec = Math.max(1, Math.round((now - (Number(conversation.lastActiveAt) || now)) / 1000));
+    report('info', `${describeConversation(conversation)} 对话还热着（对方安静了约 ${silenceSec} 秒），主动补一句`);
+    enqueue(conversation, async () => {
+      try {
+        const agent = await ensureAgent(conversation);
+        const userMessage = createUserMessage({
+          content: [{ type: 'text', text: chimeNudge() }],
+          source: { kind: 'user' },
+        });
+        // 与主动搭话同一个标记：turn 结束时按它分流（SKIP 静默、出错不道歉）。
+        submitted.set(userMessage.id, {
+          key: conversation.key,
+          quote: { messageId: '', userId: '', seq: 0 },
+          proactive: true,
+        });
+        agent.followup(userMessage);
+      } catch (error) {
+        report('warn', `chime turn for ${conversation.key} could not start: ${errorText(error)}`);
+      }
+    });
+  }
+
+  /**
+   * 「补一句」那条伪造的提醒。
+   *
+   * 和冷场的 `proactiveNudge` 的区别只有两处：这里的前提是**它刚回过话、对方安静了
+   * 一小会儿**，所以要说清「别重复刚说过的」，并且明确这是可有可无的一句。
+   * @returns user message 正文。
+   */
+  function chimeNudge() {
+    return [
+      '（这不是谁发给你的消息，是插件在提醒你：刚才那轮你已经回过话了，对方安静了一小会儿。还有想补充的、想追问的，可以再说一句。）',
+      '',
+      '要不要说由你定：',
+      imageAllowed()
+        ? '- 想补一句刚才没说完的、追问一句你正好奇的，或者甩一张合适的表情包（正文只写 `[[图片: 路径]]`），都行；'
+        : '- 想补一句刚才没说完的、追问一句你正好奇的，都行；',
+      '- 没什么想说的就整条回复只写 `SKIP` —— 那样一个字都不会发出去，这是很正常的选择。',
+      '',
+      '注意：',
+      '- 别重复你刚说过的话，也别把那句换个说法再说一遍；',
+      '- 别提前面这条提醒，也别说「你怎么不说话了」这种旁白；一条就够。',
+    ].join('\n');
   }
 
   /**
@@ -3035,7 +3742,9 @@ export function apply(ctx, config) {
         // 「（引用 kaguya: …）\n[回复]这啥」这种一半有内容、一半是噪音的正文。
         const rendered = new Map(resolved?.rendered ?? []);
         if (quote !== undefined) rendered.set(quote.index, '');
-        const body = dropPrefix(messageToText(item.message, selfId, rendered.size > 0 ? rendered : undefined).trim());
+        // 活跃对话里接上的那句没有前缀可去：按前缀长度硬切会把「然后呢」切成「后呢」。
+        const raw = messageToText(item.message, selfId, rendered.size > 0 ? rendered : undefined).trim();
+        const body = item.continued === true ? raw : dropPrefix(raw);
         if (body.length === 0 && quote === undefined) continue;
         const composed = quote === undefined
           ? body
@@ -3102,16 +3811,21 @@ export function apply(ctx, config) {
     // 先记「群里又有人说了一句」，`admit` 紧接着快照的序号才算上这条自己 ——
     // 快照与发送时读到的值相等就说明没人插话，`auto` 便不引用。
     noteChatter(event, selfId);
+    // 同一时刻记一次「这个会话是活跃的」：主动说话只挑安静下来的群（见 touchActivity）。
+    touchActivity(event, selfId);
     const admitted = admit(event, selfId);
     // 复读链在所有别人的群消息上进账（被 @ 的那条也打断「连着」），但只有没被 @ 的才真的跟。
     maybeRepeat(event, selfId, admitted === undefined);
     // 长期记忆：把这条消息记进这个会话的转录（**所有**别人的消息，包括没 @ 机器人的
     // 群聊）。放在复读/环境上下文之前 —— 那两条路都会提前 return，而转录不该漏掉任何一条。
-    const jmCommandForLog = admitted === undefined ? undefined : readJmCommand(messageToText(admitted.message, selfId).trim());
+    // 「活跃对话里接上的一句」（`continued`）**不算指令**：`/jm` 与 `/reset` 这类旁路要求
+    // 明确叫了它（@ 或前缀）才认 —— 否则窗口里一句闲聊「jm 123」就会绕开模型去下本子。
+    const commanded = admitted !== undefined && admitted.continued !== true;
+    const jmCommandForLog = commanded ? readJmCommand(messageToText(admitted.message, selfId).trim()) : undefined;
     rememberTranscript(event, selfId, {
       admitted,
       jmCommand: jmCommandForLog,
-      reset: resetCommand.length > 0 && admitted !== undefined && admitted.preview.toLowerCase() === resetCommand,
+      reset: commanded && resetCommand.length > 0 && admitted.preview.toLowerCase() === resetCommand,
     });
     if (admitted === undefined) {
       rememberAmbient(event, selfId);
@@ -3138,7 +3852,7 @@ export function apply(ctx, config) {
     }
     // 会话重置指令：整条消息恰好等于指令才触发，且只清空「发指令的这个会话」。
     // 攒着的那批是在清空之前收到的，必须先投出去，否则那几句话会被一起忘掉。
-    if (resetCommand.length > 0 && preview.toLowerCase() === resetCommand) {
+    if (commanded && resetCommand.length > 0 && preview.toLowerCase() === resetCommand) {
       flushBatch(conversation);
       enqueue(conversation, async () => {
         const cleared = await resetConversation(conversation);
@@ -3151,6 +3865,8 @@ export function apply(ctx, config) {
     holdForBatch(conversation, {
       message,
       quote,
+      // 「活跃对话里接上的一句」正文里没有前缀可去（见 admit / dropPrefix）。
+      continued: admitted.continued === true,
       userId: String(event.user_id ?? ''),
       name: String(sender.card ?? sender.nickname ?? event.user_id ?? '某人'),
       at: Date.now(),
@@ -3197,15 +3913,32 @@ export function apply(ctx, config) {
     // 被打断 / fork 掉 / 中止的 turn 不是有效回复，静默丢弃。
     if (reason === 'aborted' || reason === 'forked' || reason === 'interrupted') return;
     if (reason === 'error') {
-      void sendToConversation(conversation, '（我这边处理时出错了，稍后再试试）');
+      // 主动搭话是我自己挑起来的话头，没人问过它：出错就安静地算了，
+      // 别反过来在群里贴一句「我这边出错了」。
+      if (owner.proactive !== true) void sendToConversation(conversation, '（我这边处理时出错了，稍后再试试）');
       return;
     }
     // 只发该 turn 里最后一条有文本的 assistant 消息；中间步骤的工具调用等不发给 QQ。
     const reply = list?.[list.length - 1]?.trim() ?? '';
     if (reply.length === 0) return;
+    if (owner.proactive === true) {
+      // 主动搭话允许「想了想，不说了」：`SKIP` 或空回复都一个字都不发（见 proactiveNudge）。
+      if (proactiveSkip(reply)) {
+        report('info', `→ ${conversation.key}: （主动搭话时决定不说话）`);
+        return;
+      }
+      report('info', `→ ${conversation.key}: ${reply.slice(0, 120)}（主动）`);
+      // 同一条「拟人」通道：拆短句 + 打字延迟。主动搭话没有可指向的消息，quote 为空。
+      void sendToConversation(conversation, reply, { human: true, quote: owner.quote });
+      return;
+    }
     report('info', `→ ${conversation.key}: ${reply.slice(0, 120)}`);
     // 自动回复走「拟人」通道：拆短句 + 打字延迟 + 引用/@ 对方。
-    void sendToConversation(conversation, reply, { human: true, quote: owner.quote });
+    // 等这一轮真的发完再挂「过一会儿也许补一句」的定时器（见 scheduleChime）：
+    // 补一句必须排在它这次回复**之后**，而且得等打完字才算「对方安静了」。
+    void sendToConversation(conversation, reply, { human: true, quote: owner.quote }).then(() => {
+      scheduleChime(conversation);
+    });
   });
 
   // ---- 工具注册 --------------------------------------------------------------
@@ -3729,6 +4462,11 @@ export function apply(ctx, config) {
           clearTimeout(conversation.batchTimer);
           conversation.batchTimer = undefined;
         }
+        // 「补一句」的短定时器同理（见 scheduleChime）。
+        if (conversation.chimeTimer !== undefined) {
+          clearTimeout(conversation.chimeTimer);
+          conversation.chimeTimer = undefined;
+        }
         conversation.pending.length = 0;
       }
       client.dispose();
@@ -3797,6 +4535,76 @@ export function apply(ctx, config) {
       };
     }, 'qq-bridge:memory-digest');
     report('info', `memory enabled at ${memoryLabel} (daily digest at ${hourLabel(atHour)}; a conversation needs ${Math.max(1, Math.floor(Number(config.digestMinLines) || 1))} new lines, once a day)`);
+  }
+
+  // ---- 主动说话：定时器 --------------------------------------------------------
+  //
+  // 与摘要循环同一套托管方式（`ctx.interval`，插件卸载即清掉）。区别在于节奏：
+  // 摘要是「每天一个整点」，主动说话是「每隔一会儿看一眼」—— 醒来不一定开口，
+  // 说不说交给 `proactiveSweep` 的条件与概率决定（这样开口的时刻才是不可预测的）。
+  if (proactiveEnabled) {
+    const checkMs = proactiveCheckMs();
+    const tick = () => {
+      try {
+        proactiveSweep();
+      } catch (error) {
+        report('warn', `proactive sweep threw: ${errorText(error)}`);
+      }
+    };
+    let proactiveTimerDisposer;
+    ctx.effect(() => {
+      const schedule = () => {
+        if (typeof ctx.interval === 'function') {
+          proactiveTimerDisposer = ctx.interval(() => {
+            proactiveTimerDisposer?.();
+            tick();
+            schedule();
+          }, checkMs);
+          return;
+        }
+        // 没有 timer 服务（测试桩或最小组合）时退回裸定时器：同样是「跑完再排」。
+        const handle = setTimeout(() => {
+          tick();
+          schedule();
+        }, checkMs);
+        handle.unref?.();
+        proactiveTimerDisposer = () => clearTimeout(handle);
+      };
+      schedule();
+      return () => {
+        proactiveTimerDisposer?.();
+        proactiveTimerDisposer = undefined;
+      };
+    }, 'qq-bridge:proactive');
+    // 启动自述：把「哪几个开关真的生效了」写清楚 —— 排查「它怎么不主动说话」时，
+    // 第一件事就是看这几行里有没有你配的那一项，而不是去猜配置有没有读进去。
+    const fromHour = Math.min(23, Math.max(0, Math.floor(Number(config.proactiveFromHour)) || 0));
+    const toHour = Math.min(23, Math.max(0, Math.floor(Number(config.proactiveToHour)) || 0));
+    report(
+      'info',
+      `proactive on — cold openers in groups only: check every ${Math.round(checkMs / 60000)} min, ` +
+        `quiet for ${Math.round(proactiveMs('proactiveIdleMs', 45 * 60 * 1000) / 60000)} min, ` +
+        `gap ${Math.round(proactiveMs('proactiveGapMs', 2 * 60 * 60 * 1000) / 60000)} min, ` +
+        `at most ${proactiveDailyMax()}/day, ${hourLabel(fromHour)}-${hourLabel(toHour)}`,
+    );
+    if (activeWindowMs() > 0 && activeChimeIdleMs() > 0 && activeChimeMax() > 0) {
+      report(
+        'info',
+        `active conversation — chime: about ${Math.round(activeChimeIdleMs() / 1000)}s after its reply, ` +
+          `at most ${activeChimeMax()}/message and ${activeChimeDailyMax() || '不限'}/day (groups and private)`,
+      );
+    } else {
+      report('info', 'active conversation — chime is off (activeWindowMs / activeChimeIdleMs / activeChimeMax)');
+    }
+    if (config.activeFollow === true && activeWindowMs() > 0) {
+      report(
+        'info',
+        `active conversation — activeFollow on: a group follow-up from the person it is talking to needs no @ ` +
+          `(window ${Math.round(activeWindowMs() / 60000)} min, at most ${activeMaxTurns() || '不限'} turns)`,
+      );
+    } else {
+      report('info', 'active conversation — activeFollow is off: group messages still need an explicit @ (or the configured prefix)');
+    }
   }
 
   // 表情包目录：启动时确保它存在 —— 「往里丢几张图就能用」比「先读文档建目录」友好。

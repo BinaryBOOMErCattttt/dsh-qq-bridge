@@ -18,10 +18,11 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import yaml from 'js-yaml';
-import { Config, apply } from '../index.js';
-import { collectMedia, mediaLabel, mediaPlaceholder, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
+import { Config, apply, inject, withinActiveHours } from '../index.js';
+import { collectMedia, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
+import { OTHER_PNG, PIC_JPEG, PIC_PNG } from './image-fixtures.mjs';
 
 /** 测试用机器人自己的 QQ 号。 */
 const SELF_ID = 100000000;
@@ -173,6 +174,13 @@ function makeHost({
       return () => timers.cleared.add(entry);
     },
   };
+  /**
+   * 复现 cordis 的 inject 检查：没在 `inject` 里声明 `timer` 的插件碰不到 timer 服务。
+   * 报错文案与 cordis 保持一致，方便对着真宿主的日志认。
+   */
+  const requireTimerService = () => {
+    if (!inject.includes('timer')) throw new Error('cannot get property "timer" without inject');
+  };
   // 记录每一次成功生效的工具收窄：{ sessionId, filter }。
   const restrictions = [];
   // join 过的预设（按 Agent），以及 create 时收到的 meta。
@@ -288,12 +296,19 @@ function makeHost({
       disposers.push(body);
       return () => {};
     },
-    // 真宿主上这两个来自 @deepseek-ai/cordis-plugin-timer 服务；这里转发到假定时器，
-    // 好让用例自己决定「摘要循环什么时候醒」。
+    // 真宿主上这两个来自 @deepseek-ai/cordis-plugin-timer 服务的 `ctx.mixin('timer', ...)`；
+    // 这里转发到假定时器，好让用例自己决定「摘要循环什么时候醒」。
+    //
+    // 但要连 cordis 的 inject 检查一起复现：真宿主只允许插件访问 inject 里声明过的服务，
+    // `inject` 漏了 'timer' 时取 `ctx.interval` 就抛错、apply() 整个失败（bot 不回复）。
+    // 桩若比真宿主宽松，这类事故就会「测试全绿但线上不激活」（真实发生过一次），所以
+    // 缺声明时这里也抛同样的错，让它在测试里就炸出来。
     timeout(callback, delay) {
+      requireTimerService();
       return fakeTimer.timeout(callback, delay);
     },
     interval(callback, delay) {
+      requireTimerService();
       return fakeTimer.interval(callback, delay);
     },
     get(service) {
@@ -556,12 +571,16 @@ async function boot(config = {}, hostOptions = {}, onebotOptions = {}) {
   // 延迟一律压到 0：拟人节奏不该让测试多等几秒，需要验证时序的用例自己覆盖。
   // 攒批窗口同理：默认关掉，要验证「几个人同时 @ 只回一轮」的用例自己给一个小窗口。
   apply(host.ctx, Config({ endpoint: onebot.endpoint, cwd: '/tmp', readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, batchWindowMs: 0, ...config }));
+  // 先登记再启动：`start()` 跑的是 `ctx.effect` 的回调（OneBot 连接、摘要与主动说话的
+  // 定时器），它可能抛错 —— 例如插件漏声明 inject 时的 cordis 检查。抛错时这个实例也
+  // 必须进收尾清单，否则刚起的假 OneBot 服务端会一直挂着监听，让整个测试文件停不下来
+  // （node 的 test runner 会等到事件循环空掉）。这类失败要「红得快且干净」。
+  const instance = { onebot, host, sessionsRoot, cwd: config.cwd ?? '/tmp' };
+  liveBoots.push(instance);
   host.list.start();
   // 等到 get_login_info 发出，说明 socket 已就绪、selfId 即将可用。
   await until(() => onebot.calls.some((call) => call.action === 'get_login_info'), 'the plugin to identify itself');
   await waitForSelfId(host);
-  const instance = { onebot, host, sessionsRoot, cwd: config.cwd ?? '/tmp' };
-  liveBoots.push(instance);
   return instance;
 }
 
@@ -596,7 +615,12 @@ test('a private message becomes an Agent turn whose reply returns to QQ', async 
       message: [{ type: 'text', data: { text: '你好' } }],
     });
 
-    const agent = await until(() => host.list.created[0], 'the conversation Agent to be created');
+    // 等到消息真的投进 Agent 的收件箱，而不是「Agent 对象刚被造出来」：create() 里还有
+    // 落盘会话记录的异步步骤，只看 created[0] 会在它写盘的那一刻就抢先断言（偶发失败）。
+    const agent = await until(
+      () => (host.list.created[0]?.inbox.length === 1 ? host.list.created[0] : undefined),
+      'the private message to reach the Agent',
+    );
     assert.deepEqual(agent.options, { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' });
     assert.equal(agent.inbox.length, 1);
     assert.equal(agent.inbox[0].content[0].text, '你好');
@@ -1572,7 +1596,10 @@ test('two identical stickers in a row get echoed', async () => {
 // 用例：不同的两张表情包不跟；表情包同样会打断文字链。
 test('two different stickers do not repeat, and a sticker breaks a text chain', async () => {
   const first = await startImageServer(TINY_PNG);
-  const second = await startImageServer(Buffer.concat([TINY_PNG, Buffer.from('different')]));
+  // 用另一张**真的不一样**的图（见 test/image-fixtures.mjs）：早先这里是在 TINY_PNG 后面
+  // 追加几个字节假装「另一张」，但那两个文件在画面上其实是同一张 1×1 的图 —— 有了画面
+  // 指纹之后，那种「伪不同」本来就该算同一张，不能再拿来当反例。
+  const second = await startImageServer(OTHER_PNG);
   const mediaRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
   const { onebot } = await boot({ cwd: mediaRoot, mediaDir: 'media' });
   try {
@@ -1591,6 +1618,56 @@ test('two different stickers do not repeat, and a sticker breaks a text chain', 
     await onebot.close();
     await first.close();
     await second.close();
+    await rm(mediaRoot, { recursive: true, force: true });
+  }
+});
+
+// 用例：同一张画面被 QQ 按发送者重新编码（字节不同）时照样跟 —— 这是 2026-10-13 那天
+// 群里连着发同一张「寿来」却没触发复读的原因，也是这个功能最常见的真实形态。
+test('the same picture re-encoded by QQ still counts as the same sticker', async () => {
+  const asPng = await startImageServer(PIC_PNG, { contentType: 'image/png' });
+  const asJpeg = await startImageServer(PIC_JPEG, { contentType: 'image/jpeg' });
+  const mediaRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
+  const { onebot, host } = await boot({ cwd: mediaRoot, mediaDir: 'media' });
+  try {
+    onebot.push(groupSticker(asPng.url(), { messageId: 200, file: 'A.png' }));
+    await settle();
+    // 只有一张时不跟：复读要有「连着」。
+    assert.deepEqual(sentTexts(onebot), []);
+
+    onebot.push(groupSticker(asJpeg.url(), { messageId: 201, userId: 3333333333, card: 'iroha', file: 'A.jpg' }));
+    const sent = await until(
+      () => onebot.calls.find((call) => call.action === 'send_group_msg' && Array.isArray(call.params.message)),
+      'the repeated sticker',
+    );
+    // 跟出去的是**后一条**那张图（复读机接的是刚说的那句），原字节就是它的 JPEG 字节。
+    assert.deepEqual(sentImageBytes(sent), PIC_JPEG);
+    // 依然不建会话、不经过模型。
+    assert.equal(host.list.created.length, 0);
+  } finally {
+    await onebot.close();
+    await asPng.close();
+    await asJpeg.close();
+    await rm(mediaRoot, { recursive: true, force: true });
+  }
+});
+
+// 用例：repeatImageTolerance: 0 时回到「只认字节完全相同」的旧行为 —— 画面一样但字节
+// 不同的两张不跟（用户想自己决定要不要这层画面比对时的出口，也是这条链路的开关）。
+test('repeatImageTolerance: 0 turns the picture comparison off', async () => {
+  const asPng = await startImageServer(PIC_PNG, { contentType: 'image/png' });
+  const asJpeg = await startImageServer(PIC_JPEG, { contentType: 'image/jpeg' });
+  const mediaRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
+  const { onebot } = await boot({ cwd: mediaRoot, mediaDir: 'media', repeatImageTolerance: 0 });
+  try {
+    onebot.push(groupSticker(asPng.url(), { messageId: 210, file: 'A.png' }));
+    onebot.push(groupSticker(asJpeg.url(), { messageId: 211, userId: 3333333333, card: 'iroha', file: 'A.jpg' }));
+    await settle(300);
+    assert.deepEqual(sentTexts(onebot), []);
+  } finally {
+    await onebot.close();
+    await asPng.close();
+    await asJpeg.close();
     await rm(mediaRoot, { recursive: true, force: true });
   }
 });
@@ -3025,6 +3102,619 @@ test('a digest that never goes idle is given up on and cleaned up', async () => 
   assert.equal(host.ctx.agents.get(digestAgent.id), undefined, 'the stuck digest agent should have been disposed');
 });
 
+// ---- 主动说话：不等 @ 自己开个话头 -----------------------------------------------------
+
+/**
+ * 起一个开了主动说话的实例。
+ *
+ * 闸门默认全部放宽（概率 1、不必等安静、不限新旧、不限间隔），时段设成「全天」
+ * （`from === to`）—— 用例因此不必关心自己跑在一天里的哪个时刻；要验哪道闸门就
+ * 自己把它收紧。
+ *
+ * `digestMinLines` 抬到很高，是因为 `fireInterval()` 会唤醒**所有**周期定时器：
+ * 不设这一条，摘要循环可能被顺带跑起来、凭空多出一个摘要会话。
+ */
+async function bootProactive(config = {}, hostOptions = {}, onebotOptions = {}) {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-proactive-'));
+  return boot(
+    {
+      proactive: true,
+      proactiveChance: 1,
+      proactiveIdleMs: 0,
+      proactiveFreshMs: 0,
+      proactiveGapMs: 0,
+      proactiveDailyMax: 4,
+      proactiveFromHour: 0,
+      proactiveToHour: 0,
+      digestCatchUp: false,
+      digestMinLines: 9999,
+      ...config,
+      cwd,
+    },
+    hostOptions,
+    onebotOptions,
+  );
+}
+
+/**
+ * 让机器人在群里被 @ 一次并回一句：会话因此建立，`lastBotSpeakAt` 也有值。
+ *
+ * 末尾多等一小会儿是必要的：`lastBotSpeakAt` 是在 `sendOne` 拿到 OneBot 响应之后才
+ * 记上的，而 `sentTexts()` 看到的是服务端**收到**请求的那一刻 —— 两者之间有一个
+ * 往返的窗口，不等就可能带着过期的「我最后说话的时间」去判主动说话。
+ */
+async function groupWhereBotSpoke(onebot, host, botReply = '在的') {
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+  await until(() => agent.inbox.length >= 1, 'the first turn to be submitted');
+  completeTurn(host, agent, botReply);
+  await until(() => sentTexts(onebot).length >= 1, 'the first reply to go out');
+  await settle(30);
+  return agent;
+}
+
+/** 一个路人在群里说一句（没 @ 机器人）—— 「群里还有人说话」的信号。 */
+async function groupChatter(onebot, text = '今晚吃啥', { messageId = 7001 } = {}) {
+  onebot.push(groupText(text, { messageId, userId: 10001, card: '路人' }));
+  await settle(80);
+}
+
+/** 主动说话的可选边界：左闭右开、两边相等 = 全天、from > to = 跨零点。 */
+test('withinActiveHours is half-open, all-day when equal, and wraps midnight', () => {
+  assert.equal(withinActiveHours(9, 23, 9), true);
+  assert.equal(withinActiveHours(9, 23, 22), true);
+  assert.equal(withinActiveHours(9, 23, 23), false, 'the end hour is exclusive');
+  assert.equal(withinActiveHours(9, 23, 3), false, 'the small hours are quiet');
+  assert.equal(withinActiveHours(22, 3, 23), true, 'a window may wrap midnight');
+  assert.equal(withinActiveHours(22, 3, 2), true);
+  assert.equal(withinActiveHours(22, 3, 3), false);
+  assert.equal(withinActiveHours(22, 3, 12), false);
+  assert.equal(withinActiveHours(23, 0, 23), true);
+  assert.equal(withinActiveHours(0, 0, 4), true, 'from === to means all day');
+});
+
+/** 主动说话：群里安静下来之后真的冒一句，而且走的是同一条拟人通道。 */
+test('proactive: the bot speaks up once a group has gone quiet, on the humanized path', async () => {
+  const { onebot, host } = await bootProactive();
+  const agent = await groupWhereBotSpoke(onebot, host);
+
+  // 它刚说完、之后没人接话：这时候再自己开口就是独白（真人也不会对着空群自说自话）。
+  host.list.timers.fireInterval();
+  await settle(120);
+  assert.equal(agent.inbox.length, 1, 'the bot must not monologue after its own reply');
+  assert.equal(sentTexts(onebot).length, 1);
+
+  // 路人的一句话之后才轮到它：这一轮是插件伪造的 user message，不是谁在跟它说话。
+  await groupChatter(onebot);
+  host.list.timers.fireInterval();
+  await until(() => agent.inbox.length >= 2, 'a proactive turn to be submitted');
+  const nudge = agent.inbox[agent.inbox.length - 1].content[0].text;
+  assert.match(nudge, /不是谁发给你的消息/);
+  assert.match(nudge, /SKIP/);
+  assert.match(nudge, /已经安静了大约 \d+ 分钟/);
+  // 群里刚说过的话在渠道提示里 —— 有上下文才可能接得上话。
+  assert.match(promptText(host, 'qq-bridge:channel'), /今晚吃啥/);
+
+  // 回复照常按「换行 = 分条」发出去，说明主动搭话用的是拟人通道而不是一条整段。
+  completeTurn(host, agent, '随便点个外卖吧\n你吃啥', 2);
+  await until(() => sentTexts(onebot).length === 3, 'the proactive messages to go out');
+  assert.deepEqual(sentTexts(onebot).slice(1), ['随便点个外卖吧', '你吃啥']);
+});
+
+/** 主动说话：判成 SKIP 就一个字都不发，但这次机会照样用掉。 */
+test('proactive: SKIP keeps the group silent yet still spends the chance', async () => {
+  const { onebot, host } = await bootProactive({ proactiveGapMs: 60 * 60 * 1000 });
+  const agent = await groupWhereBotSpoke(onebot, host);
+  await groupChatter(onebot);
+  host.list.timers.fireInterval();
+  await until(() => agent.inbox.length >= 2, 'a proactive turn to be submitted');
+  // 后面那半句「解释」也不该发出去：模型只是在说明自己的决定。
+  completeTurn(host, agent, 'SKIP（没什么可说的）', 2);
+  await settle(150);
+  assert.equal(sentTexts(onebot).length, 1, 'SKIP must not be sent to the group');
+
+  // 又一次「有人说话」把机会递到眼前：刚掷中过（虽然没说），间隔闸必须拦住 ——
+  // 否则 SKIP 会变成「再来一次」，每检查一次就掷一回骰子。
+  await groupChatter(onebot, '还在吗', { messageId: 7002 });
+  host.list.timers.fireInterval();
+  await settle(150);
+  assert.equal(agent.inbox.length, 2, 'a skipped nudge still counts against the gap');
+  assert.equal(sentTexts(onebot).length, 1);
+});
+
+/** 主动说话默认关闭：连定时器都不挂，更不会开口。 */
+test('proactive is off by default: no timer, and no unprompted message', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-proactive-off-'));
+  const { onebot, host } = await boot({
+    cwd,
+    // 除了开关，其它条件全部调成「一定会说」；它仍然不该开口。
+    proactiveChance: 1,
+    proactiveIdleMs: 0,
+    proactiveFromHour: 0,
+    proactiveToHour: 0,
+    digestCatchUp: false,
+    digestMinLines: 9999,
+  });
+  const agent = await groupWhereBotSpoke(onebot, host);
+  await groupChatter(onebot);
+  // 记忆的每日摘要定时器挂着（memory 默认开），但没有主动说话的定时器。
+  assert.equal(host.list.timers.live('intervals').length, 1, 'only the daily digest timer should be registered');
+  host.list.timers.fireInterval();
+  await settle(150);
+  assert.equal(agent.inbox.length, 1, 'without proactive the bot never speaks first');
+  assert.equal(sentTexts(onebot).length, 1);
+});
+
+/** 主动说话只在群里发生：私聊对象是真人和机器人之间的对话，不该被无端戳一下。 */
+test('proactive never messages a private chat', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-proactive-private-'));
+  const { onebot, host } = await boot({
+    cwd,
+    proactive: true,
+    proactiveChance: 1,
+    proactiveIdleMs: 0,
+    proactiveFreshMs: 0,
+    proactiveGapMs: 0,
+    proactiveFromHour: 0,
+    proactiveToHour: 0,
+    digestCatchUp: false,
+    digestMinLines: 9999,
+  });
+  onebot.push(privateMessage('在吗'));
+  const agent = await until(() => host.list.created[0], 'the private Agent');
+  await until(() => agent.inbox.length >= 1, 'the private turn');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the private reply');
+  // 对方又发了一句，而这一轮模型没话可说（没有消息发回去）—— 于是这个私聊会话正好停在
+  // 「最后说话的是对方」这个状态上：换成群，它就会进入主动说话的候选。
+  onebot.push(privateMessage('你忙不'));
+  await until(() => agent.inbox.length >= 2, 'the second private message to be submitted');
+  completeTurn(host, agent, '', 2);
+  await settle(80);
+  host.list.timers.fireInterval();
+  await settle(150);
+  assert.equal(agent.inbox.length, 2, 'private chats are never nudged by the plugin');
+  assert.equal(sentTexts(onebot, 'send_private_msg').length, 1);
+});
+
+/** 时段闸：不在配置的「清醒时段」里就一声不吭（真人半夜不会突然冒泡）。 */
+test('proactive stays inside the configured hours', async () => {
+  // 挑一个必然不含当前小时的两小时窗口：+2 → +3。
+  const hour = new Date().getHours();
+  const { onebot, host } = await bootProactive({
+    proactiveFromHour: (hour + 2) % 24,
+    proactiveToHour: (hour + 3) % 24,
+  });
+  const agent = await groupWhereBotSpoke(onebot, host);
+  await groupChatter(onebot);
+  host.list.timers.fireInterval();
+  await settle(150);
+  assert.equal(agent.inbox.length, 1, 'outside the waking hours the bot stays quiet');
+});
+
+/** 安静时长闸：群里还在聊的时候不插嘴。 */
+test('proactive leaves a group alone while it is still talking', async () => {
+  const { onebot, host } = await bootProactive({ proactiveIdleMs: 60 * 60 * 1000 });
+  const agent = await groupWhereBotSpoke(onebot, host);
+  await groupChatter(onebot);
+  host.list.timers.fireInterval();
+  await settle(150);
+  assert.equal(agent.inbox.length, 1, 'a group that just spoke is not the bot\'s turn');
+});
+
+/** 新鲜度闸：好几天没人说话的冷群不会突然诈尸。 */
+test('proactive does not resurrect a group that has been quiet for too long', async () => {
+  const { onebot, host } = await bootProactive({ proactiveFreshMs: 1 });
+  const agent = await groupWhereBotSpoke(onebot, host);
+  await groupChatter(onebot);
+  host.list.timers.fireInterval();
+  await settle(150);
+  assert.equal(agent.inbox.length, 1, 'a stale group should not suddenly hear from the bot');
+});
+
+/** 每日上限：同一个群一天说够了就不再开口，哪怕又有人接话。 */
+test('proactive respects the daily cap per group', async () => {
+  const { onebot, host } = await bootProactive({ proactiveDailyMax: 1 });
+  const agent = await groupWhereBotSpoke(onebot, host);
+  await groupChatter(onebot);
+  host.list.timers.fireInterval();
+  await until(() => agent.inbox.length >= 2, 'the first proactive turn');
+  completeTurn(host, agent, '外卖吧', 2);
+  await until(() => sentTexts(onebot).length >= 2, 'the first proactive message');
+
+  // 又有人说话、安静时长与间隔都满足，但今天这个群的额度用完了。
+  await groupChatter(onebot, '你们在干嘛', { messageId: 7002 });
+  host.list.timers.fireInterval();
+  await settle(150);
+  assert.equal(agent.inbox.length, 2, 'the daily cap should stop a second nudge');
+});
+
+/** 主动搭话出错时不道歉：没人问过它，平白多一句「我这边出错了」只是噪音。 */
+test('a proactive turn that errors stays silent instead of apologising', async () => {
+  const { onebot, host } = await bootProactive();
+  const agent = await groupWhereBotSpoke(onebot, host);
+  await groupChatter(onebot);
+  host.list.timers.fireInterval();
+  await until(() => agent.inbox.length >= 2, 'the proactive turn');
+  host.list.emit('agent/inbox/claimed', { agent, message: agent.inbox[agent.inbox.length - 1], turn: 2 });
+  host.list.emit('session/event', { id: agent.id }, { type: 'turn/end', data: { turn: 2, reason: { kind: 'error' } } });
+  await settle(150);
+  assert.equal(sentTexts(onebot).length, 1, 'nobody asked the bot anything, so it must not apologise');
+});
+
+/** `/reset` 连主动说话的节奏一起忘掉：刚清空完不该还被「两小时前主动说过」挡着。 */
+test('proactive forgets its own pacing when the conversation is reset', async () => {
+  const { onebot, host } = await bootProactive({ proactiveGapMs: 60 * 60 * 1000 });
+  const agent = await groupWhereBotSpoke(onebot, host);
+  await groupChatter(onebot);
+  host.list.timers.fireInterval();
+  await until(() => agent.inbox.length >= 2, 'the first proactive turn');
+  completeTurn(host, agent, '外卖吧', 2);
+  await until(() => sentTexts(onebot).length >= 2, 'the proactive message');
+  // 间隔闸生效：刚主动说完，下一句就不该再说。
+  await groupChatter(onebot, '话说回来', { messageId: 7002 });
+  host.list.timers.fireInterval();
+  await settle(150);
+  assert.equal(agent.inbox.length, 2, 'the gap should hold before the reset');
+
+  // 清空会话：确认消息也是一句「机器人说的话」，于是还得等群里有人接一句才轮到它。
+  // 群聊的 /reset 得 @ 它（默认 groupTrigger: mention），所以这里用 mention。
+  onebot.push(mention('/reset'));
+  await until(() => sentTexts(onebot).some((text) => String(text).includes('已清空')), 'the reset confirmation');
+  await groupChatter(onebot, '那继续吧', { messageId: 7004 });
+  host.list.timers.fireInterval();
+  // 会话真的被重建了：旧 Agent 被销毁，主动搭话投给了新造的那个 Agent。
+  const fresh = await until(() => host.list.created[1], 'a fresh Agent for the proactive turn');
+  assert.equal(fresh.inbox.length, 1);
+  assert.match(fresh.inbox[0].content[0].text, /不是谁发给你的消息/);
+  assert.ok(host.list.disposed.length >= 1, 'the reset should have disposed the old Agent');
+  assert.equal(agent.inbox.length, 2, 'the disposed Agent gets nothing more');
+});
 
 
+// ---- 活跃对话：聊起来之后保持搭话 -------------------------------------------------------
 
+/**
+ * 起一个「活跃对话」实例。
+ *
+ * A（免 @ 接话）默认开着；B（补一句）默认关（`activeChimeIdleMs: 0`），要验它的用例自己
+ * 打开并把静默门槛压到几十毫秒 —— 默认值是 20 秒，用例不可能真等。`delayJitter: 0` 用来
+ * 把补一句的延迟钉死，不然它是 20 秒 ± 40%。
+ */
+async function bootActive(config = {}, hostOptions = {}, onebotOptions = {}) {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-active-'));
+  return boot(
+    {
+      activeFollow: true,
+      activeChimeIdleMs: 0,
+      delayJitter: 0,
+      // 冷场主动开口那一套在这里没有意义（用例不会去 fireInterval），但把概率钉成 1
+      // 可以让「补一句」这条路的随机性不影响断言。
+      proactiveChance: 1,
+      digestCatchUp: false,
+      digestMinLines: 9999,
+      ...config,
+      cwd,
+    },
+    hostOptions,
+    onebotOptions,
+  );
+}
+
+/** `mentionsOthers` 只认指向**别人**的 at 段（`at all` 也算别人，空 qq 不算）。 */
+test('mentionsOthers sees at-segments aimed at somebody else', () => {
+  const at = (qq) => ({ type: 'at', data: { qq } });
+  const text = (value) => ({ type: 'text', data: { text: value } });
+  assert.equal(mentionsOthers([text('你好')], SELF_ID), false);
+  assert.equal(mentionsOthers([at(SELF_ID), text('你好')], SELF_ID), false);
+  assert.equal(mentionsOthers([at('10001'), text('你看')], SELF_ID), true);
+  assert.equal(mentionsOthers([at('all'), text('大家看')], SELF_ID), true);
+  assert.equal(mentionsOthers([at(''), text('空')], SELF_ID), false);
+  assert.equal(mentionsOthers('纯字符串没有段', SELF_ID), false);
+});
+
+/** A：跟它聊的那个人接着说的话，不用再 @ 一次。 */
+test('activeFollow: the person it was talking to can keep talking without another @', async () => {
+  const { onebot, host } = await bootActive();
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+  await until(() => agent.inbox.length >= 1, 'the mention to reach the Agent');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply to go out');
+
+  // 同一个人接着说，没有 @：窗口里算「接着聊」。
+  onebot.push(groupText('那你说呢', { messageId: 7001 }));
+  await until(() => agent.inbox.length >= 2, 'the follow-up to be admitted without a mention');
+  assert.equal(agent.inbox[1].content[0].text, '那你说呢');
+
+  // 别人插一句不算：他没在跟它聊（闲聊也不该因此进 Agent）。
+  onebot.push(groupText('我先走了', { messageId: 7002, userId: 10001, card: '路人' }));
+  await settle(60);
+  assert.equal(agent.inbox.length, 2, 'a different person is not part of the exchange');
+});
+
+/** A：默认关闭 —— 它放松的是「群里只在被 @ 时才说话」这条默认约定。 */
+test('activeFollow is off by default, so a group reply still needs a mention', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-active-off-'));
+  const { onebot, host } = await boot({ cwd, digestCatchUp: false, digestMinLines: 9999 });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+  await until(() => agent.inbox.length >= 1, 'the mention to reach the Agent');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply to go out');
+
+  onebot.push(groupText('那你说呢', { messageId: 7001 }));
+  await settle(80);
+  assert.equal(agent.inbox.length, 1, 'without activeFollow the @ requirement still holds');
+});
+
+/** A：中间有别人说话，这次「你跟我聊」就算断了。 */
+test('activeFollow: a third party speaking in between ends the exchange', async () => {
+  const { onebot, host } = await bootActive();
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  onebot.push(groupText('你们聊', { messageId: 7001, userId: 10001, card: '路人' }));
+  await settle(60);
+  onebot.push(groupText('那你说呢', { messageId: 7002 }));
+  await settle(80);
+  assert.equal(agent.inbox.length, 1, 'the exchange is over once someone else speaks');
+});
+
+/** A：@ 别人（或 @ 全体）的那句不是跟它说的。 */
+test('activeFollow: a message that mentions somebody else is not a follow-up', async () => {
+  const { onebot, host } = await bootActive();
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  onebot.push(groupMessage([
+    { type: 'at', data: { qq: '10001' } },
+    { type: 'text', data: { text: '你怎么看' } },
+  ], { messageId: 7001 }));
+  await settle(80);
+  assert.equal(agent.inbox.length, 1, 'a message aimed at somebody else must be left alone');
+});
+
+/** A：一次活跃对话里免 @ 接的轮数有上限（`activeMaxTurns`）。 */
+test('activeFollow: activeMaxTurns limits how long it keeps following', async () => {
+  const { onebot, host } = await bootActive({ activeMaxTurns: 1 });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  onebot.push(groupText('那你说呢', { messageId: 7001 }));
+  await until(() => agent.inbox.length >= 2, 'the first follow-up');
+  completeTurn(host, agent, '我觉得行', 2);
+  await until(() => sentTexts(onebot).length === 2, 'the second reply');
+
+  onebot.push(groupText('还有呢', { messageId: 7002 }));
+  await settle(80);
+  assert.equal(agent.inbox.length, 2, 'the cap should force a fresh mention');
+});
+
+/** A：窗口过期之后又得重新 @ 它。 */
+test('activeFollow: the window expires', async () => {
+  // 窗口 1 毫秒：下一条消息到的时候必然已经过期 —— 不依赖用例跑多久。
+  const { onebot, host } = await bootActive({ activeWindowMs: 1 });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  onebot.push(groupText('那你说呢', { messageId: 7001 }));
+  await settle(80);
+  assert.equal(agent.inbox.length, 1, 'an expired window means a mention is needed again');
+});
+
+/** A：窗口跟着「最后被叫到的那个人」走。 */
+test('activeFollow: the window follows whoever spoke to it last', async () => {
+  const { onebot, host } = await bootActive();
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the first mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the first reply');
+
+  // 路人 也 @ 它：窗口换到 路人 身上。
+  onebot.push(mention('我也问一句', { userId: 10001, card: '路人', messageId: 7001 }));
+  await until(() => agent.inbox.length >= 2, 'the second mention');
+  completeTurn(host, agent, '你说', 2);
+  await until(() => sentTexts(onebot).length === 2, 'the second reply');
+
+  onebot.push(groupText('那然后呢', { messageId: 7002, userId: 10001, card: '路人' }));
+  await until(() => agent.inbox.length >= 3, 'the new speaker may continue');
+  // 最早那个人回来了，但他已经不在窗口里。
+  onebot.push(groupText('（我问的）', { messageId: 7003 }));
+  await settle(80);
+  assert.equal(agent.inbox.length, 3, 'only the latest speaker is inside the window');
+});
+
+/** A：前缀模式下接上的那句不能按前缀长度硬切（「然后呢」不该变成「后呢」）。 */
+test('activeFollow: a followed message keeps its text intact in prefix mode', async () => {
+  const { onebot, host } = await bootActive({ groupTrigger: 'prefix' });
+  onebot.push(groupText('/你好'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the prefixed message');
+  assert.equal(agent.inbox[0].content[0].text, '你好');
+  completeTurn(host, agent, '你好呀', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  onebot.push(groupText('然后呢', { messageId: 7001 }));
+  await until(() => agent.inbox.length >= 2, 'the follow-up');
+  assert.equal(agent.inbox[1].content[0].text, '然后呢');
+});
+
+/** B：它回完之后对方安静一小会儿，它可能再补一句 —— 私聊也可以。 */
+test('activeChime: it adds one more line into the lull after its reply', async () => {
+  const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 30 });
+  onebot.push(privateMessage('在吗'));
+  const agent = await until(() => host.list.created[0], 'the private Agent');
+  await until(() => agent.inbox.length >= 1, 'the message');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the reply');
+
+  // 私聊里没有 @ 这回事：回完之后对方安静下来，它自己再投一条「补一句」的提醒。
+  await until(() => agent.inbox.length >= 2, 'the follow-up turn to be submitted');
+  const nudge = agent.inbox[1].content[0].text;
+  assert.match(nudge, /你已经回过话/);
+  assert.match(nudge, /SKIP/);
+  // 投放它的时候没有在跟谁说话，所以不挂引用。
+  completeTurn(host, agent, '对了，你上次说的那个展去了吗', 2);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 2, 'the follow-up to go out');
+  assert.equal(sentTexts(onebot, 'send_private_msg')[1], '对了，你上次说的那个展去了吗');
+
+  // 不会连珠炮：对方每说一句之后最多补一句。
+  await settle(150);
+  assert.equal(agent.inbox.length, 2, 'the bot must not keep talking into the void');
+});
+
+/** B：判成 SKIP 就一个字都不发。 */
+test('activeChime: a SKIP keeps the lull silent', async () => {
+  const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 30 });
+  onebot.push(privateMessage('在吗'));
+  const agent = await until(() => host.list.created[0], 'the private Agent');
+  await until(() => agent.inbox.length >= 1, 'the message');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the reply');
+
+  await until(() => agent.inbox.length >= 2, 'the follow-up turn');
+  completeTurn(host, agent, 'SKIP', 2);
+  await settle(150);
+  assert.equal(sentTexts(onebot, 'send_private_msg').length, 1, 'SKIP must not be sent');
+});
+
+/** B：没有 proactive 这个总开关就不补 —— 它是「允许主动发消息」的唯一开关。 */
+test('activeChime needs the proactive master switch', async () => {
+  const { onebot, host } = await bootActive({ activeChimeIdleMs: 30 });
+  onebot.push(privateMessage('在吗'));
+  const agent = await until(() => host.list.created[0], 'the private Agent');
+  await until(() => agent.inbox.length >= 1, 'the message');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the reply');
+
+  await settle(200);
+  assert.equal(agent.inbox.length, 1, 'without proactive nothing is sent unprompted');
+});
+
+/** B：群里中间有人插话时不要硬补一句（那会儿话头已经不是它的了）。 */
+test('activeChime: somebody else speaking first keeps the bot from chiming in', async () => {
+  const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 40 });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  // 它正准备补一句的时候，群里别人先说话了 → 不插嘴。
+  onebot.push(groupText('那我先撤了', { messageId: 7001, userId: 10001, card: '路人' }));
+  await settle(200);
+  assert.equal(agent.inbox.length, 1, 'a third party breaks the lull');
+});
+
+/** B：群里没人插话时，补一句照常发生（用户能看见的那条通路）。 */
+test('activeChime: in a group it adds its line when nobody else speaks', async () => {
+  const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 40 });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  await until(() => agent.inbox.length >= 2, 'the follow-up turn to be submitted');
+  assert.match(agent.inbox[1].content[0].text, /你已经回过话/);
+  completeTurn(host, agent, '对了，你昨天那个事怎么样了', 2);
+  await until(() => sentTexts(onebot).length === 2, 'the follow-up to go out');
+  assert.equal(sentTexts(onebot)[1], '对了，你昨天那个事怎么样了');
+});
+
+/** B：对方再说话会把挂着的「补一句」作废（一条消息只对应一次机会）。 */
+test('activeChime: a new message from the other side cancels the pending follow-up', async () => {
+  const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 60 });
+  onebot.push(privateMessage('第一句'));
+  const agent = await until(() => host.list.created[0], 'the private Agent');
+  await until(() => agent.inbox.length >= 1, 'the first message');
+  completeTurn(host, agent, '回第一句', 1);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the first reply');
+
+  // 补一句的定时器还没醒（60 毫秒），对方又说话了：那个定时器作废，只按新消息再排一个。
+  onebot.push(privateMessage('第二句'));
+  await until(() => agent.inbox.length >= 2, 'the second message');
+  completeTurn(host, agent, '回第二句', 2);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 2, 'the second reply');
+
+  await until(() => agent.inbox.length >= 3, 'exactly one follow-up turn');
+  await settle(200);
+  assert.equal(agent.inbox.length, 3, 'the stale timer must not add a second follow-up');
+});
+
+/** B：单会话每天的补一句额度用完了就不再补。 */
+test('activeChime: activeChimeDailyMax caps the day', async () => {
+  const { onebot, host } = await bootActive({
+    proactive: true,
+    activeChimeIdleMs: 30,
+    activeChimeMax: 5,
+    activeChimeDailyMax: 1,
+  });
+  onebot.push(privateMessage('第一句'));
+  const agent = await until(() => host.list.created[0], 'the private Agent');
+  await until(() => agent.inbox.length >= 1, 'the first message');
+  completeTurn(host, agent, '回第一句', 1);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the first reply');
+
+  // 第一次补一句用掉了当天的额度。
+  await until(() => agent.inbox.length >= 2, 'the first follow-up turn');
+  completeTurn(host, agent, '补的第一句', 2);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 2, 'the follow-up');
+
+  // 对方又说话、它又回：这一轮不该再补。
+  onebot.push(privateMessage('第三句'));
+  await until(() => agent.inbox.length >= 3, 'the third message');
+  completeTurn(host, agent, '回第三句', 3);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 3, 'the third reply');
+  await settle(200);
+  assert.equal(agent.inbox.length, 3, 'the daily chime budget is spent');
+});
+
+/** `/reset` 会把「还聊着」也忘掉：清空之后不会再补一句。 */
+test('/reset forgets the active exchange as well', async () => {
+  const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 40 });
+  onebot.push(privateMessage('在吗'));
+  const agent = await until(() => host.list.created[0], 'the private Agent');
+  await until(() => agent.inbox.length >= 1, 'the message');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the reply');
+
+  // 补一句还没醒就 /reset：窗口与定时器一起没了。
+  onebot.push(privateMessage('/reset'));
+  await until(() => sentTexts(onebot, 'send_private_msg').some((text) => String(text).includes('已清空')), 'the reset confirmation');
+  await settle(200);
+  // 补一句若真的醒了，它会开一轮新 turn —— 那必然要新建一个 Agent（旧的刚被销毁）。
+  // 所以「没有第二个 Agent」就是「那个定时器确实被作废了」的最强证据。
+  assert.equal(host.list.created.length, 1, 'the cancelled chime must not open a turn after the reset');
+});
+
+/** 活跃对话里接上的一句只是闲聊，不是指令：`/reset` 得明确叫它才算。 */
+test('activeFollow: a followed message never triggers a command bypass', async () => {
+  const { onebot, host } = await bootActive();
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  // 窗口内同一句话没有 @：它被当成闲聊交给 Agent，而不是当作 /reset 执行。
+  onebot.push(groupText('/reset', { messageId: 7001 }));
+  await until(() => agent.inbox.length >= 2, 'the followed message to reach the Agent');
+  assert.equal(agent.inbox[1].content[0].text, '/reset');
+  await settle(80);
+  assert.ok(!sentTexts(onebot).some((text) => String(text).includes('已清空')), 'the window must not run commands');
+});
