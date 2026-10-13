@@ -48,14 +48,14 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 ## 2. 文件地图
 
 ```
-index.js      3243 行  插件本体：全部运行时状态、事件路由、发送/准入/复读/主动说话/活跃对话、连接生命周期
+index.js      3247 行  插件本体：全部运行时状态、事件路由、发送/准入/复读/主动说话/活跃对话、连接生命周期
 chatter.js      171 行  群里「谁在说话」的三本账（插话序号 / 回答指向 / 热度窗口）：只暴露语义动作，不暴露 Map
 util.js        233 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 记忆路径边界 / key 池解析与打码 / withinActiveHours
 filestore.js    78 行  几个「原子写 / 尽力而为读」的小工具（读不到返回空而不是抛错），记忆与转录都走它
 config.js      137 行  配置 schema（**配置的唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段
 settings.js    238 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
 tools.js       569 行  6 个宿主平面工具的**声明**（qq_send_message / qq_send_image / qq_list_conversations / qq_jm_pdf / qq_transcript / qq_memory），依赖由 index.js 显式传入
-memory.js     1144 行  长期记忆子系统：转录落盘、记忆文件读写（那两个记忆工具的能力来源）、每日摘要循环；依赖由 index.js 显式传入
+memory.js     1118 行  长期记忆子系统：转录落盘、记忆文件读写（那两个记忆工具的能力来源）、每日摘要循环；依赖由 index.js 显式传入
 onebot.js      639 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/文本化）
 media.js       327 行  入站媒体：QQ 的图/表情包 → 按内容哈希落盘 → 给模型 read_image 的本地路径
 image.js       135 行  出站图片：本地路径 / URL → 校验（大小、格式、目录越界）→ base64:// 段
@@ -68,6 +68,8 @@ scripts/jm_download.py  禁漫下载的 python 实现（jmcomic + img2pdf），�
 test/bridge.test.mjs  集成测试：假 OneBot 服务端 + 假 Harness ctx（含假 timer），跑完整往返
 test/settings.test.mjs  配置归一化的契约测试（默认值 / 非法值 / 白名单不 trim 这类刻意的不对称）
 test/chatter.test.mjs   「谁在说话」三本账的**不变量**测试（合并两本账就会红的那种）
+test/util.test.mjs      纯函数边界：写边界 memoryRelativePath、memorySlug、本地时间、errorText、key 打码
+test/filestore.test.mjs 原子读写与「读不到就返回空/undefined，不抛错」这条失败语义
 test/jm.test.mjs      下载链路的单元/协议测试（假 python shell 脚本）
 test/perceptual.test.mjs  图片指纹的单元测试（同图不同编码 / 异图 / 畸形输入 / 解压炸弹）
 test/image-fixtures.mjs  上面两个测试共用的图片 fixture（真编码的字节，不是 test 文件）
@@ -148,8 +150,17 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 **往外搬的两条纪律**（`tools.js` / `config.js` / `settings.js` / `util.js` / `filestore.js` /
 `chatter.js` / `memory.js` 都是这么搬的，后续按同样方式拆主动说话）：
 
-1. 被搬出去的模块**不 import `index.js`**，需要什么由 `index.js` 显式传（`tools.js` 的
-   `deps` 对象就是样例）。这样依赖方向永远是单向的，也一眼看得出那个模块能碰什么状态。
+1. 被搬出去的模块**不 import `index.js`**（那会成环，ESM 下加载期就炸）。需要的东西
+   分两类，别混：
+   - **叶子模块直接 import** —— `util.js` / `filestore.js` / `onebot.js` / `image.js` /
+     `jm.js` / `perceptual.js` 与 `@deepseek-ai/dsh-*` 都不依赖闭包，本来就能在任意上下文
+     里调，当参数传进来只是多一层看不出来的间接（`tools.js` 直接 import `chunkText` 就是
+     这个道理）。
+   - **闭包里的状态与装配动作走 `deps`** —— 会话表、`settings`、`ctx`、开 Agent 的那几个
+     动作，只有 `index.js` 有。`tools.js` / `memory.js` 的 `deps` 表就是样例，它同时是一份
+     「这个模块能碰什么」的清单。
+   （这一步一开始把 `errorText` / `sessionIdFor` / `createUserMessage` 也当依赖传了进去，
+   与「`localDate` 直接 import」并列时显得很怪 —— 后来收掉了。新模块别重犯。）
 2. `index.js` 里**保留再导出**（`export { Config } from './config.js'`）—— `bridge.test.mjs`
    只 import `index.js`，Loader 也只认插件入口，搬走的东西必须在入口处仍然拿得到。
 

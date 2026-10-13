@@ -5,8 +5,14 @@
  * `// ---- 长期记忆：目录、布局边界与内存态 ----` 那一节。
  *
  * 从 `index.js` 搬出来，是因为这一整块（目录派生 + 五张内存账 + 摘要的串行链）自成一个
- * 子系统，而它与闭包的关系只有「读哪些配置、问哪些会话」这几件事。依赖全部由 `deps`
- * 显式传入，模块自己不 import `index.js`（那会成环，见 AGENTS.md §3）。
+ * 子系统，而它与闭包的关系只有「读哪些配置、问哪些会话」这几件事。
+ *
+ * 依赖分两类，别混：
+ *   - **叶子模块直接 import**（`util.js` / `filestore.js` / `onebot.js` / `image.js` /
+ *     `dsh-llm`）—— 它们不依赖闭包，本来就能在任意上下文里调，绕一圈当参数传进来只是
+ *     多一层看不出来的间接（`tools.js` 也是这么直接 import `chunkText` 的）。
+ *   - **闭包里的状态与装配动作走 `deps`**（会话表、`settings`、`ctx`、开 Agent 的那几个
+ *     动作）—— 这些只有 `index.js` 有。**绝不 import `index.js`**（那会成环）。
  *
  * 几条容易无声破坏的不变量（改动前先读这一段）：
  *
@@ -31,8 +37,11 @@
  */
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
-import { localDate, localStamp, memoryOneLine, memoryRelativePath, memorySlug, msUntilDailyHour } from './util.js';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { errorText, localDate, localStamp, memoryOneLine, memoryRelativePath, memorySlug, msUntilDailyHour, sessionIdFor } from './util.js';
 import { readJsonl, readTextOrUndefined, readdirOrEmpty, writeJsonAtomic, writeTextAtomic } from './filestore.js';
+import { collectMedia, messageToText } from './onebot.js';
+import { insideDirectory } from './image.js';
 
 /** 索引片段（INDEX.md）最多这么大：它每次提示词装配都会被读一遍，不能无节制地长。 */
 const MEMORY_INDEX_MAX_CHARS = 4096;
@@ -59,11 +68,10 @@ const MEMORY_FILE_RETURN_CHARS = 12000;
  *   - `report`：`(level, msg)` 运维日志（index.js 里那个 logger + stderr 的镜像）。
  *   - `conversations` / `sessionIndex`：会话表与 session id → key 的反查，解析「在说哪个会话」用。
  *   - `allowTools`：工具白名单 —— 「记忆工具到底可不可见」跟着它走。
- *   - `createUserMessage` / `sessionIdFor` / `errorText`：外部构造器与纯函数。
- *   - `messageToText` / `collectMedia`：解码一条 OneBot 消息（转录的正文与「带图」标记）。
- *   - `insideDirectory`：记忆目录的越界校验（与 mediaDir / stickerDir 同一套）。
- *   - `stickerRoot`：兼容旧配置用（`memoryDir` 与 `stickerDir` 同名时复用已解析的路径）。
  *   - `approvalPolicy`：摘要 Agent 也按这个策略收审批。
+ *
+ *   `createUserMessage` / `sessionIdFor` / `errorText` / `messageToText` / `collectMedia` /
+ *   `insideDirectory` **不在这里**：它们是叶子模块的纯函数或构造器，本模块直接 import。
  *   - `resolveRoute` / `resolveAgentPreset` / `mountAgentPreset` / `restrictAgentTools` /
  *     `channelSectionOrder`：开摘要 Agent 要用的那套装配动作（与 QQ 会话共用）。
  * @returns 见文件末尾的返回对象：`enabled` / `label` 给启动自述与渠道提示，`tools` 交给
@@ -78,13 +86,6 @@ export function createMemory(deps) {
     conversations,
     sessionIndex,
     allowTools,
-    createUserMessage,
-    sessionIdFor,
-    errorText,
-    messageToText,
-    collectMedia,
-    insideDirectory,
-    stickerRoot,
     approvalPolicy,
     resolveRoute,
     resolveAgentPreset,
@@ -121,15 +122,14 @@ export function createMemory(deps) {
   /**
    * 记忆目录的绝对路径（以 `/` 结尾），给「写盘」这一侧用。
    *
-   * 相对路径在概念上是相对 **Agent 的 cwd** 的，所以这里必须解析成绝对路径再拼；
-   * 而兼容旧配置的那条分支（memoryDir 与 stickerDir 同名时复用已解析的 stickerRoot）
-   * 说明 stderr 上确实出现过「相对进程 cwd」的写法，两种都认。
+   * 相对路径在概念上是相对 **Agent 的 cwd** 的，所以必须解析成绝对路径再拼。
+   *
+   * 这里原本有一条「`memoryDir` 与 `stickerDir` 同名时复用已解析的 stickerRoot」的兼容
+   * 分支，搬运时核过它**恒等于**下面这一条：分支成立时两个配置串相等，而两边的算法都是
+   * `resolve(cwd, 那个串)`，算出来逐字节相同 —— 一条永远走不到别处的分支，留着只会让人
+   * 以为「记忆目录有可能落在表情包目录上」。删掉，顺带少一个 deps 字段。
    */
-  const memoryBase = memoryEnabled
-    ? (stickerRoot !== undefined && memoryCfg === settings.stickerDir.trim()
-        ? `${stickerRoot}${sep}`
-        : `${memoryRoot}${sep}`)
-    : undefined;
+  const memoryBase = memoryEnabled ? `${memoryRoot}${sep}` : undefined;
   /** 会话 key → 记忆目录下的安全子目录名（见 memorySlug）。 */
   const memorySlugs = new Map();
   /** 会话 key → 上一次成功摘要之后、这个会话又来了多少条消息（内存计数，重启归零）。 */
@@ -182,7 +182,6 @@ export function createMemory(deps) {
 
   /** 索引片段与认知库的绝对路径（两者都在记忆目录顶层）。 */
   const memoryIndexFile = memoryEnabled ? join(memoryRoot, 'INDEX.md') : undefined;
-  const memoryCognitionFile = memoryEnabled ? join(memoryRoot, 'COGNITION.md') : undefined;
 
   /**
    * 某个目录下已经排队的转录写入（用来在**读**之前把写等干净）。
