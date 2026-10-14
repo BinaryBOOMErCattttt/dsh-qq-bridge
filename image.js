@@ -20,6 +20,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fetchBytes, sniffImageExtension } from './media.js';
+import { pathInside } from './util.js';
 
 /** 出站图片的默认字节上限（配置里可改）。 */
 export const DEFAULT_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
@@ -39,13 +40,16 @@ function reasonOf(error) {
  * 出站图片只允许发工作目录里的文件：QQ 那头是不可信输入，模型可能被群里的人
  * 指使去发 `/etc/passwd` 之类的东西 —— 虽然它有魔数校验，但「只读工作区」
  * 本来就是这个部署的沙箱边界，没理由为了发张图把它捅开。
+ *
+ * 实现搬到了 `util.js` 的 `pathInside`：这条判定不只服务出站图片，记忆目录、
+ * 表情包目录、禁漫目录的沙箱校验用的是同一条规矩（含 Windows 的大小写语义）。
+ * 这里保留同名导出，是为了不让 `memory.js` / `index.js` 与既有测试跟着改一圈。
  * @param root - 已解析的绝对目录。
  * @param target - 已解析的绝对路径。
  * @returns 在范围内为 true。
  */
 export function insideDirectory(root, target) {
-  if (target === root) return true;
-  return target.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
+  return pathInside(root, target);
 }
 
 /** 相对工作目录的展示路径（正斜杠），就是模型该把它写回来的那种写法。 */

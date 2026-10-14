@@ -5,7 +5,8 @@ data/
 .qq-stickers/
 .qq-memory/
 
-# 依赖与虚拟环境（node_modules 是指向全局安装目录的软链）
+# 依赖与虚拟环境（node_modules 在 Linux 上是指向全局安装目录的软链；Windows 上用
+# scripts/dev-node-modules.mjs 拷一份真实的依赖闭包进来，见 README「本机开发」）
 node_modules
 .venv/
 
@@ -28,3 +29,12 @@ Thumbs.db
 desktop.ini
 .idea/
 .vscode/
+
+# NapCat（Windows 桌面版用的那个免安装包）：几十 MB 的第三方二进制，不进仓库。
+# 用法是解压到仓库根目录（或任意位置，配 --napcat 指过去），脚本会自动探测；
+# 要跟发布版一起发，就把它当**发布产物**单独带上，别 git add 进来。
+NapCat.Shell/
+NapCat.Shell.zip
+
+# 本地端到端验证用的临时目录（脚本可以对着一个假的 DSH_HOME 真跑一遍，见 README）
+.tmp-*/

@@ -22,6 +22,7 @@
  */
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_IMAGE_MAX_BYTES } from './image.js';
+import { defaultJmFileHost, defaultJmPython } from './util.js';
 
 /**
  * `setTimeout` 能表达的最大延迟。
@@ -162,6 +163,11 @@ export function createSettings(config, defaultCwd) {
   const jmScript = trimmed(config.jmScript).length > 0
     ? config.jmScript
     : fileURLToPath(new URL('./scripts/jm_download.py', import.meta.url));
+  // 这两个默认值**随平台变**，所以不能在 schema 里写死（`.default()` 只能是常量）：
+  // schema 里留空，这里补上按平台算出来的那个值。取值口径写在 util.js 的两个纯函数上
+  // （`defaultJmPython` / `defaultJmFileHost`），那边有用例钉着。
+  const jmPython = trimmed(config.jmPython).length > 0 ? trimmed(config.jmPython) : defaultJmPython();
+  const jmFileHost = trimmed(config.jmFileHost).length > 0 ? trimmed(config.jmFileHost) : defaultJmFileHost();
 
   // —— 长期记忆 ——
   const memoryOn = config.memory !== false;
@@ -236,6 +242,8 @@ export function createSettings(config, defaultCwd) {
     activeGroupBatchScale,
     jmCommand,
     jmScript,
+    jmPython,
+    jmFileHost,
     memoryOn,
     memorySearchHits,
     memoryFileMaxBytes,

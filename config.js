@@ -19,7 +19,13 @@ import z from '@deepseek-ai/schemastery';
 export const Config = z.object({
   endpoint: z.string().default('ws://127.0.0.1:3001').description('OneBot v11 正向 WebSocket 地址（NapCat 的 websocketServers 端口）'),
   accessToken: z.string().default('').description('OneBot access_token；NapCat 未设置 token 时留空'),
-  cwd: z.string().default('').description('QQ 会话 Agent 的工作目录；留空则使用 Harness 进程的当前目录'),
+  cwd: z.string().default('').description('QQ 会话 Agent 的工作目录；留空则使用 Harness 进程的当前目录（Windows 桌面版是 ~/.dsh/profiles/desktop，可用环境变量 QQBOT_CWD 指定到别处）'),
+  // ---- NapCat 那一侧的配置：启动自检 +（可选的）自动写入 ----
+  // 为什么要插件管这件事：NapCat 里没开 WebSocket 服务器、或者端口/token 对不上时，
+  // 插件这边一切正常、只是永远连不上，用户看到的现象是「它一句话都不说」。
+  // 启动时读一眼 NapCat 的配置，把原因直接写进日志（实现在 napcat.js，与一键脚本同一批函数）。
+  napcatDir: z.string().default('').description('NapCat 安装目录（里面有 config/onebot11_<QQ号>.json）；留空 = 自动探测本仓库里的 NapCat.Shell 等少数几个常见位置。启动时读它做一次自检，**只读不改**'),
+  napcatAutoConfig: z.boolean().default(false).description('自检发现 NapCat 那边缺一条监听 endpoint 端口的 WebSocket 服务器时，是否自动写进去（写前先备份原文件，只动 websocketServers 里我们那一条）。默认关：那是另一个软件的配置，不该被悄悄改；一键脚本 scripts/napcat-setup.mjs 会显式打开'),
   privateChat: z.boolean().default(true).description('是否响应 QQ 私聊消息'),
   groupChat: z.boolean().default(true).description('是否响应 QQ 群消息'),
   groupTrigger: z.union(['mention', 'prefix', 'all']).default('mention').description('群消息触发方式：@机器人 / 前缀 / 全部消息（另外：被叫到之后的 activeWindowMs 内，同一个人接着说的话可以算作还在跟你聊，见 activeFollow）'),
@@ -108,7 +114,7 @@ export const Config = z.object({
   jmDownload: z.boolean().default(true).description('是否启用禁漫（JM）下载：把整本/单话合并成 PDF 并发到 QQ'),
   jmCommand: z.string().default('/jm').description('QQ 里直接触发下载的指令（如 `/jm 422866`，也接受 18comic 链接）；留空表示禁用该指令，只保留 Agent 工具'),
   jmDir: z.string().default('.qq-jm').description('禁漫 PDF 的存放目录，相对 cwd（必须落在 cwd 内，否则自动停用）'),
-  jmPython: z.string().default('.venv/bin/python').description('跑 jmcomic 的 python 解释器：绝对路径，或相对 cwd（仓库自带 .venv）'),
+  jmPython: z.string().default('').description('跑 jmcomic 的 python 解释器：绝对路径，或相对 cwd（仓库自带的 .venv）；留空 = 按平台自动（Windows 用 .venv/Scripts/python.exe，其它平台用 .venv/bin/python）'),
   jmScript: z.string().default('').description('下载脚本路径；留空使用插件自带的 scripts/jm_download.py'),
   jmMaxChapters: z.number().default(0).description('整本下载的话数上限；0 = 不限制（超出时回一句提示而不是闷头下几百话）'),
   jmMaxPages: z.number().default(0).description('单次下载的总页数上限；0 = 不限制'),
@@ -117,7 +123,7 @@ export const Config = z.object({
   jmUploadTimeoutMs: z.number().default(10 * 60 * 1000).description('把 PDF 交给 NapCat 上传的超时（毫秒）；NapCat 拉完文件才回响应，大文件要慢慢等'),
   jmMaxFiles: z.number().default(20).description('PDF 目录最多保留几个文件，超出按最近使用时间淘汰最旧的'),
   jmMaxJobs: z.number().default(1).description('同时进行的下载数上限（多个会话同时点车时排队，而不是一起压到禁漫）'),
-  jmFileHost: z.string().default('172.17.0.1').description('NapCat 取 PDF 时访问的地址：容器里要能连到宿主机，默认 docker 网桥 172.17.0.1（只在本机容器网段可达）'),
+  jmFileHost: z.string().default('').description('NapCat 取 PDF 时访问的地址：留空 = 按平台自动（Linux/容器部署用 docker 网桥 172.17.0.1，Windows 桌面版用 127.0.0.1，因为那边 NapCat 就是本机进程）'),
   jmFilePort: z.number().default(0).description('给 NapCat 用的 HTTP 文件服务端口；0 = 由系统分配'),
   jmUrlTtlMs: z.number().default(10 * 60 * 1000).description('交给 NapCat 的一次性下载 URL 有效期（毫秒）'),
   // ---- 长期记忆：聊天记录落盘 + 定时摘要 + 认知库（见 README「长期记忆」）----

@@ -247,6 +247,79 @@ export function stickerFileName(raw, extension) {
 }
 
 /**
+ * 把路径压成「比较用」的形状：Windows 上折成小写，其余平台原样。
+ *
+ * 为什么非要有这一步：NTFS **不区分大小写**，而同一个目录在这台机器上真会以不同写法
+ * 出现 —— `process.cwd()` 给 `D:\…`、配置里手写 `d:\…`、`resolve()` 又可能把盘符
+ * 归一成另一种大小写。按字节前缀比较的话，「明明在沙箱里」的路径会被判成越界，
+ * 表现是记忆 / 表情包 / 禁漫目录被**静默停用**（那几处越界判定失败只记一条 warn）。
+ *
+ * @param value - 任意路径。
+ * @param platform - `process.platform` 的值（测试可注入，用来在任一平台上验 Windows 语义）。
+ * @returns 可比较的键。
+ */
+function pathKey(value, platform) {
+  const text = String(value ?? '');
+  return platform === 'win32' ? text.toLowerCase() : text;
+}
+
+/**
+ * 目标路径是否在 `root` 里（`root` 自身也算）—— 全项目**唯一**的路径包含判定。
+ *
+ * 三件事必须同时做对，否则它就是一条能被绕过的写边界或一条会误伤的沙箱边界：
+ *   - **补分隔符再比较**：`/tmp/mem` 不能把 `/tmp/memory/x` 算成「在里面」；
+ *   - **Windows 忽略大小写**：见 {@link pathKey}，那边同一个目录有多种写法；
+ *   - **两侧都先归一化**（调用方传进来的应当已经是 `resolve()` 过的绝对路径）。
+ *
+ * 从 `image.js` 搬到这里，是因为它不只服务出站图片：`memoryRelativePath`（`qq_memory`
+ * 的写边界）、`mediaDir` / `stickerDir` / `jmDir` 的沙箱校验都靠同一条规矩 —— 散成
+ * 三份实现迟早有一份忘了补分隔符或者忘了大小写。
+ *
+ * @param root - 已解析的绝对目录。
+ * @param target - 已解析的绝对路径。
+ * @param platform - `process.platform` 的值（测试可注入）。
+ * @returns 在范围内为 true。
+ */
+export function pathInside(root, target, platform = process.platform) {
+  const left = pathKey(root, platform);
+  const right = pathKey(target, platform);
+  if (right === left) return true;
+  // 分隔符也要跟着 `platform` 走，而不是用宿主机的 `sep`：这个参数存在的意义就是
+  // 「在任一平台上验证另一条平台的语义」，用宿主分隔符会当场得出相反的结论。
+  const slash = platform === 'win32' ? '\\' : '/';
+  return right.startsWith(left.endsWith(slash) ? left : `${left}${slash}`);
+}
+
+/**
+ * 禁漫用的 python 解释器默认位置（相对 `cwd`）。
+ *
+ * 两边的 venv 布局不一样：POSIX 是 `.venv/bin/python`，Windows 是
+ * `.venv\Scripts\python.exe`。写死成前者的话，Windows 上会在**每次** `/jm` 时
+ * 报「cannot start .venv/bin/python」—— 一个只在这边出现的、看起来像环境没装好的错。
+ *
+ * @param platform - `process.platform` 的值。
+ * @returns 相对工作目录的解释器路径（正斜杠，两边的 path 都能解析）。
+ */
+export function defaultJmPython(platform = process.platform) {
+  return platform === 'win32' ? '.venv/Scripts/python.exe' : '.venv/bin/python';
+}
+
+/**
+ * 禁漫文件服务默认绑定的地址 —— 「NapCat 从哪里能取到这个 PDF」。
+ *
+ * Linux 部署里 NapCat 在容器里，插件在宿主机上，所以默认绑 docker 网桥
+ * （`172.17.0.1`），只有本机容器网段够得着。Windows 桌面版没有容器：NapCat 是
+ * 注入进本机 QQ 的原生进程，容器网桥那个地址**根本不存在**，绑它必然失败并退回
+ * 127.0.0.1（还白记一条 warn），所以那边直接就是回环地址。
+ *
+ * @param platform - `process.platform` 的值。
+ * @returns 绑定地址。
+ */
+export function defaultJmFileHost(platform = process.platform) {
+  return platform === 'win32' ? '127.0.0.1' : '172.17.0.1';
+}
+
+/**
  * 把模型给的路径解析成记忆目录内的相对路径；越界（`../`、绝对路径）时返回 undefined。
  *
  * 这是 qq_memory 的写边界：模型只能动 `.qq-memory/` 里的东西。故意不做 glob、
@@ -263,7 +336,14 @@ export function memoryRelativePath(base, raw) {
   if (trimmed.startsWith('/')) return undefined;
   const segments = trimmed.split('/').filter((segment) => segment.length > 0 && segment !== '.');
   if (segments.length === 0 || segments.includes('..')) return undefined;
-  const absolute = resolve(base, ...segments);
-  if (absolute !== resolve(base) && !absolute.startsWith(base)) return undefined;
+  // 段里出现 Windows 非法字符（`: * ? " < > |`）一律拒绝。`:` 是其中关键的一个：
+  // `C:/…` 这种段会被 `resolve()` 当盘符解释，于是「相对路径」会变成另一个盘上的绝对
+  // 路径；虽然包含判定随后也会拒掉它（除非记忆目录恰好在同一个盘），但那时返回的
+  // 「相对路径」已经是一串带盘符的胡说八道，不如在这里就断掉。
+  if (segments.some((segment) => /[:*?"<>|]/.test(segment))) return undefined;
+  const root = resolve(base);
+  const absolute = resolve(root, ...segments);
+  // 补分隔符 + Windows 忽略大小写都在这一个判定里（见 pathInside 的注释）。
+  if (!pathInside(root, absolute)) return undefined;
   return segments.join('/');
 }

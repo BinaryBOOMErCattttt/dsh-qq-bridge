@@ -10,8 +10,6 @@
 - **出站**：任何 DSH Agent（包括你在 Web UI 里的主会话）都能调用工具主动发 QQ 消息。
 - **表情包**：它真的会发表情包 —— 自己在群里聊天时可以挑一张甩出来，也能把别人刚发的那张原样发回去；**整条回复只写一行标记，就只发一张表情、一个字都不说**。别人说「存一下这个表情」，它还能把那张图**存进自己的表情包目录**，以后随手就能挑。见[它也能发表情包](#它也能发表情包)。
 - **复读**：群里连着出现同一条消息时，它跟着复读一句；连着两张一样的表情包时，就把那张原样发回去 —— 这一句/这张图**不经过模型**，插件自己发，见[自动复读](#自动复读repeat)。
-- **禁漫下载**：QQ 里发 `/jm 422866`（或让 Agent 调 `qq_jm_pdf`）→ 下载整本、合并成
-  一个 PDF、直接把文件发回会话。见[禁漫（JM）下载](#禁漫jm下载车号--pdf--发到-qq)。
 - **长期记忆**：每句话都落盘，定时由一个独立的摘要会话把它整理成「这个群记得什么」，
   聊天时随时能查；顺带学会群里的梗和表情包。见[长期记忆](#长期记忆聊天记录--摘要--认知)。
 
@@ -63,9 +61,11 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `endpoint` | `ws://127.0.0.1:3001` | OneBot v11 正向 WebSocket 地址 |
-| `accessToken` | `''` | OneBot access_token，未设置则留空 |
-| `cwd` | 进程当前目录 | QQ 会话 Agent 的工作目录（也是沙箱根） |
+| `endpoint` | `ws://127.0.0.1:3001` | OneBot v11 正向 WebSocket 地址（可用 `QQBOT_ENDPOINT` 覆盖，见 [Windows 桌面版](#windows-桌面版napcatshell)） |
+| `accessToken` | `''` | OneBot access_token，未设置则留空（`QQBOT_ACCESS_TOKEN`） |
+| `cwd` | 进程当前目录 | QQ 会话 Agent 的工作目录（也是沙箱根）；**Windows 桌面版上那个「进程当前目录」是 `~/.dsh/profiles/desktop`**，所以一键脚本会写一个 `QQBOT_CWD` 指到 `~/.dsh/qq-bot` |
+| `napcatDir` | `''` | NapCat 安装目录（里面有 `config/onebot11_<QQ号>.json`）：启动时读它做一次**只读**自检，把「NapCat 那边还差什么」直接写进日志。留空 = 自动探测本仓库 / 当前目录 / 家目录下的 `NapCat.Shell`（`QQBOT_NAPCAT_DIR`） |
+| `napcatAutoConfig` | `false` | 自检发现 NapCat 缺一条监听 `endpoint` 端口的 WebSocket 服务器时，**是否让插件自己写进去**（写前备份原文件，只动 `websocketServers` 里我们那一条）。默认关：那是另一个软件的配置。一键脚本会显式打开（`QQBOT_NAPCAT_AUTOCONFIG=1`） |
 | `privateChat` | `true` | 是否响应私聊 |
 | `groupChat` | `true` | 是否响应群消息 |
 | `groupTrigger` | `mention` | 群消息触发：`mention` / `prefix` / `all`（`activeFollow` 打开时，被叫到之后的窗口内同一个人接着说的话、以及群里聊热之后的「多人搭话」也都算，见[聊起来之后保持搭话](#聊起来之后保持搭话活跃对话)） |
@@ -135,7 +135,6 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | `replyStyle` | `auto` | 群聊回复的指向：`auto` 只在中途又出现消息（包括机器人自己发的那几条）时引用 / `quote` 引用被回复的那条 / `at` @ 对方 / `plain` 直接发；只挂在第一条上 |
 | `persona` | `''` | 替换内置的「群友口吻」段落；空 = 用内置的那份 |
 | `instructions` | `''` | 追加到 QQ 会话系统提示的额外要求 |
-| `jm*` | 见下文 | 禁漫（JM）下载 → PDF → 发到 QQ 的一组开关，单独一张表：见[禁漫下载](#禁漫jm下载车号--pdf--发到-qq) |
 | `memory` | `true` | 是否启用长期记忆（聊天记录落盘 + 定时摘要 + 认知库 + 两个记忆工具 + `.dsh/skills` 里的 `message-digest` / `update-cognition` skill） |
 | `memoryDir` | `.qq-memory` | 长期记忆目录，相对 `cwd`；必须落在 `cwd` 内，否则整个功能记 warn 并停用 |
 | `memoryFileMaxBytes` | `32768` | 单个记忆文件的字节上限：超了 `qq_memory` 的 append 会报错、逼着摘要重写得更精炼 |
@@ -183,7 +182,7 @@ mutsumi: 我也想问
 - 一批都是**同一个人连着发的**时，回复仍然指向他最后那条；一批里**有好几个人**时
   不挂任何指向 —— 引用谁的截图都像是只在回他。
 - 私聊同样适用：一个人连发几句，本来也常常是同一个意思。
-- `/reset` 会先把攒着的那批投出去再开新一轮（那些话是重置前说的）；`/jm` 这类旁路同理。
+- `/reset` 会先把攒着的那批投出去再开新一轮（那些话是重置前说的）。
 - `batchWindowMs: 0` 关掉攒批，回到「来一条回一条」。
 
 **2. 它看得到群里在聊什么（`ambientMessages`）**
@@ -336,7 +335,7 @@ QQ 里的 @ 是消息里的一个**段**（`{ type: 'at', data: { qq } }`），�
   会话里根本没露过面的人），那时把 `[[@某某]]` 一字不改地发进群里是最糟的结果 ——
   宁可少一次 @。整条回复只有一个解析不出来的标记时，**一个字都不发**。
 - **只有这一层解析标记**：`[[@…]]` 与表情包的 `[[图片: …]]` 一样，都是「正文里的一行」——
-  复读、以及 `/jm` 的用法提示那些**原样转发**消息的地方不解析它（复读的内容全部来自不可信的
+  复读那些**原样转发**消息的地方不解析它（复读的内容全部来自不可信的
   群消息，一步都不多做）。
 - **和「回复指向」的 `at` 是两回事**：`replyStyle: 'at'` 是插件自动 @ 回提问者（只挂在第一条
   上）；`[[@昵称]]` 是模型自己在正文里点名，位置由它自己写。两者可以同时出现，
@@ -597,8 +596,8 @@ A 与 C 都只决定「够不够资格」，够资格不等于就接 —— 每�
   触发下一次补（否则就成了对着空气自言自语）。
 - **对方又说话就作废**：挂着的「补一句」会被新消息取消 —— 那条消息自己会走正常回复，
   不需要它再补。
-- **接话不是指令**：窗口里免 @ 接上的那句只当闲聊交给模型，`/jm`、`/reset` 这类旁路仍然
-  要求明确叫它（@ 或前缀）—— 否则群里一句「jm 123」就会绕开模型去下本子。
+- **接话不是指令**：窗口里免 @ 接上的那句只当闲聊交给模型，`/reset` 这类旁路仍然
+  要求明确叫它（@ 或前缀）—— 否则窗口里随便一句「reset」就绕开模型把会话重置了。
 - **私聊也补，但冷场不主动**：私聊里窗口照样滑，所以它会在你回完、安静一会儿之后追一句；
   而「主动找人聊天」（冷场开口）仍然只在群里发生。这就是[偶尔主动说话](#偶尔主动说话proactive)
   里那句「私聊永远不主动打扰」的边界 —— **聊着的时候可以补，没人理的时候不会去戳你**。
@@ -629,7 +628,7 @@ QQ: （私聊）一个空格  →  模型看到的正文： （对方发来一�
 
 几条边界：
 
-- **空 @ 不是指令**：`/jm`、`/reset` 这类旁路照样只认**明确叫了它且有正文**的消息，
+- **空 @ 不是指令**：`/reset` 这类旁路照样只认**明确叫了它且有正文**的消息，
   空 @ 永远只走模型。
 - **空 @ 不打断攒批**：有人 @ 一句「在吗」、紧接着又空 @ 一下，两句会攒成同一轮
   （正文分别是两行），而不是一前一后回两次。
@@ -856,16 +855,16 @@ write / edit、也没有 bash**，所以模型自己没有任何办法把那张�
 
 ### 为什么是 base64，而不是把路径丢给 NapCat
 
-和 PDF 那边（[为什么是「发个 URL 让它自己拉」](#为什么是发个-url-让它自己拉而不是直接把路径给-napcat)）
-是同一个现实：NapCat 跑在**容器**里、插件跑在**宿主机**上，容器的文件系统里没有
+现实是这样的：NapCat 跑在**容器**里、插件跑在**宿主机**上，容器的文件系统里没有
 `.qq-media/xxxx.jpg`。给 `upload_*_file` 传本地路径实测会回 `识别URL失败`（它的
 `enableLocalFile2Url` 默认还是关的），image 段里的本地路径同理。
 
 所以这里用 OneBot image 段的 **`base64://`**：字节直接跟在 `file` 字段里发过去，
 NapCat 自己解码落进它的临时目录（实测：同样一段 base64 喂给 NapCat 的 `download_file`，
 容器里落出来的文件与宿主机的图 md5 完全一致），之后的链路与手动发图一模一样。
-好处是不依赖任何「容器能不能连到宿主机」的假设 —— PDF 那边的 URL 方案必须绑在
-docker 网桥上，这里不需要；代价是体积膨胀约 4/3，所以有 `imageMaxBytes` 上限。
+好处是不依赖任何「容器能不能连到宿主机」的假设 —— 另一种常见做法（把文件放在本机、
+给 NapCat 一个 URL 让它自己来拉）必须绑在 docker 网桥上，这里不需要；代价是体积膨胀
+约 4/3，所以有 `imageMaxBytes` 上限。
 
 NapCat 的 WebSocket 服务端 `maxPayload` 实测是 **50MB**，默认 8MB 离它还很远。
 真发超大图时唯一的代价是慢：`timeout.uploadSpeedKBps` 默认 256 KB/s，八兆的图要等
@@ -877,129 +876,6 @@ NapCat 的 WebSocket 服务端 `maxPayload` 实测是 **50MB**，默认 8MB 离�
 journalctl --user -u qqbot -f | grep 'qq-bridge: →'   # 每张发出去的图都记一行（目标、格式、字节数、来源）
 ls -la ~/Projects/qqbot/.qq-stickers       # 表情包目录：丢几张图进去就能用
 ```
-
-## 禁漫（JM）下载：车号 → PDF → 发到 QQ
-
-在 QQ 里发 `/jm 422866`（`jm 422866` 也行，18comic 的 `album` / `photo` 链接同样认），
-机器人把这本下下来、合并成**一个 PDF**、直接把文件发到当前会话：
-
-```
-QQ: /jm 422866
-      ↓  插件旁路：不建 Agent 会话、不烧 token
-   python 子进程（jmcomic）：下载 + 解密打乱 + 合并
-      ↓  .qq-jm/《…》.pdf
-   本机 HTTP 服务（一次性 URL，只绑 docker 网桥）
-      ↓  NapCat 自己来拉这个 URL
-   upload_private_file / upload_group_file → 文件出现在 QQ 里
-```
-
-也可以不记指令：群里 @ 机器人说「帮我下 jm422866」就行 —— QQ 会话的 Agent 会调
-`qq_jm_pdf` 工具，效果一样（它会自己把 PDF 发回**问它的那个会话**）。
-
-### 一次性准备：python 环境
-
-```bash
-cd ~/Projects/qqbot
-python3 -m venv .venv
-.venv/bin/pip install jmcomic img2pdf
-```
-
-装完就不用再管了（配置里的 `jmPython` 默认指向 `.venv/bin/python`）。
-
-**为什么用现成的 python 库**：禁漫的移动端接口会做 APP 版本协商（版本落后直接回
-`Not legal.api`）、响应体是 AES 加密的、图片还按本子 id **竖切打乱**需要解密，
-域名也在 Cloudflare 后面经常换。[jmcomic](https://github.com/hect0x7/JMComic-Crawler-Python)
-把这些（以及域名表自动更新）都做好了，自己造一遍只会持续被域名和签名折腾。
-
-### 为什么是「发个 URL 让它自己拉」，而不是直接把路径给 NapCat
-
-NapCat 跑在 **容器** 里、插件跑在 **宿主机** 上，容器里根本没有那个 PDF 文件。
-实测把本地路径丢给 `upload_private_file` 会被直接拒掉：
-
-```
-{"status":"failed","retcode":1200,"message":"识别URL失败, uri= ~/Projects/qqbot/.qq-jm/x.pdf"}
-```
-
-（NapCat 的 `enableLocalFile2Url` 默认还是关的。）所以插件在下完 PDF 之后，会在本机
-起一个极小的 HTTP 服务，给它一个**带一次性 token 的 URL**，由 NapCat 自己来取：
-
-```
-http://172.17.0.1:41234/f/<32位随机token>/<文件名>.pdf
-```
-
-要点：
-
-- 服务**只绑 docker 网桥**（默认 `172.17.0.1`），只有本机与容器够得着；校园网 /
-  局域网都访问不到它。绑不上时（比如没有 docker）会退回 `127.0.0.1` 并打一条 warn
-  —— 那时容器里的 NapCat 取不到文件，日志里能一眼看到原因。
-- URL 只在 `jmUrlTtlMs`（默认 10 分钟）内有效，且 token 是一次性的哈希值，猜不到。
-- NapCat 的 `timeout.downloadSpeedKBps` 默认会限速（256 KB/s），所以大文件上传会慢，
-  `jmUploadTimeoutMs` 就是给它留的时间。
-- 实测（NapCat 4.18.15）：私聊 `upload_private_file`、群 `upload_group_file`
-  （`folder: ''`）都能用；群文件需要机器人有上传权限，失败时插件会把原因回给 QQ。
-
-### 整本还是单话
-
-`/jm <车号>` 的判据是**车号指向哪里**，与禁漫自己的结构对齐：
-
-| 你发的 | 会发生什么 |
-|---|---|
-| 本子 id（`/jm 422866`，它同时是第一话的 id） | 整本：所有话按顺序合并成一个 PDF |
-| 某一话的 id（`/jm 498681`，属于本子 400222） | 只下那一话 |
-| `/album/422866/` 链接 | 整本 |
-| `/photo/498681/` 链接 | 只下那一话 |
-
-判断靠的是 `/chapter?id=X` 给出的 `album_id`：等于 X 说明 X 就是这本本子，否则 X 只是
-其中一话。工具参数里的 `kind`（`auto` / `album` / `chapter`）可以显式覆盖。
-
-整本可能大得离谱（有的本子 146 话、几千页），所以留了两个护栏：`jmMaxChapters`
-与 `jmMaxPages`（默认 0 = 不限制）。超限时**不会闷头下**，而是回一句
-「这本有 146 话，超过上限 20；请指定单话，或调大 jmMaxChapters」。
-
-### 行为细节
-
-- `/jm` 走的是**旁路**：消息不进会话队列、也不会为它建 Agent 会话。整本要下十几分钟，
-  排在队列里会把后面所有消息堵死。准入规则照旧（私聊 / 群白名单、群里的 @ 触发），
-  `/jm` 带上多余内容（`/jm 422866 谢谢`）也照常识别。
-- 同一个会话同时只允许一个下载（第二个会回「还在下上一本，等下」）；不同会话按
-  `jmMaxJobs` 排队，默认 1 —— 一起压禁漫只会大家一起慢。
-- 进度会说人话：先回「收到，去下 jm422866 了…」，一两秒后拿到本子元信息再回一句
-  「找到了：《…》（2 话 · 3 页）」，下完把文件发上来，最后一句「下好了」。
-- 失败也是一句话（「没下成：…」/「下好了，但文件发不出去：…」），不会静默，
-  也不会把 turn 拖死：下载有硬超时（`jmTimeoutMs`，默认 15 分钟），到点**连子进程组
-  一起杀**。
-- PDF 落在 `jmDir`（默认 `.qq-jm`，必须在 `cwd` 里，否则整个功能自动停用）；下载用的
-  图片是中间产物，下完即删；目录里只保留最近 `jmMaxFiles` 个 PDF（默认 20，按最近使用淘汰）。
-- 环境里的 `HTTP_PROXY` / `HTTPS_PROXY` 等会被**显式摘掉**，jmcomic 侧也写了
-  `proxies: None`：这台机器直连禁漫，代理设置一旦被 curl 捡走，轻则超时重则触发风控。
-- 关掉整个功能：`jmDownload: false`（工具与 `/jm` 都会回一句「没开」，不会假装成功）；
-  只想去掉指令就设 `jmCommand: ''`。
-
-排查：
-
-```bash
-journalctl --user -u qqbot -f | grep 'qq-bridge: jm'   # 下载开始 / 元信息 / 落盘 / 上传结果
-ls -la ~/Projects/qqbot/.qq-jm             # 生成的 PDF
-rm -rf ~/Projects/qqbot/.qq-jm             # 手动清
-```
-
-### 相关配置
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `jmDownload` | `true` | 是否启用禁漫下载（关掉后工具与指令都会明说没开） |
-| `jmCommand` | `/jm` | QQ 里直接触发的指令；留空 = 只保留 `qq_jm_pdf` 工具 |
-| `jmDir` | `.qq-jm` | PDF 目录，相对 `cwd`；必须落在 `cwd` 内 |
-| `jmPython` | `.venv/bin/python` | 跑 jmcomic 的解释器 |
-| `jmScript` | `''` | 留空 = 用插件自带的 `scripts/jm_download.py` |
-| `jmMaxChapters` / `jmMaxPages` | `0` / `0` | 话数 / 页数上限，0 = 不限制 |
-| `jmTimeoutMs` | `900000` | 单次下载硬超时（毫秒） |
-| `jmRequestTimeoutMs` | `30000` | jmcomic 单次 HTTP 请求超时（毫秒） |
-| `jmUploadTimeoutMs` | `600000` | 交给 NapCat 上传的超时（毫秒） |
-| `jmMaxFiles` | `20` | PDF 最多保留几个（LRU） |
-| `jmMaxJobs` | `1` | 同时进行的下载数 |
-| `jmFileHost` / `jmFilePort` | `172.17.0.1` / `0` | 给 NapCat 取文件用的地址与端口（0 = 自动） |
-| `jmUrlTtlMs` | `600000` | 一次性下载 URL 的有效期（毫秒） |
 
 ## 长期记忆：聊天记录 → 摘要 → 认知
 
@@ -1133,7 +1009,7 @@ journalctl --user -u qqbot | grep 'qq-bridge: memory'           # 目录、定�
 `glob` / `grep` / `web_search` / `web_fetch` 这些「agent 平面」的工具**不在宿主上**：
 它们被搬进了每个 Agent 预设，只有 join 了预设的 Agent 才继承得到。直接
 `ctx.agents.create()` 出来的 Agent 不 join 任何预设，于是它只有宿主平面的全局工具
-——也就是本插件的 `qq_*` 那几个（发消息 / 发图 / 会话列表 / 禁漫）。
+——也就是本插件的 `qq_*` 那几个（发消息 / 发图 / 存表情 / 会话列表 / 记忆）。
 
 所以插件会在 `setup()` 里先给 QQ 会话 Agent 挂一个预设，再施加 `allowTools`。
 挂的是 **bundle 自带的 `qq` 预设**（声明在 `cordis.patch.yml`）：
@@ -1336,14 +1212,12 @@ qq-bridge: api key rotation: switched DEEPSEEK_API_KEY from sk-aaa…#d1c0be27 t
 | `qq_send_image` | 向指定 QQ 号或群发一张图 / 表情包：来源是 `cwd` 里的图片路径（含 `.qq-stickers/…`、`.qq-media/…`）或一个 http(s) 图片链接；从 QQ 会话里调用时默认发回当前会话 |
 | `qq_save_sticker` | 把一张图**存进表情包目录**（`.qq-stickers/<名字>.<真格式>`）变成以后能挑的表情：来源同上，名字会被清洗成单层文件名、同名不覆盖、张数受 `stickerMaxFiles` 限制；图片本身不可用（目录没配 / 配到 `cwd` 外）或白名单没放开时**根本不注册** |
 | `qq_list_conversations` | 列出在线群/好友列表，以及本 Harness 已处理过的 QQ 会话、当前 Session id 与轮次（`session_round`） |
-| `qq_jm_pdf` | 下载禁漫（JM）整本/单话 → 合并成一个 PDF → 发到 QQ（从 QQ 会话里调用时默认发回当前会话） |
 | `qq_transcript` | 读某个 QQ 会话的聊天记录：`list` / `read` / `search`（长期记忆的原料，见[长期记忆](#长期记忆聊天记录--摘要--认知)） |
 | `qq_memory` | 读 / 追加 / 覆盖 / 搜索长期记忆文件：`conversations/<slug>/MEMORY.md`、`COGNITION.md`、`INDEX.md`；写被限制在 `memoryDir` 之内 |
 
-这七个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
-`qq_send_image` / `qq_save_sticker` 见[它也能发表情包](#它也能发表情包)；`qq_jm_pdf` 需要 python 环境与
-NapCat 能访问到本机（见[禁漫下载](#禁漫jm下载车号--pdf--发到-qq)），关掉 `jmDownload`
-后调用会明确报错；`qq_transcript` / `qq_memory` 见[长期记忆](#长期记忆聊天记录--摘要--认知)，
+这六个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
+`qq_send_image` / `qq_save_sticker` 见[它也能发表情包](#它也能发表情包)；
+`qq_transcript` / `qq_memory` 见[长期记忆](#长期记忆聊天记录--摘要--认知)，
 关掉 `memory` 后它们**根本不会注册**。
 
 ## NapCat 端要求
@@ -1365,6 +1239,10 @@ NapCat 需要开启一个 **WebSocket 服务器**（不是 websocketClients）�
 ```bash
 docker exec napcat cat /app/napcat/config/onebot11_100000000.json
 ```
+
+**Windows 桌面版不是这套**：那边 NapCat 是注入进本机 QQ 的原生进程（没有容器、没有 docker
+网桥），配置在 `<NapCat>\config\onebot11_<QQ号>.json`，而且有脚本代劳 —— 见
+[Windows 桌面版](#windows-桌面版napcatshell)。
 
 ## 运行方式：独立的 `qqbot` profile
 
@@ -1440,27 +1318,100 @@ QQ 会话用的模型是 `deepseek-official/deepseek-flash`（继承 `dsh-base` 
 > 注意那条路径写的就是上面这个 `$DSH_HOME/.credentials.yaml`，而且要求 key 是**存在文件里**
 > 的（从启动环境传进来的 key 优先级更高，轮换写不进去，插件会说明并跳过）。
 
+## Windows 桌面版（NapCat.Shell）
+
+桌面版 DSH（Electron）与 NapCat 跑在**同一台 Windows 机器**上，形态和上面那套「容器 +
+systemd」完全不同：没有 docker 网桥、没有 `systemctl`、Host 进程的 cwd 是 DSH 的 profile
+目录。仓库里备了一个一键脚本，把**两边**一起配好：
+
+```powershell
+# 在仓库根目录（或者直接双击 scripts\napcat-setup.cmd）
+node scripts\napcat-setup.mjs --dry-run      # 先看它打算做什么：一个字都不写
+node scripts\napcat-setup.mjs                # 真配
+node scripts\napcat-setup.mjs --start        # 顺手把 NapCat 起起来
+node scripts\napcat-setup.mjs --qq 123456    # NapCat 还没登录过时，先按这个号写配置
+```
+
+它做四件事，每一步都是**幂等 + 先备份**：
+
+1. **NapCat 的网络配置**：在 `<NapCat>\config\onebot11_<QQ号>.json` 里写好（或对齐）一条
+   监听 `endpoint` 端口的 WebSocket 服务器 —— `name: dsh-qq-bridge`、`enable: true`、
+   `reportSelfMessage: false`、`messagePostFormat: array`、token 与 `accessToken` 一致。
+   **只动 `websocketServers` 里我们那一条**：用户自己调过的 `debug` / `heartInterval`、
+   以及 `httpServers` / `websocketClients` / `timeout` 全部原样保留；改之前把原文件复制成
+   `onebot11_<QQ>.json.bak-<时间戳>`。已经配好时**一个字节都不写**（连备份都不产生）。
+2. **profile 的 `.env`**：把 `QQBOT_ENDPOINT` / `QQBOT_ACCESS_TOKEN` / `QQBOT_CWD` /
+   `QQBOT_NAPCAT_DIR` 写进 `~/.dsh/profiles/desktop/.env` 里一段带标记的段落，段落**之外**
+   的内容一个字节都不动。这些取值由 `cordis.patch.yml` 里的 `!!js process.env.QQBOT_*`
+   读进配置 —— 「每台机器不一样的值」全走 `.env`，仓库里那份 patch 保持所有部署共用。
+   （`#` 是 `.env` 的注释符，取值里别出现它。）
+3. **装进 desktop profile**：`package.json` 里加 `"@qqbot/dsh-plugin-qq": "link:<仓库>"`，
+   并把它追加进 `dsh.profile.bundles` —— **两处都必须有**，只加依赖不加 bundles 等于
+   「装上了但不加载」；再在 `profiles/desktop/node_modules/@qqbot/dsh-plugin-qq` 建一个指向
+   仓库的链接（Windows 上用 junction，不需要开发者模式）。原 `package.json` 先备份成
+   `.bak-<时间戳>`。
+4. `--start` 时用 `launcher-user.bat` 启动 NapCat（会开一个新窗口：二维码与日志都在里面）。
+
+`--dry-run` 与真跑共用同一条代码路径，所以试运行的输出就是真会发生的事。脚本**不碰**
+`~/.dsh/.credentials.yaml`：模型凭据仍然在 DSH 的 Models 页面里填一次。
+
+### 装进 `desktop` profile 的四个代价（都处理掉了）
+
+| 代价 | 怎么修的 |
+|---|---|
+| QQ 会话可能继承 desktop 的默认预设（`standard`，带 shell / 子代理 / write） | 本 bundle 自带 `qq` 预设，`cordis.patch.yml` 里写死 `agentPreset: qq`，所以 QQ 会话拿到的仍然只是「只读文件 + 检索 + 联网 + 本地 skill」；`allowTools` 再收一层。换 profile 不影响这条 |
+| 媒体 / 表情包 / 记忆会写进 `~/.dsh/profiles/desktop` | 桌面版是拿 profile 目录当 Host 进程的 cwd 的。脚本写的 `QQBOT_CWD`（默认 `~/.dsh/qq-bot`）把这三个目录挪到一个干净、独立的地方（它们必须落在 `cwd` 内，否则各自记 warn 并停用） |
+| `@deepseek-ai/schemastery` / `dsh-tools` / `dsh-llm` 的解析 | 按 DSH 的解析规则，link 安装的插件是「linked root」，宿主那份包**只有声明成 `peerDependencies` 才会被用上**；`package.json` 里因此声明了这三个 peer。不声明的话会去用仓库里那份副本，于是宿主与插件各持一个实例（工具注册、消息构造都会开始出怪问题） |
+| 改了代码不生效 | Loader 按 URL 缓存插件模块：装完 / 改完源码必须**重启整个桌面版**（停用启用插件没用）。只有 `cordis.patch.yml` 的配置改动能热生效 |
+
+### NapCat 自检与「它为什么不说话」
+
+插件启动时会读一眼 `napcatDir` 下的配置，**默认只读**：
+
+- 一切正常 → 一句 info（`napcat: … 里已经有监听端口 3001 的 WebSocket 服务器`）；
+- 缺那条服务器 / 端口不对 / 没启用 / token 不一致 → 一条 warn，把**原因**和修法一起写出来，
+  例如 `napcat: 没有配置任何 WebSocket 服务器（缺一条监听 3001 的）；跑 node scripts/napcat-setup.mjs …`；
+- `napcatAutoConfig: true` 时才动手写，写完提示**要重启 NapCat 才生效**。
+
+找不到 NapCat 目录时只记一句 info（容器部署里它压根不在这个文件系统上，那不是错误）。
+`token` 不一致是最容易查半天的一种：WS 连上又立刻被拒，而日志里只有一句 `closed`。
+
+### 目录、配置与文件都在哪
+
+```
+DSH profile   ~\.dsh\profiles\desktop\         （Electron 独占；插件与 .env 都装在这里）
+profile .env  ~\.dsh\profiles\desktop\.env     （QQBOT_* 那一段由脚本维护）
+NapCat         <你解压的位置>\NapCat.Shell\     （仓库根目录下放一份也行，脚本会自动探测）
+NapCat 配置    <NapCat>\config\onebot11_<QQ>.json
+QQ 会话数据    ~\.dsh\qq-bot\                   （QQBOT_CWD：.qq-media / .qq-stickers / .qq-memory / data）
+```
+
 ## 本机开发
 
-插件以 `link:` 方式装进 profile，源码就在当前目录。为了让 Node 能从本目录
-解析 `@deepseek-ai/*` 包，仓库里有一个指向 dsh 依赖目录的软链接：
+插件以 `link:` 方式装进 profile，源码就在当前目录。裸跑 `node --test test/` 时，Node 需要
+能从本目录解析插件 import 的那三个 `@deepseek-ai/*` 包（`schemastery` / `dsh-tools` /
+`dsh-llm`）。Linux/macOS 上那是一条第 0 代的软链接：
 
 ```
-node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
+node_modules -> <dsh 安装目录>/node_modules
 ```
 
-**这个软链接不能删**，否则插件会以 `failed to import` 报错
-（`link:` 安装按真实路径解析依赖，而真实路径下没有 `@deepseek-ai/*`）。
+**Windows 上这条路走不通**：桌面版把这三个包放在 `resources/app.asar/dsh/node_modules`
+（asar 归档里的虚拟目录，没有对应的真实目录可以软链），而 Windows 建软链/junction 在受限
+令牌下会被拒。所以仓库里改用「按依赖闭包拷贝真实文件」的脚本：
 
-仓库里还有一个 `.venv`（python 虚拟环境），只给禁漫下载用：
-
+```powershell
+node scripts\dev-node-modules.mjs --from D:\deepseek-harness   # DSH 源码 checkout
+node --test test\
 ```
-.venv/                     python3 -m venv .venv
-.venv/bin/pip install jmcomic img2pdf
-```
 
-它和插件本体无关 —— 没有它，其它功能照常工作，只有 `/jm` 与 `qq_jm_pdf` 会回一句
-「禁漫下载没启用」。配置里的 `jmPython` 就是指向它的，换位置改这个字段即可。
+它从一份 DSH 源码 checkout 出发，解析出那三个包真正 import 到的每一个包（十几二十个），
+平铺拷进本仓库的 `node_modules/`（已在 `.gitignore` 里）。**它只服务开发与测试**：插件运行时
+用的是 DSH 自己的解析（靠 `package.json` 里的 `peerDependencies` 声明，见
+[Windows 桌面版](#windows-桌面版napcatshell)）。
+
+> 在 DSH 自己的沙箱里跑测试时，`node --test` 会派生子进程并捕获输出，而沙箱不允许管道
+> （`spawn EPERM`）。同一个套件用同进程模式跑即可：`node --test --experimental-test-isolation=none "test/*.test.mjs"`。
 
 ### 改完源码必须重启 Harness
 
@@ -1476,10 +1427,6 @@ dsh --profile qqbot --port 3081 --no-open
 
 只有插件 `cordis.patch.yml` 里的配置改动可以热生效，源码改动必须重启。
 
-（禁漫下载是**例外**：下载逻辑在 `scripts/jm_download.py` 里，插件每次下载都重新
-spawn 它，所以改这个脚本不用重启，下一条 `/jm` 就生效。改了 `jm.js` / `index.js`
-或上面那几个模块仍然要重启。）
-
 ### 跑测试
 
 `test/bridge.test.mjs` 会起一个假的 OneBot WebSocket 服务端 + 假的 Harness
@@ -1489,9 +1436,13 @@ spawn 它，所以改这个脚本不用重启，下一条 `/jm` 就生效。改�
 node --test test/
 ```
 
+（Windows 上先跑一次 `node scripts\dev-node-modules.mjs --from <DSH checkout>` 铺好
+`node_modules`；在 DSH 沙箱里跑要加 `--experimental-test-isolation=none`，见
+[本机开发](#本机开发)。）
+
 覆盖：私聊往返、群里 @ 触发与 `@机器人你好` 的 mention 剥离、白名单与
 未开启渠道的丢弃、**没有正文的消息**（单纯 @ 与只有空白都开一轮且带对措辞、
-`groupTrigger: all` 与私聊的措辞不同、`blankReply: false` 回到丢弃、空 @ 不会误入 `/jm` 旁路、
+`groupTrigger: all` 与私聊的措辞不同、`blankReply: false` 回到丢弃、
 活跃对话窗口里的空消息不算接话）、空白文案纯函数的三种情形、模型路由（配置优先、
 否则继承部署默认）、出站工具、
 超长消息分段、会话列表，以及「像真实群友」那一组：群聊上下文进入提示词并可关闭、
@@ -1562,14 +1513,6 @@ OneBot 按真实形状回 `image` 段，另外起一个 HTTP 服务假装腾讯�
 发不出去时回「（表情包没发出去）」而不是静默、`imageSend: false` 或白名单没放开时标记
 退回普通文字。
 
-最后是「禁漫下载」那一组（`test/jm.test.mjs` + `bridge.test.mjs` 里的几个用例）：
-车号/链接解析与文件名清洗、目录越界即停用、spawn 假 python 走完整协议、失败与
-「进程没吐结果」的报错、硬超时会**连子进程组一起杀**、同一会话不能并发下载、
-一次性 URL 真的取得到 PDF（错 token 404）、PDF 按 LRU 淘汰，以及插件层的
-`/jm` 旁路（不进 Agent、不建会话）、群/私聊分别走 `upload_group_file` /
-`upload_private_file`、上传失败与下载失败的措辞、`qq_jm_pdf` 从 QQ 会话里默认发回
-当前会话、以及 `allowTools` 挡掉它之后提示词里不再提它。
-
 最后是「长期记忆」那一组：每条别人的消息都落一行转录（**没 @ 机器人的群聊也算**，
 并标出 `addressed`）、闲聊不会凭空把某个群变成「已处理会话」、`qq_transcript` 的
 list / read / search（默认就是调用它的那个会话）、`qq_memory` 的 append / read /
@@ -1611,7 +1554,7 @@ write / search / list 与「路径写出记忆目录一律被拒」、每天一�
 `/reset` 把「还聊着」与挂着的补一句一起忘掉、以及「`/reset` 换成新一轮的 Session id
 而旧会话留在磁盘上」「重开进程后仍然停在同一轮」「只有 `resetUsers` 里的人能重置，别人
 连会话都开不出来」，外加 `mentionsOthers` 的纯函数用例。
-窗口里接上的那句**不会**触发 `/jm` / `/reset` 这类旁路（它只是闲聊，指令要明确叫它）。
+窗口里接上的那句**不会**触发 `/reset` 这类旁路（它只是闲聊，指令要明确叫它）。
 
 以及「每天轮换 API key」那一组：池子文件的纯函数边界（注释 / 空行 / CRLF / 前后空白 /
 重复）、到点从**当前 key 的下一个**开始试、探测失败（401）的候选被跳过而第一个通过的
@@ -1620,6 +1563,24 @@ key 由启动环境提供（`describe().writable === false`）时提前退场（
 组合里没有凭据服务时只记一条 warn、池子里没有第二个 key 时什么都不做、池子文件还没建时
 只记一条 info 说明该放哪、池子配到 `cwd` 外时整个停用且不排定时器、默认开着而
 `apiKeyRotate: false` 时连定时器都不挂，以及**日志里不会出现完整的 key**。
+
+最后是这次 Windows 适配新增的两组（都不起 Harness，直接测纯函数/文件）：
+
+- `test/napcat.test.mjs`：endpoint 解析（只认 `ws`/`wss`、端口越界不猜）、账号文件识别
+  （只认 `onebot11_<QQ>.json`）、「NapCat 那边够不够用」的每一条判据（没配 / 端口不对 /
+  没启用 / token 两个方向不一致 / `reportSelfMessage` 与监听地址只当 note）、幂等改写
+  （追加 / 原地合并且**保留用户的 debug 与 heartInterval** / 再应用一次不变 / 不就地改原对象），
+  以及真落盘的那几条：**默认一个字节都不改**、允许写时先备份且第二次不再动、token 不一致
+  改回同一条而不是追加第二条、坏 JSON 与不存在的目录只报告**绝不覆盖**、自动探测只认
+  「有 config 且有账号配置」的目录；`test/bridge.test.mjs` 末尾另有两条验接线：自检发现问题时
+  warn 里带原因与修法且不改文件、`napcatAutoConfig` 打开时才写（含备份、并提示重启 NapCat）。
+- `test/desktop.test.mjs`：`.env` 维护段落的**幂等**（重复运行逐字节相同、取值变了只换一段、
+  段落之外的内容不动、CRLF 检出也认得出来）与 profile manifest 的两处一起改
+  （依赖 + `dsh.profile.bundles`、只差一半时能补上、换仓库路径时 `link:` 跟着改、
+  原有依赖与 bundle 一个不少、不就地改原对象）。
+
+> 这两组之外，「一键脚本」本身是**照着 README 里那份流程在真机上手工验过**的
+> （`--dry-run` 与真跑共用同一条代码路径），端到端行为不靠单测钉。
 
 ## 安全提醒
 

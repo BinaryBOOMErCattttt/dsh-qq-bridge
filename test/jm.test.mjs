@@ -2,16 +2,22 @@
  * 禁漫（JM）下载链路里「不依赖 Harness」的那一半：车号解析、文件名清洗，以及
  * `jm.js` 的下载服务本身。
  *
- * 这里不连真实的禁漫：`jm_download.py` 的位置被换成一个**假的 shell 脚本**，
+ * 这里不连真实的禁漫：`jm_download.py` 的位置被换成一个**假的解释器 + 假脚本**，
  * 它按协议往 stdout 上吐 JSON Lines，于是 spawn / 超时 / 并发键 / 一次性 URL
  * 这些真实逻辑全都跑在真代码上，只有「下载」这一步是假的。
+ *
+ * 假解释器**用 Node**（`process.execPath`）而不是 shell 脚本：桌面版在 Windows 上，
+ * 那边既没有 `/bin/sh` 也不认 shebang，一个 `.sh` 假脚本会让整条链路在那台机器上
+ * 根本起不来 —— 而这条链路恰恰是「必须真的 spawn 一次」才验证得到的那部分。
+ * `node <script> --out …` 与 `python <script> --out …` 的参数形状完全一致，
+ * 插件侧（`jm.js`）看不出区别。
  *
  * 插件层面的行为（`/jm` 指令、qq_jm_pdf 工具）在 bridge.test.mjs 里跑。
  *
  * 运行：node --test test/jm.test.mjs
  */
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,40 +25,50 @@ import { test } from 'node:test';
 import { createJmService, parseJmRef, safeFileName } from '../jm.js';
 
 /**
- * 造一个假的「python」：一个 shell 脚本，行为由 `body` 决定。
+ * 假脚本的公共前缀：解析 `--key value` 形式的参数，并给出写 PDF 的助手。
  *
- * 插件是把 `jmPython` 当可执行文件直接 spawn 的，所以这里只要一个能打印协议
- * JSON 的可执行文件就够了 —— 参数里的 `--work` / `--out` 由脚本自己按需解析。
+ * 与真 `jm_download.py` 的约定一致：`--out` 是 PDF 目录、`--work` 是中间目录。
+ */
+const FAKE_PREAMBLE = `
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const readArg = (name) => {
+  const index = process.argv.indexOf(name);
+  return index === -1 ? undefined : process.argv[index + 1];
+};
+const out = readArg('--out');
+const work = readArg('--work');
+const say = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+const writePdf = (name, bytes = '%PDF-1.4 fake') => {
+  const path = join(out, name);
+  writeFileSync(path, bytes);
+  return path;
+};
+`;
+
+/**
+ * 造一个假的「python」：先写一个由 `body` 决定行为的脚本，再返回
+ * `{ python, script }` —— 解释器是 Node 自己，脚本是刚写下去的那个文件。
+ *
  * @param dir - 放脚本的目录。
- * @param body - 脚本体（`sh`）。
- * @returns 脚本的绝对路径。
+ * @param body - 脚本体（Node 语法，见 {@link FAKE_PREAMBLE} 里的助手）。
+ * @returns `{ python, script }`：交给 createJmService 的两项。
  */
 async function fakePython(dir, body) {
-  const path = join(dir, `fake-python-${Math.random().toString(16).slice(2)}.sh`);
-  await writeFile(path, `#!/bin/sh\n${body}\n`, 'utf8');
-  await chmod(path, 0o755);
-  return path;
+  const script = join(dir, `fake-python-${Math.random().toString(16).slice(2)}.mjs`);
+  await writeFile(script, `${FAKE_PREAMBLE}\n${body}\n`, 'utf8');
+  return { python: process.execPath, script };
 }
-
-/** 解析 `--key value` 形式的参数（假脚本用）。 */
-const READ_ARG = `read_arg() {
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      "$2") eval "$3=\\$2"; shift 2 ;;
-      *) shift ;;
-    esac
-  done
-}`;
 
 /** 起一个下载服务：cwd 是临时目录，python 指向假脚本。 */
 async function serviceWith(body, overrides = {}) {
   const root = await mkdtemp(join(tmpdir(), 'qq-jm-test-'));
-  const python = await fakePython(root, body);
+  const { python, script } = await fakePython(root, body);
   const service = createJmService({
     cwd: root,
     dir: '.qq-jm',
     python,
-    script: join(root, 'jm_download.py'),
+    script,
     fileHost: '127.0.0.1',
     // 测试里的假脚本是瞬时的，超时给足；需要验证超时的用例自己覆盖。
     timeoutMs: 10000,
@@ -64,12 +80,13 @@ async function serviceWith(body, overrides = {}) {
 
 /** 一个「下载成功」的假脚本：先发 meta，再写一个 PDF，最后发 result。 */
 const OK_BODY = [
-  'out=""',
-  'while [ $# -gt 0 ]; do case "$1" in --out) out="$2"; shift 2 ;; *) shift ;; esac; done',
-  `echo '{"event":"meta","id":"422866","title":"Test Book","author":"tester","chapters":2,"pages":3}'`,
-  'printf "%s" "%PDF-1.4 fake" > "$out/Test Book.pdf"',
-  `echo '{"event":"result","ok":true,"pdf":"'"$out"'/Test Book.pdf","pages":3,"bytes":13,"title":"Test Book","kind":"album","chapters":2}'`,
+  `say({ event: 'meta', id: '422866', title: 'Test Book', author: 'tester', chapters: 2, pages: 3 });`,
+  `const pdf = writePdf('Test Book.pdf');`,
+  `say({ event: 'result', ok: true, pdf, pages: 3, bytes: 13, title: 'Test Book', kind: 'album', chapters: 2 });`,
 ].join('\n');
+
+/** 一个「什么都不做、立刻退出」的假脚本（只用来铺目录，不跑下载）。 */
+const NOOP_BODY = 'void work;';
 
 test('parseJmRef understands bare ids, JM-prefixed ids and 18comic links', () => {
   assert.deepEqual(parseJmRef('422866'), { kind: 'auto', id: '422866' });
@@ -98,13 +115,13 @@ test('safeFileName strips path separators and control characters', () => {
 
 test('the jm service is disabled when the download dir leaves cwd', async () => {
   const root = await mkdtemp(join(tmpdir(), 'qq-jm-test-'));
-  const python = await fakePython(root, OK_BODY);
+  const { python, script } = await fakePython(root, OK_BODY);
   const warnings = [];
   const service = createJmService({
     cwd: root,
     dir: '../outside',
     python,
-    script: join(root, 'jm_download.py'),
+    script,
     report: (level, message) => warnings.push(`${level}: ${message}`),
   });
   assert.equal(service.enabled, false);
@@ -136,7 +153,7 @@ test('a download spawns the script, reports meta and returns the PDF', async () 
 
 test('a failed download surfaces the script error instead of hanging', async () => {
   const { service } = await serviceWith(
-    [`echo '{"event":"result","ok":false,"error":"这本有 146 话，超过上限 20；请指定单话"}'`].join('\n'),
+    `say({ event: 'result', ok: false, error: '这本有 146 话，超过上限 20；请指定单话' });`,
   );
   try {
     await assert.rejects(() => service.run({ id: '400222', key: 'k' }), /超过上限 20/);
@@ -146,7 +163,7 @@ test('a failed download surfaces the script error instead of hanging', async () 
 });
 
 test('a python that exits without a result line is reported with its stderr tail', async () => {
-  const { service } = await serviceWith(['echo "boom: python is broken" >&2', 'exit 3'].join('\n'));
+  const { service } = await serviceWith(['process.stderr.write("boom: python is broken\\n");', 'process.exit(3);'].join('\n'));
   try {
     await assert.rejects(() => service.run({ id: '422866', key: 'k' }), /exited with code 3.*boom: python is broken/s);
   } finally {
@@ -155,7 +172,9 @@ test('a python that exits without a result line is reported with its stderr tail
 });
 
 test('a download that never finishes is killed at the hard timeout', async () => {
-  const { service } = await serviceWith('sleep 30', { timeoutMs: 1100 });
+  // 假脚本必须真的「活着不动」：一个只 await 一个 pending promise 的 Node 进程会立刻
+  // 退出（事件循环空了），那样这条用例测到的就不是超时分支了，所以要挂一个定时器撑住。
+  const { service } = await serviceWith('setInterval(() => {}, 1000);', { timeoutMs: 1100 });
   try {
     await assert.rejects(() => service.run({ id: '422866', key: 'k' }), /timed out after 1s/);
   } finally {
@@ -164,7 +183,8 @@ test('a download that never finishes is killed at the hard timeout', async () =>
 });
 
 test('the same conversation cannot start two downloads at once', async () => {
-  const { service } = await serviceWith(['sleep 1', OK_BODY].join('\n'));
+  // 「第一次还没跑完」靠假脚本自己先睡一会儿来制造。
+  const { service } = await serviceWith([`await new Promise((done) => setTimeout(done, 1000));`, OK_BODY].join('\n'));
   try {
     const first = service.run({ id: '422866', key: 'group:7' });
     await new Promise((resolve) => setTimeout(resolve, 150));
@@ -200,7 +220,7 @@ test('serve hands out a one-shot URL that NapCat can fetch, and 404s otherwise',
 });
 
 test('prune keeps only the newest PDFs in the download directory', async () => {
-  const { service, root } = await serviceWith('true');
+  const { service, root } = await serviceWith(NOOP_BODY);
   try {
     await mkdir(service.directory, { recursive: true });
     for (let index = 0; index < 5; index += 1) {

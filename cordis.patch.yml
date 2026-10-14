@@ -90,16 +90,28 @@
     - id: qq-bridge
       name: '@qqbot/dsh-plugin-qq'
       config:
-        # OneBot v11 正向 WebSocket 地址（容器 napcat 映射出来的 3001 端口）
-        endpoint: ws://127.0.0.1:3001
-        accessToken: ''
+        # OneBot v11 正向 WebSocket 地址（NapCat 的 websocketServers 端口）。
+        # 可用环境变量覆盖，取值按 继承的环境 > <启动 cwd>/.env > $DSH_HOME/.env：
+        # Windows 桌面版的一键脚本（scripts/napcat-setup.cmd）就是往 profile 目录的
+        # .env 里写这几个 QQBOT_* 的 —— 每台机器不一样的取值都走这条路，而不是改这个
+        # 文件（那个文件的这一份是**所有部署共用**的默认值，见 §「补丁是整块替换」那段注释）。
+        endpoint: !!js process.env.QQBOT_ENDPOINT ?? 'ws://127.0.0.1:3001'
+        accessToken: !!js process.env.QQBOT_ACCESS_TOKEN ?? ''
+        # NapCat 那一侧的配置在哪儿：插件启动时读它做一次自检（只读；发现缺一条监听上面
+        # 那个端口的 WebSocket 服务器就记一条 warn，把原因说清楚）。留空 = 自动探测本仓库
+        # 里的 NapCat.Shell / 当前目录 / 家目录下的 NapCat.Shell。
+        napcatDir: !!js process.env.QQBOT_NAPCAT_DIR ?? ''
+        # 自检发现缺那条服务器时，是否允许插件自己写进 NapCat 的配置（写前先备份，
+        # 只动 websocketServers 里我们那一条）。默认关；一键脚本会显式打开它。
+        napcatAutoConfig: !!js (process.env.QQBOT_NAPCAT_AUTOCONFIG ?? '') === '1'
         # QQ 会话 Agent 的工作目录，同时也是它的沙箱根。
-        # 留空（= 注释掉这一行）= 用 Harness 进程的当前目录；deploy/qqbot.service 里的
-        # WorkingDirectory 已经指向本仓库，所以本机这样就是对的。
-        # 换机器 / 换目录部署时，把下面这行改开并写成你自己的**绝对路径** ——
-        # 这里不认 `~`，写相对路径也只会相对进程 cwd（mediaDir / stickerDir / jmDir /
-        # memoryDir 都相对它解析，且必须落在它里面，否则对应功能记 warn 并停用）。
-        # cwd: /absolute/path/to/this/repo
+        # 留空 = 用 Harness 进程的当前目录。**注意 Windows 桌面版那个当前目录是
+        # `~/.dsh/profiles/desktop`**（Electron 是用它当子进程 cwd 启动 Host 的），
+        # 也就是媒体缓存 / 表情包 / 记忆 / 下载的 PDF 都会落在 profile 目录里 ——
+        # 能跑，但不干净。所以一键脚本默认会写一个 QQBOT_CWD 指到 `~/.dsh/qq-bot`：
+        #   QQBOT_CWD=D:\qq-bot        （.env 里不能带引号，反斜杠原样写）
+        # Linux 那边由 deploy/qqbot.service 的 WorkingDirectory 指向本仓库，不必配。
+        cwd: !!js process.env.QQBOT_CWD ?? ''
         privateChat: true
         groupChat: true
         # 群里只有被 @ 时才响应：mention / prefix / all
@@ -386,8 +398,10 @@
         # PDF 落盘目录（相对 cwd，本机 = 本仓库根目录），必须落在 cwd 内。
         # 超过 jmMaxFiles 按最近使用时间淘汰最旧的；图片中间产物下完即删，只留 PDF。
         jmDir: .qq-jm
-        # 跑 jmcomic 的解释器：相对 cwd 或绝对路径
-        jmPython: .venv/bin/python
+        # 跑 jmcomic 的解释器：相对 cwd 或绝对路径。
+        # 留空 = 按平台自动（Windows: .venv/Scripts/python.exe；其它: .venv/bin/python，
+        # 也就是 settings.js 里那两个随平台变的默认值）。可用 QQBOT_JM_PYTHON 覆盖。
+        jmPython: !!js process.env.QQBOT_JM_PYTHON ?? ''
         jmScript: ''                  # 留空 = 用插件自带的 scripts/jm_download.py
         jmMaxChapters: 0              # 整本下载的话数上限；0 = 不限制（超了会回一句提示）
         jmMaxPages: 0                 # 单次下载的总页数上限；0 = 不限制
@@ -398,7 +412,9 @@
         jmMaxJobs: 1                  # 同时下几个（多个会话同时点车就排队）
         # NapCat 在容器里、插件在宿主机上：文件只能给 URL 让它自己来拉（实测传本地路径
         # 会回「识别URL失败」，因为容器里根本没有那个文件）。这里就是那个文件服务的绑定
-        # 地址 —— 默认 docker 网桥，只有本机容器网段够得着，校园网 / 局域网都碰不到。
-        jmFileHost: 172.17.0.1
+        # 地址 —— 容器部署用 docker 网桥（只有本机容器网段够得着，校园网 / 局域网都碰不到）；
+        # **Windows 桌面版没有容器**（NapCat 是注入进本机 QQ 的原生进程），那边用 127.0.0.1。
+        # 留空 = 按平台自动（见 util.js 的 defaultJmFileHost）；可用 QQBOT_JM_FILE_HOST 覆盖。
+        jmFileHost: !!js process.env.QQBOT_JM_FILE_HOST ?? ''
         jmFilePort: 0                 # 0 = 由系统分配
         jmUrlTtlMs: 600000            # 一次性下载 URL 的有效期

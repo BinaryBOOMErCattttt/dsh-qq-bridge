@@ -10,7 +10,7 @@
  */
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
-import { mkdtemp, mkdir, chmod, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -512,8 +512,13 @@ function sentTexts(onebot, action = 'send_group_msg') {
 }
 
 /**
- * 造一个假的「python 解释器」：一个可执行的 shell 脚本，按 jm_download.py 的
- * JSON Lines 协议说话，并真的在 `--out` 目录里落一个 PDF。
+ * 造一个假的「python 解释器」：**用 Node 当解释器**跑一个按 jm_download.py 的
+ * JSON Lines 协议说话的脚本，并真的在 `--out` 目录里落一个 PDF。
+ *
+ * 为什么不是 shell 脚本（本文件早先的写法）：桌面版跑在 Windows 上，那边既没有
+ * `/bin/sh` 也不认 shebang，`.sh` 假脚本会让 `/jm` 这条链路在那台机器上根本起不来
+ * —— 而这条链路恰恰是「必须真的 spawn 一次」才验证得到的那部分。
+ * `node <script> --out …` 与 `python <script> --out …` 的参数形状一致，插件侧看不出区别。
  *
  * 为什么要连进程一起测：spawn / 超时 / 并发键 / 文件服务这些才是这条链路上最容易
  * 出错的地方，只有把假脚本真的 spawn 起来才验证得到。
@@ -521,28 +526,28 @@ function sentTexts(onebot, action = 'send_group_msg') {
  * @param dir - 放脚本的目录（会作为插件的 cwd）。
  * @param options.body - `'ok'` = 正常下载；`'fail'` = 回一个失败结果；其余字符串当作错误信息。
  * @param options.delayMs - 脚本先睡多久（用来验证「同一个会话不能并发下载」）。
- * @returns 脚本的绝对路径。
+ * @returns `{ python, script }`：解释器（Node 自己）与假脚本的绝对路径。
  */
 async function writeFakeJmPython(dir, { body = 'ok', delayMs = 0 } = {}) {
-  const path = join(dir, 'fake-jm-python.sh');
+  const script = join(dir, 'fake-jm-python.mjs');
   const lines = [
-    '#!/bin/sh',
-    'out=""',
-    'while [ $# -gt 0 ]; do case "$1" in --out) out="$2"; shift 2 ;; *) shift ;; esac; done',
+    `import { writeFileSync } from 'node:fs';`,
+    `import { join } from 'node:path';`,
+    `const at = (name) => { const i = process.argv.indexOf(name); return i === -1 ? undefined : process.argv[i + 1]; };`,
+    `const out = at('--out');`,
+    `const say = (value) => process.stdout.write(JSON.stringify(value) + '\\n');`,
   ];
-  if (delayMs > 0) lines.push(`sleep ${(delayMs / 1000).toFixed(1)}`);
+  if (delayMs > 0) lines.push(`await new Promise((done) => setTimeout(done, ${Math.round(delayMs)}));`);
   if (body === 'ok') {
-    lines.push(`echo '{"event":"meta","id":"422866","title":"Test Book","author":"tester","chapters":2,"pages":3}'`);
-    lines.push('printf "%s" "%PDF-1.4 fake" > "$out/Test Book.pdf"');
-    lines.push(
-      `echo '{"event":"result","ok":true,"pdf":"'"$out"'/Test Book.pdf","pages":3,"bytes":13,"title":"Test Book","kind":"album","chapters":2}'`,
-    );
+    lines.push(`say({ event: 'meta', id: '422866', title: 'Test Book', author: 'tester', chapters: 2, pages: 3 });`);
+    lines.push(`const pdf = join(out, 'Test Book.pdf');`);
+    lines.push(`writeFileSync(pdf, '%PDF-1.4 fake');`);
+    lines.push(`say({ event: 'result', ok: true, pdf, pages: 3, bytes: 13, title: 'Test Book', kind: 'album', chapters: 2 });`);
   } else {
-    lines.push(`echo '{"event":"result","ok":false,"error":"${body === 'fail' ? '本子不存在' : body}"}'`);
+    lines.push(`say({ event: 'result', ok: false, error: ${JSON.stringify(body === 'fail' ? '本子不存在' : body)} });`);
   }
-  await writeFile(path, `${lines.join('\n')}\n`, 'utf8');
-  await chmod(path, 0o755);
-  return path;
+  await writeFile(script, `${lines.join('\n')}\n`, 'utf8');
+  return { python: process.execPath, script };
 }
 
 /**
@@ -551,14 +556,14 @@ async function writeFakeJmPython(dir, { body = 'ok', delayMs = 0 } = {}) {
  */
 async function bootJm(config = {}, hostOptions = {}, onebotOptions = {}) {
   const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-jm-'));
-  const python = await writeFakeJmPython(cwd, config.__python ?? {});
+  const fake = await writeFakeJmPython(cwd, config.__python ?? {});
   const { __python, ...rest } = config;
   const booted = await boot(
-    { cwd, jmDir: '.qq-jm', jmPython: python, jmFileHost: '127.0.0.1', ...rest },
+    { cwd, jmDir: '.qq-jm', jmPython: fake.python, jmScript: fake.script, jmFileHost: '127.0.0.1', ...rest },
     hostOptions,
     onebotOptions,
   );
-  return { ...booted, cwd, python };
+  return { ...booted, cwd, python: fake.python, script: fake.script };
 }
 
 /**
@@ -588,16 +593,20 @@ async function boot(config = {}, hostOptions = {}, onebotOptions = {}) {
   // 每个用例一个独立的临时会话根目录：/reset 只可能碰到这里面的东西，
   // 绝不会扫到真实的 ~/.dsh/sessions。
   const sessionsRoot = await mkdtemp(join(tmpdir(), 'qq-bridge-test-'));
+  // 工作目录也给它一个临时目录，**不要**写死 `/tmp`：Windows 上那会被 resolve 成
+  // `<当前盘符>:\tmp`，于是跑一次测试就在用户的 D 盘（或 C 盘）根目录下留一份
+  // `.qq-media` / `.qq-memory` / `.qq-stickers`。用例要断言 cwd 时用返回的 `instance.cwd`。
+  const cwd = config.cwd ?? await mkdtemp(join(tmpdir(), 'qq-bridge-cwd-'));
   const host = makeHost({ sessionsRoot, ...hostOptions });
   // 用 Config() 过一遍真实 schema，测试里传的配置因此也顺带验证了默认值合并。
   // 延迟一律压到 0：拟人节奏不该让测试多等几秒，需要验证时序的用例自己覆盖。
   // 攒批窗口同理：默认关掉，要验证「几个人同时 @ 只回一轮」的用例自己给一个小窗口。
-  apply(host.ctx, Config({ endpoint: onebot.endpoint, cwd: '/tmp', readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, batchWindowMs: 0, ...config }));
+  apply(host.ctx, Config({ endpoint: onebot.endpoint, cwd, readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, batchWindowMs: 0, ...config }));
   // 先登记再启动：`start()` 跑的是 `ctx.effect` 的回调（OneBot 连接、摘要与主动说话的
   // 定时器），它可能抛错 —— 例如插件漏声明 inject 时的 cordis 检查。抛错时这个实例也
   // 必须进收尾清单，否则刚起的假 OneBot 服务端会一直挂着监听，让整个测试文件停不下来
   // （node 的 test runner 会等到事件循环空掉）。这类失败要「红得快且干净」。
-  const instance = { onebot, host, sessionsRoot, cwd: config.cwd ?? '/tmp' };
+  const instance = { onebot, host, sessionsRoot, cwd };
   liveBoots.push(instance);
   host.list.start();
   // 等到 get_login_info 发出，说明 socket 已就绪、selfId 即将可用。
@@ -1095,13 +1104,13 @@ test('the QQ agent joins an agent preset, so preset-plane tools exist for the wh
   };
   const allowTools = ['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch', 'qq_send_message', 'qq_list_conversations'];
 
-  const { onebot, host } = await boot({ allowTools }, { presets });
+  const { onebot, host, cwd } = await boot({ allowTools }, { presets });
   try {
     onebot.push(privateMessage('帮我查一下今天的新闻'));
     const agent = await until(() => host.list.created[0], 'the Agent');
     // 加入的是部署的默认预设，并且写进了会话 header 的 agentPreset。
     assert.deepEqual(host.list.mountedPresets, ['standard']);
-    assert.deepEqual(host.list.metas, [{ sessionId: agent.id, meta: { cwd: '/tmp', agentPreset: 'standard' } }]);
+    assert.deepEqual(host.list.metas, [{ sessionId: agent.id, meta: { cwd, agentPreset: 'standard' } }]);
     // 预设里的工具 join 之后才存在，白名单因此**完整**生效，而不是退化成「只剩 qq_*」。
     assert.deepEqual(host.list.restrictions, [{ sessionId: agent.id, filter: { allow: allowTools } }]);
     assert.equal(
@@ -1157,7 +1166,7 @@ test('agentPreset selects the mount explicitly and none skips it', async () => {
     await until(() => skipped.host.list.created[0], 'the Agent');
     assert.deepEqual(skipped.host.list.mountedPresets, []);
     // 不挂预设就没有 agentPreset 字段，会话按「无预设」记录。
-    assert.deepEqual(skipped.host.list.metas[0].meta, { cwd: '/tmp' });
+    assert.deepEqual(skipped.host.list.metas[0].meta, { cwd: skipped.cwd });
   } finally {
     await skipped.onebot.close();
   }
@@ -1238,6 +1247,33 @@ test('the bundled patch declares the narrowed preset the plugin mounts', async (
   // write / edit 由 tool-fs 提供，但必须在白名单之外（QQ 那头是只读的）。
   assert.ok(!bridge.config.allowTools.includes('write'));
   assert.ok(!bridge.config.allowTools.includes('edit'));
+});
+
+// 用例：一键脚本写进 `.env` 的取值，插件必须真的读得到。
+//
+// 这条链路是「发布版方便」的全部：`scripts/napcat-setup.cmd` 把 endpoint / cwd / NapCat
+// 目录写进 profile 目录的 `.env`，而 DSH 只把 `.env` 变成环境变量 —— **把它们接进配置的
+// 是 patch 里的 `!!js process.env.QQBOT_*`**。哪天有人图省事把某一项写死回常量，一键脚本
+// 就会静默失效（用户看到的是「明明跑了脚本还是连不上」），所以在这里钉住这几行。
+test('the bundled patch reads the QQBOT_* variables the Windows setup script writes', async () => {
+  const jsExpression = new yaml.Type('tag:yaml.org,2002:js', { kind: 'scalar', construct: (data) => data });
+  const schema = yaml.DEFAULT_SCHEMA.extend([jsExpression]);
+  const doc = yaml.load(await readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8'), { schema });
+  const bridge = doc.flatMap((entry) => entry.insert ?? []).find((row) => row.name === '@qqbot/dsh-plugin-qq');
+  const expected = {
+    endpoint: 'QQBOT_ENDPOINT',
+    accessToken: 'QQBOT_ACCESS_TOKEN',
+    cwd: 'QQBOT_CWD',
+    napcatDir: 'QQBOT_NAPCAT_DIR',
+    napcatAutoConfig: 'QQBOT_NAPCAT_AUTOCONFIG',
+    jmPython: 'QQBOT_JM_PYTHON',
+    jmFileHost: 'QQBOT_JM_FILE_HOST',
+  };
+  for (const [field, variable] of Object.entries(expected)) {
+    const value = bridge.config[field];
+    assert.equal(typeof value, 'string', `${field} 应当是 !!js 表达式`);
+    assert.ok(value.includes(variable), `${field} 必须读 ${variable}（否则一键脚本写的 .env 不起作用），现在是：${value}`);
+  }
 });
 
 // 用例十五：插件日志必须真的能进 journal。
@@ -1326,8 +1362,9 @@ test('the reset command opens a new session instead of deleting the old one', as
 test('the session round survives a plugin restart', async () => {
   const sessionsRoot = await mkdtemp(join(tmpdir(), 'qq-bridge-restart-'));
   // 其余节奏参数压到 0：这个用例关心的是「跨进程还在不在第 1 轮」，不是时序。
-  // endpoint 必须留给 boot 自己填（假 OneBot 服务端的地址）。
-  const config = { cwd: '/tmp', readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, batchWindowMs: 0, resetUsers: [String(PRIVATE_USER_ID)] };
+  // endpoint 必须留给 boot 自己填（假 OneBot 服务端的地址）；cwd 也交给 boot
+  // （它会给一个临时目录 —— 写死 `/tmp` 在 Windows 上会落到 `D:\tmp` 去）。
+  const config = { readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, batchWindowMs: 0, resetUsers: [String(PRIVATE_USER_ID)] };
   let first;
   let second;
   let before;
@@ -4735,7 +4772,10 @@ test('.dsh/skills 下的每个 skill 都能被 skill-filesystem 发现', async (
   );
   for (const dir of dirs) {
     const text = await readFile(new URL(`${dir.name}/SKILL.md`, root), 'utf8');
-    const frontmatter = /^---\n([\s\S]*?)\n---\n/.exec(text);
+    // 行尾刻意宽容 `\r`：Windows 上 core.autocrlf=true 的检出会把文件变成 CRLF，而
+    // dsh-skill-filesystem 的真解析器本来就逐行剥 `\r`（它是宽容的）。这里若写死 `\n`，
+    // 一整组用例会在 Windows 上假红 —— 「skill 明明能用，测试说它坏了」。
+    const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(text);
     assert.ok(frontmatter, `${dir.name}/SKILL.md 缺 YAML frontmatter，会被整个忽略`);
     const data = yaml.load(frontmatter[1]);
     assert.equal(data.name, dir.name, 'frontmatter 的 name 必须与目录同名');
@@ -4959,11 +4999,74 @@ test('api key rotation is disabled when the pool file leaves cwd', async () => {
 
 /** 默认开着（池子不存在时只是不做事），显式关掉则连定时器都不挂。 */
 test('api key rotation is on by default and can be switched off', async () => {
-  const { host } = await boot({ cwd: '/tmp', memory: false }, { credentials: fakeCredentials() });
+  // 不指定 cwd：boot 会给一个临时目录（写死 `/tmp` 在 Windows 上会落到 `D:\tmp`）。
+  const { host } = await boot({ memory: false }, { credentials: fakeCredentials() });
   assert.ok(host.list.infos.some((line) => line.includes('api key rotation: on')));
   assert.equal(host.list.timers.live('intervals').length, 1, '只有一个每日轮换定时器');
 
-  const off = await boot({ cwd: '/tmp', memory: false, apiKeyRotate: false }, { credentials: fakeCredentials() });
+  const off = await boot({ memory: false, apiKeyRotate: false }, { credentials: fakeCredentials() });
   assert.ok(off.host.list.infos.some((line) => line.includes('api key rotation is off')));
   assert.equal(off.host.list.timers.live('intervals').length, 0);
 });
+
+// ---- NapCat 那一侧的自检（启动时读一眼，默认只读）-------------------------------------
+//
+// 「它为什么不说话」里最常见的一环就在另一个软件里：插件这边全都配好了，但 NapCat
+// 里没有一条启用的 WebSocket 服务器。这里验的是**接线**（index.js 有没有真的跑那次
+// 自检、有没有把结论写进日志）；判据本身的边界在 test/napcat.test.mjs 里。
+
+/** 造一个假的 NapCat 安装目录：`<root>/config/onebot11_<qq>.json`。 */
+async function fakeNapcatConfig(config, qq = '10001') {
+  const root = await mkdtemp(join(tmpdir(), 'qq-bridge-napcat-'));
+  const dir = join(root, 'config');
+  await mkdir(dir, { recursive: true });
+  const file = join(dir, `onebot11_${qq}.json`);
+  await writeFile(file, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  return { root, dir, file };
+}
+
+/** 一条「什么都没配」的 onebot11 配置。 */
+const NAPCAT_EMPTY = { network: { httpServers: [], websocketServers: [], websocketClients: [] }, enableLocalFile2Url: false };
+
+/** 自检说「NapCat 那边缺一条服务器」时要把原因和修法一起给出来，而不是只说一句「连不上」。 */
+test('napcat self-check reports a missing websocket server without touching the file', async () => {
+  const napcat = await fakeNapcatConfig(NAPCAT_EMPTY);
+  const before = await readFile(napcat.file, 'utf8');
+  const { host } = await boot({ napcatDir: napcat.root, memory: false, apiKeyRotate: false });
+  await until(
+    () => host.list.warnings.some((line) => line.includes('napcat:') && line.includes('没有配置任何 WebSocket 服务器')),
+    'the napcat self-check to report the missing server',
+  );
+  assert.ok(
+    host.list.warnings.some((line) => line.includes('napcat-setup.mjs')),
+    `说清怎么修：${host.list.warnings.join(' | ')}`,
+  );
+  // 默认**不写**：那是另一个软件的配置，插件不该悄悄改它。
+  assert.equal(await readFile(napcat.file, 'utf8'), before);
+});
+
+/** 打开 napcatAutoConfig 才会写：写之前留备份，写完记一句「要重启 NapCat」。 */
+test('napcatAutoConfig writes the missing server with a backup and asks for a NapCat restart', async () => {
+  const napcat = await fakeNapcatConfig(NAPCAT_EMPTY);
+  const before = await readFile(napcat.file, 'utf8');
+  const { host, onebot } = await boot({ napcatDir: napcat.root, napcatAutoConfig: true, memory: false, apiKeyRotate: false });
+  await until(
+    () => host.list.infos.some((line) => line.includes('napcat:') && line.includes('重启 NapCat')),
+    'the napcat self-check to write the server',
+  );
+  const patched = JSON.parse(await readFile(napcat.file, 'utf8'));
+  const server = patched.network.websocketServers[0];
+  // 端口必须写的是**插件连的那个**（假 OneBot 用的是系统分配的随机端口）。
+  assert.equal(server.port, Number(new URL(onebot.endpoint).port));
+  assert.equal(server.enable, true);
+  assert.equal(server.reportSelfMessage, false);
+  const backups = (await readdir(napcat.dir)).filter((name) => name.includes('.bak-'));
+  assert.equal(backups.length, 1, '改之前要留一份原文件');
+  assert.equal(await readFile(join(napcat.dir, backups[0]), 'utf8'), before);
+});
+
+// 「已经配好了就只记一句 info、不刷 warn」这一条没有放在这里：假 OneBot 用的是系统分配的
+// 随机端口，而这个用例需要**先知道端口**才能把 NapCat 的配置写成「已经对了」的样子，
+// 在 boot() 之后再改配置又赶不上那次自检。它由 test/napcat.test.mjs 的
+// `repairNapcat` → `action: 'ok'`（幂等、不产生第二个备份）覆盖。
+

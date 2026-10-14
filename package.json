@@ -12,6 +12,11 @@
     "./locale/*.json": "./locale/*.json"
   },
   "icon": "./icon.svg",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
   "files": [
     "index.js",
     "settings.js",
@@ -26,6 +31,7 @@
     "media.js",
     "image.js",
     "jm.js",
+    "napcat.js",
     "perceptual.js",
     "cordis.patch.yml",
     "icon.svg",

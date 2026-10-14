@@ -13,9 +13,11 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 
 import { Config } from '../config.js';
 import { createSettings, MAX_TIMER_MS } from '../settings.js';
+import { defaultJmFileHost, defaultJmPython } from '../util.js';
 
 /** 用真 schema 铺一层默认值，再按需覆盖 —— 覆盖的可以是 schema 不会产出的非法值。 */
 function settings(overrides = {}, cwd = '/tmp') {
@@ -175,8 +177,21 @@ test('字符串项去空白，禁漫脚本留空时补上插件自带的绝对�
   assert.equal(settings({ agentPreset: ' qq ' }).agentPreset, 'qq');
   assert.equal(settings({ persona: '   ' }).persona, '');
   assert.equal(settings({ jmCommand: ' /jm ' }).jmCommand, '/jm');
-  assert.ok(settings({ jmScript: '' }).jmScript.endsWith('scripts/jm_download.py'));
+  // 用 join 拼期望值：Windows 上 fileURLToPath 给的是反斜杠路径，写死正斜杠会假红。
+  assert.ok(settings({ jmScript: '' }).jmScript.endsWith(join('scripts', 'jm_download.py')));
   assert.equal(settings({ jmScript: '/opt/custom.py' }).jmScript, '/opt/custom.py');
+});
+
+test('禁漫的两项平台默认值：留空按平台补，写死了就用写死的', () => {
+  // 留空 = 按平台自动（Windows 的 venv 布局与容器部署的绑定地址都跟 Linux 不一样）。
+  // 这两条默认值住在 util.js 的纯函数里，那边有用例逐平台钉住取值。
+  assert.equal(settings({ jmPython: '' }).jmPython, defaultJmPython());
+  assert.equal(settings({ jmFileHost: '' }).jmFileHost, defaultJmFileHost());
+  // 空白也按「没写」算 —— 手写配置里留几个空格是常事。
+  assert.equal(settings({ jmPython: '   ' }).jmPython, defaultJmPython());
+  // 显式写了就一个字都不改（包括相对路径这种要交给 jm.js 去 resolve 的写法）。
+  assert.equal(settings({ jmPython: '.venv/bin/python' }).jmPython, '.venv/bin/python');
+  assert.equal(settings({ jmFileHost: ' 192.168.1.9 ' }).jmFileHost, '192.168.1.9');
 });
 
 test('未再加工的字段原样透传（schema 已经保证类型与默认值）', () => {

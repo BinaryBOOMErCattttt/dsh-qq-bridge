@@ -28,7 +28,8 @@
  * @module @qqbot/dsh-plugin-qq
  */
 import { readdirSync } from 'node:fs';
-import { join, relative, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdir, readFile, stat } from 'node:fs/promises';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -37,6 +38,7 @@ import { createMediaStore } from './media.js';
 import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
 import { createJmService, parseJmRef } from './jm.js';
+import { endpointTarget, findNapcatDir, repairNapcat } from './napcat.js';
 import { registerQqTools } from './tools.js';
 import { createSettings, MAX_TIMER_MS } from './settings.js';
 import { createChatter } from './chatter.js';
@@ -3329,6 +3331,63 @@ export function apply(ctx, config) {
     // 不留「一调就报错」的壳。
     memory: memory.tools,
   });
+  // ---- NapCat 那一侧的自检 ----------------------------------------------------
+  //
+  // 这是「它为什么不说话」里最值钱的一条线索：插件这边全都配好了，但 NapCat 里没有
+  // 一条启用的 WebSocket 服务器（或者端口 / token 对不上），进程会安静地一直重连。
+  // 所以启动时读一眼 NapCat 的配置：**默认只读**，发现问题记一条带原因与修法的 warn；
+  // 只有显式打开 `napcatAutoConfig` 才会写（写前备份，且只动 websocketServers 里我们那一条）。
+  //
+  // 目录怎么找：配了 `napcatDir` 就以它为准；没配就只看少数几个「像 NapCat 装在这里」的
+  // 位置 —— 一个插件不该为了找配置把用户的硬盘遍历一遍。找不到时只记 info 而不是 warn：
+  // 容器部署里 NapCat 压根不在这个文件系统上，那不是错误。
+  const pluginRoot = dirname(fileURLToPath(import.meta.url));
+
+  /** 自动探测时的候选目录（只在没配 `napcatDir` 时用）。 */
+  function napcatCandidates() {
+    return [
+      join(pluginRoot, 'NapCat.Shell'),
+      join(cwd, 'NapCat.Shell'),
+      join(homedir(), 'NapCat.Shell'),
+    ];
+  }
+
+  /** 跑一次自检并把结论写进日志。任何异常都只记一行 warn —— 它是别家软件的配置，不该拖垮插件。 */
+  async function checkNapcat() {
+    const configured = String(settings.napcatDir ?? '').trim();
+    const target = endpointTarget(settings.endpoint);
+    const found = configured.length > 0 ? configured : await findNapcatDir(napcatCandidates());
+    if (found === undefined || found.length === 0) {
+      const hint = configured.length > 0
+        ? `napcatDir "${configured}" 里没有 config/onebot11_<QQ号>.json`
+        : `没找到 NapCat 安装目录（找过 ${napcatCandidates().join(' / ')}）`;
+      report(configured.length > 0 ? 'warn' : 'info', `napcat: ${hint}；需要的话跑 node scripts/napcat-setup.mjs（它会把 NapCat 的网络配置与 .env 一起写好）`);
+      return;
+    }
+    const configDir = join(found, 'config');
+    const result = await repairNapcat({
+      dir: configDir,
+      endpoint: settings.endpoint,
+      token: settings.accessToken,
+      autoConfig: settings.napcatAutoConfig === true,
+    });
+    const portLabel = target?.port === undefined ? settings.endpoint : `端口 ${target.port}`;
+    if (result.action === 'ok') {
+      report('info', `napcat: ${configDir} 里已经有监听 ${portLabel} 的 WebSocket 服务器`);
+      for (const note of result.verdict?.notes ?? []) report('warn', `napcat: ${note}`);
+      return;
+    }
+    if (result.action === 'repaired') {
+      report('info', `napcat: ${result.reason} —— 已写进 ${result.file}（原文件备份在 ${result.backup}）；**要重启 NapCat 才生效**`);
+      return;
+    }
+    if (result.action === 'needs-repair') {
+      report('warn', `napcat: ${result.reason}；跑 node scripts/napcat-setup.mjs 一条命令就能配好（或打开 napcatAutoConfig 让插件自己写）`);
+      return;
+    }
+    report('warn', `napcat: 自检没跑成：${result.reason}`);
+  }
+
   // ---- 连接生命周期 ----------------------------------------------------------
 
   // 用 ctx.effect 托管连接：插件卸载/停用时自动 dispose，不留悬挂的定时器与 socket。
@@ -3355,6 +3414,12 @@ export function apply(ctx, config) {
 
   // 下载链路的托管：关掉那个给 NapCat 取文件的小 HTTP 服务与一次性 token。
   ctx.effect(() => () => jmService.close(), 'qq-bridge:jm');
+
+  // NapCat 那一侧的自检：跑完就没了，不需要托管任何句柄；放进 ctx.effect 只是为了让
+  // 「它在生命周期这一节里」这件事一眼可见（异步部分自己把异常收进日志）。
+  ctx.effect(() => {
+    void checkNapcat().catch((error) => report('warn', `napcat: 自检失败：${errorText(error)}`));
+  }, 'qq-bridge:napcat');
 
   // ---- 长期记忆：定时摘要的生命周期 -------------------------------------------
   //

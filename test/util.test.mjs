@@ -12,12 +12,21 @@
  *
  * 时间相关的用例一律用 `new Date(...)` 的本地构造 + 本地格式化来对齐，
  * 这样任何时区下结论都一样（不写死 UTC 偏移）。
+ *
+ * 路径相关的用例则相反：**基准目录一律用 `join(tmpdir(), …)` 现算**，不写
+ * `/tmp/mem/` 这种 POSIX 字面量 —— 桌面版跑在 Windows 上，写死的 POSIX 路径在那里
+ * 会被 `resolve()` 解释成「当前盘符 + \tmp\mem」，于是「目录内的路径」全被判成越界，
+ * 一整组用例假红（这正是这次 Windows 适配要修掉的东西之一）。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
 
 import {
   apiKeyFingerprint,
+  defaultJmFileHost,
+  defaultJmPython,
   errorText,
   hourLabel,
   localDate,
@@ -26,12 +35,16 @@ import {
   memoryRelativePath,
   memorySlug,
   msUntilDailyHour,
+  pathInside,
   stickerFileName,
   visibleText,
 } from '../util.js';
 
+/** 记忆目录的基准：一个当前平台上真实存在的绝对路径（含结尾分隔符）。 */
+const MEMORY_BASE = join(tmpdir(), 'qq-bridge-util-test', 'mem') + sep;
+
 test('memoryRelativePath：目录内的路径原样通过（正斜杠、保留子目录）', () => {
-  const base = '/tmp/mem/';
+  const base = MEMORY_BASE;
   assert.equal(memoryRelativePath(base, 'COGNITION.md'), 'COGNITION.md');
   assert.equal(memoryRelativePath(base, 'conversations/group-100000001/MEMORY.md'), 'conversations/group-100000001/MEMORY.md');
   assert.equal(memoryRelativePath(base, './a.md'), 'a.md', '开头的 ./ 要去掉');
@@ -42,12 +55,45 @@ test('memoryRelativePath：目录内的路径原样通过（正斜杠、保留�
 });
 
 test('memoryRelativePath：越界一律 undefined（这是唯一的写边界）', () => {
-  const base = '/tmp/mem/';
-  for (const raw of ['../evil.md', 'a/../../evil.md', '..', '', '   ', '/etc/passwd', '/tmp/mem/x.md']) {
+  const base = MEMORY_BASE;
+  for (const raw of ['../evil.md', 'a/../../evil.md', '..', '', '   ', '/etc/passwd', join(base, 'x.md')]) {
     assert.equal(memoryRelativePath(base, raw), undefined, `必须拒绝: ${JSON.stringify(raw)}`);
   }
-  // 只是前缀相同的兄弟目录：base 以分隔符结尾就是靠这一条守住的（`/tmp/mem/` vs `/tmp/mem2/`）。
+  // 只是前缀相同的兄弟目录：base 以分隔符结尾就是靠这一条守住的（`…/mem/` vs `…/mem2/`）。
   assert.equal(memoryRelativePath(base, '../mem2/x.md'), undefined);
+  // 就算基准目录**没有**结尾分隔符，兄弟目录也必须被拒 —— 这是这次抽公共判定时
+  // 顺手修掉的老写法（`absolute.startsWith(base)` 会把 `…/mem2` 当成在 `…/mem` 里）。
+  assert.equal(memoryRelativePath(MEMORY_BASE.slice(0, -1), '../mem2/x.md'), undefined);
+  // 段里带盘符 / Windows 非法字符的写法一律拒绝：`C:/…` 会被 resolve 当盘符解释，
+  // 返回一串带盘符的「相对路径」比直接拒绝危险得多。
+  assert.equal(memoryRelativePath(base, 'C:/Windows/win.ini'), undefined);
+  assert.equal(memoryRelativePath(base, 'a:b.md'), undefined);
+});
+
+test('pathInside：补分隔符 + Windows 忽略大小写（同一个目录的多种写法）', () => {
+  // 前缀相同但不是一个目录 —— 不补分隔符的实现在这里就会放过。
+  assert.equal(pathInside('/tmp/mem', '/tmp/memory/x', 'linux'), false);
+  assert.equal(pathInside('/tmp/mem/', '/tmp/mem/x', 'linux'), true);
+  assert.equal(pathInside('/tmp/mem', '/tmp/mem', 'linux'), true);
+  // Windows：NTFS 不区分大小写，cwd 与配置里的盘符/目录大小写经常不一致。
+  // 这一条是「配了媒体目录却被静默停用」那个坑的正解。
+  assert.equal(pathInside('D:\\repo', 'd:\\repo\\.qq-media\\a.jpg', 'win32'), true);
+  assert.equal(pathInside('d:\\repo', 'D:\\REPO\\a.jpg', 'win32'), true);
+  assert.equal(pathInside('D:\\repo', 'D:\\repo2\\a.jpg', 'win32'), false);
+  // 反斜杠的另一侧：同一个盘上的另一个目录不能被算进来。
+  assert.equal(pathInside('D:\\repo\\media', 'D:\\repo\\media2\\a.jpg', 'win32'), false);
+  // POSIX 下大小写是**有意义**的：不能为了迁就 Windows 把这条也放松掉。
+  assert.equal(pathInside('/tmp/Mem', '/tmp/mem/x', 'linux'), false);
+});
+
+test('禁漫的平台默认值：Windows 与容器部署各按各的来', () => {
+  // venv 布局：POSIX `.venv/bin/python`，Windows `.venv\Scripts\python.exe`。
+  assert.equal(defaultJmPython('linux'), '.venv/bin/python');
+  assert.equal(defaultJmPython('darwin'), '.venv/bin/python');
+  assert.equal(defaultJmPython('win32'), '.venv/Scripts/python.exe');
+  // 文件服务绑定：容器部署走 docker 网桥，Windows 桌面版 NapCat 就是本机进程 → 回环。
+  assert.equal(defaultJmFileHost('linux'), '172.17.0.1');
+  assert.equal(defaultJmFileHost('win32'), '127.0.0.1');
 });
 
 test('memorySlug：会话 key → 磁盘目录名', () => {

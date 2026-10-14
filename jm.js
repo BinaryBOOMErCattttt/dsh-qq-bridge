@@ -26,9 +26,10 @@ import { createReadStream } from 'node:fs';
 import { mkdir, readdir, stat, unlink } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { basename, isAbsolute, join, resolve, sep } from 'node:path';
+import { defaultJmFileHost, defaultJmPython } from './util.js';
 
-/** 默认的 python 解释器位置（相对 cwd）：仓库自带的 venv。 */
-const DEFAULT_PYTHON = '.venv/bin/python';
+/** 默认的 python 解释器位置（相对 cwd）：仓库自带的 venv，两条平台的布局不一样。 */
+const DEFAULT_PYTHON = defaultJmPython();
 
 /** 默认的下载目录（相对 cwd）。 */
 const DEFAULT_DIR = '.qq-jm';
@@ -44,6 +45,55 @@ const DEFAULT_MAX_FILES = 20;
 
 /** 响应里带 ANSI 颜色，journal 里不好看，剥掉。 */
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+/**
+ * 子进程的启动/终止方式在两条平台上**不是同一件事**，这里一次性判掉。
+ *
+ *   - POSIX：`detached: true` 让子进程自成进程组，超时时用 `process.kill(-pid)` 整组带走
+ *     （jmcomic 会再开线程、偶尔起子进程，只杀主进程会留下孤儿占着网络与管道）。
+ *   - Windows：`detached: true` 的语义是「**给子进程开一个新的控制台窗口**」—— 桌面版里
+ *     就是每次下载弹一个黑框；而 `process.kill(-pid)` 在那边直接抛错（没有进程组信号）。
+ *     所以那边不 detached、加 `windowsHide`，杀树交给 `taskkill /T`。
+ */
+const IS_WINDOWS = process.platform === 'win32';
+
+/**
+ * 杀掉一个下载子进程**连同它的子孙**。
+ *
+ * POSIX 上子进程带 `detached: true` 起在自己的进程组里（jmcomic 会再开线程、甚至起
+ * 子进程），只 kill 主进程会留下孤儿继续占着网络与管道 —— 实测那样会让测试进程一直
+ * 等到孤儿退出为止，所以整组杀。
+ *
+ * Windows 上没有进程组信号，`process.kill(-pid)` 会直接抛错；`taskkill /T` 才是那边
+ * 「连子孙一起杀」的等价物。它不 await：调用方（超时或关服务）要立刻往下走，子进程
+ * 随后会自己发 `close` 事件。
+ *
+ * @param child - 已 spawn 的子进程。
+ */
+function killProcessTree(child) {
+  if (child.pid === undefined) return;
+  if (IS_WINDOWS) {
+    try {
+      spawnProcess('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    } catch {
+      try {
+        child.kill();
+      } catch {
+        /* 已经退出了 */
+      }
+    }
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* 已经退出了 */
+    }
+  }
+}
 
 /**
  * 从一段文本里认出禁漫车号。
@@ -131,7 +181,7 @@ function createLimiter(limit) {
  * @param options.requestTimeoutMs - jmcomic 单次 HTTP 请求超时（秒，传给 python）。
  * @param options.maxFiles - 目录里最多保留几个 PDF（LRU）。
  * @param options.maxJobs - 全局同时进行的下载数。
- * @param options.fileHost - NapCat 能访问到本机的地址（默认 docker 网桥 172.17.0.1）。
+ * @param options.fileHost - NapCat 能访问到本机的地址（留空 = 按平台自动，见 util.js 的 defaultJmFileHost）。
  * @param options.filePort - HTTP 文件服务端口；0 = 由系统分配。
  * @param options.urlTtlMs - 交给 NapCat 的下载 URL 有效期。
  * @param options.spawn - 子进程实现（测试可注入）。
@@ -150,7 +200,7 @@ export function createJmService({
   requestTimeoutMs = 30000,
   maxFiles = DEFAULT_MAX_FILES,
   maxJobs = 1,
-  fileHost = '172.17.0.1',
+  fileHost = defaultJmFileHost(),
   filePort = 0,
   urlTtlMs = DEFAULT_URL_TTL_MS,
   spawn = spawnProcess,
@@ -341,7 +391,13 @@ export function createJmService({
     const outcome = await new Promise((settle, fail) => {
       let child;
       try {
-        child = spawn(pythonPath, args, { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+        child = spawn(pythonPath, args, {
+          cwd: root,
+          env,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          detached: !IS_WINDOWS,
+          ...(IS_WINDOWS ? { windowsHide: true } : {}),
+        });
       } catch (error) {
         fail(new Error(`cannot start ${pythonPath}: ${reasonOf(error)}`));
         return;
@@ -352,23 +408,11 @@ export function createJmService({
       let result;
       let finished = false;
       /**
-       * 杀整棵进程树，而不是只杀 shell。
-       *
-       * 子进程带 `detached: true` 起在自己的进程组里（jmcomic 会再开线程、甚至
-       * 起子进程），只 kill 主进程会留下孤儿继续占着网络与管道 —— 实测那样会让
-       * 测试进程一直等到孤儿退出为止。
+       * 超时 / 出错时收掉这棵树。判定与两个平台的分支都在模块级的
+       * {@link killProcessTree} 里 —— 插件卸载时的 `close()` 用的是同一个函数，
+       * 免得两处各写一遍、其中一处忘了 Windows 没有进程组信号。
        */
-      const killTree = () => {
-        try {
-          process.kill(-child.pid, 'SIGKILL');
-        } catch {
-          try {
-            child.kill('SIGKILL');
-          } catch {
-            /* 已经退出了 */
-          }
-        }
-      };
+      const killTree = () => killProcessTree(child);
       children.add(child);
       const timer = setTimeout(() => {
         if (finished) return;
@@ -464,17 +508,7 @@ export function createJmService({
   function close() {
     disposed = true;
     tickets.clear();
-    for (const child of children) {
-      try {
-        process.kill(-child.pid, 'SIGKILL');
-      } catch {
-        try {
-          child.kill('SIGKILL');
-        } catch {
-          /* 已经退出了 */
-        }
-      }
-    }
+    for (const child of children) killProcessTree(child);
     children.clear();
     const current = server;
     server = null;
