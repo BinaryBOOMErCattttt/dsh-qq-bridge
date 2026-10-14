@@ -211,6 +211,42 @@ export function memoryOneLine(text) {
 }
 
 /**
+ * 把模型给的表情包名字清洗成一个**单层文件名**，扩展名一律以真实图片格式为准。
+ *
+ * 这是 `qq_save_sticker` 的写边界，所以按「QQ 消息是不可信输入」来写：
+ *   - 目录部分直接丢掉（`../../etc/passwd` → `passwd`），只保留最后一段 —— 比「遇到
+ *     分隔符就拒绝」友好：模型经常把 `.qq-stickers/委屈` 整串当名字传进来；
+ *   - 去掉控制字符与 Windows 非法字符（`:*?"<>|`），结尾的点/空格也去掉（那边不允许）；
+ *   - 开头的点去掉：`.` 开头是隐藏文件，而列表情包目录时隐藏文件是被跳过的，
+ *     存下来却看不见等于没存；
+ *   - 扩展名不看模型写的那个，用 `sniffImageExtension` 嗅出来的真格式 —— 否则会出现
+ *     `笑死.png` 里装着 GIF 字节这种「发得出去、但目录看名字以为是别的格式」的坑；
+ *   - 长度封顶 60：名字要进每轮提示词，太长的名字是纯 token 开销。
+ *
+ * 导出是为了能被单测直接钉住边界（它不碰任何状态，也不碰磁盘）。
+ *
+ * @param raw - 模型给的名字（可以带目录、带扩展名、带非法字符）。
+ * @param extension - 图片的真实扩展名（`png` / `jpg` / `gif` / `webp`）。
+ * @returns 形如 `委屈.gif` 的文件名；清洗完什么都不剩、或格式不认识时 undefined。
+ */
+export function stickerFileName(raw, extension) {
+  const ext = String(extension ?? '').trim().toLowerCase().replace(/^\./, '');
+  if (!['png', 'jpg', 'gif', 'webp'].includes(ext)) return undefined;
+  const base = String(raw ?? '').replace(/\\/g, '/').split('/').pop() ?? '';
+  const cleaned = base
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[:*?"<>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^[. ]+/, '')
+    .replace(/[. ]+$/, '');
+  // 模型可能把扩展名一起写了（`委屈.gif`），也可能写了另一个格式的后缀（`委屈.png`）——
+  // 两种都在这里剥掉，再按真实格式接一个，保证「一个名字对应一个文件」。
+  const stem = cleaned.replace(/\.(png|jpe?g|gif|webp)$/i, '').replace(/[. ]+$/, '');
+  if (stem.length === 0) return undefined;
+  return `${stem.slice(0, 60)}.${ext}`;
+}
+
+/**
  * 把模型给的路径解析成记忆目录内的相对路径；越界（`../`、绝对路径）时返回 undefined。
  *
  * 这是 qq_memory 的写边界：模型只能动 `.qq-memory/` 里的东西。故意不做 glob、

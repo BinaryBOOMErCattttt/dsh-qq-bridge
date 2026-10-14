@@ -86,6 +86,10 @@ export function createSettings(config, defaultCwd) {
   const imageMaxBytes = Number.isFinite(config.imageMaxBytes) && config.imageMaxBytes > 0
     ? Math.floor(config.imageMaxBytes)
     : DEFAULT_IMAGE_MAX_BYTES;
+  // 表情包张数上限：0 是**明确的不限制**，但非法值要退回默认的 60 —— 这里不能照抄
+  // 别处 `Number(x) || 0` 的写法，那会把一次手滑（拼错的字段、字符串）变成最危险的那种值。
+  const stickerMaxFilesRaw = Math.floor(Number(config.stickerMaxFiles));
+  const stickerMaxFiles = Number.isFinite(stickerMaxFilesRaw) && stickerMaxFilesRaw >= 0 ? stickerMaxFilesRaw : 60;
   // 上限 0.3 是「同一套画风只换了字」的实测下限（16%~23%）留出的安全边距，见 perceptual.js。
   const repeatImageTolerance = Math.min(0.3, Math.max(0, Number(config.repeatImageTolerance) || 0));
 
@@ -189,6 +193,7 @@ export function createSettings(config, defaultCwd) {
     memoryDir,
     imageSend,
     imageMaxBytes,
+    stickerMaxFiles,
     repeatImageTolerance,
     repeatWindowMs,
     repeatCount,

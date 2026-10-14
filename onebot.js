@@ -229,6 +229,52 @@ export function mentionsOthers(message, selfId) {
 }
 
 /**
+ * 这条消息在 @ 哪些**别人**（带上能拿到的名字）。
+ *
+ * 与 {@link mentionsOthers} 的区别：那个只回答「有没有 @ 别人」（活跃对话的判据），
+ * 这个要把人**列出来**，好登记进「这个会话里谁可以被 @」的名单 —— 有人 @ 过某个人，
+ * 那个人显然就在这个群里，机器人之后也该能 @ 到他。机器人与 `@全体成员` 都不登记
+ * （前者是它自己，后者不是一个具体的人）。
+ *
+ * @param message - OneBot 的 `message` 字段。
+ * @param selfId - 机器人自己的 QQ 号（这一票排除掉）。
+ * @returns `{ id, name }[]`：`name` 可能为空串（有些实现不给 `at` 段带名字）。
+ */
+export function atMentions(message, selfId) {
+  if (!Array.isArray(message)) return [];
+  const seen = new Set();
+  const list = [];
+  for (const segment of message) {
+    if (segment?.type !== 'at') continue;
+    const id = String(segment?.data?.qq ?? '').trim();
+    if (id.length === 0 || id === String(selfId) || id === 'all') continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    list.push({ id, name: String(segment?.data?.name ?? '').trim() });
+  }
+  return list;
+}
+
+/**
+ * 这次该用哪个名字称呼发消息的人。
+ *
+ * 优先**群名片**（`card`，群里大家都这么叫他），其次是昵称，都没有才退回兜底。
+ * 群聊与私聊用同一套顺序，而不是各挑一个字段：投递给模型的正文里写着 `名字: 内容`，
+ * 模型照着写 `[[@名字]]` —— 两处一旦不一致，@ 就会解析不到（历史上群聊取 card、
+ * 私聊取 nickname，正是这种「同一件事两处各算一遍」的隐患）。
+ *
+ * @param sender - OneBot 事件的 `sender` 字段。
+ * @param fallback - 连昵称都没有时的兜底（通常是 QQ 号本身）。
+ * @returns 非空的显示名。
+ */
+export function userDisplayName(sender, fallback) {
+  const card = String(sender?.card ?? '').trim();
+  const nickname = String(sender?.nickname ?? '').trim();
+  const name = card || nickname;
+  return name.length > 0 ? name : String(fallback ?? '').trim();
+}
+
+/**
  * 找出「这条消息在回复哪一条」：`reply` 段的下标与它指向的 message_id。
  *
  * `reply` 段里只有 id —— OneBot v11 不带被引用消息的任何内容（没有正文、没有

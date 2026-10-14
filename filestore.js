@@ -34,6 +34,20 @@ export async function writeTextAtomic(absolute, text) {
   await rename(temp, absolute);
 }
 
+/**
+ * 把一段字节原子地写进文件（同一套临时文件 + rename）。
+ *
+ * 表情包是**二进制**且体量可能到几 MB，所以不能走 `writeTextAtomic`（那会把 Buffer
+ * 按 utf8 编码一遍，写出来的是坏图）。不写编码参数 = 原样落盘。
+ * @param absolute - 目标绝对路径。
+ * @param bytes - 文件字节（Buffer / Uint8Array）。
+ */
+export async function writeBytesAtomic(absolute, bytes) {
+  const temp = `${absolute}.tmp`;
+  await writeFile(temp, bytes);
+  await rename(temp, absolute);
+}
+
 /** 读取一个文本文件；不存在时返回 undefined（而不是抛错）。 */
 export async function readTextOrUndefined(absolute) {
   try {

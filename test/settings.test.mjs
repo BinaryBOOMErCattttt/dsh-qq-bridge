@@ -56,6 +56,17 @@ test('活下来的一批毫秒项：非法退回默认，负数按 0', () => {
   assert.equal(settings({ activeChimeMax: 3 }).activeChimeMax, 3);
 });
 
+test('表情包张数上限：0 = 明确的不限制，非法值退回默认的 60', () => {
+  // 这是唯一一个「QQ 那头能一直往里塞东西」的上限，所以两个方向都要钉住：
+  // 手滑配错（字符串 / 负数 / NaN）绝不能被当成「不限制」。
+  assert.equal(settings().stickerMaxFiles, 60);
+  assert.equal(settings({ stickerMaxFiles: 0 }).stickerMaxFiles, 0);
+  assert.equal(settings({ stickerMaxFiles: 12 }).stickerMaxFiles, 12);
+  assert.equal(settings({ stickerMaxFiles: -1 }).stickerMaxFiles, 60);
+  assert.equal(settings({ stickerMaxFiles: NaN }).stickerMaxFiles, 60);
+  assert.equal(settings({ stickerMaxFiles: 'nonsense' }).stickerMaxFiles, 60);
+});
+
 test('有明确上下界的整数项被夹紧', () => {
   assert.equal(settings({ digestAtHour: 25 }).digestAtHour, 23);
   assert.equal(settings({ digestAtHour: -1 }).digestAtHour, 0);

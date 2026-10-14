@@ -26,6 +26,7 @@ import {
   memoryRelativePath,
   memorySlug,
   msUntilDailyHour,
+  stickerFileName,
   visibleText,
 } from '../util.js';
 
@@ -124,4 +125,38 @@ test('apiKeyFingerprint：日志里绝不能出现完整 key', () => {
   // 短 key 不露头（太短的头几乎等于整个 key）。
   assert.match(apiKeyFingerprint('short'), /^#[0-9a-f]{8}$/);
   assert.match(apiKeyFingerprint(''), /^#[0-9a-f]{8}$/);
+});
+
+// `stickerFileName` 是 `qq_save_sticker` 的写边界（见 AGENTS.md §4.E 的同一条道理）：
+// 名字来自 QQ 那头（模型的转述），所以「能不能写出去一个目录之外的文件」全部取决于它。
+// 它同时也是每轮提示词里那串候选名字的来源，所以「一个名字 = 一个文件」必须成立。
+test('stickerFileName：目录被丢掉、扩展名以真实格式为准', () => {
+  assert.equal(stickerFileName('委屈', 'gif'), '委屈.gif');
+  assert.equal(stickerFileName('委屈.gif', 'gif'), '委屈.gif', '模型又把扩展名写了一遍，不能变成 委屈.gif.gif');
+  assert.equal(stickerFileName('委屈.png', 'gif'), '委屈.gif', '模型写的后缀是错的，按字节嗅出来的格式算');
+  assert.equal(stickerFileName('.qq-stickers/委屈', 'png'), '委屈.png', '整串路径当名字传进来时只取最后一段');
+  assert.equal(stickerFileName(' C:\\stickers\\笑死 ', 'jpg'), '笑死.jpg', '反斜杠同样是分隔符');
+  assert.equal(stickerFileName('摸摸头', 'webp'), '摸摸头.webp');
+});
+
+test('stickerFileName：清洗掉非法字符，但绝不留下能越界的名字', () => {
+  // 目录部分一律丢掉，所以「往上跳」在结果里根本不存在。
+  assert.equal(stickerFileName('../../etc/passwd', 'png'), 'passwd.png');
+  assert.equal(stickerFileName('a/../../b.png', 'png'), 'b.png');
+  assert.equal(stickerFileName('a:b*c?d|e', 'png'), 'abcde.png');
+  assert.equal(stickerFileName('  笑 死  ', 'png'), '笑 死.png', '中间空格保留、首尾去掉');
+  // Windows 不允许结尾是点/空格，开头是点会变成隐藏文件（列目录时被跳过，等于存了看不见）。
+  assert.equal(stickerFileName('...笑死...', 'png'), '笑死.png');
+  assert.equal(stickerFileName(' . 笑死 ', 'png'), '笑死.png');
+  assert.equal(stickerFileName('笑\u0000死\n', 'png'), '笑死.png');
+});
+
+test('stickerFileName：清洗完没剩下东西、或格式不认识时 undefined（调用方据此报错）', () => {
+  for (const raw of ['', '   ', '..', '../', '////', '.', '...', '\u0000']) {
+    assert.equal(stickerFileName(raw, 'png'), undefined, `必须拒绝: ${JSON.stringify(raw)}`);
+  }
+  assert.equal(stickerFileName('笑死', 'bmp'), undefined, '只认这条图片链路支持的四种格式');
+  assert.equal(stickerFileName('笑死', ''), undefined);
+  // 名字要进每轮提示词，所以长度封顶（超长名是纯 token 开销）。
+  assert.equal(stickerFileName('笑'.repeat(80), 'png').length, 60 + '.png'.length);
 });

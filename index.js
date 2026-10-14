@@ -30,9 +30,9 @@
 import { readdirSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, stat } from 'node:fs/promises';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { OneBotClient, blankMessageLabel, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from './onebot.js';
+import { OneBotClient, atMentions, blankMessageLabel, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs, userDisplayName } from './onebot.js';
 import { createMediaStore } from './media.js';
 import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
@@ -40,6 +40,7 @@ import { createJmService, parseJmRef } from './jm.js';
 import { registerQqTools } from './tools.js';
 import { createSettings, MAX_TIMER_MS } from './settings.js';
 import { createChatter } from './chatter.js';
+import { buildMentionResolver, hasMentionMarker, mentionSegments } from './mention.js';
 import {
   activeFollowAllows as activeFollowAllowsRule,
   activeTurnsLeft as activeTurnsLeftRule,
@@ -61,10 +62,11 @@ import {
   msUntilDailyHour,
   parseApiKeyPool,
   sessionIdFor,
+  stickerFileName,
   visibleText,
   withinActiveHours,
 } from './util.js';
-import { readTextOrUndefined, writeJsonAtomic } from './filestore.js';
+import { readTextOrUndefined, writeBytesAtomic, writeJsonAtomic } from './filestore.js';
 
 // 这三个的契约由 test/bridge.test.mjs 直接从插件入口验，所以在这里再导出一次
 // （Loader 也只认 index.js 这个入口，搬走的东西必须在入口处仍然拿得到）。
@@ -124,6 +126,15 @@ const QUOTE_FETCH_TIMEOUT_MS = 5000;
  * 超出的部分模型仍然可以用 glob 自己看。
  */
 const STICKER_PROMPT_MAX = 40;
+
+/**
+ * 一个会话最多记住多少个「可以被 @ 的人」。
+ *
+ * 名单只用来把 `[[@昵称]]` 解析成 QQ 号，超过几十个人之后更早的发言者本来也早就
+ * 沉到聊天记录里去了（模型 @ 的多半是刚刚跟它说话的人）。上限存在的意义是别让一个
+ * 大群的长期运行把这份缓冲撑大 —— 超了就丢最早登记的那个。
+ */
+const PARTICIPANT_MAX = 64;
 
 /**
  * 默认的「群友口吻」要求，注入系统提示的 QQ 渠道小节。
@@ -350,6 +361,8 @@ export function apply(ctx, config) {
   const imageMaxBytes = Number.isFinite(settings.imageMaxBytes) && settings.imageMaxBytes > 0
     ? Math.floor(settings.imageMaxBytes)
     : DEFAULT_IMAGE_MAX_BYTES;
+  // 表情包目录的张数上限（0 = 不限制）。归零/夹紧的口径在 settings.js，这里只读结果。
+  const stickerMaxFiles = settings.stickerMaxFiles;
   const stickerRoot = settings.stickerDir.trim().length > 0 ? resolve(cwd, settings.stickerDir.trim()) : undefined;
   const stickerInside = stickerRoot !== undefined && insideDirectory(resolve(cwd), stickerRoot);
   /**
@@ -877,16 +890,19 @@ export function apply(ctx, config) {
    *
    * 只有一个人时就是原来那句；几个人几乎同时说话（一批攒到一起）时把人都列出来 ——
    * 只报最后一个会让模型以为只有那一个人在问，回出来就是漏人的客服式答复。
+   *
+   * **刻意不印 QQ 号**：印出来模型就会照着念（「@100000003 你来说」），而群里大家认的是
+   * 昵称。想 @ 谁写 `[[@昵称]]` 就行了（见 `mention.js`），名字必须与这里逐字一致。
    * @param conversation - 目标会话。
    * @returns 一行提示词。
    */
   function speakerLine(conversation) {
     const speakers = conversation.speakers ?? [];
     if (speakers.length > 1) {
-      const list = speakers.map((speaker) => `${speaker.name}（QQ ${speaker.id}）`).join('、');
+      const list = speakers.map((speaker) => speaker.name).join('、');
       return `几乎同时在跟你说话的是：${list} —— 他们的话是一起到的，按聊天的节奏挑着接。`;
     }
-    return `刚跟你说话的人：${conversation.senderName}（QQ ${conversation.senderId}）。`;
+    return `刚跟你说话的人：${conversation.senderName}。`;
   }
 
   /**
@@ -944,6 +960,53 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 把「一张图」固化进表情包目录：`qq_save_sticker` 的全部实现。
+   *
+   * 为什么需要它（实测缺口）：QQ 会话按设计没有 write / edit / bash —— 那三样在不可信
+   * 输入面上太危险 —— 于是群里那句最自然的「存一下这个表情」模型**永远做不到**。真实
+   * 发生过的样子是：它 `read_image` 看完、`glob .qq-stickers/**` 发现是空的，只能把含义
+   * 追加进 `COGNITION.md`，key 还是 `.qq-media/<内容哈希>` 这个 LRU 缓存路径，然后回一句
+   * 「存好了」。那条记忆迟早指向一个被淘汰掉的文件，群里收到的就是「（表情包没发出去）」。
+   *
+   * 所以这里开一条**窄**通道，把边界全部收在函数里：
+   *   - 只写 `stickerRoot` 之内，文件名由纯函数 `stickerFileName` 洗成单层名字；
+   *   - 字节先过 `loadOutgoingImage`（魔数判格式 + 大小上限 + 必须在 cwd 内），
+   *     所以「`.txt` 改名成 `.png`」和越界路径都进不来；
+   *   - 张数到 `stickerMaxFiles` 就拒绝 —— 群里谁都能让它一直存，磁盘不该被这么撑大；
+   *   - 同名**不覆盖**：覆盖等于让群里任何一个人用一句「存一下」把现有表情换掉。
+   *
+   * @param source - 图片来源（`.qq-media/…` 相对路径 / cwd 内绝对路径 / http(s) 链接）。
+   * @param name - 模型起的中文名（可带扩展名，最终以真实格式为准）。
+   * @returns `{ path, bytes, format, source }`：可直接写进标记或交给 qq_send_image 的路径。
+   */
+  async function saveSticker(source, name) {
+    if (stickerRoot === undefined || !stickerInside || stickerLabel === undefined) {
+      throw new Error(`the sticker directory is not usable (${settings.stickerDir.trim() || '(empty)'}): it must be a directory inside ${cwd}`);
+    }
+    const existing = stickerFiles();
+    if (stickerMaxFiles > 0 && existing.length >= stickerMaxFiles) {
+      throw new Error(`the sticker directory already holds ${existing.length} images (stickerMaxFiles: ${stickerMaxFiles}); ask the operator to clean it up or raise the limit`);
+    }
+    // 先取字节、先校验，再动目录：失败时不会在表情包目录里留下半个文件。
+    const image = await loadOutgoingImage({ source, cwd, maxBytes: imageMaxBytes });
+    const fileName = stickerFileName(name, image.format);
+    if (fileName === undefined) {
+      throw new Error(`"${String(name ?? '').slice(0, 40)}" is not a usable sticker name: pass a short file name such as "委屈" (the extension comes from the image itself)`);
+    }
+    // `existing` 只列认得出来的图片；再多一次 stat 是为了挡住「同名但扩展名不同 / 是个目录」
+    // 这类列不出来的占位，免得 rename 覆盖掉用户自己放的东西。
+    const target = join(stickerRoot, fileName);
+    const occupied = existing.includes(fileName) || (await stat(target).catch(() => undefined)) !== undefined;
+    if (occupied) {
+      throw new Error(`${stickerLabel}/${fileName} already exists: pick another name (or read that sticker first and ask the operator if it should be replaced)`);
+    }
+    await mkdir(stickerRoot, { recursive: true });
+    await writeBytesAtomic(target, image.bytes);
+    report('info', `sticker saved: ${stickerLabel}/${fileName} (${image.bytes.length} bytes, from ${image.label})`);
+    return { path: `${stickerLabel}/${fileName}`, bytes: image.bytes.length, format: image.format, source: image.label };
+  }
+
+  /**
    * 生成「每个会话各不相同」的系统提示补充段落（渠道身份、群聊上下文、说话方式）。
    *
    * 注意这个函数是作为 `text` 的 provider 注册的、每次提示词装配都会被调用：
@@ -955,7 +1018,7 @@ export function apply(ctx, config) {
     const title = conversation.name.length > 0 ? `「${conversation.name}」` : '';
     const who = isGroup
       ? `你正在 QQ 群${title}（群号 ${conversation.id}）里潜水，身份是群里的一个普通群友 —— 不是客服，也不是助手。`
-      : `你正在用 QQ 私聊：对方 ${conversation.name}（QQ ${conversation.id}）。`;
+      : `你正在用 QQ 私聊：对方 ${conversation.name}。`;
     const lines = [
       '## QQ 渠道',
       '',
@@ -1002,6 +1065,17 @@ export function apply(ctx, config) {
       '- 一条回复只有一个形状：要么就一两句说完（几个字也行），要么就把事情完整讲一段 —— **绝不把「一句短的」和「一段长的」拼在一起**，尤其别用「先嘴硬 / 先吐槽 / 先敷衍一句，再补一段正经的」这种两拍。情绪、态度、傲娇都体现在用词上，不是体现在「先来一句、再补一段」的排布上。',
       '- 是 / 否题就回一个是 / 否：有人问「知不知道 / 会不会 / 有没有 / 是不是 / 能不能 / 行不行」这类是非题时，整条回复只写肯定或否定本身（「是」/「否」，口语就是「知道」「不知道」「会」「不会」，可以带点语气），**不要再接一句解释**；对方追问了再展开。',
       burstRule,
+    );
+    // @ 别人：模型只会写文本，QQ 的 @ 是消息里的一个段，所以给它一个标记去表达。
+    // 三个要点必须一起说清，少一个都会出问题：
+    //   - 怎么写（`[[@昵称]]`，昵称就是正文里 `昵称: 内容` 那个名字）；
+    //   - **绝对不要写 QQ 号**（这正是提示词里不再印 QQ 号的原因：它看得见就会照着念）；
+    //   - 别每条都 @（真人不会每句话都点一次名）。
+    lines.push(
+      isGroup
+        ? '- 想 @ 群里的人时，在回复里写 `[[@昵称]]`（昵称就是上面那句「跟你说话的人」/「群里最近的消息」里的名字，原样照抄，一个字都别改），它会在发出去时变成真正的 @；想 @ 所有人的话写 `[[@全体成员]]`，但只在真的要喊大家的时候用。**不要**把 QQ 号写进正文，也不要自己拼 `@` 加号码 —— 群里谁也不这么说话。'
+        : '- 想 @ 对方时在回复里写 `[[@昵称]]`（昵称就是上面那句「对方 …」里的名字），它会变成真正的 @。**不要**把 QQ 号写进正文。',
+      '- @ 不是每句都要挂的：平时接着聊就行，只有真的要把话丢给某个人、或者中间插了别人的话怕对不上时再点一次名。',
     );
     // 空消息（单纯的 @、或者一个空格）现在也会走到这里，正文位置就是这么一句说明 ——
     // 不解释的话模型会把它当成对方真的发了这串字，回一句「我没发这个啊」。同时点明
@@ -1058,6 +1132,14 @@ export function apply(ctx, config) {
             ? `- 你自己的表情包在 ${stickerLabel}/ 里：${names.join('、')}。文件名通常就是它的意思${canReadImages ? '，拿不准的先 read_image 看一眼' : ''}；想发哪张就把它的路径写进标记里。表情包别滥用 —— 一次最多一张，也别每句都配一张。`
             : `- 你自己的表情包目录 ${stickerLabel}/ 目前是空的，没有现成的表情包可挑（别人刚发的那张图仍然可以发回去）。`,
         );
+        // 「把这张存下来」是群里最常见的一句话，而模型自己没有写文件的能力（QQ 会话没有
+        // write / edit / bash），不给它这条通道时它会假装存好了，然后只往 COGNITION.md 里
+        // 记一个迟早被淘汰的 `.qq-media/<哈希>` 路径 —— 见 `saveSticker` 的注释。
+        if (stickerSaveAllowed()) {
+          lines.push(
+            '- 有人让你「存一下」某张表情包 / 你自己觉得某张图以后还会用到时，用 qq_save_sticker 存进上面那个目录：source 就写正文里给它的那个路径（例如 `.qq-media/ab12….jpg`，也可以是 http 图片链接），name 起一个**有含义的短名字**（`委屈` / `笑死` / `摸摸头`）—— 那个名字以后每轮都会摆在你眼前，起得准才挑得动；扩展名不用管，插件按图片真实格式接。同名已存在时会报错，换个名字。别见一张存一张：存的是你以后真的会想发的。',
+          );
+        }
       }
     }
     // 引用前缀是插件加上去的，得告诉模型它是什么，否则会被当成对方原话的一部分。
@@ -1089,6 +1171,19 @@ export function apply(ctx, config) {
    */
   function imageAllowed() {
     return imageSend && (allowTools.length === 0 || allowTools.includes('qq_send_image'));
+  }
+
+  /**
+   * 这个 Agent 能不能把图**存**进表情包目录（`qq_save_sticker`）。
+   *
+   * 三层：发图总开关开着（存下来的唯一用途就是以后发出去，所以它不该在一个发不了图的
+   * 会话里冒出来）、表情包目录可用（没配 / 配到 cwd 外时只能记 warn 并停用）、
+   * `qq_save_sticker` 自己那一格白名单。
+   */
+  function stickerSaveAllowed() {
+    return imageAllowed()
+      && stickerRoot !== undefined && stickerInside
+      && (allowTools.length === 0 || allowTools.includes('qq_save_sticker'));
   }
 
   /**
@@ -1208,12 +1303,19 @@ export function apply(ctx, config) {
    * 一条文字都不会发出去。没允许发图时（`imageAllowed()`）它退回普通文字，
    * 别让一个错标记变成一次「发不出去的图」。
    *
+   * 文字段里的 `[[@昵称]]` 标记在这里只**标记出来**（`mention: true`），真正的段解析放在
+   * `sendParts` 里做 —— 那里才拿得到会话记录（「谁可以被 @」的名单挂在会话上）。
+   * 没有标记的文字段仍然以纯字符串发出，与旧行为逐字节一致。
+   *
    * @param text - 模型给出的完整回复。
    * @param human - 是否按拟人节奏拆短句（与 `burstParts` 同一套规则）。
-   * @returns `{ kind: 'text', text }` 或 `{ kind: 'image', source, raw }` 的数组。
+   * @returns `{ kind: 'text', text, mention? }` 或 `{ kind: 'image', source, raw }` 的数组。
    */
   function replyPieces(text, human) {
-    const asText = (value) => (human ? burstParts(value) : chunkText(value, settings.maxReplyChars)).map((part) => ({ kind: 'text', text: part }));
+    // 有 @ 标记的那段会带上 `mention`，所以「一条消息」不再必然等于「一个字符串」。
+    const asText = (value) =>
+      (human ? burstParts(value) : chunkText(value, settings.maxReplyChars)).map((part) =>
+        hasMentionMarker(part) ? { kind: 'text', text: part, mention: true } : { kind: 'text', text: part });
     return splitStickerLines(text).flatMap((piece) => {
       if (piece.kind === 'text') return asText(piece.text);
       if (!imageAllowed()) return asText(piece.raw); // 没允许发图时标记只是普通文字
@@ -1248,6 +1350,9 @@ export function apply(ctx, config) {
   /** `sendToConversation` 的实际发送步骤（调用方已保证同一会话串行）。 */
   async function sendParts(conversation, text, human, quote) {
     const pieces = replyPieces(text, human);
+    // 「昵称 → QQ 号」的名单在一次发送里只造一遍：几个分段共用同一份，也保证同一次回复里
+    // 同名的解析结果一致。
+    const mentionsFor = conversationMentions(conversation);
     for (const [index, piece] of pieces.entries()) {
       if (human) {
         // 第一条前多等一个「读消息」的时间；后续每条只算打字时间。
@@ -1263,8 +1368,18 @@ export function apply(ctx, config) {
       }
       const head = quoteHead(conversation, index, quote);
       if (piece.kind === 'text') {
-        // 没有指向时仍然发纯字符串：与旧版发送格式完全一致，也少一个出错点。
-        if (!(await sendOne(conversation, head === undefined ? piece.text : [head, { type: 'text', data: { text: piece.text } }]))) return;
+        // 没有 @ 标记、也没有指向时仍然发纯字符串：与旧版发送格式完全一致，也少一个出错点。
+        if (piece.mention !== true && head === undefined) {
+          if (!(await sendOne(conversation, piece.text))) return;
+          continue;
+        }
+        const segments = piece.mention === true
+          ? mentionSegments(piece.text, mentionsFor)
+          : [{ type: 'text', data: { text: piece.text } }];
+        const message = head === undefined ? segments : [head, ...segments];
+        // 标记解析完什么都不剩（只写了一个认不出来的名字）时，这一条就没有内容可发了。
+        if (segments.length === 0) continue;
+        if (!(await sendOne(conversation, message))) return;
         continue;
       }
       let bytes;
@@ -1357,7 +1472,7 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 解析出站工具（`qq_send_image` / `qq_jm_pdf`）该发给谁。
+   * 解析出站工具（`qq_send_message` / `qq_send_image` / `qq_jm_pdf`）该发给谁。
    *
    * 优先用显式给的 `target_type` / `target_id`；没给就看调用它的 Agent 是不是某个
    * QQ 会话的 Agent —— 从 QQ 会话里调用时，「发回当前会话」才是最自然的默认值，
@@ -1576,6 +1691,17 @@ export function apply(ctx, config) {
       pending: [],
       batchTimer: undefined,
       speakers: [],
+      /**
+       * 这个会话里「可以被 @ 的人」：`{ name, id }[]`，最近说过话的排在前面。
+       *
+       * 为什么需要它：渠道提示里**不再印任何 QQ 号**（模型会照着念出来），改成让模型写
+       * `[[@昵称]]` 标记，由 `mention.js` 换成真正的 at 段 —— 于是「昵称 → QQ 号」的
+       * 映射必须在这里维护。名单**按会话隔离**：在一个群里学到的昵称不会 @ 到别的群去。
+       *
+       * 登记点（都只有「这个人在这个会话里说过话」这一个来源）：`conversationFor` 记当前
+       * 发言者与他自己 @ 的人，`rememberAmbient` 记群里闲聊的人。上限见 `PARTICIPANT_MAX`。
+       */
+      participants: [],
       /** 记忆元信息（群名等）是否已经写过一次，避免每条消息都重写一遍 meta.json。 */
       metaWritten: false,
       /**
@@ -1639,7 +1765,37 @@ export function apply(ctx, config) {
     return conversation.type === 'group' ? `群 ${conversation.id}` : `私聊 ${conversation.id}`;
   }
 
-  /** 取出（或新建）一条入站消息所属的会话记录，并刷新发送者信息。 */
+  /**
+   * 记一个「在这个会话里说过话的人」，供 `[[@昵称]]` 解析成 QQ 号。
+   *
+   * 三条纪律：
+   *   - **按 id 去重，并把刚说话的人挪到队首**：名单是「谁最可能被 @」的排序，
+   *     模型 @ 的多半是刚刚跟它说话的人（`mentionResolverFrom` 先到先得）；
+   *   - **只有非空的名字才登记**：入站事件里昵称可能缺（就是没有可 @ 的名字），
+   *     登记一个空名字只会让 `@ ` 变成一个谁也不是的东西；
+   *   - **上限 `PARTICIPANT_MAX`**：超了丢最早登记的那个（见该常量的说明）。
+   *
+   * @param conversation - 归属的会话记录。
+   * @param name - 显示名（群聊用群名片 / 昵称，与正文里 `昵称: 内容` 的那个写法一致）。
+   * @param id - 这个人的 QQ 号。
+   */
+  function registerParticipant(conversation, name, id) {
+    const label = String(name ?? '').replace(/\s+/g, ' ').trim();
+    const userId = String(id ?? '').trim();
+    if (label.length === 0 || userId.length === 0 || conversation === undefined) return;
+    const list = conversation.participants;
+    const at = list.findIndex((entry) => entry.id === userId);
+    if (at >= 0) list.splice(at, 1);
+    list.unshift({ name: label, id: userId });
+    if (list.length > PARTICIPANT_MAX) list.length = PARTICIPANT_MAX;
+  }
+
+  /**
+   * 取出（或新建）一条入站消息所属的会话记录，并刷新发送者信息。
+   *
+   * `sender.name` 是**这一次**该怎么称呼这个人（群聊给群名片、私聊给昵称，与投递给模型的
+   * 正文里那个写法必须逐字一致 —— `[[@昵称]]` 就是拿它去名单里查的）。
+   */
   function conversationFor(type, id, sender) {
     const key = `${type}:${id}`;
     let conversation = conversations.get(key);
@@ -1662,7 +1818,24 @@ export function apply(ctx, config) {
       conversation.senderId = String(sender?.userId ?? '');
       conversation.senderName = conversation.name;
     }
+    // 「谁可以被 @」的名单：说话的人自己，以及他这条消息里 @ 过的人（那群人显然在这个群里）。
+    // 只有**带 QQ 号**的那些才登记得进来：没有号就 @ 不出去，编一个只会把 `at` 段发成
+    // 一个谁也不是的号码。
+    registerParticipant(conversation, sender?.name, sender?.userId);
+    for (const mention of sender?.mentions ?? []) registerParticipant(conversation, mention.name, mention.id);
     return conversation;
+  }
+
+  /**
+   * 造一个「昵称 → QQ 号」的解析函数，喂给 `mention.js` 把 `[[@昵称]]` 换成 at 段。
+   *
+   * 每次发送时现造（而不是缓存在会话上）：名单会随着新的发言者变，几行数组的查找
+   * 比维护一份缓存的失效逻辑便宜得多。
+   * @param conversation - 目标会话。
+   * @returns `(name) => string | undefined`；`@全体成员` 只在群聊里解析得出来。
+   */
+  function conversationMentions(conversation) {
+    return buildMentionResolver(conversation);
   }
 
   /**
@@ -1703,6 +1876,10 @@ export function apply(ctx, config) {
       const groupId = String(event.group_id);
       if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(groupId)) return undefined;
       const userId = String(event.user_id ?? '');
+      // 这一次该怎么称呼这个人。**只有这一个地方决定**（群聊给群名片、其次昵称），
+      // 因为投递给模型的正文里就写作 `名字: 内容`，而 `[[@名字]]` 拿的正是同一串字去
+      // 名单里查（见 `registerParticipant`）—— 两处各算一次早晚会不一样。
+      const displayName = userDisplayName(sender, event.user_id);
       // 这一句有没有 @ 机器人，后面两处都要用：判显式触发，以及空消息的替身该写成
       // 「@ 了你一下」还是「一条空消息」。
       const mentionedMe = mentions(message, selfId);
@@ -1750,7 +1927,9 @@ export function apply(ctx, config) {
       const conversation = conversationFor('group', groupId, {
         groupName: '',
         userId: event.user_id,
-        userName: sender.card ?? sender.nickname ?? String(event.user_id),
+        userName: displayName,
+        name: displayName,
+        mentions: atMentions(message, selfId),
       });
       noteActiveMessage(conversation, userId, continued);
       return {
@@ -1759,6 +1938,9 @@ export function apply(ctx, config) {
         preview: blank ? blankBody : preview,
         blankBody,
         continued,
+        // 这次该怎么称呼他：`submitBatch` 把它交给模型（正文里的 `昵称:` 与它逐字一致），
+        // 模型回话时写 `[[@昵称]]` 就能把这个人 @ 出来。
+        displayName,
         // 回复指向：引用被回复的那条消息（`reply` 段要 message_id），或 @ 回提问者（要 QQ 号）。
         // `seq` 是这条消息在群里的进度，供 `auto` 判断「等我回话时有没有人（包括我自己）
         // 又说了话」。三样都在这里一次性快照：发送在几秒后，那时会话记录和群里的进度都可能变了。
@@ -1777,9 +1959,11 @@ export function apply(ctx, config) {
     if (blank && settings.blankReply !== true) return undefined;
     const blankBody = blank ? blankMessageLabel({ group: false }) : '';
     const preview = blank ? blankBody : dropPrefix(text);
+    const displayName = String(sender.nickname ?? sender.card ?? userId);
     const conversation = conversationFor('private', userId, {
       userId,
-      userName: sender.nickname ?? sender.card ?? userId,
+      userName: displayName,
+      name: displayName,
     });
     // 私聊的每条消息本来就都是「跟它说的」，所以活跃对话在私聊里不需要额外判定 ——
     // 只要把这个窗口往后滑，它回完之后才可能自己补一句（见 scheduleChime）。
@@ -1790,6 +1974,7 @@ export function apply(ctx, config) {
       preview,
       blankBody,
       continued: false,
+      displayName,
       // 私聊始终是 plain，`seq` 只是让 quote 的字段形状保持一致。
       quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: 0 },
     };
@@ -1885,6 +2070,9 @@ export function apply(ctx, config) {
     list.push(entry);
     while (list.length > limit) list.shift();
     ambient.set(groupId, list);
+    // 在群里说过话的人也要进「可以被 @」的名单：环境上下文里那些人正是模型最可能想点名的
+    // （「刚才说吃啥的那位」）。只认**已经有会话记录**的群 —— 闲聊不该凭空建出会话记录来。
+    registerParticipant(conversations.get(`group:${groupId}`), name, event.user_id);
     // 先按占位符入缓冲（提示词立刻可用），下载完成后再就地改写成带路径的版本。
     if (settings.ambientMedia) void hydrateAmbientMedia(raw, entry, lineChars);
   }
@@ -2847,9 +3035,11 @@ export function apply(ctx, config) {
       const names = [...new Set(entries.map((entry) => entry.name))].join('、');
       report('info', `← ${describeConversation(conversation)} ${names}${entries.length > 1 ? `（${entries.length} 条）` : ''}: ${text.slice(0, 120)}`);
       // 发言人：提示词里要说得清「现在是谁在跟你说话」，所以几个人的话都记下来。
+      // 同一个登记顺手保证他们都能被 @ 到（名单以「刚刚说过话」为序，见 `registerParticipant`）。
       const speakers = new Map();
       for (const entry of entries) speakers.set(entry.id, { name: entry.name, id: entry.id });
       conversation.speakers = [...speakers.values()];
+      for (const speaker of conversation.speakers) registerParticipant(conversation, speaker.name, speaker.id);
       const agent = await ensureAgent(conversation);
       const userMessage = createUserMessage({
         content: [{ type: 'text', text }],
@@ -2969,7 +3159,9 @@ export function apply(ctx, config) {
       // 空消息（单纯 @ / 一个空格）的那句说明：媒体落盘后正文还是空的，用它兜底。
       blankBody: admitted.blankBody ?? '',
       userId: String(event.user_id ?? ''),
-      name: String(sender.card ?? sender.nickname ?? event.user_id ?? '某人'),
+      // 名字取自 `admit` 算好的那一个，不在这里重算：正文里写作 `名字: …`，而
+      // `[[@名字]]` 要靠同一串字解析（重算一次就是一份要同步维护的重复口径）。
+      name: admitted.displayName ?? String(event.user_id ?? '某人'),
       at: Date.now(),
     });
   }
@@ -3064,7 +3256,12 @@ export function apply(ctx, config) {
     protocolLimit: settings.maxReplyChars,
     noteOwnMessage,
     resolveTarget,
+    // 工具里的 `[[@昵称]]` 标记也要解析成 at 段：名单挂在会话记录上（见 `conversationMentions`）。
+    mentionResolver: conversationMentions,
     resolveStickerSource,
+    // 存表情包：不可用时传 undefined，`registerQqTools` 会跳过那个工具
+    // （与 memory.tools 同一个规矩：不留「一调就报错」的壳）。
+    saveSticker: stickerSaveAllowed() ? saveSticker : undefined,
     imageSend,
     imageMaxBytes,
     resolveRoute,

@@ -18,6 +18,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { chunkText } from './onebot.js';
 import { imageSegment, loadOutgoingImage } from './image.js';
 import { parseJmRef } from './jm.js';
+import { hasMentionMarker, mentionSegments } from './mention.js';
 
 /**
  * 工具一：qq_send_message —— 主动向某个 QQ 号或群号发文本（超长自动分段）。
@@ -44,7 +45,7 @@ function qqSendMessage(deps) {
       message: {
         type: 'string',
         required: true,
-        description: 'The plain-text message body to send. Long text is split automatically.',
+        description: 'The plain-text message body to send. Long text is split automatically. A person in the target group can be @-mentioned by writing [[@their nickname]] (the nickname as it appears in the conversation), a true at-segment is then sent. Never write a bare QQ number as text.',
       },
     },
     // 输出结构：回显目标与实际发送的段数，便于模型确认「发了几条」。
@@ -63,7 +64,7 @@ function qqSendMessage(deps) {
         { type: 'text', text: `Sent ${value.parts} QQ message part(s) to ${value.target_type} ${value.target_id}.` },
       ],
     },
-    async execute(args) {
+    async execute(args, exec) {
       // 未连接时直接报错，而不是静默丢弃消息。
       if (!deps.client.connected) throw new Error(`QQ bridge is not connected to ${deps.endpoint}; start NapCat or check the endpoint.`);
       const targetType = args.target_type;
@@ -73,10 +74,17 @@ function qqSendMessage(deps) {
       if (body.length === 0) throw new Error('qq_send_message requires a non-empty message');
       const action = targetType === 'group' ? 'send_group_msg' : 'send_private_msg';
       const idKey = targetType === 'group' ? 'group_id' : 'user_id';
+      // 目标会话记录（拿它上面那份「谁可以被 @」的名单）：显式给的目标可能还没聊过，
+      // 这时 `resolveTarget` 给的是一个临时的空壳（名单为空），@ 会退化成「不 @ 任何人」。
+      const { conversation } = deps.resolveTarget(args, exec, 'qq_send_message');
+      const mentionsFor = deps.mentionResolver(conversation);
       // 这是 Agent 的显式动作（「就发这段」），所以只按协议上限分段：
       // 不做拆句、不加打字延迟 —— 拟人节奏只加在 QQ 会话的自动回复上。
       const parts = chunkText(body, deps.protocolLimit);
-      for (const part of parts) await deps.client.call(action, { [idKey]: targetId, message: part });
+      for (const part of parts) {
+        // 没有 `[[@昵称]]` 的那几段仍然发纯字符串（与旧行为逐字节一致）；有标记的才走段解析。
+        await deps.client.call(action, { [idKey]: targetId, message: hasMentionMarker(part) ? mentionSegments(part, mentionsFor) : part });
+      }
       // 发进群里的工具消息也是「我自己说的话」，回复指向的进度要跟着走（见 `noteOwnMessage`）。
       deps.noteOwnMessage(targetType, targetId);
       return { target_type: targetType, target_id: targetId, parts: parts.length };
@@ -152,7 +160,61 @@ function qqSendImage(deps) {
 }
 
 /**
- * 工具三：qq_list_conversations —— 列出在线群/好友，以及本 Harness 已处理过的
+ * 工具三：qq_save_sticker —— 把一张图固化进表情包目录，成为「以后随手能挑」的表情。
+ *
+ * 和 qq_send_image 是两件事：那个是**发出去**（一次性动作），这个是**留下来**（改磁盘）。
+ * 存在的理由只有一个：QQ 会话按设计没有 write / edit / bash，所以群里那句「存一下这个
+ * 表情」模型自己做不到 —— 实测它会把含义记进 COGNITION.md、key 写成 `.qq-media/<哈希>`
+ * 这个会被淘汰的缓存路径，然后回一句「存好了」（见 index.js 的 `saveSticker`）。
+ *
+ * 写边界全部在 `deps.saveSticker` 里（单层文件名 + 只写 stickerDir + 不覆盖同名 +
+ * 张数上限），这里只管参数、报错和 render。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqSaveSticker(deps) {
+  return defineTool({
+    name: 'qq_save_sticker',
+    description:
+      'Save one image (PNG/JPEG/WebP/GIF) into the QQ sticker directory so it becomes a reusable sticker you can send later — typically a meme someone just posted and asked you to keep, or a picture the conversation downloaded into the media cache. The bytes are validated (magic number, size limit, must be inside the working directory) and the name is sanitized; the extension comes from the image itself. Returns the sticker path to use with qq_send_image or the [[图片: …]] marker. An existing name is refused (never overwritten).',
+    parameters: {
+      source: {
+        type: 'string',
+        required: true,
+        description: 'The image to keep: a path relative to the working directory (usually the ".qq-media/…" path this conversation gave you), an absolute path inside the working directory, or an http(s) image URL.',
+      },
+      name: {
+        type: 'string',
+        required: true,
+        description: 'The sticker file name, without the extension — a short, meaningful name saying what it means ("委屈", "笑死", "摸摸头"). This name is what you will see in every prompt from now on, so it is worth getting right.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true },
+          bytes: { type: 'integer', required: true },
+          format: { type: 'string', required: true },
+          source: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: `Saved ${value.source} as ${value.path} (${value.format}, ${value.bytes} bytes). Send it back with [[图片: ${value.path}]].`,
+        },
+      ],
+    },
+    async execute(args) {
+      if (deps.saveSticker === undefined) throw new Error('saving stickers is not available (the sticker directory is disabled, imageSend is off, or qq_save_sticker is not in allowTools)');
+      return deps.saveSticker(args.source, args.name);
+    },
+  });
+}
+
+/**
+ * 工具四：qq_list_conversations —— 列出在线群/好友，以及本 Harness 已处理过的
  * QQ 会话及其 Session id，同时附带当前生效的模型路由（便于排查 MISSING_CREDENTIAL
  * 之类的模型问题）。
  * @param {object} deps - 见 `registerQqTools` 的说明。
@@ -277,7 +339,7 @@ function qqListConversations(deps) {
 }
 
 /**
- * 工具四：qq_jm_pdf —— 下载禁漫（JM）本子/单话，合并成 PDF，并发到 QQ。
+ * 工具五：qq_jm_pdf —— 下载禁漫（JM）本子/单话，合并成 PDF，并发到 QQ。
  *
  * 从 QQ 会话里调用时可以不填目标：调用它的那个 Agent 对应的会话就是收件人
  * （`exec.agent.id` → 会话 key）。Web UI 里的主会话调用时必须显式给目标。
@@ -357,7 +419,7 @@ function qqJmPdf(deps) {
 }
 
 /**
- * 工具五：qq_transcript —— 查某个 QQ 会话的聊天记录（长期记忆的原料）。
+ * 工具六：qq_transcript —— 查某个 QQ 会话的聊天记录（长期记忆的原料）。
  *
  * 这是「想不起来就去查」的那条路：`ambientMessages` 只喂最近十来条，一旦真需要
  * 「上周三讨论的那个链接是什么」就必须能翻到更早的记录，而不是靠模型编。
@@ -456,7 +518,7 @@ function qqTranscript(deps) {
 }
 
 /**
- * 工具六：qq_memory —— 读/追加/覆盖记忆文件（`MEMORY.md` / `COGNITION.md` / `INDEX.md`）。
+ * 工具七：qq_memory —— 读/追加/覆盖记忆文件（`MEMORY.md` / `COGNITION.md` / `INDEX.md`）。
  *
  * 写路径被限制在 memoryDir 之内（`memoryRelativePath`），单个文件也有字节上限：
  * 记忆的价值在「精炼且总是被读到」，一个无限增长的文件只会把提示词撑爆。
@@ -535,8 +597,10 @@ function qqMemory(deps) {
 }
 
 /**
- * 注册全部适用的 QQ 工具。两个记忆工具只在长期记忆可用时注册
- * （`deps.memory` 为 undefined 时跳过）—— 停用的功能不该留下一个「一调就报错」的工具。
+ * 注册全部适用的 QQ 工具。两个可选的工具族只在对应能力可用时注册：记忆工具要
+ * `deps.memory`（长期记忆停用时是 undefined），`qq_save_sticker` 要 `deps.saveSticker`
+ * （表情包目录不可用、或白名单没放开时是 undefined）—— 停用的功能不该留下一个
+ * 「一调就报错」的工具。
  *
  * @param {object} ctx - 插件上下文，只用它的 `tools` 服务。
  * @param {object} deps - 全部依赖显式传入，本模块不持有状态：
@@ -547,7 +611,11 @@ function qqMemory(deps) {
  * @param {number} deps.protocolLimit - 协议单条上限（工具只按它切分，不加拟人节奏）。
  * @param {(type: string, id: string) => void} deps.noteOwnMessage - 记「我自己发了一条」。
  * @param {(args: object, exec: object, toolName: string) => object} deps.resolveTarget - 解析收件人。
+ * @param {(conversation: object) => (name: string) => string | undefined} deps.mentionResolver -
+ *   把 `[[@昵称]]` 里的昵称解析成 QQ 号（名单挂在会话记录上）。
  * @param {(source: string) => string} deps.resolveStickerSource - 把表情包文件名解析成路径。
+ * @param {(source: string, name: string) => Promise<object>} [deps.saveSticker] -
+ *   把一张图存进表情包目录（校验 + 清洗文件名 + 张数上限）；缺失 = 不注册 qq_save_sticker。
  * @param {boolean} deps.imageSend - `imageSend`，关掉时发图工具直接报错。
  * @param {number} deps.imageMaxBytes - 出站图片字节上限。
  * @param {() => object} deps.resolveRoute - 当前生效的模型路由（`qq_list_conversations` 回显）。
@@ -560,6 +628,9 @@ function qqMemory(deps) {
 export function registerQqTools(ctx, deps) {
   ctx.tools.register(qqSendMessage(deps));
   ctx.tools.register(qqSendImage(deps));
+  // 表情包目录不可用（没配 / 配到 cwd 外）或白名单里没有它时整个跳过：留一个必然报错的
+  // 工具，只会让模型浪费一次调用去撞墙。
+  if (deps.saveSticker !== undefined) ctx.tools.register(qqSaveSticker(deps));
   ctx.tools.register(qqListConversations(deps));
   ctx.tools.register(qqJmPdf(deps));
   if (deps.memory !== undefined) {

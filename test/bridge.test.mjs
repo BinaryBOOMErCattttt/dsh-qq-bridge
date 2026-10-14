@@ -471,9 +471,9 @@ function privateMessageWithReply(text, quotedId) {
  * 造一条群聊入站事件；`messageId` 用于验证引用回复。
  *
  * `name`（昵称）与 `card`（群名片）**刻意给成两个不同的值**，别顺手统一：
- * 群聊正文取的是 `sender.card ?? sender.nickname`（index.js 的 userName），
- * 私聊取的是 `sender.nickname ?? sender.card`。两者一样的话，「群里显示名片、
- * 私聊显示昵称」这条优先级就再也测不出来了 —— 断言依然会绿，但没在验东西。
+ * 「显示名优先群名片、其次昵称」这条优先级靠它才测得出来（index.js 的
+ * `userDisplayName`）—— 两者一样的话断言依然会绿，但没在验东西。这个名字同时也是
+ * `[[@昵称]]` 要照抄的那个名字（见 mention.js）。
  */
 function groupMessage(segments, { userId = 100000003, name = 'tomori', card = 'kaguya', messageId = 7000 } = {}) {
   return {
@@ -831,9 +831,12 @@ test('mentions that land together become one turn instead of one reply each', as
     assert.ok(text.includes('mutsumi: 我也想问'), text);
 
     // 提示词里说的是「几个人一起在跟你说话」，而不是只报最后一个。
+    // 名字**不带 QQ 号**：号码印在提示词里，模型就会照着念出来（那正是不该发生的事），
+    // 而它想 @ 谁时写的是 `[[@昵称]]`（见 mention.js / 下面那组用例）。
     const prompt = promptText(host, 'qq-bridge:channel');
-    assert.ok(prompt.includes('kaguya（QQ 100000003）'), prompt);
-    assert.ok(prompt.includes('mutsumi（QQ 4444444444）'), prompt);
+    assert.ok(prompt.includes('几乎同时在跟你说话的是：kaguya、iroha、mutsumi'), prompt);
+    assert.ok(!prompt.includes('100000003'), prompt);
+    assert.ok(!prompt.includes('4444444444'), prompt);
 
     completeTurn(host, agent, '都在呢', 1);
     const sent = await until(() => sentTexts(onebot)[0], 'the single reply');
@@ -1219,9 +1222,11 @@ test('the bundled patch declares the narrowed preset the plugin mounts', async (
   // 白名单只能收窄、不能授予：每个放开的工具名都要能在这个预设里找到出处。
   // 本插件的工具是**宿主平面**的全局工具（不在预设里），所以直接算作出处：
   //   - qq_send_* / qq_jm_pdf：一直注册；
+  //   - qq_save_sticker：表情包目录可用时才注册（白名单里有它、但目录配到 cwd 外时，
+  //     插件只是不注册那个工具 —— 这与「白名单挡掉」是两条独立的路，见 tools.js）；
   //   - qq_transcript / qq_memory：memory 开着时才注册；
   //   - skill：由预设里的 tool-skill 提供。
-  const provided = new Set(['qq_send_message', 'qq_send_image', 'qq_list_conversations', 'qq_jm_pdf', 'skill']);
+  const provided = new Set(['qq_send_message', 'qq_send_image', 'qq_save_sticker', 'qq_list_conversations', 'qq_jm_pdf', 'skill']);
   if (bridge.config.memory !== false) for (const name of ['qq_transcript', 'qq_memory']) provided.add(name);
   if (names.includes('@deepseek-ai/dsh-tool-fs')) for (const name of ['read', 'read_image', 'write', 'edit']) provided.add(name);
   if (names.includes('@deepseek-ai/dsh-tool-fs-search')) for (const name of ['glob', 'grep']) provided.add(name);
@@ -2298,6 +2303,124 @@ test('a multiline group reply becomes separate messages with the quote only on t
   }
 });
 
+// 用例：回复里可以 @ 别人（`[[@昵称]]` → at 段），而正文里**不会**出现 QQ 号。
+//
+// 这一组的出发点是「模型看不见、也不该写出任何 QQ 号」：提示词里只给它昵称，
+// 它想点名就写 `[[@昵称]]`，插件负责换成真正的 at 段。
+test('a reply can @ somebody by nickname, and raw QQ numbers never reach the chat', async () => {
+  const { onebot, host } = await boot({ replyStyle: 'plain' });
+  try {
+    // 第一个人 @ 了它，第二个人的名字要靠环境上下文/自己发言进名单。
+    onebot.push(mention('在吗', { messageId: 5001, userId: 100000003, name: 'tomori', card: 'kaguya' }));
+    const agent = await until(() => host.list.created[0], 'the group Agent');
+    completeTurn(host, agent, '[[@kaguya]] 在的', 1);
+    const sent = await until(() => sentTexts(onebot)[0], 'the mentioned reply');
+    assert.deepEqual(sent, [
+      { type: 'at', data: { qq: '100000003' } },
+      { type: 'text', data: { text: ' 在的' } },
+    ]);
+
+    // 认不出来的名字：整个标记丢掉，绝不会把 `[[@…]]` 原样糊进群里。
+    onebot.push(mention('还有人吗', { messageId: 5002 }));
+    await until(() => agent.inbox.length === 2, 'the second message');
+    completeTurn(host, agent, '[[@查无此人]] 没别人了', 2);
+    const second = await until(() => sentTexts(onebot)[1], 'the reply with an unknown name');
+    assert.deepEqual(second, [{ type: 'text', data: { text: ' 没别人了' } }]);
+    assert.ok(!JSON.stringify(second).includes('[['), JSON.stringify(second));
+
+    // 整条回复只有一个没法解析的 @：什么都不发（而不是发一串乱码）。
+    onebot.push(mention('你倒是说啊', { messageId: 5003 }));
+    await until(() => agent.inbox.length === 3, 'the third message');
+    completeTurn(host, agent, '[[@查无此人]]', 3);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(sentTexts(onebot).length, 2);
+
+    // 整条回复只有一个**解析得出来**的 @：只发一个 at 段，一个字都不说。
+    onebot.push(mention('叫我干嘛', { messageId: 5004 }));
+    await until(() => agent.inbox.length === 4, 'the fourth message');
+    completeTurn(host, agent, '[[@kaguya]]', 4);
+    const onlyAt = await until(() => sentTexts(onebot)[2], 'the @-only reply');
+    assert.deepEqual(onlyAt, [{ type: 'at', data: { qq: '100000003' } }]);
+
+    // `[[@全体成员]]` 是群里唯一认的「所有人」，且不依赖名单。
+    onebot.push(mention('通知一下', { messageId: 5005 }));
+    await until(() => agent.inbox.length === 5, 'the fifth message');
+    completeTurn(host, agent, '[[@全体成员]] 都来看看这个', 5);
+    const everyone = await until(() => sentTexts(onebot)[3], 'the all-mention reply');
+    assert.deepEqual(everyone, [
+      { type: 'at', data: { qq: 'all' } },
+      { type: 'text', data: { text: ' 都来看看这个' } },
+    ]);
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：@ 的名单按会话隔离 —— 一个人在群里说过话，不代表能在私聊里 @ 到他。
+test('the @ list is per conversation: a group member is not mentionable in a private chat', async () => {
+  const { onebot, host } = await boot({ replyStyle: 'plain' });
+  try {
+    // 先在群里认识 kaguya（他 @ 了机器人）。
+    onebot.push(mention('在吗', { messageId: 5101, userId: 100000003, name: 'tomori', card: 'kaguya' }));
+    await until(() => host.list.created[0], 'the group Agent');
+    // 私聊里对方是另一个人，kaguya 不在这个会话的名单里。
+    onebot.push(privateMessage('你好'));
+    const priv = await until(() => host.list.created.find((entry) => entry.id !== host.list.created[0].id), 'the private Agent');
+    completeTurn(host, priv, '[[@kaguya]] 你好', 1);
+    const sent = await until(() => sentTexts(onebot, 'send_private_msg')[0], 'the private reply');
+    // 私聊里也没有「全体成员」这回事：都解析不出来，于是只剩正文。
+    assert.deepEqual(sent, [{ type: 'text', data: { text: ' 你好' } }]);
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：@ 标记与引用指向可以同时挂在同一条消息上（顺序是「先指向、后正文」）。
+test('an @ in the reply keeps the quote head in front of it', async () => {
+  const { onebot, host } = await boot({ replyStyle: 'quote' });
+  try {
+    onebot.push(mention('在吗', { messageId: 5201, userId: 100000003, name: 'tomori', card: 'kaguya' }));
+    const agent = await until(() => host.list.created[0], 'the group Agent');
+    completeTurn(host, agent, '[[@kaguya]] 在的', 1);
+    const sent = await until(() => sentTexts(onebot)[0], 'the reply');
+    assert.deepEqual(sent, [
+      { type: 'reply', data: { id: '5201' } },
+      { type: 'at', data: { qq: '100000003' } },
+      { type: 'text', data: { text: ' 在的' } },
+    ]);
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：出站工具（qq_send_message）也能 @ 人 —— 但它只认得「这个会话聊过的人」。
+test('qq_send_message resolves [[@nickname]] against the conversation it is sending to', async () => {
+  const { onebot, host } = await boot();
+  try {
+    const tool = host.tools.get('qq_send_message');
+    // 先从 QQ 会话里认识 kaguya（他在群里 @ 了机器人）。
+    onebot.push(mention('在吗', { messageId: 5301, userId: 100000003, name: 'tomori', card: 'kaguya' }));
+    await until(() => host.list.created[0], 'the group Agent');
+    // 工具是 Agent 的显式动作：这里直接调用，模拟模型点名要 @ 群里的人。
+    const value = await tool.execute({ target_type: 'group', target_id: '100000001', message: '[[@kaguya]] 出来说话' }, {});
+    assert.deepEqual(value, { target_type: 'group', target_id: '100000001', parts: 1 });
+    const sent = onebot.calls.filter((call) => call.action === 'send_group_msg').at(-1);
+    assert.deepEqual(sent.params.message, [
+      { type: 'at', data: { qq: '100000003' } },
+      { type: 'text', data: { text: ' 出来说话' } },
+    ]);
+
+    // 一个从没聊过的群：名单是空的，@ 解析不出来 —— 退化成纯文本，而不是报错。
+    const stranger = await tool.execute({ target_type: 'group', target_id: '999999999', message: '[[@kaguya]] 在吗' }, {});
+    assert.equal(stranger.parts, 1);
+    const last = onebot.calls.filter((call) => call.action === 'send_group_msg').at(-1);
+    assert.deepEqual(last.params.message, [{ type: 'text', data: { text: ' 在吗' } }]);
+  } finally {
+    await onebot.close();
+  }
+});
+
+
 // 用例十八：修两个「不像真人」的旧毛病 —— 群名从第二条消息起不再丢失，
 // 提示词里的「刚跟你说话的人」也永远是当前这位，而不是建 Agent 时的第一位。
 test('the channel prompt keeps the group name and always names the latest speaker', async () => {
@@ -2866,6 +2989,101 @@ test('qq_send_image refuses non-images, oversized files, and paths outside cwd',
   await assert.rejects(() => off.host.tools.get('qq_send_image').execute({ image: '.qq-stickers/笑死.png' }, {}), /imageSend/);
 });
 
+// ---- 存表情包：qq_save_sticker -------------------------------------------------
+// 为什么需要这个工具：QQ 会话按设计没有 write / edit / bash（那三样在不可信输入面上
+// 太危险），于是群里最常见的那句「存一下这个表情」模型**自己做不到**。真实发生过的
+// 样子是它 `read_image` 看完、`glob .qq-stickers/**` 发现空的，只能把含义追加进
+// `COGNITION.md`、key 写成 `.qq-media/<内容哈希>`（一个会被淘汰的缓存路径），然后回一句
+// 「存好了」。这一组钉住的是：存下去的是**原字节**、名字被洗成单层、目录满了/同名了会拒绝，
+// 以及存完下一轮提示词里就能挑到它。
+
+test('qq_save_sticker keeps a picture the conversation posted and it shows up in the pack', async () => {
+  const images = await startImageServer(TINY_PNG);
+  const { onebot, host, cwd } = await bootImages();
+  try {
+    onebot.push(privateMessageWithImage(images.url(), { text: '存一下这个' }));
+    const agent = await until(() => host.list.created[0], 'the conversation Agent');
+    const body = await until(() => agent.inbox[0]?.content[0]?.text, 'the message body to reach the Agent');
+    const source = /\[图片\(动画表情\): ([^\]]+)\]/.exec(body)?.[1];
+    assert.ok(source, body);
+
+    const value = await host.tools.get('qq_save_sticker').execute({ source, name: '委屈' }, { agent });
+    assert.equal(value.path, '.qq-stickers/委屈.png');
+    assert.equal(value.format, 'png');
+    assert.equal(value.bytes, TINY_PNG.length);
+    // 落盘的必须是原字节：这张图以后要原样发回去，转码过就不是同一张表情了。
+    assert.deepEqual(await readFile(join(cwd, '.qq-stickers', '委屈.png')), TINY_PNG);
+    // 提示词每次装配都重新 readdir，所以不用重启就该列出来（名字就是它的意思）。
+    assert.match(promptText(host, 'qq-bridge:channel'), /\.qq-stickers\/委屈\.png/);
+    // 存下来的唯一用途就是发出去：裸文件名（不带扩展名）也该认得出来。
+    const sent = await host.tools.get('qq_send_image').execute({ image: '委屈' }, { agent });
+    assert.equal(sent.source, '.qq-stickers/委屈.png');
+  } finally {
+    await onebot.close();
+    await images.close();
+  }
+});
+
+test('qq_save_sticker refuses non-images, outside paths, unusable names, and overwrites', async () => {
+  const { onebot, host, cwd } = await bootImages();
+  try {
+    const tool = host.tools.get('qq_save_sticker');
+    await assert.rejects(() => tool.execute({ source: 'notes.txt', name: '笔记' }, {}), /not a PNG\/JPEG\/WebP\/GIF/);
+    await assert.rejects(() => tool.execute({ source: '../../etc/hostname', name: '越界' }, {}), /inside the working directory/);
+    // 名字清洗完什么都不剩时必须报错，而不是写一个 `.png` 这种残名进去。
+    await assert.rejects(() => tool.execute({ source: '.qq-stickers/笑死.png', name: '..' }, {}), /not a usable sticker name/);
+    await assert.rejects(() => tool.execute({ source: '.qq-stickers/笑死.png', name: '\u0000' }, {}), /not a usable sticker name/);
+    // 同名**绝不覆盖**：不然群里任何人一句「存一下」就能把现有表情换掉。
+    await assert.rejects(() => tool.execute({ source: '.qq-stickers/笑死.png', name: '笑死' }, {}), /already exists/);
+    // 一次都没写成功：所有校验都发生在动目录之前。
+    assert.deepEqual((await readdir(join(cwd, '.qq-stickers'))).sort(), ['笑死.png']);
+  } finally {
+    await onebot.close();
+  }
+});
+
+test('qq_save_sticker stops at imageMaxBytes and at stickerMaxFiles', async () => {
+  // 太大的图先被 imageMaxBytes 挡住（与发图同一条校验）。
+  const big = await bootImages({ imageMaxBytes: 32 });
+  await assert.rejects(() => big.host.tools.get('qq_save_sticker').execute({ source: '.qq-stickers/笑死.png', name: '大图' }, {}), /larger than 32 bytes/);
+  await big.onebot.close();
+
+  // 目录里已经有 1 张、上限也是 1：QQ 那头能一直让它存，所以必须在这里截断。
+  const capped = await bootImages({ stickerMaxFiles: 1 });
+  try {
+    await assert.rejects(
+      () => capped.host.tools.get('qq_save_sticker').execute({ source: '.qq-stickers/笑死.png', name: '再一张' }, {}),
+      /already holds 1 images/,
+    );
+  } finally {
+    await capped.onebot.close();
+  }
+});
+
+test('qq_save_sticker is not registered when the sticker directory or its whitelist slot is missing', async () => {
+  // 目录配到 cwd 外 = 表情包功能整体停用（只记 warn）：不给模型一个必然报错的工具。
+  const outside = await bootImages({ stickerDir: '../stickers' });
+  try {
+    outside.onebot.push(privateMessage('在吗'));
+    await until(() => outside.host.list.created[0], 'the outside Agent');
+    assert.equal(outside.host.tools.get('qq_save_sticker'), undefined);
+    assert.doesNotMatch(promptText(outside.host, 'qq-bridge:channel'), /qq_save_sticker/);
+  } finally {
+    await outside.onebot.close();
+  }
+
+  // 白名单里没有它（这里只给 read）时同样不注册 —— 白名单只能收窄，漏一层就等于没收。
+  const restricted = await bootImages({ allowTools: ['read'] }, { knownTools: ['read', 'qq_send_image', 'qq_save_sticker'] });
+  try {
+    restricted.onebot.push(privateMessage('在吗'));
+    await until(() => restricted.host.list.created[0], 'the restricted Agent');
+    assert.equal(restricted.host.tools.get('qq_save_sticker'), undefined);
+    assert.doesNotMatch(promptText(restricted.host, 'qq-bridge:channel'), /qq_save_sticker/);
+  } finally {
+    await restricted.onebot.close();
+  }
+});
+
 test('the channel prompt offers qq_send_image and lists the sticker pack', async () => {
   const on = await bootImages();
   on.onebot.push(privateMessage('在吗'));
@@ -2873,6 +3091,8 @@ test('the channel prompt offers qq_send_image and lists the sticker pack', async
   const prompt = promptText(on.host, 'qq-bridge:channel');
   assert.match(prompt, /qq_send_image/);
   assert.match(prompt, /\.qq-stickers\/笑死\.png/);
+  // 「存一下这个」是群里最常出现的一句，提示词必须把那条窄通道说清楚。
+  assert.match(prompt, /qq_save_sticker/);
 
   // 白名单挡掉这个工具时，提示词里一个字都不能再提它。
   const off = await bootImages(
@@ -2883,6 +3103,7 @@ test('the channel prompt offers qq_send_image and lists the sticker pack', async
   await until(() => off.host.list.created[0], 'the second Agent');
   const hidden = promptText(off.host, 'qq-bridge:channel');
   assert.doesNotMatch(hidden, /qq_send_image/);
+  assert.doesNotMatch(hidden, /qq_save_sticker/);
   assert.doesNotMatch(hidden, /笑死\.png/);
 });
 
