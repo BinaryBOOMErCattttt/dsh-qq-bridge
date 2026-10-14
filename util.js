@@ -320,6 +320,43 @@ export function defaultJmFileHost(platform = process.platform) {
 }
 
 /**
+ * cosmokit 的 volatile 引用协议：`createVolatile()` 造出来的引用身上带着这个 symbol，
+ * 值是「把新值写进去」的函数。`isVolatileRef` 靠它就够认出引用，不必 import cosmokit
+ * —— 那个包不在 `peerDependencies` 里，裸 import 会让宿主与插件各持一个副本
+ * （见 AGENTS.md §2 末尾的解析规则）。
+ */
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write');
+
+/**
+ * 这个配置节点是不是 cordis 的 volatile 引用（`.volatile()` 字段解析出来的东西）。
+ *
+ * `config.js` 的 schema 是根 volatile（整份配置一个引用），所以 `apply()` 拿到的
+ * `config` 不是普通对象：读字段要先 `.get()`。判断用的是稳定的 symbol 协议，
+ * 字符串/数字/布尔这类普通值永远不是引用，混着传也不会误判。
+ *
+ * @param value - schema 解析后的配置节点。
+ * @returns 是 volatile 引用时 true。
+ */
+export function isVolatileRef(value) {
+  return typeof value === 'object' && value !== null && VOLATILE_WRITE in value;
+}
+
+/**
+ * 取出 volatile 引用的当前快照；普通值原样返回。
+ *
+ * 为什么需要它：`settings.js` 是纯函数层，只认普通对象；`index.js` 装配时用它把
+ * schema 解析出来的引用摊平成一份快照。**快照会过期** —— 配置在 Web UI 里改是
+ * volatile 热更新（就地换值、不重跑 apply），所以插件靠 `loader/volatile-update`
+ * 事件重启自己来重建这份快照，而不是把这个引用一直留在 hand 上。
+ *
+ * @param value - volatile 引用或普通值。
+ * @returns 引用里的当前值，或原值。
+ */
+export function liveConfig(value) {
+  return isVolatileRef(value) ? value.get() : value;
+}
+
+/**
  * 把模型给的路径解析成记忆目录内的相对路径；越界（`../`、绝对路径）时返回 undefined。
  *
  * 这是 qq_memory 的写边界：模型只能动 `.qq-memory/` 里的东西。故意不做 glob、

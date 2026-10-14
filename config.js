@@ -15,6 +15,22 @@ import z from '@deepseek-ai/schemastery';
 /**
  * 插件配置的校验 schema（bundle 的 config: 段或 Web UI 插件设置里填写）。
  * 这里同时充当配置文档：每个字段的 .description 会显示在界面上给使用者看。
+ *
+ * **末尾的 `.volatile()` 是 Web UI 设置页的前提**，不是随手加的：DSH 的设置表单
+ * （`dsh-settings` 的 `volatileForm`）只把「volatile 节点底下的字段」投影成可编辑
+ * 表单，没有它的话这份 schema 在设置面板里连一个命名空间都不会出现（`describe()`
+ * 直接跳过没有 volatile 字段的条目）。为什么加在根上而不是每个字段上：根上的
+ * volatile 让**整份配置**成为一个稳定引用（schemastery 的 `validateVolatileSchema`
+ * 不允许 volatile 套 volatile，所以根上打一次是最省的写法），插件拿到的 `config`
+ * 因此要用 `.get()` 取值（见 util.js 的 `liveConfig`）。
+ *
+ * 由此带来的两条语义，改代码前先读：
+ *   1. 配置改动**不会**重跑 `apply()` —— Loader 判定「只有 volatile 变了」之后就
+ *      就地换引用里的值（`loader/volatile-update`），所以 `index.js` 自己挂了一个
+ *      监听：收到就重启插件（连接、定时器、工具注册都是 apply 时装配的）。
+ *   2. 设置页保存写的是**整份配置**（普通字段保留 `!!js` 表达式原样，见
+ *      `projectForm` 的 isExpression 分支），所以 `QQBOT_*` 环境变量覆盖不会因为
+ *      在界面上点了一次保存而失效。
  */
 export const Config = z.object({
   endpoint: z.string().default('ws://127.0.0.1:3001').description('OneBot v11 正向 WebSocket 地址（NapCat 的 websocketServers 端口）'),
@@ -107,8 +123,8 @@ export const Config = z.object({
   maxDelayMs: z.number().default(5000).description('单条消息前延迟的上限（毫秒）'),
   delayJitter: z.number().default(0.4).description('延迟的随机抖动比例（0 = 固定延迟，0.4 = 上下浮动 40%）'),
   replyStyle: z.union(['auto', 'plain', 'quote', 'at']).default('auto').description('群聊回复的指向方式：auto = 只在「回的那条后面又出现了消息（包括我自己发的）」时才引用（默认），quote = 引用被回复的那条消息，at = @ 对方，plain = 直接发；指向只挂在第一条上，私聊始终为 plain'),
-  persona: z.string().default('').description('替换默认的「群友口吻」段落；留空使用插件内置的那份'),
-  instructions: z.string().default('').description('追加到 QQ 会话系统提示的额外要求'),
+  persona: z.string().default('').description('人设：整段替换默认的「群友口吻」段落，可以写多行；留空 = 用插件内置的那份（见 README「口吻是普通群友」）'),
+  instructions: z.string().default('').description('额外要求：可以写多行，追加到 QQ 会话系统提示的末尾；与内置口吻叠加，不替换任何东西'),
   // ---- 禁漫（JM / 18comic）下载 → PDF → 发到 QQ ----
   // 依赖外部 python：见 README「禁漫下载」。关掉 jmDownload 后一条网络请求都不会发。
   jmDownload: z.boolean().default(true).description('是否启用禁漫（JM）下载：把整本/单话合并成 PDF 并发到 QQ'),
@@ -145,4 +161,5 @@ export const Config = z.object({
   apiKeyRef: z.string().default('DEEPSEEK_API_KEY').description('要轮换的那个凭据引用名：写进 $DSH_HOME/.credentials.yaml 的就是它（必须是 A-Za-z_ 开头的变量名写法）'),
   apiKeyProbeUrl: z.string().default('https://api.deepseek.com/models').description('切换前先 GET 一下候选 key 是否可用（2xx 才算可用，不消耗 token）；留空 = 不探测、直接按顺序换下一个。DeepSeek 的 OpenAI 兼容面用 Authorization 头、Anthropic 面用 x-api-key，插件两个头一起带'),
   apiKeyProbeTimeoutMs: z.number().default(15000).description('探测单个候选 key 的超时（毫秒）；网络不通时按「这个候选不可用」处理，继续试下一个'),
-});
+// 根 volatile：整份配置一个稳定引用（理由见文件头的注释）。
+}).volatile();

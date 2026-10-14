@@ -54,10 +54,11 @@ index.js      3524 行  插件本体：全部运行时状态、事件路由、�
 chatter.js      171 行  群里「谁在说话」的三本账（插话序号 / 回答指向 / 热度窗口）：只暴露语义动作，不暴露 Map
 mention.js      209 行  `[[@昵称]]` → OneBot `at` 段：纯函数解析 + 「昵称 → QQ 号」名单（名单挂在会话记录上）
 speaking-rules.js 292 行  「什么时候该主动开口」的纯判据（五道闸门 + 两个节奏闸、免 @ 接话与搭话抽卡、补一句的九条闸门）：给普通入参、返回布尔
-util.js        269 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 记忆路径与表情包文件名的写边界 / key 池解析与打码 / withinActiveHours
+util.js        269 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 写边界（记忆路径、表情包文件名）/ key 池解析与打码 / withinActiveHours / isVolatileRef 与 liveConfig
 filestore.js    92 行  几个「原子写 / 尽力而为读」的小工具（读不到返回空而不是抛错），记忆、转录与存下来的表情包都走它
-config.js      142 行  配置 schema（**配置的唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段
+config.js      175 行  配置 schema（**配置的唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段；**根上是 `.volatile()`**（Web UI 设置页的前提，见 §5.12）
 settings.js    252 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
+client.js      约 800 行  **浏览器半侧**（手写的 `window.__ModuleLoader__.load({...})` bundle）：把 schema 投影成**设置面板里自己的一页**（`settings.section`：左边导航多一格「QQ Bridge」，与 `dsh-our-free-model` 同一套）——字段按 `SECTIONS` 分成十几张**折叠卡片**、默认只展开第一组；保存走 Host 的 settings 写路径（见 §5.12）
 tools.js       640 行  宿主平面工具的**声明**（qq_send_message / qq_send_image / qq_save_sticker / qq_list_conversations / qq_transcript / qq_memory 等），依赖由 index.js 显式传入
 memory.js     1143 行  长期记忆子系统：转录落盘、记忆文件读写（那两个记忆工具的能力来源）、每日摘要循环；依赖由 index.js 显式传入
 onebot.js      707 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/文本化/@ 名单提取）
@@ -76,7 +77,8 @@ test/settings.test.mjs  配置归一化的契约测试（默认值 / 非法值 /
 test/chatter.test.mjs   「谁在说话」三本账的**不变量**测试（合并两本账就会红的那种）
 test/speaking-rules.test.mjs 主动说话 / 免 @ 接话 / 搭话抽卡 / 补一句的判据：每个用例从「通过」的基准入参出发，只翻一个字段
 test/mention.test.mjs  `[[@昵称]]` → at 段的纯函数测试：标记边界、认不出来就丢、名单按会话隔离
-test/util.test.mjs      纯函数边界：写边界 memoryRelativePath 与 stickerFileName、memorySlug、本地时间、errorText、key 打码
+test/util.test.mjs      纯函数边界：写边界、memorySlug、本地时间、errorText、key 打码、isVolatileRef/liveConfig
+test/client.test.mjs    浏览器半侧的契约测试（假 `window.__ModuleLoader__` + 假 require + 假 `useState`）：注册位置（`settings.section`）/ 字段全覆盖 / 分组不漏 / 折叠卡片默认只展开第一组 / 草稿口径
 test/filestore.test.mjs 原子读写与「读不到就返回空/undefined，不抛错」这条失败语义
 test/perceptual.test.mjs  图片指纹的单元测试（同图不同编码 / 异图 / 畸形输入 / 解压炸弹）
 test/image-fixtures.mjs  上面两个测试共用的图片 fixture（真编码的字节，不是 test 文件）
@@ -135,7 +137,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 |---|---|---|
 | 顶部常量 | `CHANNEL_SECTION_ORDER=8950`、`PRESET_NONE`、`QUOTE_TEXT_CHARS`、`STICKER_PROMPT_MAX` | 调提示词用 |
 | 配置 schema | **不在这里**：在 `config.js`（第 136 行只是 `export { Config } from './config.js'`） | 唯一真相来源，`.description()` 就是 Web UI 上给用户看的文档 |
-| 配置的取值 | **不在这里**：`settings = createSettings(config, process.cwd())`（第 172 行）之后一律读 `settings.*` | 取默认值/夹紧/去空白都在 `settings.js`；`index.js` 里**没有一处**直接读 `config.xxx` |
+| 配置的取值 | **不在这里**：`settings = createSettings(liveConfig(config), process.cwd())`（第 198 行）之后一律读 `settings.*` | 取默认值/夹紧/去空白都在 `settings.js`；`index.js` 里**没有一处**直接读 `config.xxx`。`liveConfig` 必须调：schema 是根 volatile（§5.12），`apply()` 拿到的是引用 |
 | 运行时状态 | 第 243–534 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / **`chatter`**（谁在说话的三本账，见 `chatter.js`；`chatterSeq` / `groupChatter` / `quoteSeq` 是它搬出去之前的名字）/ `repeatStates` / `mediaResolutions`（记忆的五张账已经跟着子系统搬去 `memory.js`）；每条会话记录里还挂着 `sessionGeneration`（第几轮会话，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` / `activeInterposeSeq`（那条消息那一刻的插话序号快照）与主动说话、活跃对话的那几组记账（见 `blankConversation`） |
 | Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` | 见 §7 |
 | 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` `conversationMentions` | 串行队列保证同一会话的消息不乱序；`sendOne` 顺便记 `lastBotSpeakAt`（主动说话靠它避免独白）；正文里的 `[[@昵称]]` 在 `sendParts` 里换成 `at` 段（解析在 `mention.js`），没有标记的段仍然发纯字符串 |
@@ -149,7 +151,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 | 长期记忆 | 只剩一行装配（`const memory = createMemory({ … })`）与三个调用点（`handleEvent` / `channelPrompt` / 生命周期） | 整个子系统在 `memory.js`（见 §4.D）；依赖表就在那一行里 |
 | 模型凭据轮换 | `rotateApiKey` `probeApiKey` | 见 §4.H；每天到点从 `apiKeyFile` 里挑下一个探测通过的 key，交给 `ctx.credentials.set()` 写进 `$DSH_HOME/.credentials.yaml`（**不用重启**，凭据层监听该文件）。时段/超时/探测地址这些取值在 `settings` 上 |
 | 工具装配 | `registerQqTools(ctx, { … })`（第 3260 行起，24 行） | 只剩一张**依赖表**：把上面那些函数递给 `tools.js`（记忆那一格是 `memory.tools`，存表情包那一格是 `saveSticker`）。工具声明本身在 `tools.js`，不在这里 |
-| 生命周期 | `ctx.effect(...)` | 托管 socket、API key 轮换定时器、主动说话的定时器；摘要定时器由 `memory.startDigestTimer()` 挂 |
+| 生命周期 | `ctx.effect(...)` + `ctx.on('loader/volatile-update', …)` | 托管 socket、API key 轮换定时器、主动说话的定时器；摘要定时器由 `memory.startDigestTimer()` 挂。那个 volatile-update 监听是**设置页保存之后唯一的生效路径**（延后一拍 `ctx.fiber.restart()`，见 §5.12） |
 
 **体量实况**（别被文件行数吓到）：闭包里 90 个函数，中位数 10 行；超过 60 行的只有 8 个
 （最长的是 `channelPrompt`，大半是提示词模板）。文件大是因为「一个大闭包 + 大段取舍注释」，
@@ -518,24 +520,23 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
    见 README 的同名小节）。
 7. **`Config` schema 是配置的唯一真相（在 `config.js`）。** 加配置项 = 在 schema 里加字段
    （带**中文** `.description()`）+ 需要再加工的话在 `settings.js` 里加一行 + README 表格里
-   同步一行。已有 100+ 字段，§3 的表格只是导览，别照抄。**`index.js` 里不允许出现
-   `config.xxx`** —— 一律读 `settings.xxx`，否则取值口径又会散开（那是这次重构要消掉的东西）。
+   同步一行 +（界面上要分组正确的话）`client.js` 的 `SECTIONS` 里给它一段。已有 100+ 字段，
+   §3 的表格只是导览，别照抄。**`index.js` 里不允许出现 `config.xxx`** —— 一律读
+   `settings.xxx`，否则取值口径又会散开（那是这次重构要消掉的东西）。另外**根上的
+   `.volatile()` 不能删**：它是 Web UI 设置页的前提（见 §5.12）。
 8. **日志要同时写 logger 和 stderr。** 这个部署没把 cordis logger 接到 stdout，
    `ctx.logger.warn()` 在 journal 里一个字都看不到。用 `report(level, msg)`，
    它靠 `logger.exporter` 是否存在来避免污染测试输出。
 9. **同一会话的消息必须串行**（`enqueueSend` / `enqueue`）。QQ 消息到达顺序和异步
    IO 完成顺序不一致，绕过队列会串话/乱序。
-10. **profile 的 `cordis.patch.yml` 里不许给 `qq-bridge` 写 `config`：DSH 的 patch 是整块
-    替换，不是深合并。** `dsh-app-boot` 的 `applyEntryPatches` 对命中的行做
-    `target[key] = value`，所以 profile 层写一个 `resetUsers` 就会把仓库 patch 里那整套
-    配置（`activeFollow` / `proactive` / `batchWindowMs` / `burstSingleMaxChars` / `persona`）
-    **连同 `agentPreset: qq` 与 `allowTools` 白名单一起顶掉**，插件静默退回 schema 默认值 ——
-    表现是「群里不 @ 就不说话」，实际更严重：QQ 会话会挂上部署默认的 `standard` 预设
-    （有 shell / 子代理 / write），而这是不可信输入面。真发生过一次。
-    所以：配置一律改仓库的 `cordis.patch.yml`；**每台部署各不相同的值走环境变量**
-    （DSH 启动时读 `<启动 cwd>/.env` 与 `$DSH_HOME/.env`，代码里 `!!js` 求值即可，
-    `resetUsers` 就是这么接的，见 §11）；非要在 profile 层覆盖，就把整份 `config` 抄全
-    （Web UI 的插件设置写的就是完整 config）。
+10. **手写 profile 的 `cordis.patch.yml` 时，不许给 `qq-bridge` 只写一段残缺的 `config`：DSH 的
+    patch 是整块替换、不是深合并**（`dsh-app-boot` 的 `applyEntryPatches` 就是
+    `target.config = patch.config`）。只写一个 `resetUsers` 就会把仓库 patch 里那整套配置
+    （`activeFollow` / `proactive` / `batchWindowMs` / `persona` …）**连同 `agentPreset: qq`
+    与 `allowTools` 白名单一起顶掉**：表现是「群里不 @ 就不说话」，实际更严重 —— QQ 会话会挂上
+    部署默认的 `standard` 预设（有 shell / 子代理 / write），而这是不可信输入面。真发生过一次。
+    所以：改仓库的 `cordis.patch.yml`、或用 Web UI 的设置页（它写的是完整 config，见 §5.12）；
+    每台部署各不相同的值走环境变量（`resetUsers` 就是这么接的，见 §11）。
 11. **Windows 桌面版（Electron）不是上面那套容器部署**：它以 `~/.dsh/profiles/desktop`
     作为 Host 进程的 cwd，插件以 `link:<仓库>` 装进那个 profile 的 `dependencies` **和**
     `dsh.profile.bundles`（两处都要，缺一个就是「装了不加载」；`scripts/napcat-setup.mjs`
@@ -544,13 +545,25 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
     改完源码要**重启整个桌面版**。NapCat 那一侧的自检在 `napcat.js`：默认只读，
     `napcatAutoConfig` 打开才写（先备份、只动 `websocketServers` 里我们那一条）。
     详见 README「Windows 桌面版」。
+12. **Web UI 的设置页由 schema 生成，`client.js` 里没有字段表。** 链路：`config.js` 的 Config
+    （根 volatile）→ `dsh-settings` 的 `volatileForm` 投影出表单 schema → `client.js` 读
+    `configForms.describe()` 那份 schema（按节点 `type` 选控件、按 `.description()` 取标签）→
+    保存走 `configForms.get('qq-bridge')` 的 `mutate`（写 profile patch 的**完整** config，
+    `!!js` 表达式原样保留）。**页面挂在 `settings.section`**（设置面板左边导航里的一格
+    「QQ Bridge」，与 `dsh-our-free-model` 同一套），不是插件页那张组合包卡片 —— 后者是
+    `plugins.bundle.config`，早先那一版挂在那边，一百多项把插件页撑爆了。三条推论：加配置项
+    **不用动界面**，但要在 `client.js` 的 `SECTIONS` 里给它一段（否则落进「其它」，
+    `test/client.test.mjs` 会红）；根上的 `.volatile()` 删了页面就直接消失
+    （`test/util.test.mjs` 钉着）；volatile 热更新不重跑 `apply()`，所以 `index.js` 收到
+    `loader/volatile-update` 会调 `ctx.fiber.restart()` —— 别删那个监听。
 
 ## 6. 怎么改：任务 → 动哪里
 
 | 想做的事 | 动哪里 |
 |---|---|
 | 加一个不碰状态的纯函数 | `util.js`（碰磁盘的放 `filestore.js`）；**别 import `index.js`**，也别让它读闭包状态 |
-| 加一个配置项 | `config.js` 的 schema + （需要兜底/夹紧时）`settings.js` 加一行 + README 配置表 + `test/settings.test.mjs` 补边界 |
+| 加一个配置项 | `config.js` 的 schema（含中文 `.description()`）+ （需要兜底/夹紧时）`settings.js` 加一行 + README 配置表 + `test/settings.test.mjs` 补边界；界面不用改，但要在 `client.js` 的 `SECTIONS` 里给它一段（见 §5.12） |
+| 改 Web UI 设置页（分组 / 标签 / 控件 / 草稿口径） | 只改 `client.js`：`SECTIONS`（分组）、`LABEL_OVERRIDES`（短标签，或在 schema 上加 `.comment()`）、`specFor`（布尔 / 逗号列表 / 枚举的读写口径） |
 | 改提示词 / 人设 | `DEFAULT_PERSONA`、`channelPrompt`、`Config.persona` / `.instructions` |
 | 加一个 Agent 工具 | 在 `tools.js` 里照 `qqSendMessage` 抄结构（`defineTool` + `output.schema` + `render` + 中文报错），再在 `registerQqTools` 里注册、在 `index.js` 的 `deps` 里补上它需要的能力；**别 import `index.js`** |
 | 改分条/打字节奏 | `onebot.js` 的 `splitBurst` / `splitStickerLines` / `typingDelayMs`（**纯函数，优先在这里改**） |
@@ -600,26 +613,23 @@ subagent 会绕过 `allowTools` 出现在 QQ 会话里。改预设前先读那�
 ## 8. 测试与验证
 
 ```bash
-node --test test/                      # 全部（bridge + perceptual + settings + chatter + util/filestore）
+node --test test/                      # 全部（bridge + perceptual + settings + chatter + util/filestore + client）
 node --test test/settings.test.mjs     # 只跑配置取值口径（最快，0.2 秒）
 node --test test/chatter.test.mjs      # 只跑「谁在说话」的三本账
 node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口」的判据
-node --test test/mention.test.mjs      # 只跑 `[[@昵称]]` → at 段的解析（最快，纯函数）
 node --test --test-name-pattern 复读 test/   # 按名字过滤
 ```
 
 测试用**真实插件模块 + 真实 OneBot 客户端 + 真实 `createUserMessage`**，只有 Harness
 Host 是桩（含一个**假 timer 服务**：摘要循环不真等半小时，由用例
-`host.list.timers.fireInterval()` 唤醒）。
-README「跑测试」一节有一条很长的覆盖清单 —— **那就是行为规格**，改行为前先读它，
-改完按它核对要不要补用例。
+`host.list.timers.fireInterval()` 唤醒）。README「跑测试」一节那条很长的覆盖清单
+**就是行为规格**：改行为前先读它，改完按它核对要不要补用例。
 
 **Windows 上要先把依赖铺好**（`node_modules` 不是软链，见 §2 末尾）：
-`node scripts/dev-node-modules.mjs --from <DSH checkout>`。在 DSH 自己的沙箱里 `node --test`
-会因为「派生子进程 + 捕获输出」而 `spawn EPERM`，换成同进程模式即可：
-`node --test --experimental-test-isolation=none "test/*.test.mjs"`。
+`node scripts/dev-node-modules.mjs --from <DSH checkout>`；在 DSH 自己的沙箱里 `node --test`
+会 `spawn EPERM`，改用同进程模式 `node --test --experimental-test-isolation=none "test/*.test.mjs"`。
 
-- 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**（当前基线：`test/` 下 288 个用例
+- 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**（当前基线：`test/` 下 304 个用例
   全过，约 40 秒）。
 - 加行为就加用例，用例名/注释用中文写清意图。**改哪个模块就跑哪个文件**：
   `config.js`/`settings.js`→`settings.test.mjs`；`chatter.js` 与活跃对话判定→`chatter.test.mjs`；
@@ -631,7 +641,8 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
   假 `fireInterval()` 会唤醒**所有**周期定时器）；`sessionIdFor`/`resetConversation`/`canReset`
   →bridge 里搜 `reset`；`rotateApiKey`/`probeApiKey`/`parseApiKeyPool`→bridge 最后的
   `bootKeyRotation` 那组；`napcat.js`→`napcat.test.mjs`（判据）+ bridge 末尾两条（接线）；
-  `desktop.js`→`desktop.test.mjs`；`util.js`/`filestore.js`→各自的用例。
+  `desktop.js`→`desktop.test.mjs`；`util.js`/`filestore.js`→各自的用例；
+  `client.js`（设置页）→`client.test.mjs`（它同时钉住「每个配置项都有分组」这条）。
 - 纯函数（`onebot.js` 的拆分/延迟/采集/`mentionsOthers`、`image.js`、`media.js`、`perceptual.js`、
   导出的 `withinActiveHours` / `parseApiKeyPool` / `pathInside`）尽量单独测边界。
 - **插件进程本身不归测试管**，改完记得重启（§5.1；Windows 桌面版是重启整个应用）。
@@ -647,6 +658,7 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 - [ ] 动过 `sessionIdFor` / 会话代次 → 确认「第 0 轮的 id 逐位没变」，且代次仍然落盘
 - [ ] 动过权限判断（`resetUsers` 之类）→ 确认「不配 = 全关」，而不是「不配 = 人人可用」
 - [ ] 涉及安全面（审批策略、白名单、`cwd` 越界校验）的改动单独复核过
+- [ ] 加/改了配置项 → 跑 `test/client.test.mjs`（分组别漏、标签别退化成字段名）
 
 ## 10. 常见坑速查
 
@@ -664,6 +676,7 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 | agent 会话突然没能力了 | `agentPreset` 没 join 到预设，或 `allowTools` 挡掉了 |
 | **群里不 @ 它就不说话 / 人设没了 / QQ 会话冒出 subagent** | profile 的 `~/.dsh/profiles/qqbot/cordis.patch.yml` 里给 `qq-bridge` 写了 `config`：patch 是整块替换，仓库 patch 的整套配置被顶掉（§5.10）。删掉那一行，配置改回仓库 patch |
 | `/reset` 突然没人能用 | `resetUsers` 由 `<启动 cwd>/.env` 的 `QQBOT_RESET_USERS` 决定（§11）；`.env` 只在启动时读，改了要重启 |
+| **Web UI 里改完配置没反应 / 页面上找不到配置** | 那个 `loader/volatile-update` → `ctx.fiber.restart()` 的监听没了；或根上的 `.volatile()` 被删（`describe()` 直接跳过这个条目，页面都不会注册，见 §5.12） |
 
 ## 11. 运行环境（本机）
 
@@ -677,7 +690,9 @@ OneBot    容器 napcat（mlikiowa/napcat-docker），端口 3001 = WebSocket **
 凭据      DEEPSEEK_API_KEY：推荐在 3081 的 Web UI Models 页填一次（写入
           $DSH_HOME/.credentials.yaml，任何启动方式都生效）
 私有配置  profile 的 cordis.patch.yml **只放 locale / ui-settings 这类覆盖**；
-          插件的配置一律改仓库的 cordis.patch.yml（见 §5.10）。
+          插件配置的首选入口是 3081 的 **设置 → QQ Bridge**（即 `settings.section` 里
+          我们自己那一页，保存会写 profile patch 并重启插件，见 §5.12）；直接改仓库的
+          cordis.patch.yml 也一样，但**别手写一份只有几个字段的 profile config**（见 §5.10）。
           本机私有的 /reset 白名单在仓库根的 .env（gitignore，**别把真号提交进仓库**）：
             QQBOT_RESET_USERS=<你的QQ号>      → cordis.patch.yml 的 resetUsers 从这里读
           .env 只在启动时读一次：改完必须重启才生效。

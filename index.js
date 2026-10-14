@@ -61,6 +61,7 @@ import {
   apiKeyFingerprint,
   errorText,
   hourLabel,
+  liveConfig,
   localDate,
   memorySlug,
   msUntilDailyHour,
@@ -72,9 +73,9 @@ import {
 } from './util.js';
 import { readTextOrUndefined, writeBytesAtomic, writeJsonAtomic } from './filestore.js';
 
-// 这三个的契约由 test/bridge.test.mjs 直接从插件入口验，所以在这里再导出一次
+// 这几个的契约由 test/bridge.test.mjs 直接从插件入口验，所以在这里再导出一次
 // （Loader 也只认 index.js 这个入口，搬走的东西必须在入口处仍然拿得到）。
-export { parseApiKeyPool, sessionIdFor, withinActiveHours } from './util.js';
+export { liveConfig, parseApiKeyPool, sessionIdFor, withinActiveHours } from './util.js';
 
 /** 插件在 Loader 中的稳定标识（改名会导致配置/状态对不上）。 */
 export const name = 'qq-bridge';
@@ -195,7 +196,12 @@ export function apply(ctx, config) {
   // cwd 留空时退回 Harness 进程当前目录；它既是 Agent 工作目录，也是沙箱根。
   // 配置的运行时视图：所有「取默认值 / 夹紧 / 去空白」都在 settings.js 里做完，
   // 下面一律读 `settings.*`，不再直接读 `config`（改默认值只需改一处）。
-  const settings = createSettings(config, process.cwd());
+  //
+  // `liveConfig` 是必须的一步：配置 schema 是根 volatile（见 config.js），apply()
+  // 拿到的 `config` 是**引用**而不是普通对象，读字段要先 `.get()`。摊平之后的这份
+  // 快照只在本次 apply 里有效 —— 设置页改配置不会重跑 apply，靠下面那个
+  // `loader/volatile-update` 监听重启插件来重建。
+  const settings = createSettings(liveConfig(config), process.cwd());
   const cwd = settings.cwd;
   const approvalPolicy = settings.approvalPolicy;
   // 工具白名单：去掉空白项与重复项。空数组 = 不限制，与 allowUsers / allowGroups 语义一致。
@@ -3389,6 +3395,37 @@ export function apply(ctx, config) {
   }
 
   // ---- 连接生命周期 ----------------------------------------------------------
+
+  // 配置热更新：Web UI 的插件设置保存之后，自己重启一次。
+  //
+  // 配置 schema 是根 volatile（见 config.js），所以保存走的是 Loader 的「volatile
+  // 热更新」路径：它就地换掉引用里的值，**不重跑 apply()**。而这个插件的装配几乎
+  // 全在 apply() 里 —— OneBot 连接、主动说话 / 摘要 / 凭据轮换的定时器、工具注册、
+  // 目录越界校验、jm 文件服务，光换值它们一个都不会重建。
+  //
+  // 所以这里挂一个监听：收到热更新就重启自己（`ctx.fiber.restart()`，等价于把这一行
+  // 停用再启用）。重启**不丢聊天记忆**：会话 id 是确定性的（sessionIdFor），下一条
+  // 消息照样 resume 出同一个 Session，只是连接与内存里的记账重建一遍。
+  //
+  // 延后一拍再重启：事件是在 Loader 的 update() 中间派发的，当场 dispose 自己等于
+  // 踩在它自己的调用栈上。
+  let restartScheduled = false;
+  ctx.on('loader/volatile-update', () => {
+    if (restartScheduled) return;
+    restartScheduled = true;
+    if (typeof ctx.fiber?.restart !== 'function') {
+      // 测试桩 / 最小组合里没有 fiber：不吭声会让人以为配置已经生效了。
+      report('warn', '配置热更新收到，但当前上下文没有 fiber.restart —— 这份配置要重启进程才生效');
+      return;
+    }
+    const timer = setTimeout(() => {
+      report('info', '配置已更新（Web UI 保存 / Loader 热更新），重启插件以应用');
+      Promise.resolve()
+        .then(() => ctx.fiber.restart())
+        .catch((error) => report('warn', `配置热更新后的重启失败：${errorText(error)}`));
+    }, 0);
+    timer.unref?.();
+  });
 
   // 用 ctx.effect 托管连接：插件卸载/停用时自动 dispose，不留悬挂的定时器与 socket。
   // 注意：Loader 按 URL 缓存插件模块，改源码后必须重启进程才生效（见 README）。

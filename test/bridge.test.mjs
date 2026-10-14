@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import yaml from 'js-yaml';
-import { Config, apply, inject, parseApiKeyPool, sessionIdFor, withinActiveHours } from '../index.js';
+import { Config, apply, inject, liveConfig, parseApiKeyPool, sessionIdFor, withinActiveHours } from '../index.js';
 import { blankMessageLabel, collectMedia, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
@@ -151,6 +151,11 @@ function makeHost({
   credentials,
   /** 真实宿主的 cordis LoggerService 门面带 exporter()；带上它插件会额外镜像一份到 stderr。 */
   loggerExporter = false,
+  /**
+   * `ctx.fiber` 的桩：插件在配置热更新（`loader/volatile-update`）之后会调
+   * `ctx.fiber.restart()` 重启自己。不传 = 最小组合里没有 fiber（插件只记一条 warn）。
+   */
+  fiber,
 } = {}) {
   const listeners = new Map();
   const tools = new Map();
@@ -225,6 +230,7 @@ function makeHost({
       error() {},
       ...(loggerExporter ? { exporter: () => () => {} } : {}),
     },
+    ...(fiber === undefined ? {} : { fiber }),
     agents: {
       get: (id) => agents.get(id),
       // 默认模拟「没有可恢复的会话」，于是插件会走 create 分支。
@@ -960,10 +966,49 @@ test('the reset command delivers a pending batch before it starts the next round
 });
 
 // 用例：攒批窗口的默认值是可以直接用的「人味」节奏，也可以关掉。
+// （配置 schema 是根 volatile，`Config()` 解析出来的是引用，读值要先摊平 —— 见 util.js 的 liveConfig。）
 test('the batch window defaults to a human beat and can be turned off', () => {
-  assert.equal(Config({}).batchWindowMs, 1200);
-  assert.equal(Config({}).batchMaxWaitMs, 5000);
-  assert.equal(Config({ batchWindowMs: 0 }).batchWindowMs, 0);
+  assert.equal(liveConfig(Config({})).batchWindowMs, 1200);
+  assert.equal(liveConfig(Config({})).batchMaxWaitMs, 5000);
+  assert.equal(liveConfig(Config({ batchWindowMs: 0 })).batchWindowMs, 0);
+});
+
+// 用例：配置在 Web UI 里保存之后走的是 Loader 的「volatile 热更新」路径 —— 它就地换掉
+// 引用里的值、**不重跑 apply()**。插件的连接、定时器、工具注册、目录校验全在 apply 里
+// 装配，所以它必须自己重启一次（`ctx.fiber.restart()`），否则界面上改了配置毫无反应。
+test('配置热更新（volatile-update）之后插件重启自己，同一拍里只重启一次', async () => {
+  const fiber = {
+    restarts: 0,
+    restart() {
+      this.restarts += 1;
+      return Promise.resolve();
+    },
+  };
+  const { host } = await boot({}, { fiber });
+
+  assert.equal(fiber.restarts, 0, '启动时不该重启');
+
+  // 一次保存可能报出多个字段：事件是每条路径一次，但只该重启一次。
+  host.list.emit('loader/volatile-update', [['repeatChance']]);
+  host.list.emit('loader/volatile-update', [['proactiveChance']]);
+  await until(() => fiber.restarts === 1, '热更新之后插件重启自己');
+  await settle(60);
+  assert.equal(fiber.restarts, 1, '一拍里只重启一次（重启本身会重跑 apply、重建监听）');
+  assert.ok(
+    host.list.infos.some((line) => line.includes('配置已更新')),
+    '重启必须留下一条日志，否则线上排查「改了没生效」时无从下手',
+  );
+});
+
+test('没有 fiber 的组合里配置热更新只记一条 warn，不假装配置生效了', async () => {
+  const { host } = await boot();
+
+  host.list.emit('loader/volatile-update', [[]]);
+  await settle(20);
+  assert.ok(
+    host.list.warnings.some((line) => line.includes('fiber.restart')),
+    '拿不到 fiber 时要说明「这份配置要重启进程才生效」',
+  );
 });
 
 // 用例三：白名单、未开启的渠道、以及消息发送者是机器人自己 —— 都应被丢弃。
@@ -4490,10 +4535,10 @@ test('activeFollow: a followed message never triggers a command bypass', async (
 
 /** 多人搭话的默认值：1 分钟窗口、6 条、2 个人、倾听时间 ×2。 */
 test('group talk defaults: a 1-minute window, 6 lines from 2 speakers, listening doubled', () => {
-  assert.equal(Config({}).activeWindowMs, 60 * 1000);
-  assert.equal(Config({}).activeGroupLines, 6);
-  assert.equal(Config({}).activeGroupSpeakers, 2);
-  assert.equal(Config({}).activeGroupBatchScale, 2);
+  assert.equal(liveConfig(Config({})).activeWindowMs, 60 * 1000);
+  assert.equal(liveConfig(Config({})).activeGroupLines, 6);
+  assert.equal(liveConfig(Config({})).activeGroupSpeakers, 2);
+  assert.equal(liveConfig(Config({})).activeGroupBatchScale, 2);
 });
 
 /**

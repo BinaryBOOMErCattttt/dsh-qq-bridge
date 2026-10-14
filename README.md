@@ -47,7 +47,7 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 
 在 `cordis.patch.yml` 的 `config:` 下配置，也可以在 Web UI 的插件设置里改。
 
-> ⚠️ **不要另外在 profile 自己的 `~/.dsh/profiles/<名字>/cordis.patch.yml` 里覆盖这些字段。**
+> ⚠️ **不要手写一个只有几个字段的 `config:` 去覆盖它。**
 > DSH 的 patch 语义是：按 id 命中的行**整块替换** `config`，**不深合并**（`dsh-app-boot` 的
 > `applyEntryPatches` 就是 `target.config = patch.config`）。在那边只写一个 `resetUsers`
 > 也会把本文件里的整套配置一起顶掉 —— `activeFollow` / `proactive` / `batchWindowMs` /
@@ -56,8 +56,34 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 > 暴露给不可信的群消息（`allowTools` 白名单同时失效）。
 >
 > 想改配置：改本文件（bundle 层，配置的唯一真相），或在 Web UI 的插件设置里改 —— 后者
-> 写的就是**完整** config。唯一一个「每台部署都不一样」的值 `resetUsers` 走环境变量，
-> 见[新开一轮会话](#新开一轮会话reset)。
+> 写的是**完整** config（见下一节），不是上面那种「手写几个字段」。本机私有的
+> `resetUsers` 白名单仍然走环境变量，见[新开一轮会话](#新开一轮会话reset)。
+
+### 在 Web UI 的设置页里改
+
+侧栏底部的 **设置** → 左边导航里的 **QQ Bridge**：本插件的全部配置都在这单独的一页里，
+按「连接与运行环境 / 准入与触发 / QQ 会话与 Agent / 人设与提示词 / 图片与表情包 /
+攒批与群聊上下文 / 自动复读 / 主动说话 / 活跃对话 / 说话方式与节奏 / 禁漫 / 长期记忆 /
+凭据轮换」分成
+一叠**折叠卡片**（默认只展开第一组，点标题展开、再点收起；组名右边的记号是「这一组里
+改过几项」）。每一项都带说明，点字段右边的 ⓘ 看完整解释与配置项名。它读的就是本文件
+这份 schema，所以**加了新配置项，页面上自动多一个字段**，不用改界面。
+`persona` / `instructions` 是整段提示词，单独一张卡片、用多行输入框改。
+
+保存时发生的事，值得先知道：
+
+- 写的是**当前 profile** 的 `cordis.patch.yml`，内容是**完整配置**：其余字段按当时
+  **生效的值**一起写进去。所以保存之后这一层就固定住了当时的取值 —— 以后再改本文件的
+  默认值，那份 profile 里的值不会跟着变。想回到「跟着本文件走」，把那一段 `config:`
+  删掉，或在字段上点「恢复默认」。
+- **`!!js` 表达式原样保留**：`endpoint` / `accessToken` / `cwd` / `resetUsers` 这些从
+  环境变量读的值是以表达式写回去的，不会因为在界面上点了一次保存就变成写死的字面量
+  （除非你就是在那个字段里填了个新值 —— 那本来就是要覆盖它）。
+- 保存之后插件会**重启一次**：配置走的是 Loader 的 volatile 热更新，它不重跑 `apply()`，
+  而连接、定时器、工具注册都是 `apply()` 里装配的。重启会断一次 OneBot 连接，**聊天记忆
+  不受影响** —— 会话 id 是确定性的，下一条消息照样 resume 出同一个 Session。
+- `accessToken` 这类秘密不会随设置页下发（只告诉你「配了 / 没配」），但保存时它会作为
+  完整配置的一部分写进 profile patch（那个文件是 0600）。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -133,8 +159,8 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | `minDelayMs` / `maxDelayMs` | `300` / `5000` | 单条消息前延迟的上下限（毫秒） |
 | `delayJitter` | `0.4` | 延迟的随机抖动比例（0 = 固定延迟） |
 | `replyStyle` | `auto` | 群聊回复的指向：`auto` 只在中途又出现消息（包括机器人自己发的那几条）时引用 / `quote` 引用被回复的那条 / `at` @ 对方 / `plain` 直接发；只挂在第一条上 |
-| `persona` | `''` | 替换内置的「群友口吻」段落；空 = 用内置的那份 |
-| `instructions` | `''` | 追加到 QQ 会话系统提示的额外要求 |
+| `persona` | `''` | 人设：整段替换内置的「群友口吻」段落（可以写多行）；空 = 用内置的那份。设置页里它在单独的「人设与提示词」卡片里，用多行框改 |
+| `instructions` | `''` | 额外要求：可以写多行，追加到 QQ 会话系统提示末尾；与内置口吻叠加，不替换任何东西 |
 | `memory` | `true` | 是否启用长期记忆（聊天记录落盘 + 定时摘要 + 认知库 + 两个记忆工具 + `.dsh/skills` 里的 `message-digest` / `update-cognition` skill） |
 | `memoryDir` | `.qq-memory` | 长期记忆目录，相对 `cwd`；必须落在 `cwd` 内，否则整个功能记 warn 并停用 |
 | `memoryFileMaxBytes` | `32768` | 单个记忆文件的字节上限：超了 `qq_memory` 的 append 会报错、逼着摘要重写得更精炼 |
@@ -1581,6 +1607,15 @@ key 由启动环境提供（`describe().writable === false`）时提前退场（
 
 > 这两组之外，「一键脚本」本身是**照着 README 里那份流程在真机上手工验过**的
 > （`--dry-run` 与真跑共用同一条代码路径），端到端行为不靠单测钉。
+
+设置页那半侧（`client.js`）另有一套 `test/client.test.mjs`：它不需要浏览器 —— 假的
+`window.__ModuleLoader__` 收下注册、假的 `require` 给出 react / primitives、假的
+`useState` 让折叠状态能被驱动，然后把 `apply()` 跑一遍，钉住「页面注册在
+`settings.section` + 条目 id `qq-bridge`」「schema 里每个配置项都上了页面、都有中文标签、
+都不落进『其它』分组」「默认只展开第一组、点标题才渲染那一组的字段」「布尔 / 逗号列表 /
+枚举三种草稿的读写口径（`true`/`是`/`1` 都算真，空串 = 恢复默认，胡说会被挡住）」，
+以及整棵树真的能渲染成 `SettingsForm` + 折叠卡片 + `SettingsValueField`。
+**加了新配置项忘了分组，这里会红。**
 
 ## 安全提醒
 

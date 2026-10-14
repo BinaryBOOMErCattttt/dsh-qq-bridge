@@ -23,12 +23,15 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 
+import { Config } from '../config.js';
 import {
   apiKeyFingerprint,
   defaultJmFileHost,
   defaultJmPython,
   errorText,
   hourLabel,
+  isVolatileRef,
+  liveConfig,
   localDate,
   localStamp,
   memoryOneLine,
@@ -205,4 +208,41 @@ test('stickerFileName：清洗完没剩下东西、或格式不认识时 undefin
   assert.equal(stickerFileName('笑死', ''), undefined);
   // 名字要进每轮提示词，所以长度封顶（超长名是纯 token 开销）。
   assert.equal(stickerFileName('笑'.repeat(80), 'png').length, 60 + '.png'.length);
+});
+
+// `liveConfig` / `isVolatileRef` 是「配置 schema 是根 volatile」这条改动的接缝：
+// schema（config.js）解析出来的是 cordis 的稳定引用，插件与测试都必须先摊平再读数。
+// 认出引用的依据是 cosmokit 的 symbol 协议（不 import cosmokit，见 util.js 的注释），
+// 所以这里连「普通对象带个同名 get()」这种看起来像引用的东西也一起钉住。
+test('isVolatileRef / liveConfig：只认 cosmokit 的引用协议', () => {
+  const WRITE = Symbol.for('cosmokit.volatile.write');
+  const ref = Object.freeze({ get: () => ({ a: 1 }), [WRITE]: () => {} });
+
+  assert.equal(isVolatileRef(ref), true);
+  assert.deepEqual(liveConfig(ref), { a: 1 });
+
+  // 普通值原样返回（字符串 / 数字 / 数组 / undefined / null）。
+  assert.equal(isVolatileRef('ws://x'), false);
+  assert.equal(liveConfig('ws://x'), 'ws://x');
+  assert.equal(isVolatileRef(7), false);
+  assert.equal(liveConfig(null), null);
+  assert.equal(liveConfig(undefined), undefined);
+
+  // 只是「看起来像」引用：没有那个 symbol 就不算（否则一个普通对象会被当成配置）。
+  const lookalike = { get: () => ({ a: 1 }) };
+  assert.equal(isVolatileRef(lookalike), false);
+  assert.equal(liveConfig(lookalike), lookalike, '认不出来就原样返回同一个对象');
+
+  // 引用本身的字段被冻结/不可枚举也不影响判断（真实引用就是 Object.freeze 的）。
+  assert.equal(isVolatileRef(Object.freeze({ [WRITE]: () => {}, get: () => 1 })), true);
+});
+
+test('liveConfig：真 schema 解析出来的配置是引用，摊平后才读得到字段', () => {
+  // 这里直接用 config.js 的 Config，钉住的是「根 volatile 这条契约还在」：
+  // 一旦有人把它去掉（比如为了省事改回普通 object），设置页会整个消失 ——
+  // dsh-settings 的 volatileForm 对没有 volatile 字段的 schema 直接跳过。
+  const parsed = Config({ proactiveChance: 0.5 });
+  assert.equal(isVolatileRef(parsed), true, '配置根必须是 volatile 引用（Web UI 设置页的前提）');
+  assert.equal(liveConfig(parsed).proactiveChance, 0.5);
+  assert.equal(typeof liveConfig(parsed).endpoint, 'string');
 });

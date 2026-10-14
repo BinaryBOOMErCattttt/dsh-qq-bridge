@@ -15,7 +15,7 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { Config } from '../index.js';
+import { Config, liveConfig } from '../index.js';
 import { hashDistance, imageGrayPlane, perceptualHash } from '../perceptual.js';
 import {
   CAPTION_PNG,
@@ -39,8 +39,9 @@ import {
   OTHER_PNG,
 } from './image-fixtures.mjs';
 
-/** 复读判定用的默认阈值（配置的真相在 index.js 的 Config 里，这里跟着它走）。 */
-const TOLERANCE = Config({}).repeatImageTolerance;
+/** 复读判定用的默认阈值（配置的真相在 config.js 的 Config 里，这里跟着它走）。
+ *  `liveConfig` 是必须的：schema 是根 volatile，`Config()` 解析出来的是引用。 */
+const TOLERANCE = liveConfig(Config({})).repeatImageTolerance;
 
 /** 「同一张画面」在 fixture 上必须几乎完全一致；重新编码实测差 0%~2%，留到 3% 也够紧。 */
 const SAME_PICTURE = 0.03;

@@ -17,11 +17,16 @@ import { join } from 'node:path';
 
 import { Config } from '../config.js';
 import { createSettings, MAX_TIMER_MS } from '../settings.js';
-import { defaultJmFileHost, defaultJmPython } from '../util.js';
+import { defaultJmFileHost, defaultJmPython, liveConfig } from '../util.js';
 
-/** 用真 schema 铺一层默认值，再按需覆盖 —— 覆盖的可以是 schema 不会产出的非法值。 */
+/**
+ * 用真 schema 铺一层默认值，再按需覆盖 —— 覆盖的可以是 schema 不会产出的非法值。
+ *
+ * `liveConfig` 是必须的：schema 是根 volatile（Web UI 设置页的前提，见 config.js），
+ * `Config({})` 解析出来的是**引用**，直接往 createSettings 里传会读不到任何字段。
+ */
 function settings(overrides = {}, cwd = '/tmp') {
-  return createSettings({ ...Config({}), ...overrides }, cwd);
+  return createSettings({ ...liveConfig(Config({})), ...overrides }, cwd);
 }
 
 test('默认配置原样落到 settings 上', () => {

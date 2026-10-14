@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "QQ 桥接",
-    "description": "通过 OneBot v11 连接 QQ：QQ 消息驱动 Harness Agent，Agent 也能主动发 QQ 消息、图片与表情包。"
+    "description": "通过 OneBot v11 连接 QQ：QQ 消息驱动 Harness Agent，Agent 也能主动发 QQ 消息、图片与表情包。全部配置在「设置 → QQ Bridge」里改（连接、触发、复读、主动说话、长期记忆……）。"
   }
 }
