@@ -48,6 +48,18 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 
 在 `cordis.patch.yml` 的 `config:` 下配置，也可以在 Web UI 的插件设置里改。
 
+> ⚠️ **不要另外在 profile 自己的 `~/.dsh/profiles/<名字>/cordis.patch.yml` 里覆盖这些字段。**
+> DSH 的 patch 语义是：按 id 命中的行**整块替换** `config`，**不深合并**（`dsh-app-boot` 的
+> `applyEntryPatches` 就是 `target.config = patch.config`）。在那边只写一个 `resetUsers`
+> 也会把本文件里的整套配置一起顶掉 —— `activeFollow` / `proactive` / `batchWindowMs` /
+> `persona` 静默退回 schema 默认值，表现就是「群里不 @ 它就不说话」「人设没了」；更糟的是
+> `agentPreset` 也一起丢，QQ 会话会挂上部署默认的 `standard` 预设，等于把 shell / 子代理
+> 暴露给不可信的群消息（`allowTools` 白名单同时失效）。
+>
+> 想改配置：改本文件（bundle 层，配置的唯一真相），或在 Web UI 的插件设置里改 —— 后者
+> 写的就是**完整** config。唯一一个「每台部署都不一样」的值 `resetUsers` 走环境变量，
+> 见[新开一轮会话](#新开一轮会话reset)。
+
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `endpoint` | `ws://127.0.0.1:3001` | OneBot v11 正向 WebSocket 地址 |
@@ -65,7 +77,7 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | `approvalPolicy` | `never` | `never` = 无人值守时一律拒绝需要审批的操作 |
 | `allowTools` | `[]` | QQ 会话可用的工具白名单；空 = 不限制 |
 | `resetCommand` | `/reset` | 新开一轮会话（旧会话留在磁盘上当存档）的指令；空 = 禁用 |
-| `resetUsers` | `[]` | 允许用 `resetCommand` 的 QQ 号；**留空 = 谁都不能重置**（与 `allowUsers` 反过来，见[新开一轮会话](#新开一轮会话reset)） |
+| `resetUsers` | `[]` | 允许用 `resetCommand` 的 QQ 号；**留空 = 谁都不能重置**（与 `allowUsers` 反过来，见[新开一轮会话](#新开一轮会话reset)）。本仓库的 `cordis.patch.yml` 把这一项接在 `QQBOT_RESET_USERS` 环境变量上（写进 `<启动 cwd>/.env`，逗号分隔）—— 免得把自己的号提交进仓库 |
 | `maxReplyChars` | `1500` | 单条 QQ 消息最大字符数（协议上限），超出自动分段 |
 | `mediaDownload` | `true` | 是否把消息里的图片/表情包下载到本地（模型只能读本地文件，不下载就只看到占位符） |
 | `mediaDir` | `.qq-media` | 媒体缓存目录，相对 `cwd`；必须落在 `cwd` 内，否则自动停用下载 |
@@ -1111,7 +1123,18 @@ allowTools:
 - **只有 `resetUsers` 里的 QQ 号能重置**，而且这一项**默认是空的 —— 也就是谁都不能**。
   这一条与 `allowUsers` 的「留空 = 不限制」刻意相反：群消息是不可信输入，一个「没配就等于
   人人可用」的重置指令意味着群里任何一个人都能悄悄把会话重开一轮，而且默认没人会去配它。
-  所以想用这个指令必须显式写号：`resetUsers: ['你的QQ号']`。
+  所以想用这个指令必须显式写号。本仓库的写法是把号放进**环境变量**（DSH 启动时会读
+  `<启动 cwd>/.env` 和 `$DSH_HOME/.env`）：
+
+  ```bash
+  # <仓库根>/.env（已被 .gitignore 盖住）
+  QQBOT_RESET_USERS=123456789,987654321
+  ```
+
+  `cordis.patch.yml` 里那行 `resetUsers: !!js …` 会把逗号分隔的变量拆成数组、去空白，
+  变量不存在或为空时就是空数组（= 谁都不能，与默认值一致）。**改完要重启进程**（`.env`
+  只在启动时读一次）。也可以在 Web UI 的插件设置里直接填 `resetUsers` —— 那边写的是完整
+  config；但别去 profile 的 `cordis.patch.yml` 里单写这一个字段（见[配置项](#配置项)开头的警告）。
   群里看的是**发言者**的 QQ 号（不是群号）；私聊看的是对方。
 - **没权限的人发 `/reset` 会被静默忽略**：不重置，也不回一句「你没有权限」—— 回话等于告诉
   全群这里有这么个指令、还激人去试。这条消息仍然照常记进转录（留痕在长期记忆里），但不会

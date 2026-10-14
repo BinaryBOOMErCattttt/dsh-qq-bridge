@@ -341,6 +341,16 @@
           底线：可以嘴硬，但不辱骂、不人身攻击、不碰政治和涉黄内容；真被认真求助时，把嘴硬收起来，正常把事情说清楚。
         # 在 QQ 里单独发送该指令可清空当前会话记忆（连同该群的上下文缓冲）；留空则禁用
         resetCommand: /reset
+        # 允许用 resetCommand 的 QQ 号；**留空 = 谁都不能重置**（与 allowUsers 的「空 = 不限制」
+        # 刻意相反）。这是整个配置里唯一一个「每台部署都不一样、且属于个人数据」的值，所以不写死
+        # 在文件里，而是从环境读（启动目录的 .env，也就是 `.env`；已被 .gitignore 盖住）：
+        #   QQBOT_RESET_USERS=123456789,987654321
+        # 为什么不写在 profile 自己的 ~/.dsh/profiles/<名>/cordis.patch.yml 里覆盖这个字段：
+        # DSH 的 patch 是**整块替换** config、不深合并，实测在那里写一个 resetUsers 会把
+        # activeFollow / proactive / agentPreset / allowTools / persona 等一整套一起顶掉，
+        # 插件静默退回 schema 默认值（群里不 @ 就不说话、QQ 会话还挂上带 shell 的默认预设）。
+        # 留空/没这个变量时是一串空串，settings.js 会去空白去重成 [] —— 与默认值等价。
+        resetUsers: !!js (process.env.QQBOT_RESET_USERS ?? '').split(',').map((s) => s.trim()).filter(Boolean)
         # ---- 禁漫（JM / 18comic）下载 → PDF → 发到 QQ ----
         # 依赖插件工作目录下的 venv（只装一次）：
         #   cd ~/Projects/qqbot

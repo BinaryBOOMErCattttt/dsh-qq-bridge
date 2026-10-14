@@ -520,6 +520,17 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
    它靠 `logger.exporter` 是否存在来避免污染测试输出。
 9. **同一会话的消息必须串行**（`enqueueSend` / `enqueue`）。QQ 消息到达顺序和异步
    IO 完成顺序不一致，绕过队列会串话/乱序。
+10. **profile 的 `cordis.patch.yml` 里不许给 `qq-bridge` 写 `config`：DSH 的 patch 是整块
+    替换，不是深合并。** `dsh-app-boot` 的 `applyEntryPatches` 对命中的行做
+    `target[key] = value`，所以 profile 层写一个 `resetUsers` 就会把仓库 patch 里那整套
+    配置（`activeFollow` / `proactive` / `batchWindowMs` / `burstSingleMaxChars` / `persona`）
+    **连同 `agentPreset: qq` 与 `allowTools` 白名单一起顶掉**，插件静默退回 schema 默认值 ——
+    表现是「群里不 @ 就不说话」，实际更严重：QQ 会话会挂上部署默认的 `standard` 预设
+    （有 shell / 子代理 / write），而这是不可信输入面。真发生过一次。
+    所以：配置一律改仓库的 `cordis.patch.yml`；**每台部署各不相同的值走环境变量**
+    （DSH 启动时读 `<启动 cwd>/.env` 与 `$DSH_HOME/.env`，代码里 `!!js` 求值即可，
+    `resetUsers` 就是这么接的，见 §11）；非要在 profile 层覆盖，就把整份 `config` 抄全
+    （Web UI 的插件设置写的就是完整 config）。
 
 ## 6. 怎么改：任务 → 动哪里
 
@@ -658,6 +669,8 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 | subagent 出现在 QQ 会话里 | 预设用了 `standard`，`tools.restrict()` 收不到作用域内注册的工具（§7） |
 | agent 会话突然没能力了 | `agentPreset` 没 join 到预设，或 `allowTools` 挡掉了 |
 | `/jm` 回「没启用」 | `.venv` 里缺 `jmcomic` / `img2pdf`，或路径不是 `jmPython` 指的那个 |
+| **群里不 @ 它就不说话 / 人设没了 / QQ 会话冒出 subagent** | profile 的 `~/.dsh/profiles/qqbot/cordis.patch.yml` 里给 `qq-bridge` 写了 `config`：patch 是整块替换，仓库 patch 的整套配置被顶掉（§5.10）。删掉那一行，配置改回仓库 patch |
+| `/reset` 突然没人能用 | `resetUsers` 由 `<启动 cwd>/.env` 的 `QQBOT_RESET_USERS` 决定（§11）；`.env` 只在启动时读，改了要重启 |
 
 ## 11. 运行环境（本机）
 
@@ -670,6 +683,11 @@ UI        http://127.0.0.1:3081/
 OneBot    容器 napcat（mlikiowa/napcat-docker），端口 3001 = WebSocket **服务器**
 凭据      DEEPSEEK_API_KEY：推荐在 3081 的 Web UI Models 页填一次（写入
           $DSH_HOME/.credentials.yaml，任何启动方式都生效）
+私有配置  profile 的 cordis.patch.yml **只放 locale / ui-settings 这类覆盖**；
+          插件的配置一律改仓库的 cordis.patch.yml（见 §5.10）。
+          本机私有的 /reset 白名单在仓库根的 .env（gitignore，**别把真号提交进仓库**）：
+            QQBOT_RESET_USERS=<你的QQ号>      → cordis.patch.yml 的 resetUsers 从这里读
+          .env 只在启动时读一次：改完必须重启才生效。
 ```
 
 调试实时行为可以直接开 3081 的 Web UI 看 QQ 会话（每个 QQ 会话就是一个 Session）。
