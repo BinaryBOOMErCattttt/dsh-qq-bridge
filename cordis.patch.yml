@@ -255,22 +255,30 @@
         # 上面那套 proactive 只在**冷场**时开口；这一组管「正聊着」的时候。真人聊起来之后
         # 不需要你每句都叫一遍名字，也不会在你说完十秒之后就彻底闭嘴 —— 三件事各有开关：
         #   A 免 @ 接话（activeFollow）：被 @ 到之后的窗口内、正在跟它聊的那个人接着说的话
-        #     也算在跟它聊。只认那个人、中间没人插话、那句没 @ 别人，一次最多接 activeMaxTurns 轮。
-        #     它放松的是「群里只在被 @ 时才说话」这条默认约定，所以插件默认关闭（这里开着）。
+        #     也算在跟它聊。只认那个人、中间没人插话、那句没 @ 别人，一次最多考虑
+        #     activeMaxTurns 条免 @ 消息。它放松的是「群里只在被 @ 时才说话」这条默认约定，
+        #     所以插件默认关闭（这里开着）。
         #   B 自己补一句（activeChimeIdleMs / activeChimeMax）：它正常回完一轮、对方安静了
         #     一小会儿、中间没人插话时，可能再追一句「啊对了…」（需要 proactive: true，
         #     走同一个 proactiveChance 掷骰子；对方每说一句之后最多补 activeChimeMax 句，
         #     同一个会话一天最多 activeChimeDailyMax 句）。私聊也有 B —— 那边不需要 A。
         #   C 多人搭话（activeGroupLines / activeGroupSpeakers）：群里几个人自己聊热了
         #     （最近 activeWindowMs 里别人说够 N 条、且来自 M 个不同的人）就进入搭话状态，
-        #     那之后**谁**接话都免 @，直到窗口里凑不齐条数或人数（大家一停就自动退出）。
+        #     那之后**谁**接话都算数，直到窗口里凑不齐条数或人数（大家一停就自动退出）。
         #     搭话状态里「倾听时间」变长：攒批窗口与整批上限一起乘 activeGroupBatchScale，
         #     多听几句再合成一轮回复。activeGroupLines: 0 = 关掉多人搭话。
+        # 够资格不等于就接：A 与 C 的每条够资格的消息还要掷一次**会自己涨**的概率
+        # （activeTalkChance 起、每没抽中一条 +activeTalkChanceStep、activeTalkChanceMax 封顶），
+        # 像抽卡那样 —— 抽中或被 @ 到之后归零，这段对话凉了也归零。所以群里看到的是
+        # 「它偶尔接一句」，而不是聊热了就每条都回。没抽中的那条什么都不发（转录照记）。
         # 一对一窗口靠**别人发来的消息**往后滑（机器人自己说的话不算），中间有别人插话
         # 这段一对一就算断了，要重新 @ 它一次（够热的话会走 C）。activeWindowMs: 0 关整套。
         # activeWindowMs: 60000          # 「还跟你聊着」的窗口（毫秒）：默认 1 分钟，@ 一次买这一小段
         activeFollow: true             # A + C 的总闸门：窗口内 / 多人搭话时免 @ 接话（默认 false）
-        # activeMaxTurns: 10             # 一次一对一最多免 @ 接几轮（多人搭话不看它）；0 = 不限
+        # activeMaxTurns: 10             # 一次一对一最多考虑几条免 @ 消息（没抽中的也算）；0 = 不限
+        # activeTalkChance: 0.05         # A/C：够资格之后接话的起始概率（0 = 起步不接，但仍会攒）
+        # activeTalkChanceStep: 0.1      # A/C：每多一条没抽中的消息，概率涨这么多
+        # activeTalkChanceMax: 0.8       # A/C：概率上限（留一点不确定性，别变成每条都回）
         # activeGroupLines: 6            # C：最近窗口里别人说够这么多条才算聊热了；0 = 关掉多人搭话
         # activeGroupSpeakers: 2         # C：且至少这么多不同的人说过话（一个人刷屏不算）
         # activeGroupBatchScale: 2       # C：搭话状态里攒批窗口与上限 ×N（倾听时间）；1 = 不放大

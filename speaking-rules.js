@@ -138,6 +138,54 @@ export function activeFollowAllows(input) {
 }
 
 /**
+ * 「免 @ 搭话」的累计概率（抽卡那套保底，见 AGENTS.md §4.G）。
+ *
+ * A 路（一对一窗口里同一个人接着说的话）与 C 路（多人搭话）**共用同一条曲线**：够资格
+ * 不等于就接 —— 每够资格一次就按这个概率掷一回，没掷中就把「连丢」计数 +1，下一次更接近
+ * 上限；掷中、或者被明确 @ 到（那是不用抽的直接回复）之后计数归零，重新从起始概率攒。
+ *
+ * 三处刻意的取值：
+ *   - `max < base` 时按 `base` 封顶，而不是让配反的上限把起始概率也压掉；
+ *   - 任何非有限值（NaN，配置写坏）都当 0 —— 宁可一句不接，也不要按一个莫名其妙的
+ *     概率乱接（与 `proactiveChance` 的 NaN → 不开口是同一种失败方向）；
+ *   - `max` 自己 NaN（没填）时当成「没有上限」。
+ *
+ * @param {number} base - `activeTalkChance`（起始概率，0~1）。
+ * @param {number} step - `activeTalkChanceStep`（每连丢一条加多少）。
+ * @param {number} max - `activeTalkChanceMax`（上限）。
+ * @param {number} misses - 这段对话里已经连丢了几条（`conversation.talkMisses`）。
+ * @returns {number} 这一次的搭话概率（0~1）。
+ */
+export function activeTalkChance(base, step, max, misses) {
+  const start = clampChance(base);
+  const grow = clampChance(step);
+  const count = Math.max(0, Math.floor(Number(misses) || 0));
+  const raw = start + grow * count;
+  if (!Number.isFinite(raw)) return 0;
+  const cap = clampChance(max);
+  return Math.min(Number.isFinite(cap) ? Math.max(start, cap) : 1, raw);
+}
+
+/**
+ * 这一次搭话掷中了吗。
+ *
+ * 与 `chimeAllows` 的最后一条同构：`chance > 0 && roll < chance`，`roll` 由调用方掷
+ * （判据要可重复才测得动边界）。`eligible` 是 A/C 两路是否够资格 —— 不够资格时连概率
+ * 都不用算，这里一并挡住。
+ *
+ * @param {object} input
+ * @param {boolean} input.eligible - 够资格（一对一窗口里，或者群聊进了搭话状态）。
+ * @param {number} input.chance - 已算好的概率（见 `activeTalkChance`）。
+ * @param {number} input.roll - 已掷好的 0~1 随机数。
+ * @returns {boolean} 这一句该接时为 true。
+ */
+export function activeTalkAllows(input) {
+  if (input.eligible !== true) return false;
+  const chance = clampChance(input.chance);
+  return chance > 0 && input.roll < chance;
+}
+
+/**
  * 「自己补一句」的延迟（毫秒）：在 `idleMs` 上按 `jitter` 抖动，下限 500。
  *
  * 掐着表 20 秒整补一句比不补还像机器人；复用打字延迟那个抖动比例，不额外加配置。

@@ -31,6 +31,9 @@ test('默认配置原样落到 settings 上', () => {
   assert.equal(s.activeGroupLines, 6);
   assert.equal(s.activeGroupSpeakers, 2);
   assert.equal(s.activeGroupBatchScale, 2);
+  assert.equal(s.activeTalkChance, 0.05);
+  assert.equal(s.activeTalkChanceStep, 0.1);
+  assert.equal(s.activeTalkChanceMax, 0.8);
   assert.equal(s.proactiveIdleMs, 45 * 60 * 1000);
   assert.equal(s.proactiveDailyMax, 4);
   assert.equal(s.digestAtHour, 4);
@@ -106,6 +109,21 @@ test('多人搭话的倾听倍数只在 > 1 时生效', () => {
   assert.equal(settings({ activeGroupBatchScale: 0.5 }).activeGroupBatchScale, 1);
   assert.equal(settings({ activeGroupBatchScale: NaN }).activeGroupBatchScale, 1);
   assert.equal(settings({ activeGroupBatchScale: 3 }).activeGroupBatchScale, 3);
+});
+
+test('搭话抽卡的概率三项夹在 0~1，非法值保持 NaN（= 一句都不接）', () => {
+  assert.equal(settings({ activeTalkChance: -1 }).activeTalkChance, 0);
+  assert.equal(settings({ activeTalkChance: 5 }).activeTalkChance, 1);
+  assert.equal(settings({ activeTalkChance: 0.4 }).activeTalkChance, 0.4);
+  assert.equal(settings({ activeTalkChanceStep: 2 }).activeTalkChanceStep, 1);
+  assert.equal(settings({ activeTalkChanceStep: -1 }).activeTalkChanceStep, 0);
+  assert.equal(settings({ activeTalkChanceMax: 9 }).activeTalkChanceMax, 1);
+  assert.equal(settings({ activeTalkChanceMax: -1 }).activeTalkChanceMax, 0);
+  // 三项里 NaN 都**刻意不退回默认值**（与 proactiveChance 同口径）：它进到判据里会让
+  // `roll < chance` 恒假 = 一句都不接，这比「按一个莫名其妙的概率乱接」安全得多。
+  assert.ok(Number.isNaN(settings({ activeTalkChance: 'nonsense' }).activeTalkChance));
+  assert.ok(Number.isNaN(settings({ activeTalkChanceStep: 'nonsense' }).activeTalkChanceStep));
+  assert.ok(Number.isNaN(settings({ activeTalkChanceMax: 'nonsense' }).activeTalkChanceMax));
 });
 
 test('拆条相关的 0 都得保住「不限」的含义', () => {

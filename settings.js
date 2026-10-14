@@ -140,6 +140,12 @@ export function createSettings(config, defaultCwd) {
   // —— 活跃对话（免 @ 接话 / 补一句 / 多人搭话）——
   const activeWindowMs = msOf(config.activeWindowMs, 60 * 1000);
   const activeMaxTurns = msOf(config.activeMaxTurns, 10);
+  // 抽卡概率三项都夹到 0~1；NaN 保持 NaN（与 proactiveChance 同口径）。NaN 进到判据里
+  // 会让 `roll < chance` 恒假 = 一句都不接 —— 这是比「按一个莫名其妙的概率乱接」更安全
+  // 的失败方向，所以这里刻意不退回默认值。
+  const activeTalkChance = Math.min(1, Math.max(0, Number(config.activeTalkChance)));
+  const activeTalkChanceStep = Math.min(1, Math.max(0, Number(config.activeTalkChanceStep)));
+  const activeTalkChanceMax = Math.min(1, Math.max(0, Number(config.activeTalkChanceMax)));
   const activeGroupLines = msOf(config.activeGroupLines, 6);
   const activeGroupSpeakers = msOf(config.activeGroupSpeakers, 2);
   const activeChimeIdleMs = msOf(config.activeChimeIdleMs, 20 * 1000);
@@ -219,6 +225,9 @@ export function createSettings(config, defaultCwd) {
     proactiveChance,
     activeWindowMs,
     activeMaxTurns,
+    activeTalkChance,
+    activeTalkChanceStep,
+    activeTalkChanceMax,
     activeGroupLines,
     activeGroupSpeakers,
     activeChimeIdleMs,

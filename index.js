@@ -43,6 +43,8 @@ import { createChatter } from './chatter.js';
 import { buildMentionResolver, hasMentionMarker, mentionSegments } from './mention.js';
 import {
   activeFollowAllows as activeFollowAllowsRule,
+  activeTalkAllows as activeTalkAllowsRule,
+  activeTalkChance as activeTalkChanceRule,
   activeTurnsLeft as activeTurnsLeftRule,
   batchCap as batchCapRule,
   batchScale as batchScaleRule,
@@ -1660,6 +1662,8 @@ export function apply(ctx, config) {
     conversation.activeSpeakerId = '';
     conversation.activeInterposeSeq = 0;
     conversation.activeTurns = 0;
+    // 抽卡的累计也一起忘：新开一轮的第一句不该继承上一轮攒下的「保底」。
+    conversation.talkMisses = 0;
     conversation.chimeCount = 0;
     conversation.chimeDay = '';
     conversation.chimeToday = 0;
@@ -1738,12 +1742,18 @@ export function apply(ctx, config) {
        * `activeUntil` 是这次聊天的截止时刻（每接一句就往后滑），`activeSpeakerId` 是正在
        * 跟它聊的那个人 —— 群里只有这个人接着说的话才可能免 @ 算进来（别人插话就另说了）。
        * `activeInterposeSeq` 是那条消息那一刻的插话序号，用来判断「中间有没有别人说过话」；
-       * `activeTurns` 是这次活跃对话里已经免 @ 接了几轮（受 activeMaxTurns 约束）。
+       * `activeTurns` 是这次活跃对话里已经考虑了几条免 @ 消息（受 activeMaxTurns 约束，
+       * 抽卡没抽中的也算 —— 那是安全上限，不随概率放松）。
+       *
+       * `talkMisses` 是抽卡那套「保底」：这段对话里连着几条够资格却没抽中。每连丢一条，
+       * 下一次的搭话概率就高一点（见 `activeTalkChance`）；抽中、被明确 @ 到、或者这段
+       * 对话凉了（既不在一对一窗口里、群也没聊热）都会归零。
        */
       activeUntil: 0,
       activeSpeakerId: '',
       activeInterposeSeq: 0,
       activeTurns: 0,
+      talkMisses: 0,
       /**
        * 「自己补一句」的定时器与记账（见 scheduleChime）。
        *
@@ -1895,20 +1905,6 @@ export function apply(ctx, config) {
       // 前缀只在**显式带前缀**的那条上剥掉：活跃对话里接上的那句本来就没有前缀，
       // 按前缀长度硬切会把「然后呢」切成「后呢」（见 dropPrefix）。
       const preview = prefixed ? dropPrefix(rawText) : rawText;
-      // 活跃对话：没被叫到，但同一个人正在跟它聊，接着说的这句也算。（只认**已经存在**
-      // 的会话 —— 闲聊不该因为「窗口」把某个群变成「处理过」的群。）
-      const existing = conversations.get(`group:${groupId}`);
-      // 多人搭话：这个群最近自己聊热了（够条数、够人数），那之后谁接话都算 —— 这也是
-      // 「有人插话就进入多人搭话」的落点：插话的人与那句话本身就记在 chatter 的热度窗口里，
-      // 大家说得够多就整体升级，而不是像一对一那样被一句话打断。
-      //
-      // 它**不**消耗 `activeMaxTurns`：那个上限是防「一个人揪着它刷屏」的，而这里的闸门
-      // 本身就是「窗口里够条数、够人数」—— 大家一停，窗口自己就空了。再叠一层轮数上限，
-      // 只会让它在最热闹的时候接几句就哑掉（那正是搭话状态该起作用的时候）。
-      const groupTalk = !explicit && existing !== undefined && groupTalkActive(groupId);
-      const followed = !explicit && existing !== undefined && activeFollowAllows(existing, userId, message, selfId);
-      const continued = groupTalk || followed;
-      if (!explicit && !continued) return undefined;
       // 没有正文：单纯的 @、或者就是一个空格。这和「被叫到之后闲聊」是两回事 —— 对方
       // 明确点了名却什么都没说，本身就是一种信号（想让它接上一句、或者就是想看它反应）。
       // 所以显式的空消息照常放行，只把正文位置换成一句说明，由模型接着上下文决定回
@@ -1917,9 +1913,57 @@ export function apply(ctx, config) {
       // 两处刻意收紧：活跃对话窗口里接上的空消息不算（那只是「他说了句话，正好没内容」，
       // 不是点名，接上去就成了抢答）；前缀模式下按前缀长度硬切出空串也不算（那不是空消息，
       // 是没内容可切，别硬凑一句话回）。
+      //
+      // 这段判定放在抽卡**之前**：反正要被丢掉的空消息不该消耗连丢计数，也不该把一对一
+      // 窗口往后滑 —— 一条什么都没说的消息不算「还在跟它说话」。
       const blank = preview.length === 0 && explicit && !prefixed;
       if (preview.length === 0 && !blank) return undefined;
       if (blank && settings.blankReply !== true) return undefined;
+      // 活跃对话：没被叫到，但同一个人正在跟它聊，接着说的这句也算。（只认**已经存在**
+      // 的会话 —— 闲聊不该因为「窗口」把某个群变成「处理过」的群。）
+      const existing = conversations.get(`group:${groupId}`);
+      // 多人搭话：这个群最近自己聊热了（够条数、够人数），那之后谁接话都算数 —— 这也是
+      // 「有人插话就进入多人搭话」的落点：插话的人与那句话本身就记在 chatter 的热度窗口里，
+      // 大家说得够多就整体升级，而不是像一对一那样被一句话打断。
+      //
+      // 它**不**消耗 `activeMaxTurns`：那个上限是防「一个人揪着它刷屏」的，而这里的闸门
+      // 本身就是「窗口里够条数、够人数」—— 大家一停，窗口自己就空了。再叠一层轮数上限，
+      // 只会让它在最热闹的时候接几句就哑掉（那正是搭话状态该起作用的时候）。
+      const groupTalk = !explicit && existing !== undefined && groupTalkActive(groupId);
+      const followed = !explicit && existing !== undefined && activeFollowAllows(existing, userId, message, selfId);
+      // 够资格 ≠ 就接：A/C 两路共用的这一抽（见 speaking-rules.js 的 activeTalkChance）。
+      // 每够资格一次掷一回「越攒越高」的概率，没掷中就把连丢计数 +1，下一次更接近上限；
+      // 掷中、或者被明确 @ 到之后归零重新攒。这样群里几个人正聊着时，它不会每条都回，
+      // 也不会一直装死 —— 频率落在一个可调的概率曲线上。
+      const talkEligible = groupTalk || followed;
+      const talkChance = talkEligible
+        ? activeTalkChanceRule(
+          settings.activeTalkChance,
+          settings.activeTalkChanceStep,
+          settings.activeTalkChanceMax,
+          existing.talkMisses,
+        )
+        : 0;
+      const continued = activeTalkAllowsRule({ eligible: talkEligible, chance: talkChance, roll: Math.random() });
+      if (talkEligible) {
+        const who = describeConversation(existing);
+        if (continued) {
+          existing.talkMisses = 0;
+          report('info', `${who} 免 @ 搭话抽中（概率 ${Math.round(talkChance * 100)}%）：接这一句`);
+        } else {
+          existing.talkMisses = (Number(existing.talkMisses) || 0) + 1;
+          // A 路没抽中也算「人还在跟它说话」：窗口照滑、免 @ 轮数照扣。不这样的话，
+          // 60 秒的窗口会在概率攒够之前先过期，或者把「这次没接」当成「这段断了」，
+          // 那条路就名存实亡了。（C 路不扣轮数 —— 它的闸门本来就是「够条数、够人数」。）
+          if (followed) noteActiveMessage(existing, userId, true);
+          report('info', `${who} 免 @ 搭话没抽中（概率 ${Math.round(talkChance * 100)}%，已连丢 ${existing.talkMisses} 条）：这一句不接`);
+        }
+      } else if (!explicit && existing !== undefined && existing.talkMisses) {
+        // 既不在一对一窗口里、群也没聊热：这段对话凉了，累计清零，下次重新从起始概率攒
+        // —— 不然半小时前攒下的「保底」会在一段全新的聊天开头突然炸出来。
+        existing.talkMisses = 0;
+      }
+      if (!explicit && !continued) return undefined;
       // 空消息的说明在这里算**一次**、往下传给 `submitBatch`：那边是媒体落盘后重新渲染
       // 的正文（`at` 段同样会被剔掉，仍然是空），若让它自己再拼一句，就得把「有没有 @」
       // 这件事也带下去，多一份要同步维护的状态（第一版正是这么写的，@ 与空消息的措辞串了）。
@@ -1931,6 +1975,9 @@ export function apply(ctx, config) {
         name: displayName,
         mentions: atMentions(message, selfId),
       });
+      // 被明确叫到（@ / 前缀 / groupTrigger: all）就直接回，不抽卡；它刚说过话，累计的
+      // 「连丢」也该清零 —— 否则抽卡那点保底会攒到它刚回完的下一句上。
+      if (explicit) conversation.talkMisses = 0;
       noteActiveMessage(conversation, userId, continued);
       return {
         conversation,
@@ -2535,8 +2582,13 @@ export function apply(ctx, config) {
   //      也算在跟它聊（window 默认 1 分钟 —— 一个人 @ 一次只买这一小段）；
   //   B. 自己补一句（`activeChime*`）：它回完之后对方安静了一小会儿，它可能再追一句；
   //   C. **多人搭话**（`activeGroup*`）：群里几个人自己聊了起来（最近窗口里够条数、够人数），
-  //      它就进入搭话状态 —— 那之后谁接话都免 @，而且「倾听时间」变长（攒批更久），
+  //      它就进入搭话状态 —— 那之后谁接话都算数，而且「倾听时间」变长（攒批更久），
   //      多听几句才合成一轮回复。
+  //
+  // A 与 C 都只是「够资格」：够资格之后还要按 `activeTalkChance` 一族**抽一次卡**
+  // （见 speaking-rules.js 的 `activeTalkChance`）—— 这是刻意的，人多嘴杂的群里
+  // 「够热就每条都回」会变成刷屏；抽卡让它在热群里也保持一份不确定（连丢越多越容易接上，
+  // 抽中或被打断之后归零）。
   //
   // 窗口只靠**别人发来的消息**往后滑（机器人自己说的话不算，否则它自己就能给窗口续命）；
   // 一对一窗口里有人插话，这次「你跟我聊」就算断了，要重新叫它一次 —— 但插话本身会记进
@@ -2562,6 +2614,9 @@ export function apply(ctx, config) {
    *
    * 它是**纯查询**（不写状态）：搭话状态因此不会赖着不走 —— 大家一停，窗口自己就空了，
    * 下一次消息重新判。这也让「插话」自然成为进入方式之一：有人接一句，人数与条数就往上走。
+   *
+   * 进入搭话状态不等于每条都回：它只是「够资格抽卡」（见 `admit` 里那一抽与
+   * speaking-rules.js 的 `activeTalkChance`）。
    *
    * @param groupId - 群号。
    * @returns 现在算多人搭话时为 true。
@@ -2603,7 +2658,8 @@ export function apply(ctx, config) {
    *
    * 七条判据在 `speaking-rules.js` 的 `activeFollowAllows` 里（那里逐条写着为什么）；
    * 这里只把会话状态、插话序号与配置凑成那份入参。这一步放松的是「群里只在被 @ 时
-   * 才说话」这条默认约定，宁可少接一句也别抢话。
+   * 才说话」这条默认约定，宁可少接一句也别抢话 —— 通过之后也不一定接，还要过 `admit`
+   * 里那一抽（`activeTalkChance`）。
    * @param conversation - 已有的会话记录。
    * @param userId - 发消息的人。
    * @param message - OneBot 的 `message` 字段。
@@ -3433,7 +3489,9 @@ export function apply(ctx, config) {
       `active conversation — activeFollow on: a group follow-up from the person it is talking to needs no @ ` +
         `(window ${Math.round(settings.activeWindowMs / 60000)} min, at most ${settings.activeMaxTurns || '不限'} turns); ` +
         `group talk after ${settings.activeGroupLines || '关闭'} lines from ${settings.activeGroupSpeakers} speakers ` +
-        `(listen x${settings.activeGroupBatchScale})`,
+        `(listen x${settings.activeGroupBatchScale}); either way one is only admitted by a roll — ` +
+        `start ${Math.round(settings.activeTalkChance * 100)}%, +${Math.round(settings.activeTalkChanceStep * 100)}% per miss, ` +
+        `up to ${Math.round(settings.activeTalkChanceMax * 100)}%`,
     );
   } else {
     report('info', 'active conversation — activeFollow is off: group messages still need an explicit @ (or the configured prefix)');

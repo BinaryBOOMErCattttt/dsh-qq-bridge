@@ -50,14 +50,14 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 ## 2. 文件地图
 
 ```
-index.js      3466 行  插件本体：全部运行时状态、事件路由、发送/准入/复读/存表情包/主动说话/活跃对话、连接生命周期
+index.js      3524 行  插件本体：全部运行时状态、事件路由、发送/准入/复读/存表情包/主动说话/活跃对话、连接生命周期
 chatter.js      171 行  群里「谁在说话」的三本账（插话序号 / 回答指向 / 热度窗口）：只暴露语义动作，不暴露 Map
 mention.js      209 行  `[[@昵称]]` → OneBot `at` 段：纯函数解析 + 「昵称 → QQ 号」名单（名单挂在会话记录上）
-speaking-rules.js 244 行  「什么时候该主动开口」的纯判据（五道闸门 + 两个节奏闸、免 @ 接话、补一句的九条闸门）：给普通入参、返回布尔
+speaking-rules.js 292 行  「什么时候该主动开口」的纯判据（五道闸门 + 两个节奏闸、免 @ 接话与搭话抽卡、补一句的九条闸门）：给普通入参、返回布尔
 util.js        269 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 记忆路径与表情包文件名的写边界 / key 池解析与打码 / withinActiveHours
 filestore.js    92 行  几个「原子写 / 尽力而为读」的小工具（读不到返回空而不是抛错），记忆、转录与存下来的表情包都走它
-config.js      139 行  配置 schema（**配置的唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段
-settings.js    238 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
+config.js      142 行  配置 schema（**配置的唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段
+settings.js    252 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
 tools.js       640 行  7 个宿主平面工具的**声明**（qq_send_message / qq_send_image / qq_save_sticker / qq_list_conversations / qq_jm_pdf / qq_transcript / qq_memory），依赖由 index.js 显式传入
 memory.js     1143 行  长期记忆子系统：转录落盘、记忆文件读写（那两个记忆工具的能力来源）、每日摘要循环；依赖由 index.js 显式传入
 onebot.js      707 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/文本化/@ 名单提取）
@@ -72,7 +72,7 @@ scripts/jm_download.py  禁漫下载的 python 实现（jmcomic + img2pdf），�
 test/bridge.test.mjs  集成测试：假 OneBot 服务端 + 假 Harness ctx（含假 timer），跑完整往返
 test/settings.test.mjs  配置归一化的契约测试（默认值 / 非法值 / 白名单不 trim 这类刻意的不对称）
 test/chatter.test.mjs   「谁在说话」三本账的**不变量**测试（合并两本账就会红的那种）
-test/speaking-rules.test.mjs 主动说话 / 免 @ 接话 / 补一句的判据：每个用例从「通过」的基准入参出发，只翻一个字段
+test/speaking-rules.test.mjs 主动说话 / 免 @ 接话 / 搭话抽卡 / 补一句的判据：每个用例从「通过」的基准入参出发，只翻一个字段
 test/mention.test.mjs  `[[@昵称]]` → at 段的纯函数测试：标记边界、认不出来就丢、名单按会话隔离
 test/util.test.mjs      纯函数边界：写边界 memoryRelativePath 与 stickerFileName、memorySlug、本地时间、errorText、key 打码
 test/filestore.test.mjs 原子读写与「读不到就返回空/undefined，不抛错」这条失败语义
@@ -139,7 +139,7 @@ node_modules -> ~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules
 | 会话管理 | `resetConversation` `conversationFor` `sessionIdFor` `resetMarkerDir` `loadConversationResetCounts` `writeConversationResetCount` `refreshSessionGeneration` | `/reset` 开新一轮（**不删旧会话**，代次 +1 并落盘），以及在线会话列表（新一轮时连主动说话的节奏一起清） |
 | 准入与复读 | `admit` `noteChatter` `touchActivity` `rememberAmbient` `registerParticipant` `maybeRepeat` `repeatStep` `sketchOf` `sameCandidate` | 白名单、群触发判定、环境上下文（**顺带登记「谁可以被 @」**，名单挂在会话记录的 `participants` 上）、复读状态机（图片来源判定 = 字节相同 **或** 画面指纹相近，见 `perceptual.js`）；`admit` 里还有「活跃对话」那条免 @ 的旁路 |
 | 主动说话 | `proactiveSweep` `proactiveEligible`（适配器）`proactiveSpeak` `proactiveNudge` `busyWithTurn` `proactiveTodayCount` | 见 §4.F；**闸门本身在 `speaking-rules.js`**（`proactiveEligible` / `proactiveSkip`），这里只负责把会话记录凑成入参；定时器在生命周期那一节，`withinActiveHours`（util.js）是纯函数 |
-| 活跃对话 | `noteActiveMessage` `activeFollowAllows` / `activeTurnsLeft` / `chimeAllows` / `chimeDelay` / `batchScale`（适配器）`groupTalkActive` `scheduleChime` `cancelChime` `runChime` `chimeSpeak` `chimeNudge` `chimeTodayUsed` | 见 §4.G；A（一对一免 @ 接话）与 C（多人搭话）都在 `admit` 里判，倾听倍数在 `holdForBatch` 里用，B（补一句）挂在 `turn/end` 之后 |
+| 活跃对话 | `noteActiveMessage` `activeFollowAllows` / `activeTurnsLeft` / `activeTalkChance` / `activeTalkAllows` / `chimeAllows` / `chimeDelay` / `batchScale`（适配器）`groupTalkActive` `scheduleChime` `cancelChime` `runChime` `chimeSpeak` `chimeNudge` `chimeTodayUsed` | 见 §4.G；A（一对一免 @）与 C（多人搭话）都在 `admit` 里判，够资格后共用一次抽卡（`talkMisses`），倾听倍数在 `holdForBatch` 里用，B（补一句）挂在 `turn/end` 之后 |
 | 攒批 | `enqueue` `holdForBatch` `flushBatch` `submitBatch` `renderBatch`；`batchWindow` / `batchCap` / `batchScale` 是 3 行适配器，算法在 `speaking-rules.js` | 前后脚到的消息合成一条再投给 Agent；多人搭话时窗口与上限同倍放大（见 §4.G） |
 | 媒体 | `resolveMessageMedia` `mediaFor` `resolveQuote` `hydrateAmbientMedia` | 环境上下文与复读**共用同一次下载**（`mediaResolutions` 这个 WeakMap 就是干这个的） |
 | 事件轮转 | `handleEvent`（约 77 行）+ 持久化事件路由 | 见 §4.A；`turn/end` 里按 `owner.proactive` 分流 |
@@ -351,17 +351,17 @@ F 管的是**冷场**；这一块管「正聊着」。三条路共用一个「�
 
 ```
 admit（群聊）
-  ├─ 被叫到（@ / 前缀 / groupTrigger=all）→ noteActiveMessage(..., continued=false)
-  │      重置 activeTurns、清 chime 计数、把 activeUntil 滑到 now + activeWindowMs
-  ├─ A 没被叫到 → activeFollowAllows？（七条，逐条见 speaking-rules.js）：开着 · 是 activeSpeakerId 本人
-  │     · 窗口没过期 · activeTurns < activeMaxTurns · 群里没人插过话
-  │     （chatter.others() == activeInterposeSeq + 1）· 这句没 @ 别人（mentionsOthers）
-  │     └─ 通过 → noteActiveMessage(..., continued=true)（activeTurns +1）
-  └─ C 没被叫到 → groupTalkActive(群号)？最近 activeWindowMs 的热度窗口里
-        ≥ activeGroupLines 条 且 来自 ≥ activeGroupSpeakers 个人（纯查询，不写状态）
-        └─ 通过 → 同样 continued=true（谁接话都算，不消耗 activeMaxTurns）
-             └─ admit 返回 { continued: true }：正文**不能**再走 dropPrefix
-                （前缀模式里「然后呢」会被切成「后呢」，见 submitBatch）
+  ├─ 被叫到（@ / 前缀 / groupTrigger=all）→ 不抽卡直接回；talkMisses 清零
+  │      → noteActiveMessage(..., continued=false)：activeTurns 归零、清 chime、滑窗口
+  ├─ A 没被叫到 → activeFollowAllows？（七条，逐条见 speaking-rules.js）
+  └─ C 没被叫到 → groupTalkActive(群号)？（热度窗口够条数、够人数，纯查询）
+        └─ A 或 C 够资格 → **抽卡**（activeTalkAllows，A/C 共用）：
+             概率 = min(activeTalkChanceMax, activeTalkChance + activeTalkChanceStep × talkMisses)
+               ├─ 抽中 → talkMisses = 0，continued = true（C 路不消耗 activeMaxTurns）
+               │    └─ admit 返回 { continued: true }：正文**不能**再走 dropPrefix（见 submitBatch）
+               └─ 没抽中 → talkMisses +1，这条不进 Agent（转录/环境上下文/热度照记）；
+                    A 路还要 noteActiveMessage(..., continued=true)（窗口照滑、轮数照扣）
+             两个资格都不成立 → talkMisses 清零（这段对话凉了，保底不跨对话）
 
 holdForBatch → batchScale()：C 生效时 batchWindowMs / batchMaxWaitMs 一起 ×
    activeGroupBatchScale（「倾听时间变长，多听几句再合成一轮回复」）
@@ -397,6 +397,10 @@ turn/end（正常回复发完之后）
   它自动退出；存一个 `activeGroupUntil` 反而要处理「谁负责过期」。它也因此天然支持
   「有人插话就升级」——插话本身就是往门槛上走。**不消耗 `activeMaxTurns`**：那个上限是防
   一个人揪着它刷屏的，而这里的闸门是「够条数、够人数」，再叠一层只会让它在最热闹的时候哑掉。
+- **够资格 ≠ 就接：A 与 C 共用一次抽卡**（`activeTalkChance` / `activeTalkAllows`，计数在
+  会话记录的 `talkMisses` 上）：抽中、被 @ 到、或两个资格都不成立时归零。**A 路没抽中也必须走
+  `noteActiveMessage(..., continued=true)`**（窗口照滑、轮数照扣），否则窗口会在概率攒够之前
+  过期。空消息在抽卡之前就被丢掉。
 - **搭话状态里只放大攒批（`batchScale`），不放大打字延迟**：`holdForBatch` 拿它乘窗口与上限，
   两处必须同倍——只放大窗口不放大上限时，`batchMaxWaitMs` 会把「多听几句」又卡回去。
 - **`continued` 一路要传到 `submitBatch`**：前缀模式下按前缀长度硬切会切掉正文首字
@@ -559,7 +563,7 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
 | 改主动说话的闸门 | `speaking-rules.js` 的 `proactiveEligible`（五道闸门 + 两个节奏闸）+ 它的用例；index.js 那边只是适配器 |
 | 改主动说话的文案 / 流程 | index.js 的 `proactiveNudge` / `proactiveSweep` / `proactiveSpeak` + `Config` 的 `proactive*` + README「偶尔主动说话」（见 §4.F） |
 | 改主动说话的时段语义 | `withinActiveHours`（**模块级纯函数**，导出给测试用）+ 它的边界用例 |
-| 改「聊起来之后保持搭话」 | `speaking-rules.js`（`activeFollowAllows` / `activeTurnsLeft` / `chimeAllows` / `chimeDelay` / `batchScale`）+ index.js 的编排（`noteActiveMessage` / `groupTalkActive` / `scheduleChime` / `runChime` / `chimeNudge`）+ `chatter.js`（三本账）+ `admit` 里那两条免 @ 分支 + `holdForBatch` 的倾听倍数 + `settings` 的 `active*` + README「聊起来之后保持搭话」（见 §4.G） |
+| 改「聊起来之后保持搭话」/ 抽卡 | `speaking-rules.js`（`activeFollowAllows` / `activeTurnsLeft` / `activeTalkChance` / `activeTalkAllows` / `chimeAllows` / `chimeDelay` / `batchScale`）+ index.js 的编排（`noteActiveMessage` / `groupTalkActive` / `scheduleChime` / `runChime` / `chimeNudge`）+ `chatter.js`（三本账）+ `admit` 里那两条免 @ 分支与抽卡 + `holdForBatch` + `settings` 的 `active*` + README「聊起来之后保持搭话」（见 §4.G） |
 | 改「谁算在跟它聊」 | `speaking-rules.js`（`activeFollowAllows` 的七条）与 `chatter.js`。一对一：`others()` 与 `activeInterposeSeq` 比大小（`noteActiveMessage` / `activeFollowAllows` / `runChime`）—— 别改成时间戳，它判的是「有没有人插话」；多人搭话：`isHot()` 的时间窗口（`groupTalkActive`）—— 别改成序号，它判的是「最近够不够热」。**两条判据的语义差别写在模块注释里，还有 `test/chatter.test.mjs` 守着** |
 | 改 `/reset` 的行为（轮次的算法 / 标记落盘 / 清哪些记账） | `sessionIdFor` + `resetConversation` + `resetMarkerDir` / `loadConversationResetCounts`（见 §4.H、§5.3、§5.4） |
 | 改「谁能重置会话」 | `Config.resetUsers` + `canReset` + `handleEvent` 里的 `/reset` 分支（**空白名单 = 谁都不能**，别改成 `allowUsers` 那种语义）+ README「新开一轮会话」 |
@@ -612,7 +616,7 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 改完按它核对要不要补用例。
 
 - 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**
-  （当前基线：`test/` 下 258 个用例全过，约 30 秒；其中 `settings.test.mjs` / `chatter.test.mjs` /
+  （当前基线：`test/` 下 266 个用例全过，约 33 秒；其中 `settings.test.mjs` / `chatter.test.mjs` /
   `mention.test.mjs` / `util.test.mjs` / `filestore.test.mjs` 是不用假 Host 的纯函数用例，
   几百毫秒就跑完）。
 - 加行为就加用例，并在用例名/注释里用中文写清意图。
@@ -627,9 +631,9 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
   「一个人刷屏不算热」、「窗口一过就退出」、「纯查询不改状态」、
   「门槛配得比缓冲上限还大时缓冲要跟着留够」。**改 `chatter.js` 或活跃对话的判定必跑它。**
 - **主动开口的判据**在 `test/speaking-rules.test.mjs`：主动说话的五道闸门 + 两个节奏闸、
-  免 @ 接话的七条、补一句的九条。写法是「一份能通过的基准入参 + 只翻一个字段」，所以
-  **删掉任何一条 `return false`，对应那个用例就会红**。**改 `speaking-rules.js`、或改
-  `proactiveSweep` / `runChime` / `admit` 里凑入参的那几行必跑它。**
+  免 @ 接话的七条、补一句的九条，以及搭话抽卡的曲线（起始 + 每步累加、封顶、NaN 不接）。
+  写法是「一份能通过的基准入参 + 只翻一个字段」，所以**删掉任何一条 `return false`，
+  对应那个用例就会红**。**改 `speaking-rules.js` 或 `admit` 里凑入参的那几行必跑它。**
 - **「@ 人」这一层**分两块：解析与名单的纯函数用例在 `test/mention.test.mjs`（标记边界、
   畸形标记不能吃掉后面的正文、认不出来就整个丢掉、`@全体成员` 只在群里解析得出来、名单按会话隔离）；
   端到端在 `test/bridge.test.mjs`（`[[@昵称]]` 真的变成 `at` 段、只写标记时只发一个 at 段、
@@ -649,9 +653,9 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 - 主动说话的用例在 `test/bridge.test.mjs` 末尾（一堆 `bootProactive` +
   `timers.fireInterval()`）；它们靠把 `digestMinLines` 抬到 9999 来隔离摘要循环 ——
   假 timer 的 `fireInterval()` 会唤醒**所有**周期定时器。**改主动说话必跑它们。**
-- 活跃对话的用例在 `test/bridge.test.mjs` **最末尾**（`bootActive()` 把免 @ 接话打开、
-  把补一句的静默门槛压到几十毫秒）。**改 `admit` 的触发判定、`groupTalkActive`、
-  `batchScale` 或补一句必跑它们。**
+- 活跃对话的用例在 `test/bridge.test.mjs` **最末尾**（`bootActive()` 把 `activeTalkChance` 钉成 1）。
+  **搭话抽卡**另有五条（搜「搭话抽卡」）：概率 0 时不接、连丢一条才接、抽中与被 @ 到都归零、
+  对话凉了累计不跨对话。**改抽卡、`admit` 的触发判定或 `batchScale` 必跑它们。**
 - `/reset` 的用例（「攒批先投出去」「换成新一轮的 id 而旧会话留在磁盘上」「重开进程后
   仍停在同一轮」「轮到代次相关的记账都清干净」「只有 resetUsers 里的人能用，别人连会话
   都开不出来」）在 `test/bridge.test.mjs` 里散着几处，搜 `reset` 就能找到。

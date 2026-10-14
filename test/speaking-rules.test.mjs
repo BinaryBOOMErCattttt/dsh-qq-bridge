@@ -12,6 +12,8 @@ import assert from 'node:assert/strict';
 
 import {
   activeFollowAllows,
+  activeTalkAllows,
+  activeTalkChance,
   activeTurnsLeft,
   batchCap,
   batchScale,
@@ -135,6 +137,30 @@ test('免 @ 接话：「紧跟着的下一条」这个等式是刻意留的容�
   assert.equal(activeFollowAllows(follow({ interposeOthers: 9 })), false, '快照 + 2 拦住');
   // 别人一句话都没说过（快照 0、当前这条算第 1 条）也应当通过。
   assert.equal(activeFollowAllows(follow({ interposeOthers: 1, interposeSnapshot: 0 })), true);
+});
+
+test('搭话抽卡：起始概率 + 每连丢一条涨一步，封顶', () => {
+  // 浮点加法不做逐位比较，给一个极小的容差。
+  const near = (actual, expected) => Math.abs(actual - expected) < 1e-9;
+  assert.ok(near(activeTalkChance(0.05, 0.1, 0.8, 0), 0.05), '一条都没连丢就是起始概率');
+  assert.ok(near(activeTalkChance(0.05, 0.1, 0.8, 1), 0.15), '连丢一条涨一步');
+  assert.ok(near(activeTalkChance(0.05, 0.1, 0.8, 3), 0.35));
+  assert.ok(near(activeTalkChance(0.05, 0.1, 0.8, 100), 0.8), '涨到上限就不再涨');
+  assert.ok(near(activeTalkChance(0.05, 0, 0.8, 100), 0.05), 'step = 0 = 不攒');
+  assert.ok(near(activeTalkChance(0.5, 0.1, 0.2, 0), 0.5), '上限配得比起始还小时按起始算');
+  assert.ok(near(activeTalkChance(0.05, 0.1, 0.8, -3), 0.05), '负数连丢当 0 条');
+  assert.ok(near(activeTalkChance(0.05, 0.1, NaN, 100), 1), '上限 NaN（没填）= 没有上限');
+  assert.equal(activeTalkChance(NaN, 0.1, 0.8, 3), 0, '起始 NaN → 一句都不接（不是乱接）');
+  assert.equal(activeTalkChance(0.05, NaN, 0.8, 3), 0, 'step NaN → 一句都不接');
+});
+
+test('搭话抽卡：够资格 + 概率大于 0 + 掷中，缺一条都不行', () => {
+  assert.equal(activeTalkAllows({ eligible: true, chance: 0.5, roll: 0.49 }), true, '基准应当通过');
+  assert.equal(activeTalkAllows({ eligible: false, chance: 0.5, roll: 0.49 }), false, '不够资格');
+  assert.equal(activeTalkAllows({ eligible: true, chance: 0, roll: 0 }), false, '概率 0');
+  assert.equal(activeTalkAllows({ eligible: true, chance: 0.5, roll: 0.5 }), false, 'roll 不小于 chance 就是没中');
+  assert.equal(activeTalkAllows({ eligible: true, chance: 1, roll: 0.999 }), true, '概率 1 = 必中');
+  assert.equal(activeTalkAllows({ eligible: true, chance: NaN, roll: 0 }), false, 'NaN 概率绝不乱接');
 });
 
 /** 一份「能补一句」的基准入参。 */

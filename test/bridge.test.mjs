@@ -4103,6 +4103,9 @@ async function bootActive(config = {}, hostOptions = {}, onebotOptions = {}) {
       // 冷场主动开口那一套在这里没有意义（用例不会去 fireInterval），但把概率钉成 1
       // 可以让「补一句」这条路的随机性不影响断言。
       proactiveChance: 1,
+      // 免 @ 搭话的抽卡也钉成必中：这一组用例验的是窗口 / 门槛 / 记账本身，
+      // 概率曲线由 speaking-rules.test.mjs 与下面几条专门验。
+      activeTalkChance: 1,
       digestCatchUp: false,
       digestMinLines: 9999,
       ...config,
@@ -4591,6 +4594,129 @@ test('/reset forgets the group talk window as well', async () => {
   onebot.push(groupText('还在吗', { messageId: 7503, userId: 10001, card: 'soyo' }));
   await settle(80);
   assert.equal(host.list.created.length, 1, 'the old heat must not carry into the new round');
+});
+
+// ---- 免 @ 搭话的抽卡：够资格之后还要掷一次累计概率（见 speaking-rules.js）----------------
+//
+// 上面的多人搭话 / 免 @ 接话用例把 `activeTalkChance` 钉成 1，验的是门槛与记账本身；
+// 下面这几条专门验概率曲线：没抽中就不接、连丢越多越容易中、抽中与被 @ 到之后归零、
+// 对话凉了不把「保底」留到下一场。
+
+/** 搭话抽卡：0 起、每条 +1（= 连丢一条之后必中），下面几条用例都靠它做到完全确定。 */
+function talkRollConfig(overrides = {}) {
+  return { activeTalkChance: 0, activeTalkChanceStep: 1, activeTalkChanceMax: 1, ...overrides };
+}
+
+test('搭话抽卡：够资格也未必接，连丢一条之后概率才涨上来', async () => {
+  const { onebot, host } = await bootActive(talkRollConfig());
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+  await until(() => agent.inbox.length >= 1, 'the mention to reach the Agent');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply to go out');
+
+  // 同一个人接着说：一对一窗口里够资格，但起始概率是 0 —— 这一条不该进 Agent。
+  onebot.push(groupText('那你说呢', { messageId: 7601 }));
+  await settle(100);
+  assert.equal(agent.inbox.length, 1, '概率 0 时够资格也不接');
+
+  // 连丢了一条，概率涨到 1：这一条必中。
+  onebot.push(groupText('到底行不行', { messageId: 7602 }));
+  await until(() => agent.inbox.length >= 2, 'the second follow-up to hit the roll');
+  assert.equal(agent.inbox[1].content[0].text, '到底行不行');
+});
+
+test('搭话抽卡：抽中之后归零，下一句又要重新攒', async () => {
+  const { onebot, host } = await bootActive(talkRollConfig());
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the first reply');
+
+  onebot.push(groupText('第一句', { messageId: 7611 }));
+  await settle(100);
+  onebot.push(groupText('第二句', { messageId: 7612 }));
+  await until(() => agent.inbox.length >= 2, 'the follow-up that hits');
+  completeTurn(host, agent, '好', 2);
+  await until(() => sentTexts(onebot).length === 2, 'the second reply');
+
+  // 抽中那一下把累计清零：再来一条又是 0 概率，不接。
+  onebot.push(groupText('第三句', { messageId: 7613 }));
+  await settle(100);
+  assert.equal(agent.inbox.length, 2, '抽中之后累计归零');
+});
+
+test('搭话抽卡：被明确 @ 到就直接回，并把连丢的累计清零', async () => {
+  const { onebot, host } = await bootActive(talkRollConfig());
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the first reply');
+
+  onebot.push(groupText('跟一句', { messageId: 7621 }));
+  await settle(100);
+  assert.equal(agent.inbox.length, 1, '先连丢一条');
+
+  // 被 @ 到：不抽卡，直接回；累计也该清零（它刚说过话）。
+  onebot.push(mention('那这个呢', { messageId: 7622 }));
+  await until(() => agent.inbox.length >= 2, 'the explicit mention to be admitted');
+  completeTurn(host, agent, '这个啊', 2);
+  await until(() => sentTexts(onebot).length === 2, 'the second reply');
+
+  onebot.push(groupText('再跟一句', { messageId: 7623 }));
+  await settle(100);
+  assert.equal(agent.inbox.length, 2, '被 @ 到之后累计清零：这一条又回到起始概率 0');
+});
+
+test('搭话抽卡：多人搭话里也不是每条都回，攒够概率才接', async () => {
+  const { onebot, host } = await bootActive(talkRollConfig({ activeGroupLines: 3, activeGroupSpeakers: 2 }));
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the first reply');
+
+  // 甲这一句让热度到 2，还差一条；乙那一句踩到门槛（3 条）—— 它就是够资格的那条，
+  // 概率 0 → 不接。
+  onebot.push(groupText('甲', { messageId: 7631, userId: 10001, card: 'soyo' }));
+  onebot.push(groupText('乙', { messageId: 7632, userId: 10002, card: 'rana' }));
+  await settle(100);
+  assert.equal(agent.inbox.length, 1, '搭话状态里概率 0 也不接');
+
+  // 连丢一条之后概率涨到 1：换一个人接话也算（C 路「谁接话都算数」）。
+  onebot.push(groupText('丙', { messageId: 7633, userId: 10001, card: 'soyo' }));
+  await until(() => agent.inbox.length >= 2, 'the next group-talk message to hit the roll');
+  assert.equal(agent.inbox[1].content[0].text, '丙');
+});
+
+test('搭话抽卡：这段对话凉了之后累计清零，不把保底留到下一场聊天', async () => {
+  const { onebot, host } = await bootActive(
+    talkRollConfig({ activeWindowMs: 400, activeGroupLines: 3, activeGroupSpeakers: 2 }),
+  );
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the first reply');
+
+  // 顶到门槛（3 条）并连丢一条：甲让热度到 2，乙踩到门槛 → 够资格但概率 0，不接。
+  onebot.push(groupText('甲', { messageId: 7641, userId: 10001, card: 'soyo' }));
+  onebot.push(groupText('乙', { messageId: 7642, userId: 10002, card: 'rana' }));
+  await settle(100);
+  assert.equal(agent.inbox.length, 1, '这一条没抽中');
+
+  // 等热度窗口彻底凉掉（activeWindowMs = 400ms）：这段对话结束，累计也该忘掉。
+  await settle(500);
+
+  // 重新凑一场：前两条还不够热（这时「不够资格」就该把累计清掉），第三条够资格时
+  // 概率必须回到起始的 0；若保底留着，这里会是 1（必中），断言就会红。
+  onebot.push(groupText('丁', { messageId: 7644, userId: 10001, card: 'soyo' }));
+  onebot.push(groupText('戊', { messageId: 7645, userId: 10002, card: 'rana' }));
+  onebot.push(groupText('己', { messageId: 7646, userId: 10001, card: 'soyo' }));
+  await settle(150);
+  assert.equal(agent.inbox.length, 1, '凉过之后回到起始概率，保底不跨对话');
 });
 
 // 用例：`.dsh/skills/` 下的每个 skill 都必须是**能被发现**的文件。
