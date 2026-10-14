@@ -3640,6 +3640,75 @@ test('proactive: SKIP keeps the group silent yet still spends the chance', async
   assert.equal(sentTexts(onebot).length, 1);
 });
 
+/**
+ * `SKIP` 是**整个会话**的「不说了」信号，不只管主动搭话那一轮。
+ *
+ * 提醒落在同一个会话的上下文里，模型会在**回别人**的那一轮照样写一个 `SKIP`（真实事故：
+ * 它引用了别人的表情包，正文写着 `SKIP`，群里就收到两个字面的字母）。所以「引用 + SKIP」
+ * 必须一起被拦住 —— 而会「引用」的本来就只有回别人那一轮：主动搭话的 `quote` 永远是空的。
+ *
+ * 群聊那一条用 `replyStyle: 'quote'` 把引用**钉死在第一条**上（默认 `auto` 要等话头被挤远
+ * 才引用），于是这一段正好覆盖「引用段与 SKIP 正文同时存在」的那种消息。
+ */
+test('a plain reply of SKIP is dropped in a quoted turn too', async () => {
+  // 刻意**不**开 proactive：这是「回别人」的那条路（`owner.proactive` 没有这个标记），
+  // 也正是唯一会带上引用的那条路（主动搭话的 `quote` 永远是空的）。
+  const { onebot, host } = await boot(
+    { proactive: false, digestCatchUp: false, digestMinLines: 9999 },
+    {},
+    {
+      getMsg: async () => ({ sender: { nickname: 'iroha' }, message: [{ type: 'text', data: { text: '刚才那句是什么' } }] }),
+    },
+  );
+  onebot.push(privateMessage('在吗'));
+  const agent = await until(() => host.list.created[0], 'the private Agent');
+  await until(() => agent.inbox.length >= 1, 'the first message');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the first reply');
+
+  // 引用着上一条、正文只有一个 `SKIP`：模型大概是在学着提醒里的出口，但这一轮并没有
+  // 提醒，它只是「在回别人的话」。这句照样不该变成一个群友会看到的词。
+  onebot.push(privateMessageWithReply('skip', '9001'));
+  await until(() => agent.inbox.length >= 2, 'the quoted turn to be submitted');
+  completeTurn(host, agent, 'SKIP', 2);
+  await settle(150);
+  assert.equal(sentTexts(onebot, 'send_private_msg').length, 1, 'a quoted SKIP must not be sent either');
+});
+
+test('a SKIP is dropped when the reply would have carried a quote segment', async () => {
+  // `replyStyle: 'quote'` 把引用**钉死在第一条**上（默认 `auto` 要等话头被挤远才引用），
+  // 于是这里正好是「引用段与 SKIP 正文同时存在」的那种消息。
+  const { onebot, host } = await bootProactive(
+    {
+      replyStyle: 'quote',
+      // 这组用例只关心引用；主动说话那条路（平时 `proactiveIdleMs: 0` 一定会开口）在这里
+      // 要拦住，否则两次 sweep 各自开口一次，第二轮就不是我们喂进去的那条了。
+      proactiveIdleMs: 24 * 60 * 60 * 1000,
+    },
+    {},
+    { getMsg: async () => ({ sender: { card: 'kaguya' }, message: [{ type: 'text', data: { text: '你看这个' } }] }) },
+  );
+  const agent = await groupWhereBotSpoke(onebot, host);
+
+  // 「@ 了它 + 引用了上一条」：@ 是触发方式，引用才是这条用例要的输入。
+  onebot.push(
+    groupMessage(
+      [
+        { type: 'reply', data: { id: '7000' } },
+        { type: 'at', data: { qq: SELF_ID, name: '小助手' } },
+        { type: 'text', data: { text: '这个表情是啥' } },
+      ],
+      { messageId: 7002 },
+    ),
+  );
+  await until(() => agent.inbox.length >= 2, 'the second turn to be submitted');
+  completeTurn(host, agent, 'SKIP', 2);
+  await settle(150);
+  // 只有第一条回复（带引用的那个）：判成 SKIP 的那一条连引用段都不该发出去。
+  assert.equal(sentTexts(onebot).length, 1, 'a quoted SKIP must not be sent');
+  assert.deepEqual(sentTexts(onebot)[0][0], { type: 'reply', data: { id: '7000' } });
+});
+
 /** 主动说话默认关闭：连定时器都不挂，更不会开口。 */
 test('proactive is off by default: no timer, and no unprompted message', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-proactive-off-'));

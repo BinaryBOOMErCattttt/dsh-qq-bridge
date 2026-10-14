@@ -2263,15 +2263,6 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 主动搭话的「我不说话」信号：第一行以 `SKIP` 开头（容忍各种括号与前后空白）。
-   *
-   * 宽松一点是有意的：模型经常顺手把自己的决定解释一下（`SKIP（没什么可说的）`），
-   * 那半句同样不该发到群里 —— 它是在解释内部决定，不是群友会说的话。只看第一行，
-   * 后面的解释直接丢掉。`skip` 后面要求一个词边界，免得把 `skipping` 这类正文吞掉。
-   * @param text - 这一轮的回复正文。
-   * @returns 整条都不该发出去时为 true。
-   */
-  /**
    * 让机器人主动开口：伪造一条 user message 投进**它自己那个会话**，回复照常发回群里。
    *
    * 走同一条会话而不是另开一个（与摘要 Agent 相反）：主动搭话必须看得见这段聊天
@@ -3031,12 +3022,20 @@ export function apply(ctx, config) {
     // 只发该 turn 里最后一条有文本的 assistant 消息；中间步骤的工具调用等不发给 QQ。
     const reply = list?.[list.length - 1]?.trim() ?? '';
     if (reply.length === 0) return;
+    // `SKIP` 是**这一条会话本身**的「不说了」信号，不是「主动搭话」才有的信号：提醒
+    // （`proactiveNudge` / `chimeNudge`）虽然只在那两种轮次里发，但它落在同一个会话的
+    // 上下文里，模型照样可能在回别人的那一轮里学着写出来。一旦漏判，群里收到的就是
+    // 一句字面的 `SKIP` —— 它本来是用来「什么都不做」的。空回复在上面的 length 判断里
+    // 就已经静默丢弃了，这里只管那个词。
+    //
+    // 放在最前面（而不是只放在主动搭话那一支）是必须的：真正会「引用」一条消息的正是
+    // 回别人的那一轮 —— 主动搭话的 `quote` 永远是空的（没人跟它说话），所以
+    // 「引用 + SKIP」同时出现的那种消息**一定**是走这一支的。
+    if (proactiveSkip(reply)) {
+      report('info', `→ ${conversation.key}: （判成 SKIP，不发送）`);
+      return;
+    }
     if (owner.proactive === true) {
-      // 主动搭话允许「想了想，不说了」：`SKIP` 或空回复都一个字都不发（见 proactiveNudge）。
-      if (proactiveSkip(reply)) {
-        report('info', `→ ${conversation.key}: （主动搭话时决定不说话）`);
-        return;
-      }
       report('info', `→ ${conversation.key}: ${reply.slice(0, 120)}（主动）`);
       // 同一条「拟人」通道：拆短句 + 打字延迟。主动搭话没有可指向的消息，quote 为空。
       void sendToConversation(conversation, reply, { human: true, quote: owner.quote });

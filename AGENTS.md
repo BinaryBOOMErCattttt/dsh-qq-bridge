@@ -305,7 +305,7 @@ ctx.interval（每 proactiveCheckMs）─▶ proactiveSweep
         └─▶ proactiveSpeak：先记 lastProactiveAt / 当天次数（**掷中即消耗**，SKIP 也算），
             再 enqueue(该群会话) → ensureAgent → followup(proactiveNudge(...))
                                   └─ submitted.set(msg.id, { …, proactive: true })
-   turn/end ─┬─ proactive 且正文是 SKIP → 什么都不发（判成「不说了」）
+   turn/end ─┬─ 正文判成 SKIP（`proactiveSkip`）→ 什么都不发（**不分是不是主动那一轮**）
              ├─ proactive 且 reason === 'error' → 静默（没人问过它，不道歉）
              └─ 否则照常 sendToConversation(..., { human: true })（拆句 + 打字延迟）
 ```
@@ -314,6 +314,11 @@ ctx.interval（每 proactiveCheckMs）─▶ proactiveSweep
 
 - **伪造的 user message 必须说清「这不是谁发来的」并给出 `SKIP` 出口**：不给出路时，
   模型面对「没话找话」会硬编一句，比不说话更像机器人（文案见 `proactiveNudge`）。
+- **`SKIP` 判定对 `所有` 轮次生效，不只主动那一轮**：提醒落在同一个会话的上下文里，
+  模型会在**回别人**的那一轮（尤其那一轮还引用了消息）也照样写 `SKIP`。只在
+  `owner.proactive` 分支里判的话，群里收到的就是一句字面的 `SKIP` —— 一个真实事故：
+  它引用了别人的表情包，正文写着「SKIP」。会「引用」的本来就只有回别人那一轮
+  （主动搭话的 `quote` 永远是空的）。判据在 `speaking-rules.js` 的 `proactiveSkip`。
 - **掷中即消耗**：`SKIP` / 失败也算用掉当天额度与 `proactiveGapMs`。否则每次检查都重新
   掷骰子，频率失控 —— 这条由 `proactiveSpeak` 里「先记账再 followup」的顺序保证。
 - **走的是这个群自己的会话**（与摘要 Agent 相反）：主动搭话必须看得见这段聊天的历史与
@@ -586,7 +591,7 @@ README「跑测试」一节有一条很长的覆盖清单 —— **那就是行�
 改完按它核对要不要补用例。
 
 - 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**
-  （当前基线：`test/` 下 234 个用例全过，约 30 秒；其中 `settings.test.mjs` / `chatter.test.mjs` /
+  （当前基线：`test/` 下 236 个用例全过，约 30 秒；其中 `settings.test.mjs` / `chatter.test.mjs` /
   `util.test.mjs` / `filestore.test.mjs` 是不用假 Host 的纯函数用例，几百毫秒就跑完）。
 - 加行为就加用例，并在用例名/注释里用中文写清意图。
 - 纯函数（`onebot.js` 里的拆分/延迟/采集/`mentionsOthers`、`image.js`、`media.js`、
