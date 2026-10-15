@@ -1,0 +1,26 @@
+# 换行符规则。
+#
+# 为什么必须有这个文件：`git archive` 吐出来的字节会跟着打包机器的 `core.autocrlf` 走
+# （本机是 true），于是同一个 tag 在这台 Windows 上打出来的发布包是 CRLF、在 Linux/CI 上
+# 打出来是 LF —— 同一版发布两份不一样的 artifact。规则写在这里，两边才逐字节一致。
+#
+# 具体取向：
+#   - Windows 批处理要 CRLF：cmd.exe 对只有 LF 的 .cmd/.bat 在多行 if 块与标签上会认错，
+#     而发布包是给朋友双击的，这个不能赌。
+#   - 其余一律 LF：Node 读哪种都行，但 systemd 的 unit、shell 脚本、Python 里混进 \r
+#     是真会出事的（`ExecStart` 尾巴上多个 \r 就变成一个找不到的命令）。
+* text=auto
+
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+
+# 部署模板：systemd unit 与 .env 模板都是给 Linux 用的
+deploy/** text eol=lf
