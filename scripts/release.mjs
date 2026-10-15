@@ -246,10 +246,15 @@ await mkdir(stageRoot, { recursive: true });
 
 // git archive 只吐被跟踪的文件：运行时的 data/、.env、node_modules 天然不在里面。
 // 用 tar 而不是 zip 中转，是因为 GNU tar 解不开 zip（Linux 上也能跑这套）。
+//
+// ⚠️ `git archive` **必须从仓库根跑**：它会把「当前目录」当成归档范围，在 `dist/` 里跑
+// 就只打出一个 10240 字节的空 tar（`dist/` 自己还被 gitignore 挡着），退出码照样是 0。
+// 这一条踩过：包打出来了、大小也像模像样，里面却没有插件本体。
+const tarPath = join(distDir, tarFile);
 say('· git archive 出源码树 …');
-run('git', ['archive', '--format=tar', '-o', tarFile, tag], { cwd: distDir });
-run('tar', ['-x', '-f', tarFile, '-C', join('stage', rootName)], { cwd: distDir });
-await rm(join(distDir, tarFile), { force: true });
+run('git', ['archive', '--format=tar', '-o', tarPath, tag], { cwd: repoRoot });
+run('tar', ['-x', '-f', tarPath, '-C', stageRoot], { cwd: repoRoot });
+await rm(tarPath, { force: true });
 
 if (napcatDir) {
   say('· 拷一份干净的 NapCat …');
@@ -260,11 +265,32 @@ if (napcatDir) {
   });
 }
 
+/** 体检不过就整体放弃：删掉暂存树（不留下半成品），然后把原因说清楚。 */
+async function abortBuild(message) {
+  await rm(stageRoot, { recursive: true, force: true });
+  die(message);
+}
+
 say('· 体检暂存树 …');
+
+// 先点名检查「插件本体在不在」。这不是洁癖：`git archive` 在子目录里跑会打出一个空包，
+// 而空包照样能压成 zip、大小也像模像样 —— 只有点名核对才拦得住。
+const REQUIRED_FILES = ['index.js', 'package.json', 'README.md', 'CHANGELOG.md', 'LICENSE', 'cordis.patch.yml', 'onebot.js'];
+const missing = REQUIRED_FILES.filter((name) => !existsSync(join(stageRoot, name)));
+if (missing.length) {
+  await abortBuild(`暂存树里缺了插件本体：${missing.join('、')}。\n发布包**没有**生成。多半是 git archive 那一步没打出东西（它必须从仓库根跑）。`);
+}
+const stagedPkg = JSON.parse(await readFile(join(stageRoot, 'package.json'), 'utf8'));
+if (stagedPkg.version !== version) {
+  await abortBuild(`包里那份 package.json 写着 ${stagedPkg.version}，与 ${version} 不一致 —— 打错 tag 了？`);
+}
+if (napcatDir && !existsSync(join(stageRoot, 'NapCat.Shell', 'napcat.mjs'))) {
+  await abortBuild('说了要带 NapCat，但暂存树里没有 NapCat.Shell/napcat.mjs。');
+}
+
 const report = await inspectTree(stageRoot);
 if (report.offenders.length) {
-  await rm(stageRoot, { recursive: true, force: true });
-  die(`暂存树里出现了 ${report.offenders.length} 个不该发布的文件（NapCat 的账号配置 / 登录态）：\n  ${report.offenders.slice(0, 20).join('\n  ')}\n发布包**没有**生成。检查 EXCLUDED_DIRS 与 EXCLUDED_SUFFIX。`);
+  await abortBuild(`暂存树里出现了 ${report.offenders.length} 个不该发布的文件（NapCat 的账号配置 / 登录态）：\n  ${report.offenders.slice(0, 20).join('\n  ')}\n发布包**没有**生成。检查 EXCLUDED_DIRS 与 EXCLUDED_SUFFIX。`);
 }
 
 say('· 压 zip …');
