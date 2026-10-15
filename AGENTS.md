@@ -69,6 +69,7 @@ desktop.js      约 90 行  「装进桌面版 profile」里纯的那一半：`.
 perceptual.js 约 1080 行  图片指纹：JPEG(DC)/PNG/GIF → 16×16 灰度 → dHash，复读判「同一张画面」用
 scripts/napcat-setup.mjs + .cmd  Windows 一键配置（NapCat + .env + 装进 desktop profile），幂等 + 先备份
 scripts/dev-node-modules.mjs      Windows 上铺 `node_modules`（按依赖闭包拷贝真实文件），只服务开发与测试
+scripts/release.mjs               打发布包（`git archive` 出 tag 的源码树 + 拷一份**干净**的 NapCat → `dist/<名>.zip`）：排除规则写在代码里，打完再体检一遍暂存树，命中账号配置/登录态就整体失败
 .dsh/skills/message-digest/SKILL.md    聊天记录 → 长期记忆的流程（定时摘要与「以前说过什么」用它）
 .dsh/skills/update-cognition/SKILL.md  学梗 / 表情包含义 → COGNITION.md 的流程
 .dsh/skills/moegirl/SKILL.md           二次元梗 → 萌娘百科 MediaWiki 接口查意思的流程（只读，不落盘）
@@ -85,7 +86,8 @@ test/image-fixtures.mjs  上面两个测试共用的图片 fixture（真编码�
 cordis.patch.yml      插件自带 bundle patch：注册 `qq` Agent 预设（含 skill 平面）+ 插件 config
 locale/{zh,en}.json   插件在 Web UI 里的标题/描述
 deploy/qqbot.{service,env.example}  systemd user unit 与凭据模板
-README.md             用户文档 + 设计取舍（改行为要同步它）
+README.md             用户文档 + 设计取舍（改行为要同步它；「下载与开始」一节指路 Releases）
+CHANGELOG.md          更新记录（发 Release 的说明从对应那一节里粘）
 AGENTS.md             **本文件**：给改代码的智能体的说明书（DSH 会自动注入上下文）
 ```
 

@@ -1,9 +1,12 @@
 {
   "name": "@qqbot/dsh-plugin-qq",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Bidirectional QQ (OneBot v11) bridge: QQ messages drive Harness agents, any agent can send QQ messages, images and stickers, and JM comics can be downloaded as PDFs straight into a chat.",
+  "engines": {
+    "node": ">=22"
+  },
   "exports": {
     ".": "./index.js",
     "./package.json": "./package.json",

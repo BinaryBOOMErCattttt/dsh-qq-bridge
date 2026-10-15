@@ -13,6 +13,27 @@
 - **长期记忆**：每句话都落盘，定时由一个独立的摘要会话把它整理成「这个群记得什么」，
   聊天时随时能查；顺带学会群里的梗和表情包。见[长期记忆](#长期记忆聊天记录--摘要--认知)。
 
+## 下载与开始
+
+两种拿法：
+
+- **下载发布包**（不想碰 git 的走这条）：到 [Releases](../../releases) 下载
+  `dsh-qq-bridge-<版本>.zip`。解压出来就是一个能直接用的仓库副本，连 `NapCat.Shell\`
+  都带上了 —— Windows 上双击 `scripts\napcat-setup.cmd` 就能配好。
+  包里那份 NapCat 是**干净**的：不含任何账号配置、登录态、日志与 WebUI token
+  （`config/` 由 NapCat 首次启动时自己生成；也可以 `--qq <你的号>` 让脚本直接写）。
+- **git clone**：克隆本仓库，照下面自己装。
+
+两条路的前置条件一样：**Node ≥ 22**（见 `package.json` 的 `engines`）和一份装好的
+**DSH**，模型凭据在 Web UI 的 Models 页填一次。之后按平台走：
+
+| 你的平台 | 看哪一节 |
+|---|---|
+| Windows（桌面版 DSH 与 NapCat 在同一台机器上） | [Windows 桌面版（NapCat.Shell）](#windows-桌面版napcatshell) |
+| Linux / 容器（NapCat 跑在 docker 里） | [运行方式：独立的 `qqbot` profile](#运行方式独立的-qqbot-profile) |
+
+改了什么、这个版本有什么，见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 工作原理
 
 ```
