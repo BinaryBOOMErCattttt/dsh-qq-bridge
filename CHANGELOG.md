@@ -63,12 +63,29 @@
   Windows 桌面版（`scripts/napcat-setup.mjs` 把 NapCat 的 WebSocket 配置、profile 的
   `.env`、desktop profile 的依赖与 bundles 一次配好，幂等 + 先备份，可 `--dry-run`）。
 
+**在 Web UI 里改配置**
+
+- 侧栏 **设置 → QQ Bridge**：一百多个配置项做成**单独一页**，按十几张折叠卡片分组
+  （默认只展开第一组，组名右边的记号是「这一组改过几项」）。字段来自 `config.js` 的
+  schema、标签与说明来自 `.description()`，所以**加了新配置项页面自动多一行**；
+  `persona` / `instructions` 是整段提示词，单独一张卡片、用多行输入框改。
+  `accessToken` 这类秘密不下发（只告诉你「配了 / 没配」）。原先只能手写
+  `cordis.patch.yml`，而「只写几个字段」的那种写法会把整套配置整块顶掉。
+- 保存写的是**当前 profile 的完整 config**，`!!js` 表达式原样保留 —— 从环境变量读的
+  `endpoint` / `resetUsers` 不会因为点了一次保存就变成写死的字面量。保存之后插件会
+  自动重启一次（配置走 volatile 热更新，而连接、定时器、工具注册都是 `apply()` 里装配的）：
+  断一次 OneBot 连接，**聊天记忆不受影响**（会话 id 是确定性的，下一条消息照样 resume）。
+- 浏览器半侧是手写的 `client.js`（`window.__ModuleLoader__.load({...})` bundle，本仓库
+  没有构建步骤），契约由 `test/client.test.mjs` 钉住：字段全覆盖、分组不漏、折叠默认只
+  展开第一组、布尔 / 逗号列表 / 枚举三种草稿的读写口径。
+
 **工程**
 
 - 零运行时依赖：只用 Node 全局 `WebSocket` / `fetch` / `node:*`，OneBot v11 客户端是手写的。
 - 纯 ESM，Node ≥ 22，无构建步骤，改完即用；类型信息全写在 JSDoc 注释里。
-- 288 条测试用例：真实插件模块 + 真实 OneBot 客户端 + 假 OneBot 服务端 + 假 Harness ctx
-  （含假 timer），跑完整的入站 → Agent → 出站往返。
+- 304 条测试用例：真实插件模块 + 真实 OneBot 客户端 + 假 OneBot 服务端 + 假 Harness ctx
+  （含假 timer），跑完整的入站 → Agent → 出站往返；设置页那半侧用假的 `window.__ModuleLoader__`
+  与假 `useState` 跑，不需要浏览器。
 
 **已知限制**
 
