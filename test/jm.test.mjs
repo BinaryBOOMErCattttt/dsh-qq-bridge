@@ -22,7 +22,24 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { createJmService, parseJmRef, safeFileName } from '../jm.js';
+import { createJmService, parseJmRef, safeFileName, spawnAvailable } from '../jm.js';
+
+/**
+ * 起不了子进程的环境里，把「必须真的 spawn 一次」的用例**跳过**，而不是让它们红。
+ *
+ * 判据是 `jm.js` 导出的 `spawnAvailable`（探测的正是这条链路要用的那种 spawn：带管道的），
+ * 所以插件在同一个环境里也是**停用**状态 —— 两边用同一个事实，不会出现「插件说能用、
+ * 测试却说跳过」。为什么需要这一步：DSH 的沙箱禁止带管道的子进程（实测 `spawn EPERM`，
+ * 见 AGENTS.md），于是同一份代码在普通终端里全绿、在沙箱里必红；红着跑会被误判成
+ * 发布包坏了（这份用例最初就是这么被误判的）。跳过时把**原因**打出来，比一条红色的
+ * traceback 有用得多。
+ */
+const SKIP = spawnAvailable ? false : '这个环境不能起带管道的子进程（DSH 沙箱），跳过需要真 spawn 的用例';
+
+/** 包一层：能 spawn 就正常跑，不能就带原因跳过。 */
+function spawnTest(name, body) {
+  return test(name, { skip: SKIP }, body);
+}
 
 /**
  * 假脚本的公共前缀：解析 `--key value` 形式的参数，并给出写 PDF 的助手。
@@ -129,7 +146,7 @@ test('the jm service is disabled when the download dir leaves cwd', async () => 
   assert.ok(warnings.some((line) => line.includes('outside cwd')), warnings.join('\n'));
 });
 
-test('a download spawns the script, reports meta and returns the PDF', async () => {
+spawnTest('a download spawns the script, reports meta and returns the PDF', async () => {
   const { service } = await serviceWith(OK_BODY);
   try {
     const metas = [];
@@ -151,7 +168,7 @@ test('a download spawns the script, reports meta and returns the PDF', async () 
   }
 });
 
-test('a failed download surfaces the script error instead of hanging', async () => {
+spawnTest('a failed download surfaces the script error instead of hanging', async () => {
   const { service } = await serviceWith(
     `say({ event: 'result', ok: false, error: '这本有 146 话，超过上限 20；请指定单话' });`,
   );
@@ -162,7 +179,7 @@ test('a failed download surfaces the script error instead of hanging', async () 
   }
 });
 
-test('a python that exits without a result line is reported with its stderr tail', async () => {
+spawnTest('a python that exits without a result line is reported with its stderr tail', async () => {
   const { service } = await serviceWith(['process.stderr.write("boom: python is broken\\n");', 'process.exit(3);'].join('\n'));
   try {
     await assert.rejects(() => service.run({ id: '422866', key: 'k' }), /exited with code 3.*boom: python is broken/s);
@@ -171,7 +188,7 @@ test('a python that exits without a result line is reported with its stderr tail
   }
 });
 
-test('a download that never finishes is killed at the hard timeout', async () => {
+spawnTest('a download that never finishes is killed at the hard timeout', async () => {
   // 假脚本必须真的「活着不动」：一个只 await 一个 pending promise 的 Node 进程会立刻
   // 退出（事件循环空了），那样这条用例测到的就不是超时分支了，所以要挂一个定时器撑住。
   const { service } = await serviceWith('setInterval(() => {}, 1000);', { timeoutMs: 1100 });
@@ -182,7 +199,7 @@ test('a download that never finishes is killed at the hard timeout', async () =>
   }
 });
 
-test('the same conversation cannot start two downloads at once', async () => {
+spawnTest('the same conversation cannot start two downloads at once', async () => {
   // 「第一次还没跑完」靠假脚本自己先睡一会儿来制造。
   const { service } = await serviceWith([`await new Promise((done) => setTimeout(done, 1000));`, OK_BODY].join('\n'));
   try {
@@ -198,7 +215,7 @@ test('the same conversation cannot start two downloads at once', async () => {
   }
 });
 
-test('serve hands out a one-shot URL that NapCat can fetch, and 404s otherwise', async () => {
+spawnTest('serve hands out a one-shot URL that NapCat can fetch, and 404s otherwise', async () => {
   const { service } = await serviceWith(OK_BODY);
   try {
     const job = await service.run({ id: '422866', key: 'k' });

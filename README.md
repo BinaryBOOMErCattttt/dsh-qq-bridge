@@ -24,8 +24,10 @@
   （`config/` 由 NapCat 首次启动时自己生成；也可以 `--qq <你的号>` 让脚本直接写）。
 - **git clone**：克隆本仓库，照下面自己装。
 
-两条路的前置条件一样：**Node ≥ 22**（见 `package.json` 的 `engines`）和一份装好的
-**DSH**，模型凭据在 Web UI 的 Models 页填一次。之后按平台走：
+两条路的前置条件一样：**装好的 DSH**，模型凭据在 Web UI 的 Models 页填一次。
+**Node ≥ 22**（见 `package.json` 的 `engines`）只有源码路线和那个一键配置脚本需要 ——
+**Windows 桌面版自带一份 Node**（`<DSH>\resources\runtime\...\node.exe`），
+`scripts\napcat-setup.cmd` 会自己去找它，所以桌面版用户不必另外装 Node。之后按平台走：
 
 | 你的平台 | 看哪一节 |
 |---|---|
@@ -1369,7 +1371,27 @@ QQ 会话用的模型是 `deepseek-official/deepseek-flash`（继承 `dsh-base` 
 
 桌面版 DSH（Electron）与 NapCat 跑在**同一台 Windows 机器**上，形态和上面那套「容器 +
 systemd」完全不同：没有 docker 网桥、没有 `systemctl`、Host 进程的 cwd 是 DSH 的 profile
-目录。仓库里备了一个一键脚本，把**两边**一起配好：
+目录。仓库里备了一个一键脚本，把**两边**一起配好。
+
+### 照着走一遍（第一次装就按这个顺序）
+
+1. 解压发布包到**你想长期放着的位置**（比如 `D:\dsh-qq-bridge-0.1.1`），以后别再挪：
+   profile 里存的是指向这个目录的链接，挪了要重跑一次脚本（脚本会自己发现并重建链接）。
+2. 双击 `scripts\napcat-setup.cmd`（或跑 `node scripts\napcat-setup.mjs`）—— 它配好 NapCat
+   的网络配置、profile 的 `.env`，并把插件装进 `desktop` profile。想先看它要做什么就加
+   `--dry-run`；知道自己机器人的 QQ 号就带上 `--qq <号>`，它会顺手写好快速登录。
+3. 启动 NapCat 扫码登录：`scripts\napcat-setup.cmd --start --window normal`
+   （**第一次要看得见窗口**才能扫二维码）。登完确认它能正常监听端口。
+4. **再跑一次脚本**（同第 2 步的命令）—— 这一步是必须的：`config/onebot11_<QQ号>.json`
+   与 `config/webui.json` 都是 NapCat **第一次启动时**才生成的，第二次运行才能把
+   WebSocket 服务器那一条对齐、并写进 `autoLoginAccount`。
+5. 重启 DSH 桌面版（源码在启动时加载，装完必须重启）。
+6. 在 DSH 的 **Models** 页面确认模型凭据已填。
+7. 私聊机器人发一句话，它在 QQ 里回你就说明整条链路通了。
+8. （可选，推荐）`scripts\napcat-setup.cmd --autostart install`：以后开机静默启动，
+   没有那个黑框框、也不再问 UAC。见[不要那个黑框框](#不要那个黑框框推荐做法)。
+
+命令清单（第 2 / 4 步用的就是前两条）：
 
 ```powershell
 # 在仓库根目录（或者直接双击 scripts\napcat-setup.cmd）
@@ -1380,7 +1402,13 @@ node scripts\napcat-setup.mjs --start        # 顺手启动 NapCat（提权 + �
 node scripts\napcat-setup.mjs --autostart install  # 装计划任务：以后开机静默启动，没有黑框框、也不再问 UAC
 node scripts\napcat-setup.mjs --autostart status   # 看它装没装、上次跑成没成
 node scripts\napcat-setup.mjs --autostart remove   # 不想要了
+node scripts\napcat-setup.mjs --where        # 只回答「用的是哪份 node」，排查用
 ```
+
+> **不装 Node 也能跑**：`scripts\napcat-setup.cmd` 会按「PATH → `DSH_DESKTOP_NODE_EXECUTABLE`
+> → 桌面版安装目录里自带的那份 Node」的顺序找解释器，找到了就直接用它跑 `.mjs`；
+> 桌面版自带的是完整的一份 Node（实测 v24.x），所以新机器上不需要先装 Node。
+> 一个都没找到时它会把确切路径的写法打出来，`--where` 则随时能告诉你现在用的是哪一份。
 
 它做五件事，每一步都是**幂等 + 先备份**：
 
@@ -1409,6 +1437,11 @@ node scripts\napcat-setup.mjs --autostart remove   # 不想要了
    「装上了但不加载」；再在 `profiles/desktop/node_modules/@qqbot/dsh-plugin-qq` 建一个指向
    仓库的链接（Windows 上用 junction，不需要开发者模式）。原 `package.json` 先备份成
    `.bak-<时间戳>`。
+   > 链接**已经存在**时会读一眼它指着谁（junction 也能读）：指着别的目录（上一份发布包、
+   > 旧的 clone）就删掉重建，并把你原来指向哪也打出来。「存在就当装好了」是不行的 ——
+   > 解析实际走链接，于是会出现「manifest 写的是新路径、加载的是旧代码」而**一句报错都没有**。
+   > 目录里那个东西如果**不是链接**（例如你手工拷了一份插件进去），脚本不删它，只提醒你
+   > 现在加载的是它、不是本仓库。
 5. `--start` 时启动 NapCat：**以管理员身份**（UAC 弹窗点「是」）跑官方文档让双击的那个
    `launcher.bat`，并把 `--qq` 当 `-q <号>` 传进去让它快速登录。窗口样式由 `--window` 决定：
    `normal` / `min`（默认，最小化、不挡视线）/ `hidden`（无窗口，走的是另一套机制，见下）。
@@ -1529,6 +1562,18 @@ NapCat 配置    <NapCat>\config\onebot11_<QQ>.json
 QQ 会话数据    ~\.dsh\qq-bot\                   （QQBOT_CWD：.qq-media / .qq-stickers / .qq-memory / data）
 ```
 
+### 「装完了，但它一句话都不说」
+
+按这个顺序查，前两步能盖住绝大多数：
+
+1. **DSH 启动日志里有没有这句话**：`skipping profile bundle "@qqbot/dsh-plugin-qq": cannot
+   resolve profile bundle …`。有它 = 插件**静默跳过**（DSH 照常启动，群里当然没反应）：
+   `node_modules\@qqbot\dsh-plugin-qq` 那个链接没了、或者指着一个已经被你删掉/挪走的目录。
+   重跑一次 `scripts\napcat-setup.cmd` 就会重建链接（它会读链接现在指着哪）。
+   注意：`package.json` 里的 `link:` 那行**不决定**加载什么，链接才决定。
+2. **`.env` 改动生效了没有**：`.env` 只在 DSH 启动时读一次，改完必须重启整个桌面版。
+3. 再往下是 NapCat 那一侧：见[为什么它不说话](#napcat-自检与它为什么不说话)。
+
 ## 本机开发
 
 插件以 `link:` 方式装进 profile，源码就在当前目录。裸跑 `node --test test/` 时，Node 需要
@@ -1553,8 +1598,22 @@ node --test test\
 用的是 DSH 自己的解析（靠 `package.json` 里的 `peerDependencies` 声明，见
 [Windows 桌面版](#windows-桌面版napcatshell)）。
 
+> **发布包里跑不了测试**，要先铺依赖：zip 走 `git archive`，只带被 git 跟踪的文件，所以
+> `node_modules/` 不在里面 —— 而 `bridge` / `client` / `perceptual` / `settings` / `util`
+> 这五个测试文件都 import `index.js`，会连带 import 那三个 `@deepseek-ai/*` peer 包。
+> 症状是整文件级失败（`✖ test\util.test.mjs`，只有 91 条被收集、5 条模块解析失败）。
+> 想验就把上面那条 `dev-node-modules.mjs` 跑一次 —— 但它需要一份 **DSH 源码 checkout**，
+> 只拿到 zip、没做过开发的人跑不了。**这不代表发布包坏了**：插件本身不需要自带
+> `node_modules`（那三个 peer 由宿主运行时提供）。
+
 > 在 DSH 自己的沙箱里跑测试时，`node --test` 会派生子进程并捕获输出，而沙箱不允许管道
 > （`spawn EPERM`）。同一个套件用同进程模式跑即可：`node --test --experimental-test-isolation=none "test/*.test.mjs"`。
+>
+> 沙箱里还有 **13 条会显示为「跳过」而不是失败**：`jm.test.mjs` 的 6 条与 `bridge.test.mjs`
+> 里 `/jm` 那 7 条必须真的 `spawn` 一次假 python 才验得到，而沙箱禁止带管道的子进程。
+> 判据是 `jm.js` 导出的 `spawnAvailable`（探测的正是带管道的 spawn），跳过时会把原因打出来。
+> 所以基线是：**普通终端 321 条全过；沙箱里 308 过 + 13 跳过**。
+> 这十几条**不是**坏了 —— 曾经被误读成「发布包损坏」，别再把它们改回「让它红」。
 
 ### 改完源码必须重启 Harness
 

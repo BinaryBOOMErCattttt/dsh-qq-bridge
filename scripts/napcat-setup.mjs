@@ -17,6 +17,7 @@
  *     node scripts/napcat-setup.mjs --start          # 顺手把 NapCat 启动起来（提权 + 快速登录）
  *     node scripts/napcat-setup.mjs --autostart install   # 装计划任务：以后开机静默启动、没有黑框框
  *     node scripts/napcat-setup.mjs --start --window hidden   # 就这一次不要那个控制台窗口
+ *     node scripts/napcat-setup.mjs --where          # 只回答「用的是哪份 node」，什么都不写
  *
  * 参数：
  *   --napcat <目录>   NapCat 安装目录（默认探测：本仓库里的 NapCat.Shell 等；刚解压、
@@ -50,13 +51,13 @@
  * @module @qqbot/dsh-plugin-qq/scripts/napcat-setup
  */
 import { copyFile, mkdir, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync, readlinkSync, realpathSync, rmdirSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { accountFiles, desiredServer, findNapcatDir, hiddenWrapperVbs, HIDDEN_WRAPPER_NAME, repairNapcat, scheduledTaskDeletePlan, scheduledTaskInstallPlan, scheduledTaskQueryPlan, scheduledTaskRunPlan, scheduledTaskXml, startPlan, TASK_NAME, TASK_XML_NAME, webuiTarget, withAutoLoginAccount, withNapcatLogging, withWebsocketServer } from '../napcat.js';
-import { applyEnvBlock, PLUGIN_NAME as pluginName, withPluginInstalled } from '../desktop.js';
+import { applyEnvBlock, PLUGIN_NAME as pluginName, pluginLinkState, removePluginLink, withPluginInstalled } from '../desktop.js';
 import { readTextOrUndefined, writeJsonAtomic, writeTextAtomicUtf16 } from '../filestore.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -91,6 +92,20 @@ const profileName = args.flags.has('no-install') ? 'none' : (args.values.profile
 const port = Number(args.values.port ?? 3001);
 const token = args.values.token ?? '';
 const endpoint = `ws://127.0.0.1:${port}`;
+
+/**
+ * `--where`：只回答「我这份 node 是从哪来的」。
+ *
+ * 为什么值得单独一个开关：`.cmd` 那条路会自己去找桌面版自带的 Node，而**用哪一份 node**
+ * 直接决定「找不到模块」「版本太老」这类问题查起来要多久。排查时先问一句，比截图强。
+ * 它一个字都不写盘，所以真跑和试运行没区别。
+ */
+if (args.flags.has('where')) {
+  say(`node：${process.execPath}`);
+  say(`版本：${process.version}（本插件要求 Node ≥ 22，见 package.json 的 engines）`);
+  say(`这个脚本：${fileURLToPath(import.meta.url)}`);
+  process.exit(0);
+}
 
 /** 统一的输出：每一行都带前缀，方便用户把「脚本说要做什么」和「它真的做了什么」对上。 */
 function say(message) {
@@ -309,19 +324,42 @@ async function installIntoProfile(directory) {
   }
   // node_modules 里的链接：Windows 上必须用 junction（符号链接要额外权限或开发者模式），
   // 恰好 junction 也是我们在沙箱里被拦下的那种操作，所以失败时给一条明确的退路。
+  //
+  // 这里**不能只看 `existsSync`**：链接早就存在、却指着别的目录（上一份发布包、旧的 clone、
+  // 别的盘）是这套安装最常见的一种错装 —— manifest 那一行被改成了新路径，而解析走的其实是
+  // 链接，于是「装的是新代码、跑的是旧代码」，一句报错都没有（DSH 只管能不能解析到这个包）。
+  // 所以「存在」必须升级成「存在且指着本仓库」。
   const linkPath = join(directory, 'node_modules', ...pluginName.split('/'));
-  if (existsSync(linkPath)) {
-    notes.push(`链接已存在：${linkPath}`);
-  } else if (!dryRun) {
-    await mkdir(dirname(linkPath), { recursive: true });
+  const link = pluginLinkState(linkPath, repoRoot, { lstatSync, readlinkSync, realpathSync });
+  if (link.state === 'linked') {
+    notes.push(`链接已经是这个仓库：${linkPath}`);
+  } else if (link.state === 'not-a-link') {
+    // 那里有个**真的**文件/目录：可能是用户手工拷进来的插件。不删 —— 但必须说清
+    // 「现在跑的是它、不是本仓库」，否则用户会以为这一步配好了。
+    notes.push(`链接跳过：${linkPath} 已经存在且不是一个链接（可能是一份手工拷进去的插件）：删掉它再跑本脚本，否则加载的是它、不是 ${repoRoot}`);
+  } else if (dryRun) {
+    if (link.state === 'missing') notes.push(`会建立链接 ${linkPath} → ${repoRoot}`);
+    else notes.push(`会重建链接：${linkPath} 现在指着 ${link.target ?? '一个读不出来的位置'}，要改成 ${repoRoot}`);
+  } else {
     try {
+      if (link.state === 'elsewhere' || link.state === 'unknown') {
+        // 链接本身可以安全删掉（它就只是一条指向），先删再建 —— junction 不能就地改指向。
+        // 删法是 desktop.js 里的纯函数（unlink 对 junction 是 EPERM，要退到 rmdir）。
+        const removed = removePluginLink(linkPath, { unlinkSync, rmdirSync });
+        if (!removed) {
+          notes.push(`旧链接删不掉（${linkPath}）：请自己在桌面版的「设置 → 插件」里把它指向 ${repoRoot}，或删掉它之后重跑本脚本`);
+          return { ok: true, notes };
+        }
+        notes.push(link.state === 'unknown'
+          ? '原来那条链接已经读不出指向了（目标被删过？），已删掉它重建'
+          : `原来指向 ${link.target}，已删掉那条旧链接`);
+      }
+      await mkdir(dirname(linkPath), { recursive: true });
       await symlink(repoRoot, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
       notes.push(`已建立链接 ${linkPath} → ${repoRoot}`);
     } catch (error) {
       notes.push(`建链接失败（${error?.message ?? error}）：请改用桌面版的「设置 → 插件」从本地路径安装，或在管理员/开发者模式下重跑`);
     }
-  } else {
-    notes.push(`会建立链接 ${linkPath} → ${repoRoot}`);
   }
   return { ok: true, notes };
 }

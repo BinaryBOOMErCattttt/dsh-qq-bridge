@@ -15,8 +15,12 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
-import { applyEnvBlock, ENV_BLOCK_END, ENV_BLOCK_START, PLUGIN_NAME, withPluginInstalled } from '../desktop.js';
+import { applyEnvBlock, ENV_BLOCK_END, ENV_BLOCK_START, PLUGIN_NAME, pluginLinkState, removePluginLink, withPluginInstalled } from '../desktop.js';
 
 /** 一份典型的 desktop profile manifest（形状照实测的那份）。 */
 const MANIFEST = {
@@ -92,4 +96,128 @@ test('withPluginInstalled：只差一半（有依赖没 bundle / 路径变了）
   const bare = withPluginInstalled({ name: 'x' }, 'D:\\repo');
   assert.equal(bare.changed, true);
   assert.deepEqual(bare.manifest.dsh.profile.bundles, [PLUGIN_NAME]);
+});
+
+// ---- 链接指着谁（pluginLinkState）------------------------------------------
+//
+// 这一组守的是一个**没有任何报错**的错装：`node_modules` 里的链接早就在了、却指着上一份发布包
+// 或旧的 clone，而 manifest 那一行已经被改成新仓库路径。解析实际走链接，于是「装的是新的、
+// 跑的是旧的」。所以判据不能是「链接存在不存在」，只能是「链接指着谁」。
+
+const LINK_PATH = 'C:\\Users\\me\\.dsh\\profiles\\desktop\\node_modules\\@qqbot\\dsh-plugin-qq';
+
+/** 造一份假的 `node:fs` 子集：`stat` 说那里是什么（缺省 = 什么都没，即 ENOENT）。 */
+function fakeFs({ stat, native, plain, link } = {}) {
+  return {
+    lstatSync: () => {
+      if (stat === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      return stat;
+    },
+    // 真的 `realpathSync` 上挂着 `.native`（Windows 上只有它跟得动 junction），假的一样挂。
+    realpathSync: Object.assign(
+      () => {
+        if (plain === undefined) throw Object.assign(new Error('EINVAL'), { code: 'EINVAL' });
+        return plain;
+      },
+      { native: () => { if (native === undefined) throw Object.assign(new Error('EINVAL'), { code: 'EINVAL' }); return native; } },
+    ),
+    readlinkSync: () => {
+      if (link === undefined) throw Object.assign(new Error('EINVAL'), { code: 'EINVAL' });
+      return link;
+    },
+  };
+}
+
+const DIRECTORY = { isSymbolicLink: () => false, isDirectory: () => true };
+const SYMLINK = { isSymbolicLink: () => true, isDirectory: () => false };
+const FILE = { isSymbolicLink: () => false, isDirectory: () => false };
+
+test('pluginLinkState：链接指着本仓库时才算装对了（盘符大小写与斜杠方向不算差别）', () => {
+  const same = pluginLinkState(LINK_PATH, 'd:/repo', fakeFs({ stat: SYMLINK, native: 'D:\\repo\\' }));
+  assert.equal(same.state, 'linked');
+  // 反方向也要认：目标写的是小写盘符、正斜杠。
+  assert.equal(pluginLinkState(LINK_PATH, 'D:\\repo', fakeFs({ stat: DIRECTORY, native: 'd:/REPO' })).state, 'linked');
+});
+
+test('pluginLinkState：链接指着别处时必须是 elsewhere（这正是「装了不生效」的那种状态）', () => {
+  // 实测现场：链接指着 dev 仓库，而 manifest 已经改成发布包目录。
+  const stale = pluginLinkState(LINK_PATH, 'D:\\temp\\dsh-qq-bridge-0.1.1', fakeFs({ stat: DIRECTORY, native: 'D:\\.my_projects\\dsh-qq-bridge' }));
+  assert.equal(stale.state, 'elsewhere');
+  assert.equal(stale.target.replace(/\\/g, '/').toLowerCase(), 'd:/.my_projects/dsh-qq-bridge');
+});
+
+test('pluginLinkState：native 拿不到答案就退回普通 realpath / readlink，全拿不到才是 unknown', () => {
+  // Windows junction 只有 `realpathSync.native` 跟得动；普通版把链接自己当结果返回 ——
+  // 那必须判成「指着别处」，否则脚本会以为配好了，继续用旧代码。
+  const selfReturned = pluginLinkState(LINK_PATH, 'D:\\repo', fakeFs({ stat: DIRECTORY, plain: LINK_PATH }));
+  assert.equal(selfReturned.state, 'elsewhere');
+  // 链接的目标被删过（realpath 全失败）时，POSIX 上 `readlink` 还答得出来（相对目标原样返回）。
+  const viaReadlink = pluginLinkState(LINK_PATH, 'D:\\repo', fakeFs({ stat: SYMLINK, link: '../../repo' }));
+  assert.equal(viaReadlink.state, 'elsewhere');
+  assert.equal(viaReadlink.target, '../../repo');
+  // 三条路都没有答案：交给调用方（脚本会重建链接）。
+  assert.equal(pluginLinkState(LINK_PATH, 'D:\\repo', fakeFs({ stat: DIRECTORY })).state, 'unknown');
+});
+
+test('pluginLinkState：不存在 = missing，普通文件 = not-a-link（后者不许当链接删）', () => {
+  assert.deepEqual(pluginLinkState(LINK_PATH, 'D:\\repo', fakeFs()), { state: 'missing', target: undefined });
+  // 那里有个真的普通文件：删它是破坏性动作，必须单独一种状态。
+  assert.equal(pluginLinkState(LINK_PATH, 'D:\\repo', fakeFs({ stat: FILE, native: 'D:\\repo' })).state, 'not-a-link');
+  // 空值也不能炸（脚本里 linkPath 永远是拼出来的，这里守的是纯函数的边界）。
+  assert.equal(pluginLinkState(LINK_PATH, undefined, fakeFs({ stat: DIRECTORY, native: 'D:\\repo' })).state, 'elsewhere');
+});
+
+// 真文件系统那一条：上面那份假 fs 是按「我们以为 Node 怎么答」写的，而 Windows 上的 junction
+// 正是这次踩坑的地方（`readlinkSync` 对 reparse point 一律 `EINVAL`）。所以真的建一条链接验一遍，
+// 建不了（非 Windows / 没权限）就跳过 —— 这条用例的价值在于钉住「谁跟得动 junction」这件事。
+test('pluginLinkState：真建一条 junction，必须认得出它指着哪（Windows 上只有 native realpath 跟得动）', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'qqbridge-link-'));
+  try {
+    const target = join(root, 'repo');
+    const linkPath = join(root, 'node_modules', '@qqbot', 'dsh-plugin-qq');
+    mkdirSync(target, { recursive: true });
+    mkdirSync(dirname(linkPath), { recursive: true });
+    try {
+      symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch {
+      t.skip('这个环境建不了链接（Windows 上需要权限或开发者模式）');
+      return;
+    }
+    const state = pluginLinkState(linkPath, target, fs);
+    assert.equal(state.state, 'linked', `实际读到的指向：${state.target}`);
+    // 指向变了（例如换了仓库位置）必须立刻判出来 —— 用户就是这样踩到「装了新包跑旧代码」的。
+    assert.equal(pluginLinkState(linkPath, join(root, 'other'), fs).state, 'elsewhere');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('removePluginLink：真建一条 junction 并删掉它 —— 链接消失、目标里的文件一个都不能少', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'qqbridge-rmlink-'));
+  try {
+    const target = join(root, 'repo');
+    const linkPath = join(root, 'node_modules', '@qqbot', 'dsh-plugin-qq');
+    mkdirSync(target, { recursive: true });
+    mkdirSync(dirname(linkPath), { recursive: true });
+    writeFileSync(join(target, 'index.js'), '// 插件的源码');
+    try {
+      symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch {
+      t.skip('这个环境建不了链接（Windows 上需要权限或开发者模式）');
+      return;
+    }
+    // `fs.unlink` 对 junction 是 EPERM（实测），所以先 unlink 再 rmdir 这条顺序必须保住。
+    assert.equal(removePluginLink(linkPath, fs), true);
+    assert.equal(existsSync(linkPath), false, '链接本身必须没了');
+    assert.equal(readFileSync(join(target, 'index.js'), 'utf8'), '// 插件的源码', '目标目录里的文件绝不能被删');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('removePluginLink：两条路都失败时返回 false（不抛错 —— 调用方要拿它去说一句人话）', () => {
+  const boom = () => { throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); };
+  assert.equal(removePluginLink('D:\\whatever', { unlinkSync: boom, rmdirSync: boom }), false);
+  // 只有 unlink 失败也要退到 rmdir（junction 正是这一种）。
+  assert.equal(removePluginLink('D:\\whatever', { unlinkSync: boom, rmdirSync: () => {} }), true);
 });

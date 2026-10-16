@@ -59,7 +59,7 @@ onebot.js      707 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/
 media.js       327 行  入站媒体：QQ 的图/表情包 → 按内容哈希落盘 → 给模型 read_image 的本地路径
 image.js       135 行  出站图片：本地路径 / URL → 校验（大小、格式、目录越界）→ base64:// 段
 napcat.js      828 行  NapCat 那一侧：**目录探测**（强判据 = config 里有账号配置；弱判据 = 目录里有它自带的启动件 —— 刚解压没登录过也算）、只读探测与**幂等**写入 websocketServers（含备份）、`withAutoLoginAccount`（快速登录）、`withNapcatLogging`（日志改文件）、`webuiTarget`（WebUI 地址与 token）；启动那半边：`startPlan`（提权）、`hiddenWrapperVbs` + `hiddenStartPlan`（`wscript //B` + VBS 隐藏窗口）、`scheduledTaskXml` / `scheduledTask*Plan`（计划任务）；插件启动自检与一键脚本共用
-desktop.js      约 90 行  「装进桌面版 profile」里纯的那一半：`.env` 段落幂等替换 + manifest 依赖/bundles 改写
+desktop.js      约 150 行  「装进桌面版 profile」里纯的那一半：`.env` 段落幂等替换 + manifest 依赖/bundles 改写 + `pluginLinkState`（`node_modules` 那条链接**指着谁**）/ `removePluginLink`（删链接：junction 对 `unlink` 是 EPERM，要退到 `rmdir`）
 perceptual.js 约 1080 行  图片指纹：JPEG(DC)/PNG/GIF → 16×16 灰度 → dHash，复读判「同一张画面」用
 scripts/napcat-setup.mjs + .cmd  Windows 一键配置（网络配置 + 快速登录 + .env + 装进 desktop profile；`--start` / `--autostart` / `--window`），幂等 + 先备份
 scripts/dev-node-modules.mjs      Windows 上铺 `node_modules`（按依赖闭包拷贝真实文件），只服务开发与测试
@@ -67,7 +67,7 @@ scripts/release.mjs               打发布包（`git archive` 出 tag 源码树
 .dsh/skills/message-digest/SKILL.md    聊天记录 → 长期记忆的流程（定时摘要与「以前说过什么」用它）
 .dsh/skills/update-cognition/SKILL.md  学梗 / 表情包含义 → COGNITION.md 的流程
 .dsh/skills/moegirl/SKILL.md           二次元梗 → 萌娘百科 MediaWiki 接口查意思的流程（只读，不落盘）
-test/bridge.test.mjs  集成测试：假 OneBot 服务端 + 假 Harness ctx（含假 timer），跑完整往返
+test/bridge.test.mjs  集成测试：假 OneBot 服务端 + 假 Harness ctx（含假 timer），跑完整往返（`/jm` 那组需要真 spawn，沙箱里跳过）
 test/settings.test.mjs  配置归一化的契约测试（默认值 / 非法值 / 白名单不 trim 这类刻意的不对称）
 test/chatter.test.mjs   「谁在说话」三本账的**不变量**测试（合并两本账就会红的那种）
 test/speaking-rules.test.mjs 主动说话 / 免 @ 接话 / 搭话抽卡 / 补一句的判据：每个用例从「通过」的基准入参出发只翻一个字段
@@ -584,11 +584,9 @@ workflow**。理由写在 patch 的注释里，其中一个是硬 bug 规避：`
 ## 8. 测试与验证
 
 ```bash
-node --test test/                      # 全部（bridge + perceptual + settings + chatter + util/filestore + client）
+node --test test/                      # 全部用例（普通终端里跑这一条）
 node --test test/settings.test.mjs     # 只跑配置取值口径（最快）
-node --test test/chatter.test.mjs      # 只跑「谁在说话」的三本账
 node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口」的判据
-node --test --test-name-pattern 复读 test/   # 按名字过滤
 ```
 
 测试用**真实插件模块 + 真实 OneBot 客户端 + 真实 `createUserMessage`**，只有 Harness Host 是桩
@@ -599,8 +597,15 @@ node --test --test-name-pattern 复读 test/   # 按名字过滤
 `node scripts/dev-node-modules.mjs --from <DSH checkout>`；DSH 沙箱里 `node --test` 会
 `spawn EPERM`，改用同进程模式 `node --test --experimental-test-isolation=none "test/*.test.mjs"`。
 
-- 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**（当前基线：`test/` 下 304 个用例
-  全过，约 40 秒）。
+- 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**（基线：`test/` 下 **321** 个用例；
+  普通终端 321 全过、约 40 秒，DSH 沙箱里是 **308 过 + 13 跳过**）。
+- **那 13 条跳过不是「坏了」，是环境做不到**：沙箱禁止带管道的子进程（`spawn EPERM`），而这条
+  链路必须真起一次子进程才验证得到 —— 所以 `jm.test.mjs` 的 6 条与 `bridge.test.mjs` 里 `/jm`
+  的 7 条按 `jm.js` 导出的 `spawnAvailable` **跳过并打印原因**，别改回「让它红」（0.1.1 的验收
+  报告就把它们当成了发布包损坏）。
+- 已知偶发：**全量同进程连跑**时偶尔红一条、且每次红的那条都不同（见过 `proactive` 节奏、
+  `allowTools`、群聊图片、`qq_transcript` 四组的用例），单独跑永远绿 —— 是 `until` 轮询与真实
+  计时的竞态，重跑确认即可，**别为了「让它稳」去放宽断言**。
 - 加行为就加用例，用例名/注释用中文写清意图。**改哪个模块就跑哪个文件**：
   `config.js`/`settings.js`→`settings.test.mjs`；`chatter.js` 与活跃对话判定→`chatter.test.mjs`；
   `speaking-rules.js` 或 `admit` 里凑入参那几行→`speaking-rules.test.mjs`；
@@ -610,9 +615,9 @@ node --test --test-name-pattern 复读 test/   # 按名字过滤
   主动说话→bridge 末尾 `bootProactive` 那组（靠 `digestMinLines: 9999` 隔离摘要循环，
   假 `fireInterval()` 会唤醒**所有**周期定时器）；`sessionIdFor`/`resetConversation`/`canReset`
   →bridge 里搜 `reset`；`rotateApiKey`/`probeApiKey`/`parseApiKeyPool`→bridge 最后的
-  `bootKeyRotation` 那组；`napcat.js`→`napcat.test.mjs`（判据：目录探测 / 快速登录 / 启动计划 / 隐藏包装脚本 / 计划任务 XML）+ bridge 末尾两条（接线）；
-  `desktop.js`→`desktop.test.mjs`；`util.js`/`filestore.js`→各自的用例；
-  `client.js`（设置页）→`client.test.mjs`（它同时钉住「每个配置项都有分组」这条）。
+  `bootKeyRotation` 那组；`napcat.js`/`desktop.js`→`napcat.test.mjs` / `desktop.test.mjs`；
+  `util.js`/`filestore.js`→各自的用例；`client.js`（设置页）→`client.test.mjs`（它同时钉住
+  「每个配置项都有分组」这条）。
 - **读 `agent.inbox` 的用例要等 `untilInbox(host, n)`，别只等 `host.list.created[0]`**：假 Host 的
   `create()` 是如实照搬真宿主的 —— Agent 先记进 `created`，消息由插件**之后**才
   `agent.followup(...)` 投进去，而 `until` 是 20ms 轮询，于是会偶发地抢在投递之前断言
@@ -657,20 +662,17 @@ node --test --test-name-pattern 复读 test/   # 按名字过滤
 ## 11. 运行环境（本机）
 
 ```
-profile   ~/.dsh/profiles/qqbot/      bundles: dsh-base + dsh-web-app + @qqbot/dsh-plugin-qq
-安装方式  @qqbot/dsh-plugin-qq -> link:<本仓库的绝对路径>
-UI        http://127.0.0.1:3081/
-启动      systemctl --user restart qqbot   或   dsh --profile qqbot --port 3081 --no-open
-日志      journalctl --user -u qqbot -f
+profile   ~/.dsh/profiles/qqbot/   （bundles: dsh-base + dsh-web-app + 本插件，link 安装）
+UI/启动   http://127.0.0.1:3081/   或 dsh --profile qqbot --port 3081 --no-open
+重启/日志 systemctl --user restart qqbot ｜ journalctl --user -u qqbot -f
 OneBot    容器 napcat（mlikiowa/napcat-docker），端口 3001 = WebSocket **服务器**
 凭据      DEEPSEEK_API_KEY：推荐在 3081 的 Web UI Models 页填一次（写入
           $DSH_HOME/.credentials.yaml，任何启动方式生效）
-私有配置  profile 的 cordis.patch.yml **只放 locale / ui-settings 这类覆盖**；插件配置的首选入口
-          是 3081 的 **设置 → QQ Bridge**（保存会写 profile patch 并重启插件，见 §5.12）；直接改
-          仓库的 cordis.patch.yml 也行，但**别手写只有几个字段的 profile config**（见 §5.10）。
-          本机私有的 /reset 白名单在仓库根的 .env（gitignore，**别把真号提交进仓库**）：
-            QQBOT_RESET_USERS=<你的QQ号>   → cordis.patch.yml 的 resetUsers 从这里读
-          .env 只在启动时读一次：改完必须重启才生效。
+私有配置  profile 的 cordis.patch.yml **只放 locale / ui-settings 这类覆盖**；插件配置走 3081 的
+          **设置 → QQ Bridge**（保存会写 profile patch 并重启插件，见 §5.12），或直接改仓库的
+          cordis.patch.yml —— 但**别手写只有几个字段的 profile config**（见 §5.10）。
+          /reset 白名单在仓库根的 .env（gitignore，**别把真号提交进仓库**）：QQBOT_RESET_USERS=<你的QQ号>；
+          .env 只在启动时读一次，改完必须重启（§5.11）。
 ```
 
 调试实时行为可以直接开 3081 的 Web UI 看 QQ 会话（每个 QQ 会话就是一个 Session）。

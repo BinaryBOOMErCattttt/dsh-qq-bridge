@@ -5,7 +5,49 @@
 
 ## 0.1.1 — 2026-10-15
 
-修 Windows 桌面版**安装流程**里实测出来的三处毛病。都在「NapCat 那一侧」，与 QQ 会话链路无关。
+修 Windows 桌面版**安装流程**里实测出来的一批毛病。全部在「NapCat 那一侧 / 安装 / 文档 / 测试」
+这一层，**QQ 会话链路一行没动**。
+
+> 这一版**没有真的发出去**（原计划作为首个补丁版），所以后面「发布包验收」查出来的问题直接并进了
+> 同一节 —— 拿到这个 tag 的人看到的就是修完的版本。最要紧的两条：装进 profile 时**校验链接指着谁**
+> （原来会静默加载旧代码），以及 `.cmd` **去找桌面版自带的那份 Node**（原来不装 Node 就装不上）。
+
+**发布包验收（拿 0.1.1 的 zip 在新机器上照 README 走一遍）查出来的问题**
+
+- **装进 profile：链接已存在时校验它指着谁（原来会静默装错代码）**。原来只判断
+  `node_modules\@qqbot\dsh-plugin-qq` **存在与否**：存在就打印「链接已存在」跳过，可
+  `package.json` 里的 `link:` 已经被改成了新仓库路径。而解析**完全由链接决定**（DSH 的
+  `resolveBundleDir` 走 `createRequire(profile/package.json).resolve.paths()`，那行声明只给
+  pnpm / 插件管理界面看），于是出现「manifest 说加载 A、实际加载 B」而**一句报错都没有**。
+  实测现场：链接还指着 dev 仓库、manifest 已经改成发布包目录。现在读链接的实际指向再比
+  （`pluginLinkState`，纯函数、有单测）：指别处就删掉重建，并把原来指着哪打出来；指着本仓库就
+  什么都不做；那里如果是**一个真目录/文件**（手工拷进去的插件），不删它，只提醒「加载的是它、
+  不是本仓库」。三个读法是一串实测出来的回退：Windows 上 junction 只有 `realpathSync.native`
+  跟得动（`readlinkSync` 对 reparse point 一律 `EINVAL`，普通 `realpathSync` 有时把链接自己当
+  结果返回），目标已被删掉时只剩 `readlinkSync` 答得出来。**删链接也不能用 `unlink`**：junction
+  对它一律 `EPERM`，要退到 `rmdir`（实测：删完链接消失、目标目录里的文件一个不少）。这两条都有
+  真建 junction 的用例钉着。
+- **`napcat-setup.cmd`：桌面版自带的那份 Node 现在找得到（原来挡住新用户）**。机器 PATH 上没有
+  `node` 时脚本直接失败，而桌面版自带一份完整的 Node（`<DSH>\resources\runtime\<版本>\dependencies\node\bin\node.exe`，
+  实测 v24.x）。现在按「PATH → `DSH_DESKTOP_NODE_EXECUTABLE` → 桌面版安装目录」的顺序找，常见
+  位置都探；一个都没找到才报错，并把确切路径的写法打出来。新增 `--where` 只回答「用的是哪份
+  node」。刻意**不**退到 `resources\runtime\bin\node.cmd`：那份包装自己是
+  `"%DSH_DESKTOP_NODE_EXECUTABLE%" --expose-internals %*`，而桌面版双击启动时那个变量不存在 ——
+  调它只会得到一句 `'" "' is not recognized`（实测）。这个文件里另外记了三个 cmd 的坑：
+  `if defined` 认「一个空格」的值、引号套引号会报没有行号的语法错、以及这个文件必须是 CRLF。
+- **`package.json` 的 `files` 补上漏掉的两个模块**：`mention.js`（`index.js` / `tools.js` 都 import
+  它）与 `desktop.js`（`scripts/napcat-setup.mjs` import 它）。zip 走 `git archive`，发布包不受
+  影响；但任何 `npm pack` / `pnpm add <tarball>` 装出来的包都会缺文件 → `ERR_MODULE_NOT_FOUND`
+  起不来。现在是 `private: true` 只发 zip，所以是个潜在的雷，先拆掉。
+- **文档**：「Windows 桌面版」开头加了一个七步流程，把**「第二次运行脚本」的必要性**摆到明处
+  （`config/onebot11_<QQ号>.json` 与 `config/webui.json` 都是 NapCat **第一次启动时**才生成的）；
+  「下载与开始」的前置条件改对了（**Node ≥ 22 只有源码路线与那个配置脚本需要，桌面版自带**）；
+  目录表后面补了「装完了，但它一句话都不说」的排查顺序，第一条就是上面那个链接问题 ——
+  DSH 启动日志里的 `skipping profile bundle "@qqbot/dsh-plugin-qq": cannot resolve …` 意味着插件被
+  **静默跳过**（DSH 照常启动，群里当然没反应）。另外写明了**发布包里跑不了测试**：zip 里没有
+  `node_modules/`（`git archive` 只带被跟踪的文件），而五个测试文件 import `index.js` 时会连带
+  import 那三个 peer 包 —— 验收报告里「跑包内测试」那一步只有开发机（跑过
+  `dev-node-modules.mjs`）才成立，不是发布包坏了。
 
 **一键配置现在认得出刚解压的 NapCat**
 
@@ -85,6 +127,17 @@
   `untilInbox(host, n)`；只关心「创建了几个 Agent」的用例仍然直接用
   `until(() => host.list.created[0], …)`。
 - 用例总数 304 → 307；**全量连跑三遍全绿**。
+- 发布包验收之后又补了几条：`test/desktop.test.mjs` 新增 7 条（`pluginLinkState` 的五种状态、
+  以及**真建一条 junction** 验「谁跟得动它」和「删它不会动目标目录里的文件」）。
+- 沙箱里那 13 条不再「红」，而是**带原因跳过**：`jm.test.mjs` 的 6 条与 `bridge.test.mjs` 里
+  `/jm` 的 7 条必须真的 `spawn` 一次假 python 才验得到，而 DSH 的沙箱禁止带管道的子进程
+  （`spawn EPERM`）—— 原来它们会红（其中 5 条还要先各自挂满 5 秒超时），被误读成「发布包坏了」。
+  现在按 `jm.js` 导出的 `spawnAvailable` 跳过并打印原因；探测的正是这条链路要用的那种 spawn
+  （带管道），所以「插件能不能用」与「测试跳不跳」用的是同一个事实。**探测脚本要往 stdout 写一个
+  字符**才试得出来：`node --version` 走控制台、不碰管道，在被拦的环境里照样返回 0。
+  基线因此写成：**普通终端 321 条全过；DSH 沙箱里 308 过 + 13 跳过**（原来文档里记的 304 已过时）。
+- 另记一处已知偶发：`proactive forgets its own pacing when the conversation is reset` 等个别用例
+  在**全量同进程连跑**时偶尔红，单独跑永远绿（`until` 轮询与真实计时的竞态），遇到了重跑确认。
 
 ## 0.1.0 — 2026-10-15
 

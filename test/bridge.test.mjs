@@ -19,6 +19,7 @@ import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import yaml from 'js-yaml';
 import { Config, apply, inject, liveConfig, parseApiKeyPool, sessionIdFor, withinActiveHours } from '../index.js';
+import { spawnAvailable } from '../jm.js';
 import { blankMessageLabel, collectMedia, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
@@ -3343,8 +3344,19 @@ test('the marker stays literal text when image sending is off or whitelisted awa
 // ---- 禁漫（JM）下载 → PDF → 发到 QQ -----------------------------------------
 // 这些用例把假 python 真的 spawn 起来：spawn / 协议解析 / 并发键 / 一次性 URL /
 // 上传参数都是真代码，只有「下载」这一步是假的。
+//
+// 所以它们**顺带**成了「这个环境能不能起子进程」的探针：DSH 自己的沙箱禁止带管道的子进程
+// （实测 `spawn EPERM`），那时这几条不但会红，还会各自挂满 5 秒的 `until` 超时。判据用
+// `jm.js` 导出的 `spawnAvailable`（同一个事实：带管道的 spawn），起不来就跳过并说明原因。
+// 不依赖 spawn 的那几条（用法提示、`jmCommand: ''`、`jmDownload: false`）照常跑。
+const JM_SKIP = spawnAvailable ? false : '这个环境不能起带管道的子进程（DSH 沙箱），跳过需要真 spawn 的 /jm 用例';
 
-test('the /jm command downloads a PDF and uploads it without an Agent turn', async () => {
+/** 与 `spawnTest` 同一套用法：能 spawn 就正常跑，不能就带原因跳过。 */
+function jmTest(name, body) {
+  return test(name, { skip: JM_SKIP }, body);
+}
+
+jmTest('the /jm command downloads a PDF and uploads it without an Agent turn', async () => {
   const { onebot, host } = await bootJm();
   onebot.push(privateMessage('/jm 422866'));
 
@@ -3403,7 +3415,7 @@ test('jmDownload: false turns the command into a refusal, not a silent drop', as
   assert.equal(host.list.created.length, 0);
 });
 
-test('the /jm command uploads a group file when it is used in a group', async () => {
+jmTest('the /jm command uploads a group file when it is used in a group', async () => {
   const { onebot } = await bootJm();
   onebot.push(mention('/jm 422866'));
 
@@ -3417,7 +3429,7 @@ test('the /jm command uploads a group file when it is used in a group', async ()
   assert.match(upload.params.file, /^http:\/\/127\.0\.0\.1:\d+\/f\//);
 });
 
-test('a second /jm in the same conversation is told to wait', async () => {
+jmTest('a second /jm in the same conversation is told to wait', async () => {
   const { onebot } = await bootJm({ __python: { delayMs: 1500 } });
   onebot.push(privateMessage('/jm 422866'));
   await until(
@@ -3441,7 +3453,7 @@ test('a second /jm in the same conversation is told to wait', async () => {
   assert.equal(onebot.calls.filter((call) => call.action === 'upload_private_file').length, 1);
 });
 
-test('a failed download reports the reason back to QQ', async () => {
+jmTest('a failed download reports the reason back to QQ', async () => {
   const { onebot } = await bootJm({ __python: { body: '这本有 146 话，超过上限 20；请指定单话' } });
   onebot.push(privateMessage('/jm 400222'));
 
@@ -3456,7 +3468,7 @@ test('a failed download reports the reason back to QQ', async () => {
   assert.equal(onebot.calls.some((call) => call.action === 'upload_private_file'), false);
 });
 
-test('a PDF that cannot be uploaded is reported instead of silently lost', async () => {
+jmTest('a PDF that cannot be uploaded is reported instead of silently lost', async () => {
   const { onebot } = await bootJm({}, {}, { uploadFails: '群文件上传需要管理员权限' });
   onebot.push(privateMessage('/jm 422866'));
 
@@ -3470,7 +3482,7 @@ test('a PDF that cannot be uploaded is reported instead of silently lost', async
   assert.match(texts.join('\n'), /文件发不出去：.*管理员权限/);
 });
 
-test('qq_jm_pdf sends the PDF to the QQ conversation the calling Agent belongs to', async () => {
+jmTest('qq_jm_pdf sends the PDF to the QQ conversation the calling Agent belongs to', async () => {
   const { onebot, host } = await bootJm();
   onebot.push(privateMessage('帮我下这本'));
   const agent = await until(() => host.list.created[0], 'the conversation Agent');
@@ -3490,7 +3502,7 @@ test('qq_jm_pdf sends the PDF to the QQ conversation the calling Agent belongs t
   assert.equal(upload.params.name, 'Test Book.pdf');
 });
 
-test('qq_jm_pdf needs an explicit target when no QQ conversation owns the call', async () => {
+jmTest('qq_jm_pdf needs an explicit target when no QQ conversation owns the call', async () => {
   const { onebot, host } = await bootJm();
   const tool = host.tools.get('qq_jm_pdf');
 

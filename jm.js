@@ -20,7 +20,7 @@
  *
  * @module qq-bridge/jm
  */
-import { spawn as spawnProcess } from 'node:child_process';
+import { spawn as spawnProcess, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, readdir, stat, unlink } from 'node:fs/promises';
@@ -165,6 +165,28 @@ function createLimiter(limit) {
     }
   };
 }
+
+/**
+ * 这个进程能不能起一个**带管道**的子进程？给测试一个判据：这条链路必须真的 spawn 一次，而 DSH
+ * 沙箱禁止带管道的子进程（实测 `spawn EPERM`）—— 没有它，同一份代码在普通终端全绿、沙箱里必红。
+ *
+ * 刻意**不用它**去提前停用 jm：那会把「沙箱里跑测试」与「插件真没这个能力」混成一件事。
+ * 真起不来时 `run()` 照样会失败，那是运行时事实，不该被一个探测改写。
+ *
+ * 探测脚本要往 stdout 写一个字符：`node --version` 走控制台、**不碰管道**，被拦的环境里照样返回 0。
+ */
+export const spawnAvailable = (() => {
+  try {
+    const probe = spawnSync(process.execPath, ['-e', "process.stdout.write('1')"], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+      encoding: 'utf8',
+    });
+    return probe.error === undefined && probe.status === 0;
+  } catch {
+    return false;
+  }
+})();
 
 /**
  * 建立禁漫下载服务。
