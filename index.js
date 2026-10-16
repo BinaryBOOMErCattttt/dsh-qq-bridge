@@ -3391,6 +3391,12 @@ export function apply(ctx, config) {
       report('warn', `napcat: ${result.reason}；跑 node scripts/napcat-setup.mjs 一条命令就能配好（或打开 napcatAutoConfig 让插件自己写）`);
       return;
     }
+    if (result.noAccount === true) {
+      // 「目录在、但还没登录过账号」是发布版安装流程里的**正常中间态**（`onebot11_<QQ>.json`
+      // 要等 NapCat 登录之后才生成），所以记 info 并把下一步写清楚，别用 warn 吓人。
+      report('info', 'napcat: 这份 NapCat 还没登录过账号（config/onebot11_<QQ号>.json 要等它登录之后才生成）——先启动一次 NapCat 并登录，再跑 node scripts/napcat-setup.mjs --qq <你的号>，它会把网络配置与快速登录一起配好');
+      return;
+    }
     report('warn', `napcat: 自检没跑成：${result.reason}`);
   }
 

@@ -4,11 +4,21 @@
  * 为什么值得单独一个模块：这是「机器人为什么不回复」里最常见、也最难自己看出来的一环 ——
  * 插件这边配置齐全、WS 也连上了，但 NapCat 里根本没有一条启用的 WebSocket 服务器，
  * 或者端口对不上、token 对不上。用户看到的现象只是「它不说话」，而线索全在另一个
- * 软件的 JSON 文件里。所以这里做两件事：
+ * 软件的 JSON 文件里。所以这里做三件事：
  *
  *   1. `inspectNapcat`：给一个 NapCat 的 config 目录，读它的 onebot11 配置，回答
  *      「现在这条链路通不通、不通是哪里不通」——**只看，不改**；
- *   2. `repairNapcat`：把缺的那一条写进去（先备份原文件，且**已经对了就一个字节都不动**）。
+ *   2. `repairNapcat`：把缺的那一条写进去（先备份原文件，且**已经对了就一个字节都不动**）；
+ *   3. 启动那半边（发布版安装流程踩出来的）：`findNapcatDir` 除了「有账号配置」这种强判据，
+ *      还认「目录里有 NapCat 自带的启动件」这种弱判据（刚解压、还没登录过也算）；
+ *      `withAutoLoginAccount` 让它启动时自己快速登录、不用每次扫码；`startPlan` 描述
+ *      「Windows 上要以管理员身份怎么起」——**不提权时 QQ 会在注入后崩在 QQNT.dll**，
+ *      这是实测结论，理由写在该函数上。
+ *   4. 不让它弹那个黑框框（本地实测出来的另一半）：`hiddenWrapperVbs` + `hiddenStartPlan`
+ *      用一个 GUI 宿主的包装脚本（wscript + VBS）把控制台**从创建那一刻**就隐藏掉；
+ *      `scheduledTaskXml` / `scheduledTaskInstallPlan` 再把它变成「登录时以管理员身份、
+ *      无窗口、以后不再问 UAC」的计划任务。`withNapcatLogging` 负责把日志改去文件 ——
+ *      窗口看不见之后，日志是唯一的现场。
  *
  * 三条纪律：
  *
@@ -216,6 +226,77 @@ export function withWebsocketServer(config, desired) {
 }
 
 /**
+ * 把「启动时登录哪个号」写进 NapCat 的 WebUI 配置（`config/webui.json` 的 `autoLoginAccount`）。
+ *
+ * 为什么值得写：不写的话每次启动 NapCat 都得在控制台看二维码、掏手机扫一次；写进去之后
+ * NapCat 启动时会自己**快速登录**这个号（它读的就是这一项）。前提是本机已经为这个号留下
+ * 过登录记录 —— 没有记录时 NapCat 会退回二维码，那不是失败，所以我们只写配置，
+ * 不假装「以后一定免扫码」。
+ *
+ * 与 {@link withWebsocketServer} 同一套路：只碰我们拥有的那一个字段，别的原样保留；
+ * 内容没变就返回 `changed: false`，调用方据此决定「要不要写盘、要不要留备份」。
+ *
+ * @param config - `webui.json` 解析出来的对象。
+ * @param qq - 机器人自己的 QQ 号；留空表示什么都不做。
+ * @returns `{ changed, config }`：`config` 是**新对象**（没变时是同一个引用）。
+ */
+export function withAutoLoginAccount(config, qq) {
+  const wanted = String(qq ?? '').trim();
+  const base = config !== null && typeof config === 'object' && !Array.isArray(config) ? config : {};
+  if (wanted.length === 0) return { changed: false, config };
+  if (String(base.autoLoginAccount ?? '') === wanted) return { changed: false, config };
+  return { changed: true, config: { ...base, autoLoginAccount: wanted } };
+}
+
+/**
+ * 把 NapCat 的日志**改去文件**（`config/napcat.json` 的 `consoleLog` / `fileLog`）。
+ *
+ * 为什么这件事跟「隐藏窗口」绑在一起：窗口一藏就没有控制台可看了，而 NapCat 默认是
+ * `consoleLog: true / fileLog: false` —— 出问题时用户手上会**一份现场都没有**。
+ * 打开文件日志之后日志落在 `<NapCat>/logs/<时间戳>.log`（NapCat 自己按 5MB × 5 个轮转）。
+ *
+ * 只动这两个字段：同一个文件里还有 `fileLogLevel` / `packetBackend` / `bypass` 这些
+ * 用户自己调过的东西，一律原样保留；内容没变就返回 `changed: false`。
+ *
+ * @param config - `config/napcat.json` 解析出来的对象。
+ * @param options.consoleLog - 是否要控制台日志（隐藏启动时为 false）。
+ * @param options.fileLog - 是否要文件日志（隐藏启动时为 true）。
+ * @returns `{ changed, config }`：`config` 是**新对象**（没变时是同一个引用）。
+ */
+export function withNapcatLogging(config, { consoleLog = false, fileLog = true } = {}) {
+  const base = config !== null && typeof config === 'object' && !Array.isArray(config) ? config : {};
+  if (base.consoleLog === consoleLog && base.fileLog === fileLog) return { changed: false, config };
+  return { changed: true, config: { ...base, consoleLog, fileLog } };
+}
+
+/**
+ * 从 `config/webui.json` 里算出「WebUI 在哪个地址、令牌是什么」。
+ *
+ * 隐藏启动之后，WebUI 是用户唯一还能看见的东西：**看日志、扫码登录、改配置**都在那里
+ * （NapCat 的 WebUI 自带登录页与二维码，所以「窗口藏起来就没法扫码」并不成立）。
+ * 而令牌是 NapCat 启动时随机生成、原本打在控制台上的 —— 控制台一藏，它就只能从这里读。
+ *
+ * 监听地址是 `0.0.0.0` / `::`（NapCat 的默认值，表示所有网卡）时，本机浏览器该访问
+ * `127.0.0.1`；IPv6 字面量要加方括号才是合法 URL。
+ *
+ * @param config - `webui.json` 解析出来的对象。
+ * @returns `{ url, host, port, token }`；端口读不出来时 undefined（那时不该打印一个假地址）。
+ */
+export function webuiTarget(config) {
+  const base = config !== null && typeof config === 'object' && !Array.isArray(config) ? config : {};
+  const host = String(base.host ?? '').trim();
+  const port = Number(base.port);
+  if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) return undefined;
+  const display = host.length === 0 || host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+  return {
+    url: `http://${display.includes(':') ? `[${display}]` : display}:${port}`,
+    host,
+    port,
+    token: String(base.token ?? ''),
+  };
+}
+
+/**
  * 读一个 NapCat config 目录，回答「这条链路现在通不通」。
  *
  * 只看不改，所以它适合在每次插件启动时跑一遍：配置错了当场就有一条清楚的 warn，
@@ -227,7 +308,8 @@ export function withWebsocketServer(config, desired) {
  * @param options.qq - 只关心这个账号；留空表示目录里唯一的那个（多个时取第一个并记一句）。
  * @param options.readdirImpl - 列目录的实现（测试注入）。
  * @returns `{ found, account, file, config, verdict }` —— `verdict` 是
- *   {@link inspectOnebotConfig} 的结果；认不出账号时 `found: false` 且 `reason` 说明原因。
+ *   {@link inspectOnebotConfig} 的结果；认不出账号时 `found: false` 且 `reason` 说明原因，
+ *   其中「一份刚解压、还没登录过的 NapCat」会额外带 `noAccount: true`。
  */
 export async function inspectNapcat({ dir, endpoint, token = '', qq = '', readdirImpl = readdir } = {}) {
   const target = endpointTarget(endpoint);
@@ -244,7 +326,10 @@ export async function inspectNapcat({ dir, endpoint, token = '', qq = '', readdi
   }
   const accounts = accountFiles(names);
   if (accounts.length === 0) {
-    return { found: false, reason: `${dir} 里没有 onebot11_<QQ号>.json（NapCat 还没登录过账号？）` };
+    // `noAccount` 是一个**结构化的信号**，不是又一句要人去匹配的文案：调用方靠它区分
+    // 「这份 NapCat 刚解压、还没登录过」（发布版安装流程里的正常中间态，该记 info 并告诉
+    // 用户下一步）与「目录配错了 / 读不了」（那才是 warn）。
+    return { found: false, noAccount: true, reason: `${dir} 里没有 onebot11_<QQ号>.json（NapCat 还没登录过账号？）` };
   }
   const wanted = String(qq ?? '').trim();
   const account = wanted.length > 0
@@ -293,7 +378,8 @@ export async function inspectNapcat({ dir, endpoint, token = '', qq = '', readdi
  * @param options.readdirImpl - 列目录的实现（测试注入）。
  * @returns `{ action, reason, file, backup, verdict }`：
  *   `action` 是 `'ok'`（本来就对）/ `'repaired'`（改了）/ `'needs-repair'`（要改但不允许）/
- *   `'unknown'`（查不出来，`reason` 说明为什么）。
+ *   `'unknown'`（查不出来，`reason` 说明为什么）；`noAccount: true` 是 `'unknown'` 里的一种，
+ *   专指「这份 NapCat 还没登录过账号」（调用方该记 info 并告诉用户下一步，而不是 warn）。
  */
 export async function repairNapcat({
   dir,
@@ -307,7 +393,9 @@ export async function repairNapcat({
   readdirImpl = readdir,
 } = {}) {
   const found = await inspectNapcat({ dir, endpoint, token, qq, readdirImpl });
-  if (found.found !== true) return { action: 'unknown', reason: found.reason, verdict: found.verdict };
+  if (found.found !== true) {
+    return { action: 'unknown', reason: found.reason, verdict: found.verdict, noAccount: found.noAccount === true };
+  }
   if (found.config === undefined) return { action: 'unknown', reason: found.reason, file: found.file };
   if (found.verdict.ok) return { action: 'ok', file: found.file, verdict: found.verdict };
   const target = endpointTarget(endpoint);
@@ -325,7 +413,35 @@ export async function repairNapcat({
 }
 
 /**
- * 找一个「像 NapCat 安装目录」的地方：里面有 `config` 目录，且至少有一个 onebot11 配置。
+ * 「像一份 NapCat.Shell 解压产物」的判据：目录里有它自带的启动件。
+ *
+ * 这只是一条**弱判据**（相对「config 里有账号配置」那条强判据而言），但发布版安装流程
+ * 离不开它：`config/onebot11_<QQ号>.json` 是 NapCat **登录之后**才生成的，而用户通常是
+ * 「解压 NapCat.Shell.zip → 直接跑一键脚本」—— 那一刻 config 目录可能压根不存在。
+ * 只认强判据的话，脚本会回一句「没找到 NapCat 安装目录」，`--qq` 那条「先把骨架配置
+ * 写好、登录后就能用」的路永远走不到（发布版实测踩过：仓库根下明明躺着一份 NapCat.Shell）。
+ *
+ * @param names - 目录下的文件名列表（由调用方 `readdir` 得到，便于测试）。
+ * @returns 像不像一份 NapCat 安装产物。
+ */
+export function looksLikeNapcatShell(names) {
+  return (names ?? []).some((name) => SHELL_MARKERS.some((pattern) => pattern.test(String(name))));
+}
+
+/** NapCat 自带的启动件：Windows 的 `launcher*.bat` / `launcher-elevate.ps1`，以及各平台都有的那几个。 */
+const SHELL_MARKERS = [
+  /^launcher[^\\/]*\.(bat|ps1)$/i,
+  /^napcat\.mjs$/i,
+  /^loadNapCat\.js$/i,
+  /^NapCatWinBootMain\.exe$/i,
+];
+
+/**
+ * 找一个「像 NapCat 安装目录」的地方。两种证据，强判据优先：
+ *
+ *   1. **强**：`config/onebot11_<QQ号>.json` 存在 —— 这是登录过的 NapCat，能直接读/改；
+ *   2. **弱**：目录里有 NapCat 自带的启动件（{@link looksLikeNapcatShell}）—— 刚解压、
+ *      还没登录过的那种，脚本正需要它来先写一份骨架配置。
  *
  * 只用于**自动探测**（插件启动时的自检、脚本不给参数时的兜底）：用户明确指了
  * `napcatDir` 就以那个为准。候选顺序按「越具体越优先」，并且不递归扫盘 ——
@@ -339,15 +455,375 @@ export async function findNapcatDir(candidates, { readdirImpl = readdir } = {}) 
   for (const candidate of candidates ?? []) {
     const dir = String(candidate ?? '').trim();
     if (dir.length === 0) continue;
-    const configDir = join(resolve(dir), 'config');
-    if (!existsSync(configDir)) continue;
-    let names;
+    const root = resolve(dir);
+    const configDir = join(root, 'config');
+    if (existsSync(configDir)) {
+      let names;
+      try {
+        names = await readdirImpl(configDir);
+      } catch {
+        names = undefined;
+      }
+      if (names !== undefined && accountFiles(names).length > 0) return root;
+    }
+    // 弱判据要另读一次根目录：`config` 不存在时上面那条路直接跳过了。
+    let rootNames;
     try {
-      names = await readdirImpl(configDir);
+      rootNames = await readdirImpl(root);
     } catch {
       continue;
     }
-    if (accountFiles(names).length > 0) return resolve(dir);
+    if (looksLikeNapcatShell(rootNames)) return root;
   }
   return undefined;
+}
+
+/** {@link startPlan} 支持的控制台窗口显示方式。 */
+export const START_WINDOW_STYLES = ['normal', 'min', 'hidden'];
+
+/** 计划任务名：固定、可预测，用户自己 `schtasks /query /tn <名字>` 就能找到它。 */
+export const TASK_NAME = 'dsh-qq-bridge-napcat';
+
+/** 隐藏启动的包装脚本名（VBScript）：放在 NapCat 目录里，跟着它一起删。 */
+export const HIDDEN_WRAPPER_NAME = 'dsh-qq-bridge-hidden.vbs';
+
+/** 计划任务 XML 的名字：注册时喂给 `schtasks /xml`，留着也方便用户自己看/改。 */
+export const TASK_XML_NAME = 'dsh-qq-bridge-task.xml';
+
+/** 写进计划任务「描述」栏的那句话（任务计划程序界面里能看见它）。 */
+const TASK_DESCRIPTION = '以管理员身份、无窗口启动 NapCat（QQ 机器人），由 dsh-qq-bridge 安装。';
+
+/** PowerShell 单引号字符串：里面的 `'` 要写成两个，否则路径里带引号就会被拆开。 */
+function psQuote(text) {
+  return `'${String(text).replace(/'/g, "''")}'`;
+}
+
+/**
+ * 把一段 PowerShell 包成「走 Base64 的提权调用」。
+ *
+ * 为什么统一走 `-EncodedCommand`：路径里可能有空格、中文、单引号，一层层引号转义最容易
+ * 栽在这些地方；NapCat 自己的 `launcher-elevate.ps1` 也是这么传的，跟着它走。
+ * 三个 plan（`startPlan` / `hiddenStartPlan` / `scheduledTaskInstallPlan`）共用它，
+ * 免得哪天只有一处漏了编码。
+ */
+function elevatedCommand(script) {
+  return {
+    command: 'powershell.exe',
+    args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+  };
+}
+
+/**
+ * 算出「怎么把 NapCat 启动起来」：**纯函数**，只描述要 spawn 什么、不真的 spawn（便于测试）。
+ *
+ * 两个决定写在这里，都有实测依据：
+ *
+ *   - **提权**（`-Verb RunAs`）：Windows 上必须以管理员身份启动。实测（QQ 9.9.35-52892 +
+ *     NapCat 4.18.38）：以普通用户身份启动时注入其实是成功的（崩溃转储的模块列表里能看到
+ *     `NapCatWinBootHook.dll` 已加载），但 QQ 随后在 `QQNT.dll` 里撞 `0x80000003`
+ *     （STATUS_BREAKPOINT）当场死掉，控制台只剩一句 `Process exited.`；提权启动则正常。
+ *     这与官方文档也一致 —— 它让双击的 `launcher.bat` 本身就是「会自己提权」的那个，
+ *     而 `launcher-user.bat` 是刻意不提权的变体。
+ *   - **命令走 Base64**（`-EncodedCommand`）：路径里可能有空格、中文、单引号，一层层引号
+ *     转义最容易栽在这些地方；NapCat 自己的 `launcher-elevate.ps1` 也是这么传的，跟着它走。
+ *
+ * 窗口样式只影响那个控制台：**首次登录要扫码，得能看见窗口**，所以第一次请用
+ * `normal` 或 `min`；`hidden` 交给 {@link hiddenStartPlan}（另一个机制：这个函数自己
+ * 起的那个控制台还能靠 `-WindowStyle` 藏，但只有 GUI 宿主的包装脚本才藏得干净）。
+ *
+ * @param options.platform - 目标平台（默认当前进程的）。
+ * @param options.launcher - 启动器 `.bat` 的绝对路径（有 `launcher.bat` 就优先用它）。
+ * @param options.qq - 机器人 QQ 号；给了就传 `-q <号>`，让 NapCat 走快速登录。
+ * @param options.windowMode - `normal` / `min` / `hidden`，默认 `min`；认不出的取值按默认处理。
+ * @param options.wrapper - `hidden` 时用的包装脚本（见 {@link hiddenWrapperVbs}）；其余样式不用。
+ * @returns 可以照做时 `{ command, args, describe }`；平台不对 / 缺启动器 / `hidden` 缺包装脚本时 `{ unsupported }`。
+ */
+export function startPlan({ platform = process.platform, launcher, qq = '', windowMode = 'min', wrapper = '' } = {}) {
+  if (platform !== 'win32') {
+    return { unsupported: `只在 Windows 上用启动器直接拉起 NapCat（当前平台是 ${platform}）` };
+  }
+  const mode = START_WINDOW_STYLES.includes(String(windowMode)) ? String(windowMode) : 'min';
+  // 隐藏那条路是另一个机制（wscript + VBS），在这里就分流，别把两套东西揉进一个分支里。
+  if (mode === 'hidden') return hiddenStartPlan({ platform, wrapper, qq });
+  const file = String(launcher ?? '').trim();
+  if (file.length === 0) {
+    return { unsupported: '找不到启动器（NapCat 目录里既没有 launcher.bat 也没有 launcher-user.bat）' };
+  }
+  // 只剩「看得见」的两种（hidden 已经在上面走了）：这个映射不必再有第三项。
+  const style = { normal: { name: 'Normal', label: '正常' }, min: { name: 'Minimized', label: '最小化' } }[mode];
+  const wanted = String(qq ?? '').trim();
+  const launcherArgs = wanted.length > 0 ? ['-q', wanted] : [];
+  const argumentList = launcherArgs.length > 0 ? `@(${launcherArgs.map((item) => psQuote(item)).join(', ')})` : '@()';
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `Start-Process -FilePath ${psQuote(file)} -ArgumentList ${argumentList} -Verb RunAs -WindowStyle ${style.name}`,
+  ].join('; ');
+  return {
+    ...elevatedCommand(script),
+    // 给用户看的一句话：脚本和 `--dry-run` 共用它，所以说清「干什么、什么窗口、登录谁」。
+    describe: `以管理员身份启动 ${file}（窗口：${style.label}${wanted.length > 0 ? `；快速登录 ${wanted}` : ''}）`,
+  };
+}
+
+/** VBScript 字符串字面量：里面每个 `"` 都要写两遍（VBS 的转义规则）。 */
+function vbsString(text) {
+  return `"${String(text).replace(/"/g, '""')}"`;
+}
+
+/** XML 文本转义：任务名/路径里出现 `&` `<` `"` 时不能让 XML 变成非法文档。 */
+function xmlEscape(text) {
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/**
+ * 生成「以隐藏窗口启动 NapCat」的包装脚本（VBScript 源码）。
+ *
+ * 为什么非得这么绕（对着 NapCat 的产物读出来的）：`launcher.bat` 发现自己不是管理员时，
+ * 会用 `launcher-elevate.ps1` **把 `wt.exe`（Windows Terminal）提权起来**再重跑自己 ——
+ * 而 Windows Terminal 压根没有「隐藏启动」这回事，那个窗口一定会出现在任务栏里。
+ * 反过来，`wscript.exe` 是 GUI 子系统程序（自己不带控制台），再用 `WshShell.Run` 的
+ * 窗口样式 `0`（SW_HIDE）拉起 `launcher.bat`，那个控制台**从创建那一刻**就是隐藏的。
+ *
+ * 本机实测（拿 `cmd.exe /c ping` 当探针）：普通 `Start-Process cmd` 起来的进程主窗口句柄
+ * 非 0，经这条路起来的句柄是 0 —— 也就是说窗口从头到尾没出现过。
+ *
+ * 第三个参数 `True` = 等它退出：计划任务里这个进程树因此一直活着，NapCat 也一直活着；
+ * 写 `False` 的话 wscript 立刻退出，子进程在有些环境下会被一起回收。
+ *
+ * @param options.launcher - 启动器 `.bat` 的绝对路径。
+ * @param options.qq - 机器人 QQ 号；给了就写进命令行（`-q <号>` = 快速登录）。
+ * @param options.napcatDir - NapCat 根目录（当包装脚本的工作目录；`launcher.bat` 自己也会 `cd`）。
+ * @returns VBScript 源码。**落盘要用 UTF-16LE + BOM**（`writeTextAtomicUtf16`）：WSH 读
+ *   没有 BOM 的脚本时按系统 ANSI 代码页解码，注释与中文路径都会变成乱码。
+ */
+export function hiddenWrapperVbs({ launcher, qq = '', napcatDir = '' } = {}) {
+  const file = String(launcher ?? '').trim();
+  const wanted = String(qq ?? '').trim();
+  const dir = String(napcatDir ?? '').trim();
+  // 命令行走 `cmd.exe /s /c`，**不**把 .bat 直接交给 WshShell.Run：
+  //   - 直接 Run 一个 .bat 会走**文件关联**（ShellExecute）。从下载来的 zip 里解压出来的
+  //     .bat 带 Mark-of-the-Web，那一步会弹「打开文件 - 安全警告」的模态框等人点；
+  //     我们没有窗口，于是表现是「什么都没发生」，还查不出原因。关联被改坏（指向编辑器）同理。
+  //   - 显式 cmd 是直接 CreateProcess，窗口样式 0 由 conhost 照办，也不依赖任何关联。
+  // `/s` 是让 cmd 按老规矩处理引号：`/c ""路径" 参数"` 里最外那对引号会被剥掉，
+  // 带空格的路径因此能正确落到 bat 上（实测：`sh.Run "cmd.exe /s /c ""...""", 0, True`）。
+  const inner = `${vbsString(file)}${wanted.length > 0 ? ` -q ${wanted}` : ''}`;
+  const command = `cmd.exe /s /c "${inner}"`;
+  return [
+    "' 由 dsh-qq-bridge 的 napcat-setup 生成：以**隐藏窗口**启动 NapCat（别手改，改完重跑那个脚本）。",
+    "' 原理：wscript.exe 是 GUI 子系统程序（自己没有控制台），再用 WshShell.Run 的",
+    "' 窗口样式 0（SW_HIDE）拉起命令 —— 那个黑框框从创建那一刻就是隐藏的。",
+    "' 第三个参数 True = 等它退出：计划任务里这个进程树一直活着，NapCat 才一直活着。",
+    "' 它必须用 `wscript.exe //B` 拉起来：//B = 出错时给退出码，而不是弹一个没人能看见的",
+    "' 模态对话框停在那儿（本地实测：同一份脚本加 //B 跑通，不加就卡住等点）。",
+    'Option Explicit',
+    'Dim sh',
+    'Set sh = CreateObject("WScript.Shell")',
+    ...(dir.length > 0 ? [`sh.CurrentDirectory = ${vbsString(dir)}`] : []),
+    `sh.Run ${vbsString(command)}, 0, True`,
+    '',
+  ].join('\r\n');
+}
+
+/**
+ * 「隐藏启动」的计划：**提权 + 不弹窗**，一次 UAC 换一个从头到尾不出现的控制台。
+ *
+ * 为什么不复用 {@link startPlan} 的 `-WindowStyle Hidden`：那条路把窗口样式交给
+ * ShellExecute，而**控制台窗口要不要隐藏是 conhost 说了算**，实测并不可靠；更要紧的是
+ * 它每次都要问一次 UAC。这里改成提权跑 `wscript.exe`（GUI 宿主，连「要隐藏的控制台」
+ * 都没有），窗口的问题就不存在了。
+ *
+ * 想要「连 UAC 也不问」，就装计划任务（{@link scheduledTaskInstallPlan}）——
+ * 那条路是注册一次、以后每次以管理员身份静默拉起。
+ *
+ * @param options.platform - 目标平台（默认当前进程的）。
+ * @param options.wrapper - {@link hiddenWrapperVbs} 落盘后的 `.vbs` 路径。
+ * @param options.qq - 只用来写那句给人看的描述（号码已经烘进包装脚本里了）。
+ * @returns `{ command, args, describe }` 或 `{ unsupported }`。
+ */
+export function hiddenStartPlan({ platform = process.platform, wrapper, qq = '' } = {}) {
+  if (platform !== 'win32') {
+    return { unsupported: `隐藏启动只对 Windows 有意义（当前平台是 ${platform}）` };
+  }
+  const file = String(wrapper ?? '').trim();
+  if (file.length === 0) {
+    return { unsupported: `隐藏启动需要包装脚本 ${HIDDEN_WRAPPER_NAME}（一键脚本会生成它）；不想用它就退回 --window min` };
+  }
+  const wanted = String(qq ?? '').trim();
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    // `//B` 是**必须**的：没有它，脚本一出错 WSH 就弹一个模态错误框并停在那儿等人点 ——
+    // 而我们连窗口都没有，等于机器人静默停住、还没有任何日志。`//B`（批处理模式）把错误
+    // 降级成退出码，也不再显示 WSH 自己的图标/对话框（本地实测：同一份脚本加 `//B` 跑通，
+    // 不加就是卡住等点）。
+    // 路径**要自己带一对引号**：`Start-Process -ArgumentList` 收数组时只是用空格拼起来，
+    // 不会替我们加引号 —— `C:\Program Files\...` 那种路径会被 wscript 拆成两个参数。
+    `Start-Process -FilePath ${psQuote('wscript.exe')} -ArgumentList @(${psQuote('//B')}, ${psQuote(`"${file}"`)}) -Verb RunAs -WindowStyle Hidden`,
+  ].join('; ');
+  return {
+    ...elevatedCommand(script),
+    describe: `以管理员身份、无窗口启动 NapCat（包装脚本 ${file}${wanted.length > 0 ? `；快速登录 ${wanted}` : ''}；UAC 弹窗点「是」）`,
+  };
+}
+
+/**
+ * 生成计划任务的 XML：登录时以管理员身份、无窗口跑那个包装脚本。
+ *
+ * 为什么用 XML 而不是 `Register-ScheduledTask`：后者走 CIM/WMI，在受限环境（比如 DSH 自己的
+ * 沙箱）里会被拦下（实测 `无法从客户端中访问 CIM 资源`），而 `schtasks.exe /create /xml`
+ * 走的是任务计划服务的 RPC。XML 还有个好处：**它是一份能读的产物**，用户可以自己看、
+ * 自己改、自己 `schtasks /create` 一遍。
+ *
+ * 几个字段是刻意的：
+ *   - `RunLevel: HighestAvailable`：不提权时 QQ 会在注入后崩在 QQNT.dll（见 {@link startPlan}）；
+ *   - `LogonType: InteractiveToken`：**必须跑在用户会话里**。NapCat 要拉起 QQ.exe 并注入，
+ *     「不管用户是否登录都运行」会把进程放进会话 0，那里面 QQ 起不来；
+ *   - `MultipleInstancesPolicy: IgnoreNew`：两份 NapCat 会抢同一个 QQ、同一个端口；
+ *   - `ExecutionTimeLimit: PT0S`：默认 72 小时会被任务计划服务掐掉，而机器人要一直挂着。
+ *
+ * @param options.taskName - 任务名（默认 {@link TASK_NAME}）。
+ * @param options.wrapper - 包装脚本 `.vbs` 的绝对路径。
+ * @param options.napcatDir - 工作目录（NapCat 根目录）。
+ * @param options.userId - `域\用户名`（计划任务里必须写成这个形状）。
+ * @param options.description - 写进任务描述的说明。
+ * @returns XML 文本；`wrapper` 或 `userId` 缺失时 undefined（宁可让调用方报错，也不产出一份坏 XML）。
+ */
+export function scheduledTaskXml({ taskName = TASK_NAME, wrapper, napcatDir = '', userId, description = TASK_DESCRIPTION } = {}) {
+  const file = String(wrapper ?? '').trim();
+  const user = String(userId ?? '').trim();
+  if (file.length === 0 || user.length === 0) return undefined;
+  const dir = String(napcatDir ?? '').trim();
+  return [
+    '<?xml version="1.0" encoding="UTF-16"?>',
+    '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+    '  <RegistrationInfo>',
+    `    <Description>${xmlEscape(description)}</Description>`,
+    `    <URI>\\${xmlEscape(taskName)}</URI>`,
+    '  </RegistrationInfo>',
+    '  <Triggers>',
+    '    <LogonTrigger>',
+    '      <Enabled>true</Enabled>',
+    `      <UserId>${xmlEscape(user)}</UserId>`,
+    '    </LogonTrigger>',
+    '  </Triggers>',
+    '  <Principals>',
+    '    <Principal id="Author">',
+    `      <UserId>${xmlEscape(user)}</UserId>`,
+    '      <LogonType>InteractiveToken</LogonType>',
+    '      <RunLevel>HighestAvailable</RunLevel>',
+    '    </Principal>',
+    '  </Principals>',
+    '  <Settings>',
+    '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>',
+    '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>',
+    '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>',
+    '    <AllowHardTerminate>true</AllowHardTerminate>',
+    '    <StartWhenAvailable>false</StartWhenAvailable>',
+    '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>',
+    '    <IdleSettings>',
+    '      <StopOnIdleEnd>false</StopOnIdleEnd>',
+    '      <RestartOnIdle>false</RestartOnIdle>',
+    '    </IdleSettings>',
+    '    <AllowStartOnDemand>true</AllowStartOnDemand>',
+    '    <Enabled>true</Enabled>',
+    '    <Hidden>false</Hidden>',
+    '    <RunOnlyIfIdle>false</RunOnlyIfIdle>',
+    '    <WakeToRun>false</WakeToRun>',
+    '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>',
+    '    <Priority>7</Priority>',
+    '  </Settings>',
+    '  <Actions Context="Author">',
+    '    <Exec>',
+    '      <Command>wscript.exe</Command>',
+    // `//B`：批处理模式 —— 出错时给退出码，而不是弹一个没人能看见的模态对话框（见 hiddenStartPlan）。
+    `      <Arguments>//B "${xmlEscape(file)}"</Arguments>`,
+    ...(dir.length > 0 ? [`      <WorkingDirectory>${xmlEscape(dir)}</WorkingDirectory>`] : []),
+    '    </Exec>',
+    '  </Actions>',
+    '</Task>',
+    '',
+  ].join('\r\n');
+}
+
+/**
+ * 注册（或覆盖）计划任务：**一次 UAC，以后静默提权启动**。
+ *
+ * `schtasks /create /xml` 需要管理员，所以这一步自己也要提权一次 —— 装完这一次之后，
+ * 以后启动 NapCat 就只走 `schtasks /run`（见 {@link scheduledTaskRunPlan}），不再弹 UAC。
+ *
+ * @param options.platform - 目标平台（默认当前进程的）。
+ * @param options.taskName - 任务名（默认 {@link TASK_NAME}）。
+ * @param options.xmlPath - {@link scheduledTaskXml} 落盘后的路径。
+ * @returns `{ command, args, describe }` 或 `{ unsupported }`。
+ */
+export function scheduledTaskInstallPlan({ platform = process.platform, taskName = TASK_NAME, xmlPath } = {}) {
+  if (platform !== 'win32') return { unsupported: `计划任务只在 Windows 上有意义（当前平台是 ${platform}）` };
+  const file = String(xmlPath ?? '').trim();
+  if (file.length === 0) return { unsupported: '计划任务的 XML 还没写出来，没法注册' };
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `& schtasks.exe /Create /TN ${psQuote(taskName)} /XML ${psQuote(file)} /F`,
+    'exit $LASTEXITCODE',
+  ].join('; ');
+  return {
+    ...elevatedCommand(script),
+    taskName,
+    describe: `注册计划任务「${taskName}」（登录时以管理员身份、无窗口启动 NapCat；UAC 弹窗点「是」，只需这一次）`,
+  };
+}
+
+/**
+ * 删掉计划任务（同样要管理员：任务是以最高权限注册的）。
+ *
+ * @param options.platform - 目标平台（默认当前进程的）。
+ * @param options.taskName - 任务名（默认 {@link TASK_NAME}）。
+ * @returns `{ command, args, describe }` 或 `{ unsupported }`。
+ */
+export function scheduledTaskDeletePlan({ platform = process.platform, taskName = TASK_NAME } = {}) {
+  if (platform !== 'win32') return { unsupported: `计划任务只在 Windows 上有意义（当前平台是 ${platform}）` };
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `& schtasks.exe /Delete /TN ${psQuote(taskName)} /F`,
+    'exit $LASTEXITCODE',
+  ].join('; ');
+  return {
+    ...elevatedCommand(script),
+    taskName,
+    describe: `删除计划任务「${taskName}」（UAC 弹窗点「是」）`,
+  };
+}
+
+/**
+ * 查询计划任务：`verbose` 为真时把详情打出来（状态、上次结果、下次运行时间），
+ * 否则只用退出码回答「装过没有」—— 脚本靠它决定「隐藏启动是走任务，还是走一次 UAC」。
+ *
+ * 查询**不需要提权**（自己的任务自己看得见），所以这里是直接调 `schtasks.exe`。
+ *
+ * @param options.taskName - 任务名（默认 {@link TASK_NAME}）。
+ * @param options.verbose - 是否要详情。
+ * @returns `{ command, args, describe }`。
+ */
+export function scheduledTaskQueryPlan({ taskName = TASK_NAME, verbose = false } = {}) {
+  const args = ['/Query', '/TN', String(taskName)];
+  if (verbose) args.push('/V', '/FO', 'LIST');
+  return {
+    command: 'schtasks.exe',
+    args,
+    describe: verbose ? `查询计划任务「${taskName}」的详情` : `查询计划任务「${taskName}」是否存在`,
+  };
+}
+
+/**
+ * 立刻启动一次计划任务：**不提权、不弹 UAC、也没有窗口** —— 任务自己的最高权限生效。
+ * 这是装了计划任务之后「手动再启动一次 NapCat」的正路。
+ *
+ * @param options.taskName - 任务名（默认 {@link TASK_NAME}）。
+ * @returns `{ command, args, describe }`。
+ */
+export function scheduledTaskRunPlan({ taskName = TASK_NAME } = {}) {
+  return {
+    command: 'schtasks.exe',
+    args: ['/Run', '/TN', String(taskName)],
+    describe: `启动计划任务「${taskName}」（以管理员身份、无窗口；不会再问 UAC）`,
+  };
 }

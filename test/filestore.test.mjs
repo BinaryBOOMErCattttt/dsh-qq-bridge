@@ -11,7 +11,7 @@ import { mkdtemp, rm, writeFile, mkdir, readFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { readJsonl, readTextOrUndefined, readdirOrEmpty, writeJsonAtomic, writeTextAtomic } from '../filestore.js';
+import { readJsonl, readTextOrUndefined, readdirOrEmpty, writeJsonAtomic, writeTextAtomic, writeTextAtomicUtf16 } from '../filestore.js';
 
 /** 建一个临时目录，跑完删掉。 */
 async function withTempDir(run) {
@@ -39,6 +39,19 @@ test('writeTextAtomic 覆盖已有文件（不是追加）', async () => {
     await writeTextAtomic(file, '旧的');
     await writeTextAtomic(file, '新的');
     assert.equal(await readFile(file, 'utf8'), '新的');
+  });
+});
+
+test('writeTextAtomicUtf16：UTF-16LE + BOM，且不留临时文件', async () => {
+  await withTempDir(async (dir) => {
+    const file = join(dir, 'hidden.vbs');
+    await writeTextAtomicUtf16(file, "Option Explicit\n' 中文注释 + 中文路径\n");
+    const bytes = await readFile(file);
+    // BOM 必须在：WSH 与 PowerShell 5.1 读没有 BOM 的脚本时按系统 ANSI 解码，
+    // 中文注释和中文路径会变成乱码（这条路的全部理由）。
+    assert.deepEqual([...bytes.subarray(0, 2)], [0xff, 0xfe], 'BOM 不能少');
+    assert.equal(bytes.toString('utf16le').replace(/^\ufeff/, ''), "Option Explicit\n' 中文注释 + 中文路径\n");
+    await assert.rejects(() => stat(`${file}.tmp`), /ENOENT/);
   });
 });
 

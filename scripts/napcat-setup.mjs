@@ -14,18 +14,34 @@
  *     node scripts/napcat-setup.mjs --dry-run        # 只打印将要做什么，一个字都不写
  *     node scripts/napcat-setup.mjs --qq 123456      # 指定账号（还没登录过也能先写好配置）
  *     node scripts/napcat-setup.mjs --profile none   # 只配 NapCat 和 .env，不碰 profile
- *     node scripts/napcat-setup.mjs --start          # 顺手把 NapCat 启动起来
+ *     node scripts/napcat-setup.mjs --start          # 顺手把 NapCat 启动起来（提权 + 快速登录）
+ *     node scripts/napcat-setup.mjs --autostart install   # 装计划任务：以后开机静默启动、没有黑框框
+ *     node scripts/napcat-setup.mjs --start --window hidden   # 就这一次不要那个控制台窗口
  *
  * 参数：
- *   --napcat <目录>   NapCat 安装目录（默认探测：本仓库里的 NapCat.Shell 等）
- *   --qq <号码>       账号；缺省取 config 目录里已有的那个
+ *   --napcat <目录>   NapCat 安装目录（默认探测：本仓库里的 NapCat.Shell 等；刚解压、
+ *                     还没登录过的也算 —— 靠目录里 NapCat 自带的启动件认出它）
+ *   --qq <号码>       账号；缺省取 config 目录里已有的那个。给了它就顺便把 NapCat 的
+ *                     `autoLoginAccount` 设成它：以后启动自动快速登录，不用每次扫码
+ *                     （不想要这条就加 --no-auto-login）
  *   --port <端口>     OneBot WebSocket 端口（默认 3001）
  *   --token <token>   access_token（默认空）
  *   --cwd <目录>      QQ 会话的工作目录（默认 ~/.dsh/qq-bot；写进 profile 的 .env）
  *   --profile <名字>  装进哪个 DSH profile（默认 desktop；none = 不动 profile）
  *   --no-install      等价于 --profile none
  *   --reset-users <号码,号码>  允许用 /reset 的人的 QQ 号（写进 .env 的 QQBOT_RESET_USERS；默认不写 = 谁都不能）
- *   --start           配置完成后启动 NapCat（Windows 上走 launcher-user.bat）
+ *   --start           配置完成后启动 NapCat。**必须提权**：普通用户身份下注入其实成功，
+ *                     但 QQ 随后会崩在 QQNT.dll（0x80000003），控制台只剩一句 Process exited.
+ *   --window <样式>   normal / min / hidden，默认 min。首次登录要扫二维码，得能看见窗口。
+ *                     `hidden` 走的是另一个机制（GUI 宿主的包装脚本），连「运行期间不能关掉
+ *                     那个窗口」都不存在了；装了计划任务之后它还会顺手免掉 UAC
+ *   --autostart <动作> install（默认）/ remove / status：注册一个计划任务，**登录时以管理员
+ *                     身份、无窗口**启动 NapCat。装一次 UAC，以后启动都不再问；status 只查询。
+ *                     装的时候会顺手把 NapCat 日志改成写文件（窗口看不见了，日志是唯一的现场），
+ *                     不想要就加 --no-log-to-file
+ *   --no-run-now      --autostart install 只装任务，不立即启动一次
+ *   --no-auto-login   不写 `autoLoginAccount`（默认写：`--qq` 给了就设成它）
+ *   --force           跳过「这份 NapCat 还没启动过、隐藏启动会让你看不见二维码」的拦阻
  *   --dry-run         只打印，不写任何文件
  *
  * 它**不修改插件的源码**，也不碰 `~/.dsh/.credentials.yaml`：模型凭据仍然在 DSH 的
@@ -39,23 +55,29 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { accountFiles, desiredServer, findNapcatDir, repairNapcat, withWebsocketServer } from '../napcat.js';
+import { accountFiles, desiredServer, findNapcatDir, hiddenWrapperVbs, HIDDEN_WRAPPER_NAME, repairNapcat, scheduledTaskDeletePlan, scheduledTaskInstallPlan, scheduledTaskQueryPlan, scheduledTaskRunPlan, scheduledTaskXml, startPlan, TASK_NAME, TASK_XML_NAME, webuiTarget, withAutoLoginAccount, withNapcatLogging, withWebsocketServer } from '../napcat.js';
 import { applyEnvBlock, PLUGIN_NAME as pluginName, withPluginInstalled } from '../desktop.js';
-import { writeJsonAtomic } from '../filestore.js';
+import { readTextOrUndefined, writeJsonAtomic, writeTextAtomicUtf16 } from '../filestore.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /** 一条 `--key value` / `--flag` 的命令行。 */
 function parseArgs(argv) {
   const args = { flags: new Set(), values: {} };
-  const takesValue = new Set(['napcat', 'qq', 'port', 'token', 'cwd', 'profile', 'reset-users']);
+  const takesValue = new Set(['napcat', 'qq', 'port', 'token', 'cwd', 'profile', 'reset-users', 'window', 'autostart']);
   for (let index = 0; index < argv.length; index += 1) {
     const item = argv[index];
     if (!item.startsWith('--')) continue;
     const name = item.slice(2);
     if (takesValue.has(name)) {
-      args.values[name] = argv[index + 1];
-      index += 1;
+      const next = argv[index + 1];
+      // 后面那个不是值而是另一个开关时（`--autostart --dry-run`），别把它当成值吃掉：
+      // 记成「只写了开关」——`--autostart` 单独出现就是它的默认动作 install。
+      if (next === undefined || next.startsWith('--')) args.flags.add(name);
+      else {
+        args.values[name] = next;
+        index += 1;
+      }
       continue;
     }
     args.flags.add(name);
@@ -79,6 +101,148 @@ function say(message) {
 function fail(message) {
   process.stderr.write(`${message}\n`);
   process.exit(1);
+}
+
+/** 备份文件名里的时间戳：与 `napcat.js` 那个同形（能排序、又不会有冒号这种 Windows 非法字符）。 */
+function backupStamp() {
+  return new Date().toISOString().slice(0, 16).replace(/[:T]/g, '');
+}
+
+/**
+ * 跑一个计划（`napcat.js` 里那些纯函数算出来的 `{ command, args }`）。
+ *
+ * 两个刻意的选择：
+ *   - **等待时 `stdio: 'inherit'`**：UAC 弹窗、`schtasks` 的报错都该原样给用户看见，
+ *     而且这条路上我们**不读子进程的输出**（DSH 沙箱里捕获子进程输出会被拦成
+ *     `spawn EPERM`）—— 需要的信息就是退出码。
+ *   - **`detached` 时不等待**：启动 NapCat 是常驻进程，脚本说完就该退出，不占着它。
+ *
+ * @param plan - `{ command, args, describe }`（也可能是 `{ unsupported }`）。
+ * @param options.detached - true = 发了就返回（常驻进程走这条）。
+ * @returns 退出码；`detached` 与试运行时返回 0。
+ */
+async function runPlan(plan, { detached = false } = {}) {
+  if (plan === undefined || plan.unsupported !== undefined) {
+    say(`  → ${plan?.unsupported ?? '内部错误：没有可执行的计划'}`);
+    return 1;
+  }
+  if (dryRun) {
+    say(`  → 会${plan.describe}`);
+    return 0;
+  }
+  const child = spawn(plan.command, plan.args, {
+    detached,
+    stdio: detached ? 'ignore' : 'inherit',
+    windowsHide: detached,
+  });
+  if (detached) {
+    child.unref();
+    return 0;
+  }
+  return await new Promise((resolveCode) => {
+    child.on('error', (error) => {
+      say(`  → 起不来：${error?.message ?? error}`);
+      resolveCode(1);
+    });
+    child.on('exit', (code) => resolveCode(code ?? 1));
+  });
+}
+
+/**
+ * 计划任务装过没有：只用退出码回答（`schtasks /query` 找不到时是非零）。
+ * 刻意不打印任何东西 —— 调用方是拿它当判据的，不是给用户看的。
+ */
+async function taskExists(taskName) {
+  if (dryRun) return false;
+  const plan = scheduledTaskQueryPlan({ taskName });
+  const child = spawn(plan.command, plan.args, { stdio: 'ignore', windowsHide: true });
+  return await new Promise((resolve) => {
+    child.on('error', () => resolve(false));
+    child.on('exit', (code) => resolve(code === 0));
+  });
+}
+
+/** 计划任务里要写的 `域\用户名`：环境变量里就有，别为这个去问系统。 */
+function currentUserId() {
+  const user = String(process.env.USERNAME ?? '').trim();
+  const domain = String(process.env.USERDOMAIN ?? '').trim();
+  if (user.length === 0) return '';
+  return domain.length > 0 ? `${domain}\\${user}` : user;
+}
+
+/**
+ * 打印 WebUI 的地址与令牌。
+ *
+ * 为什么这件事跟「隐藏窗口」有关：窗口一藏，WebUI 就是用户唯一还看得见的东西
+ * （看日志、扫码登录、改配置都在那儿），而它的令牌是 NapCat 随机生成、原本打在控制台里的。
+ *
+ * @param configDir - NapCat 的 `config` 目录。
+ * @returns 打印出来了没有（`webui.json` 不存在或读不出来时 false）。
+ */
+async function sayWebuiHint(configDir) {
+  const text = await readTextOrUndefined(join(configDir, 'webui.json'));
+  if (text === undefined) return false;
+  let target;
+  try {
+    target = webuiTarget(JSON.parse(text));
+  } catch {
+    target = undefined;
+  }
+  if (target === undefined) return false;
+  say(`  → WebUI：${target.url}${target.token.length > 0 ? `（token：${target.token}）` : ''} —— 日志、扫码登录、改配置都在这里`);
+  return true;
+}
+
+/**
+ * 把 NapCat 的日志改成写文件（隐藏启动时默认做的事）。
+ *
+ * 只动 `consoleLog` / `fileLog` 两个字段、先备份、幂等 —— 与 NapCat 其它的写操作同一套规矩。
+ *
+ * @param napcatDir - NapCat 根目录。
+ */
+async function setFileLogging(napcatDir) {
+  const file = join(napcatDir, 'config', 'napcat.json');
+  const text = await readTextOrUndefined(file);
+  if (text === undefined) {
+    say(`  → 没有 ${file}（NapCat 启动过一次才会生成）：跳过日志设置`);
+    return;
+  }
+  let current;
+  try {
+    current = JSON.parse(text);
+  } catch (error) {
+    say(`  → ${file} 不是合法 JSON（${error?.message ?? error}）：跳过日志设置，没动它`);
+    return;
+  }
+  const patched = withNapcatLogging(current, { consoleLog: false, fileLog: true });
+  if (!patched.changed) {
+    say('  → 日志已经是「写文件」了，不动它');
+    return;
+  }
+  if (dryRun) {
+    say(`  → 会把日志改成写文件：${file} 的 consoleLog=false / fileLog=true`);
+    return;
+  }
+  const backup = `${file}.bak-${backupStamp()}`;
+  await copyFile(file, backup);
+  await writeJsonAtomic(file, patched.config);
+  say(`  → 已把日志改成写文件：看不见窗口时，现场在 ${join(napcatDir, 'logs')}（原文件备份在 ${backup}）`);
+}
+
+/**
+ * 挑一个启动器：**首选官方文档让双击的那个**（`launcher.bat`，它会自己提权），
+ * 没有才退回不提权的 `launcher-user.bat`。
+ *
+ * 为什么不直接写死 `launcher-user.bat`：那是「刻意不提权」的变体，而 Windows 上不提权
+ * 会让 QQ 在注入后崩在 QQNT.dll（见 `napcat.js` 的 `startPlan`）。官方文档让用户双击的
+ * 正是会提权的 `launcher.bat` —— 脚本跟着文档走。
+ */
+function pickLauncher(dir) {
+  for (const name of ['launcher.bat', 'launcher-user.bat']) {
+    const file = join(dir, name);
+    if (existsSync(file)) return file;
+  }
+  return '';
 }
 
 /**
@@ -134,7 +298,7 @@ async function installIntoProfile(directory) {
   const patched = withPluginInstalled(manifest, repoRoot);
   const changed = patched.changed;
   if (changed) {
-    const backup = `${manifestPath}.bak-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}`;
+    const backup = `${manifestPath}.bak-${backupStamp()}`;
     if (!dryRun) {
       await copyFile(manifestPath, backup);
       await writeJsonAtomic(manifestPath, patched.manifest);
@@ -185,6 +349,9 @@ async function main() {
 
   // ---- 1. NapCat 那一侧 ------------------------------------------------------
   const located = await locateNapcat();
+  // 机器人自己的号：命令行给了就用它，否则取 config 里已有的那个。后面的「快速登录」
+  // 与「先把骨架配置写好」要用同一个值，所以在这里定一次。
+  let wantedQq = String(args.values.qq ?? '').trim();
   if (located.dir === undefined) {
     say('没找到 NapCat 安装目录（找过：' + located.candidates.join(' / ') + '）');
     say('  → 用 --napcat <目录> 指定，或者把 NapCat.Shell 解压到本仓库根目录下');
@@ -193,8 +360,8 @@ async function main() {
     const configDir = join(located.dir, 'config');
     const names = existsSync(configDir) ? await readdir(configDir) : [];
     const accounts = accountFiles(names);
-    const wantedQq = args.values.qq ?? accounts[0]?.qq;
-    if (accounts.length === 0 && wantedQq === undefined) {
+    if (wantedQq.length === 0) wantedQq = String(accounts[0]?.qq ?? '');
+    if (accounts.length === 0 && wantedQq.length === 0) {
       say('  → 这个 NapCat 还没登录过任何账号（config 里没有 onebot11_<QQ号>.json）');
       say('  → 先用 --qq <号码> 跑一次，登录之后再跑一次即可（脚本会把配置写好／对齐）');
     } else if (accounts.length === 0) {
@@ -219,6 +386,39 @@ async function main() {
       else if (result.action === 'repaired') say(`  → ${result.reason}；已写进 ${result.file}（原文件备份在 ${result.backup}）`);
       else if (result.action === 'needs-repair') say(`  → 需要修：${result.reason}（试运行不写盘）`);
       else say(`  → 没配成：${result.reason}`);
+    }
+
+    // 快速登录：把 `autoLoginAccount` 写进 NapCat 的 WebUI 配置（只在用户明确给了 --qq 时）。
+    // 为什么只认显式 `--qq`：一个 NapCat 可能配了多个账号，悄悄替用户挑一个登录太自作主张。
+    if (args.values.qq !== undefined && !args.flags.has('no-auto-login')) {
+      const webuiFile = join(configDir, 'webui.json');
+      const text = await readTextOrUndefined(webuiFile);
+      if (text === undefined) {
+        // 刻意**不**凭空造这个文件：它是 NapCat 的 WebUI 配置（host / port / token 等一堆字段），
+        // 我们写一份只剩下 autoLoginAccount 的，等于把它的 WebUI 配置抹掉。
+        say(`  → 还没有 ${webuiFile}（NapCat 启动过一次才会生成）—— 想让它以后自动快速登录，登录之后再跑一次本脚本`);
+      } else {
+        let current;
+        try {
+          current = JSON.parse(text);
+        } catch (error) {
+          current = undefined;
+          say(`  → ${webuiFile} 不是合法 JSON（${error?.message ?? error}）：跳过自动快速登录，没动它`);
+        }
+        if (current !== undefined) {
+          const auto = withAutoLoginAccount(current, wantedQq);
+          if (!auto.changed) {
+            say(`  → webui.json 里已经是自动快速登录 ${wantedQq}，不动它`);
+          } else if (dryRun) {
+            say(`  → 会设置自动快速登录：${webuiFile} 的 autoLoginAccount = ${wantedQq}`);
+          } else {
+            const backup = `${webuiFile}.bak-${backupStamp()}`;
+            await copyFile(webuiFile, backup);
+            await writeJsonAtomic(webuiFile, auto.config);
+            say(`  → 已设置自动快速登录 autoLoginAccount = ${wantedQq}：以后启动不用扫码（原文件备份在 ${backup}）`);
+          }
+        }
+      }
     }
   }
 
@@ -252,34 +452,137 @@ async function main() {
     if (!installed.ok) process.exitCode = 2;
   }
 
-  // ---- 4. 启动 NapCat（可选）------------------------------------------------
-  if (args.flags.has('start')) {
+  // ---- 4. 计划任务：登录时以管理员身份、无窗口启动（--autostart）--------------
+  // 这一步解决的是「那个黑框框 + 每次启动都要点 UAC」这对组合：注册一次计划任务，
+  // 以后 `schtasks /run` 以最高权限静默拉起 NapCat，窗口从头到尾不存在。
+  const autostartMode = String(args.values.autostart ?? (args.flags.has('autostart') ? 'install' : '')).trim().toLowerCase();
+  let startedAlready = false;
+  if (autostartMode !== '') {
+    if (!['install', 'remove', 'status'].includes(autostartMode)) {
+      fail(`--autostart 只认 install / remove / status（拿到的是 ${autostartMode}）`);
+    }
+    if (autostartMode === 'remove') {
+      const code = await runPlan(scheduledTaskDeletePlan({ taskName: TASK_NAME }));
+      if (code === 0) say(`  → 计划任务「${TASK_NAME}」已删除（NapCat 本身没被停掉）`);
+      else process.exitCode = 1;
+    } else if (autostartMode === 'status') {
+      if (!(await taskExists(TASK_NAME))) {
+        say(`  → 没有装过计划任务「${TASK_NAME}」（装它：--autostart install）`);
+      } else {
+        say(`  → 计划任务「${TASK_NAME}」在：`);
+        await runPlan(scheduledTaskQueryPlan({ taskName: TASK_NAME, verbose: true }));
+      }
+    } else if (located.dir === undefined) {
+      say('--autostart install：没找到 NapCat 目录，先解压一份或用 --napcat <目录> 指定');
+      process.exitCode = 2;
+    } else {
+      const launcher = pickLauncher(located.dir);
+      const configDir = join(located.dir, 'config');
+      if (launcher.length === 0) {
+        say(`--autostart install：${located.dir} 里找不到 launcher.bat / launcher-user.bat`);
+        process.exitCode = 2;
+      } else if (!existsSync(join(configDir, 'webui.json')) && !args.flags.has('force')) {
+        // 隐藏启动的前提是「出得来二维码」。`webui.json` 是 NapCat 第一次启动时生成的，
+        // 连它都没有 = 这份 NapCat 从没启动过：那时候隐藏启动会让人连二维码都看不见，
+        // WebUI 也打不开，等于把自己关在门外。所以拦住，并给出唯一的出路。
+        say(`  → 这份 NapCat 还没启动过（没有 ${join(configDir, 'webui.json')}）：隐藏启动会让你连二维码都看不见`);
+        say('  → 先跑一次 `--start --window normal` 扫码登录，再回来装计划任务');
+        say('  → 确定知道自己在做什么就加 --force');
+        process.exitCode = 2;
+      } else {
+        const wrapper = join(located.dir, HIDDEN_WRAPPER_NAME);
+        const xmlFile = join(located.dir, TASK_XML_NAME);
+        const vbs = hiddenWrapperVbs({ launcher, qq: wantedQq, napcatDir: located.dir });
+        if (dryRun) {
+          say(`  → 会写包装脚本 ${wrapper}（用 wscript 以隐藏窗口启动 NapCat${wantedQq.length > 0 ? `，快速登录 ${wantedQq}` : ''}）`);
+        } else {
+          await writeTextAtomicUtf16(wrapper, vbs);
+          say(`  → 已写包装脚本 ${wrapper}`);
+        }
+        // 窗口看不见了，日志就是唯一的现场：顺手把它改成写文件（--no-log-to-file 可关）。
+        if (args.flags.has('no-log-to-file')) say('  → --no-log-to-file：不动 NapCat 的日志设置（隐藏启动后就没有现场可看了）');
+        else await setFileLogging(located.dir);
+        const xml = scheduledTaskXml({ taskName: TASK_NAME, wrapper, napcatDir: located.dir, userId: currentUserId() });
+        if (xml === undefined) {
+          say('  → 算不出计划任务 XML：拿不到当前用户名（USERDOMAIN / USERNAME 环境变量），计划任务里必须写明它');
+          process.exitCode = 1;
+        } else {
+          if (dryRun) {
+            say(`  → 会写计划任务 XML ${xmlFile}（登录时触发、以最高权限、任务名 ${TASK_NAME}）`);
+          } else {
+            await writeTextAtomicUtf16(xmlFile, xml);
+            say(`  → 已写计划任务 XML ${xmlFile}`);
+          }
+          const code = await runPlan(scheduledTaskInstallPlan({ taskName: TASK_NAME, xmlPath: xmlFile }));
+          if (code !== 0) {
+            say('  → 注册没成（UAC 被取消？）—— 也可以自己跑：schtasks /create /tn ' + TASK_NAME + ' /xml "' + xmlFile + '" /f');
+            process.exitCode = 1;
+          } else if (args.flags.has('no-run-now')) {
+            say(`  → 已装好；要现在启动就跑 schtasks /run /tn ${TASK_NAME}`);
+          } else if ((await runPlan(scheduledTaskRunPlan({ taskName: TASK_NAME }))) === 0) {
+            startedAlready = true;
+            say('  → 已通过计划任务启动（以管理员身份、无窗口、也没问 UAC）');
+          }
+        }
+      }
+    }
+    // 装了 / 查过之后都把 WebUI 的位置说清楚 —— 它是没有窗口时唯一的「控制台」。
+    if (located.dir !== undefined) await sayWebuiHint(join(located.dir, 'config'));
+  }
+
+  // ---- 5. 启动 NapCat（可选）------------------------------------------------
+  if (args.flags.has('start') && !startedAlready) {
     if (located.dir === undefined) {
       say('--start：没有 NapCat 目录，跳过');
-    } else if (process.platform !== 'win32') {
-      say('--start 只在 Windows 上直接启动 NapCat；其它平台请按 README 的方式启动（容器里跑 NapCat 的那套）');
     } else {
-      const launcher = join(located.dir, 'launcher-user.bat');
-      if (!existsSync(launcher)) {
-        say(`--start：找不到 ${launcher}`);
-      } else if (dryRun) {
-        say(`会启动：${launcher}`);
+      // 「怎么启动」是 `napcat.js` 里的纯函数（有单测）：提权、窗口样式、快速登录参数
+      // 都在那里，这里只负责挑启动器、按需写包装脚本、真的 spawn、把结果说清楚。
+      const launcher = pickLauncher(located.dir);
+      const windowMode = String(args.values.window ?? 'min').trim();
+      if (windowMode === 'hidden' && (await taskExists(TASK_NAME))) {
+        // 装过计划任务就走它：不提权、不弹 UAC、也没有窗口 —— 这是隐藏启动的正路。
+        say(`  → 计划任务「${TASK_NAME}」已经装过：走它启动（不提权、不弹 UAC、也没有窗口）`);
+        if ((await runPlan(scheduledTaskRunPlan({ taskName: TASK_NAME }))) !== 0) {
+          say(`  → 任务没启动起来：用 --autostart status 看它怎么了`);
+        }
       } else {
-        // `cmd /c start "" <bat>`：开一个**新窗口**跑 launcher（NapCat 的登录二维码、
-        // 日志都在那个窗口里，用户需要看得见）。detached + ignore 让本脚本立刻退出。
-        spawn('cmd.exe', ['/c', 'start', '', launcher], { cwd: located.dir, detached: true, stdio: 'ignore' }).unref();
-        say(`已启动 NapCat：${launcher}（那个窗口里扫码登录）`);
+        let wrapper = '';
+        if (windowMode === 'hidden' && launcher.length > 0) {
+          // 隐藏启动要一份包装脚本：按需生成（内容固定，重跑就覆盖同一份）。
+          wrapper = join(located.dir, HIDDEN_WRAPPER_NAME);
+          if (dryRun) {
+            say(`  → 会写包装脚本 ${wrapper}`);
+          } else {
+            await writeTextAtomicUtf16(wrapper, hiddenWrapperVbs({ launcher, qq: wantedQq, napcatDir: located.dir }));
+            say(`  → 已写包装脚本 ${wrapper}`);
+          }
+        }
+        const plan = startPlan({ launcher, qq: wantedQq, windowMode, wrapper });
+        if (plan.unsupported !== undefined) {
+          say(`--start：${plan.unsupported}`);
+        } else {
+          await runPlan(plan, { detached: true });
+          if (!dryRun) say(`${plan.describe} —— 已发出启动${windowMode === 'hidden' ? '（UAC 弹窗点「是」；这次之后就装计划任务吧）' : '（UAC 弹窗点「是」）'}`);
+        }
       }
     }
   }
 
-  // ---- 5. 收尾：告诉用户还差哪一步 -------------------------------------------
+  // ---- 6. 收尾：告诉用户还差哪一步 -------------------------------------------
   say('');
   say('接下来：');
-  if (!args.flags.has('start') && located.dir !== undefined) say('  1) 启动 NapCat：双击 NapCat.Shell\\launcher-user.bat（首次要扫码登录）');
+  if (!args.flags.has('start') && !startedAlready && located.dir !== undefined) {
+    const launcher = pickLauncher(located.dir) || join(located.dir, 'launcher.bat');
+    say(`  1) 启动 NapCat：双击 ${launcher}（会弹 UAC，点「是」；首次要扫码登录）`);
+  }
   if (profileName !== 'none') say('  2) 重启 DSH 桌面版 —— 插件源码在启动时加载，装完必须重启');
   say('  3) 在 DSH 的 Models 页面确认模型凭据已填（插件不碰凭据文件）');
   say('  4) 私聊机器人发一句话：它在 QQ 里回你，就说明整条链路通了');
+  if (located.dir !== undefined) {
+    say(`  （那个控制台窗口就是 NapCat 本体：关掉它 = 停掉机器人。不想看见它就跑 --autostart install：`);
+    say(`    登录时以管理员身份、无窗口启动，以后也不再问 UAC；停止用 schtasks /end /tn ${TASK_NAME}）`);
+    await sayWebuiHint(join(located.dir, 'config'));
+  }
   if (dryRun) say('（这是试运行：上面所有「已写」都只是打算做的事，去掉 --dry-run 才真的写）');
 }
 

@@ -48,6 +48,22 @@ export async function writeBytesAtomic(absolute, bytes) {
   await rename(temp, absolute);
 }
 
+/**
+ * 把一段文本按 **UTF-16LE + BOM** 原子地写进文件。
+ *
+ * 为什么需要它：Windows 的脚本宿主（WSH）与 PowerShell 5.1 读**没有 BOM** 的脚本时，
+ * 会按系统 ANSI 代码页解码 —— 我们生成的包装脚本里有中文注释、路径也可能带中文，
+ * 用 UTF-8 写出去就是乱码，甚至找不到要启动的文件。带 BOM 的 UTF-16 两边都认得。
+ * （只有 NapCat 那两个 Windows 产物走这条路：隐藏启动的 `.vbs` 与计划任务的 `.xml`。）
+ * @param absolute - 目标绝对路径。
+ * @param text - 文件正文（不带 BOM，BOM 由这里补）。
+ */
+export async function writeTextAtomicUtf16(absolute, text) {
+  const temp = `${absolute}.tmp`;
+  await writeFile(temp, Buffer.from(`\ufeff${text}`, 'utf16le'));
+  await rename(temp, absolute);
+}
+
 /** 读取一个文本文件；不存在时返回 undefined（而不是抛错）。 */
 export async function readTextOrUndefined(absolute) {
   try {

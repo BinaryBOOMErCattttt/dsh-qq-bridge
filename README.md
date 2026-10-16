@@ -1374,12 +1374,15 @@ systemd」完全不同：没有 docker 网桥、没有 `systemctl`、Host 进程
 ```powershell
 # 在仓库根目录（或者直接双击 scripts\napcat-setup.cmd）
 node scripts\napcat-setup.mjs --dry-run      # 先看它打算做什么：一个字都不写
+node scripts\napcat-setup.mjs --qq 123456    # 指定机器人账号（还没登录过也能先写好配置）
 node scripts\napcat-setup.mjs                # 真配
-node scripts\napcat-setup.mjs --start        # 顺手把 NapCat 起起来
-node scripts\napcat-setup.mjs --qq 123456    # NapCat 还没登录过时，先按这个号写配置
+node scripts\napcat-setup.mjs --start        # 顺手启动 NapCat（提权 + 快速登录，窗口默认最小化）
+node scripts\napcat-setup.mjs --autostart install  # 装计划任务：以后开机静默启动，没有黑框框、也不再问 UAC
+node scripts\napcat-setup.mjs --autostart status   # 看它装没装、上次跑成没成
+node scripts\napcat-setup.mjs --autostart remove   # 不想要了
 ```
 
-它做四件事，每一步都是**幂等 + 先备份**：
+它做五件事，每一步都是**幂等 + 先备份**：
 
 1. **NapCat 的网络配置**：在 `<NapCat>\config\onebot11_<QQ号>.json` 里写好（或对齐）一条
    监听 `endpoint` 端口的 WebSocket 服务器 —— `name: dsh-qq-bridge`、`enable: true`、
@@ -1387,20 +1390,108 @@ node scripts\napcat-setup.mjs --qq 123456    # NapCat 还没登录过时，先�
    **只动 `websocketServers` 里我们那一条**：用户自己调过的 `debug` / `heartInterval`、
    以及 `httpServers` / `websocketClients` / `timeout` 全部原样保留；改之前把原文件复制成
    `onebot11_<QQ>.json.bak-<时间戳>`。已经配好时**一个字节都不写**（连备份都不产生）。
-2. **profile 的 `.env`**：把 `QQBOT_ENDPOINT` / `QQBOT_ACCESS_TOKEN` / `QQBOT_CWD` /
+   > NapCat 目录怎么找：`config/onebot11_<QQ号>.json` 是**登录之后**才生成的，所以
+   > 「刚解压、还没登录过」的 NapCat 也认（判据是目录里它自带的 `launcher*.bat` /
+   > `napcat.mjs`）—— 发布版安装流程正是这一种，不然 `--qq` 那条路永远走不到。
+2. **快速登录**（只在显式给了 `--qq` 时）：把 `<NapCat>\config\webui.json` 的
+   `autoLoginAccount` 设成这个号，NapCat 以后启动就自己快速登录，不用每次掏手机扫码。
+   同样只动那一个字段、先备份；`webui.json` 还不存在（NapCat 没启动过）时**不凭空造**它，
+   而是提示你登录完再跑一次。不想要这条就加 `--no-auto-login`。
+   > 快速登录的前提是本机已经为这个号留下过登录记录；没有记录时 NapCat 会退回二维码 ——
+   > 那不是失败，扫一次码，之后才会走快速登录。
+3. **profile 的 `.env`**：把 `QQBOT_ENDPOINT` / `QQBOT_ACCESS_TOKEN` / `QQBOT_CWD` /
    `QQBOT_NAPCAT_DIR` 写进 `~/.dsh/profiles/desktop/.env` 里一段带标记的段落，段落**之外**
    的内容一个字节都不动。这些取值由 `cordis.patch.yml` 里的 `!!js process.env.QQBOT_*`
    读进配置 —— 「每台机器不一样的值」全走 `.env`，仓库里那份 patch 保持所有部署共用。
    （`#` 是 `.env` 的注释符，取值里别出现它。）
-3. **装进 desktop profile**：`package.json` 里加 `"@qqbot/dsh-plugin-qq": "link:<仓库>"`，
+4. **装进 desktop profile**：`package.json` 里加 `"@qqbot/dsh-plugin-qq": "link:<仓库>"`，
    并把它追加进 `dsh.profile.bundles` —— **两处都必须有**，只加依赖不加 bundles 等于
    「装上了但不加载」；再在 `profiles/desktop/node_modules/@qqbot/dsh-plugin-qq` 建一个指向
    仓库的链接（Windows 上用 junction，不需要开发者模式）。原 `package.json` 先备份成
    `.bak-<时间戳>`。
-4. `--start` 时用 `launcher-user.bat` 启动 NapCat（会开一个新窗口：二维码与日志都在里面）。
+5. `--start` 时启动 NapCat：**以管理员身份**（UAC 弹窗点「是」）跑官方文档让双击的那个
+   `launcher.bat`，并把 `--qq` 当 `-q <号>` 传进去让它快速登录。窗口样式由 `--window` 决定：
+   `normal` / `min`（默认，最小化、不挡视线）/ `hidden`（无窗口，走的是另一套机制，见下）。
+   **首次登录要扫二维码，得能看见窗口**，所以第一次请用 `normal` 或 `min`。
+
+### 不要那个黑框框（推荐做法）
+
+> **那个黑框框就是 NapCat 本体**：关掉它 = 停掉机器人，它不是「一个可以随手关掉的日志窗口」。
+> 想让它彻底消失，三条路，按推荐程度排：
+
+| 这条路 | 适合谁 | 代价 |
+|---|---|---|
+| `node scripts\napcat-setup.mjs --autostart install` | 大多数人 | 装的时候点一次 UAC；以后开机**静默**启动，没有窗口、也不再问 UAC |
+| 官方 [NapCat.Windows 可视化管理工具](https://github.com/NapNeko/NapCatQQ-Desktop) | 想要图形界面 / 多账号的人 | 多装一个 EXE（单文件、托盘托管、后台静默） |
+| `--start --window min`（默认） | 只想最小化、不想动系统设置 | 任务栏里仍然有一个 NapCat 的控制台 |
+
+**为什么不能简单地「隐藏窗口」**：`launcher.bat` 发现自己不是管理员时，会用
+`launcher-elevate.ps1` **把 `wt.exe`（Windows Terminal）提权起来**再重跑自己 —— 而 Windows
+Terminal 根本没有「隐藏启动」这回事，那个窗口一定会出现。所以 `--window hidden` 走的是另一条
+路：提权跑 `wscript.exe`（GUI 子系统程序，自己不带控制台），由它用 `WshShell.Run` 的窗口样式
+`0`（SW_HIDE）去起 `cmd.exe /s /c "launcher.bat" -q <号>` —— 控制台**从创建那一刻**就是隐藏的。
+三个细节都是踩出来的，别顺手改：
+
+- **必须 `wscript.exe //B`**：不加 `//B` 时 WSH 一出错就弹一个模态错误框停在那儿等人点，
+  而我们连窗口都没有 —— 表现是「机器人静默停住、日志里什么都没有」（本地实测：同一份脚本
+  加 `//B` 跑通，不加就是卡住等点）。
+- **命令行走 `cmd.exe /s /c`，而不是把 `.bat` 直接交给 WshShell.Run**：后者走文件关联
+  （ShellExecute），从下载来的 zip 里解压出来的 `.bat` 带 Mark-of-the-Web，会弹「打开文件 -
+  安全警告」等人点 —— 同样是我们看不见的卡死。
+- **包装脚本按 UTF-16LE + BOM 落盘**：WSH 读没有 BOM 的脚本时按系统 ANSI 解码，注释和中文
+  路径会变成乱码。
+
+`--autostart install` 做的是一次性注册一个计划任务（名字 `dsh-qq-bridge-napcat`）：
+
+- **登录时触发 + 以最高权限运行（`RunLevel: HighestAvailable`）**：不提权 QQ 会崩在
+  `QQNT.dll`（见[下一节](#为什么必须提权启动实测)），而计划任务让「提权」不再需要每次点 UAC
+  （`schtasks /run` 直接以最高权限起来）。
+- **`LogonType: InteractiveToken`**：必须跑在**用户会话**里。NapCat 要拉起 `QQ.exe` 并注入，
+  「不管用户是否登录都运行」会把进程扔进会话 0，那里 QQ 根本起不来。
+- **`MultipleInstancesPolicy: IgnoreNew` + `ExecutionTimeLimit: PT0S`**：不许起两份（抢同一个
+  QQ 和端口），也不许跑满默认的 72 小时被掐掉。
+- 装的时候顺手把 NapCat 的日志改成**写文件**（`config/napcat.json` 的 `consoleLog=false` /
+  `fileLog=true`，先备份、幂等，`--no-log-to-file` 可关）：窗口看不见了，日志是唯一的现场，
+  落在 `<NapCat>\logs\<时间戳>.log`（NapCat 自己按 5MB × 5 个轮转）。
+- 脚本会把 **WebUI 的地址与 token** 打出来（从 `config/webui.json` 读）。它是隐藏之后唯一
+  还看得见的「控制台」：**看日志、扫码登录、改配置都在那里** —— NapCat 的 WebUI 自带登录页
+  与二维码，所以「窗口藏起来就没法第一次扫码」并不成立。token 原本是打在控制台里的，现在从
+  那个文件里读给你。
+- 停止：`schtasks /end /tn dsh-qq-bridge-napcat`（必要时再跑一次 `<NapCat>\KillQQ.bat`）。
+  卸载：`--autostart remove`。
+
+**第一次登录仍然建议先看得见**：脚本在 `config/webui.json` 还不存在时（= 这份 NapCat 从没
+启动过）会**拦住** `--autostart install`，让你先跑一次 `--start --window normal` 扫码 ——
+那时既没有二维码可看、WebUI 也还没生成，隐藏启动等于把自己关在门外。知道自己在做什么就加
+`--force`（例如你打算装完再从 WebUI 登录）。
+
+> 在 DSH 自己的沙箱里跑这个脚本时，`schtasks` 与 CIM 会被拦下（实测报「无法从客户端中访问
+> CIM 资源」/「系统找不到指定的路径」）。**注册计划任务这一步请在普通终端里跑**（双击
+> `scripts\napcat-setup.cmd` 也算）。
 
 `--dry-run` 与真跑共用同一条代码路径，所以试运行的输出就是真会发生的事。脚本**不碰**
 `~/.dsh/.credentials.yaml`：模型凭据仍然在 DSH 的 Models 页面里填一次。
+
+### 为什么必须提权启动（实测）
+
+NapCat 官方文档让用户双击的是 `launcher.bat` —— 包里那几个启动器里，它是**会自己提权**的
+那个（`launcher-user.bat` 是刻意不提权的变体）。这不是洁癖，是一次实测的结论：
+
+| 启动方式 | 结果 |
+|---|---|
+| `launcher-user.bat`（普通用户） | 注入其实**成功**了（崩溃转储的模块列表里能看到 `NapCatWinBootHook.dll` 已加载、QQ 的 Node 运行时 `major.node` 也在），但 QQ 随后在 `QQNT.dll` 里撞 `0x80000003`（STATUS_BREAKPOINT）当场死掉，控制台只剩一句 `Process exited.` |
+| `launcher.bat`（管理员） | 正常起来：登录、监听端口、插件接上，全对 |
+
+当时的组合是 QQ 9.9.35-52892 + NapCat 4.18.38，而 NapCat 自己的 `qqnt.json` 与兼容表都覆盖
+这个 build（`9.9.35-52892-x64` 的发包/收包 RVA 都在表里），QQ 的安装目录也干净 —— 没有
+`loadNapCat` 之类的改动痕迹。所以这**不是**「QQ 版本不受支持」或「装坏了」。
+
+排查用的两处证据：崩溃转储在 `%LOCALAPPDATA%\CrashDumps\QQ.exe.*.dmp`（minidump 头部的
+模块列表能看出注入到底成没成），系统事件日志里则是 `APPCRASH / QQNT.dll`。
+
+`--start` 因此走「我们自己提权」（`Start-Process -Verb RunAs`），而不是 `cmd /c start`。
+看到 `Process exited.` 时先确认启动器是提权跑的那个，再看系统事件日志里的 `APPCRASH` 落在
+哪个模块。要连窗口一起免掉（也不再一次次点 UAC），装[计划任务](#不要那个黑框框推荐做法)。
 
 ### 装进 `desktop` profile 的四个代价（都处理掉了）
 
@@ -1422,6 +1513,11 @@ node scripts\napcat-setup.mjs --qq 123456    # NapCat 还没登录过时，先�
 
 找不到 NapCat 目录时只记一句 info（容器部署里它压根不在这个文件系统上，那不是错误）。
 `token` 不一致是最容易查半天的一种：WS 连上又立刻被拒，而日志里只有一句 `closed`。
+
+控制台里出现 **`Process exited.`**（QQ 刚起来就退了）是另一类问题，**不在插件能报的范围内**：
+十之八九是启动方式不对 —— 没用提权的 `launcher.bat`，见
+[为什么必须提权启动](#为什么必须提权启动实测)。判断顺序是先确认启动器，再看系统事件日志里的
+`APPCRASH` 落在哪个模块：落在 `QQNT.dll` 就是注入/兼容那半边的事，与插件配置无关。
 
 ### 目录、配置与文件都在哪
 

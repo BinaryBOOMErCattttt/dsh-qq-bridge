@@ -426,6 +426,22 @@ async function until(check, message, timeoutMs = 5000) {
   }
 }
 
+/**
+ * 等到「Agent 造出来了」**并且它的收件箱里已经有至少 `count` 条消息**。
+ *
+ * 为什么不只看 `host.list.created[0]`：假 Host 的 `create()` 是**如实照搬真宿主**的 ——
+ * Agent 对象先造出来并记进 `created`，消息由插件在**之后**才 `agent.followup(...)` 投进去
+ * （中间还隔着登记发言人、解环境上下文、挂提示词小节这些 await）。20ms 的轮询因此会偶尔
+ * 抢在投递之前断言，表现是「`inbox[0]` 是 undefined」或者 `completeTurn` 拿着
+ * `message: undefined` 去开 turn —— 本机在跑全量（机器较忙）时抓到过两次真实翻车。
+ *
+ * 所以「要读 inbox 的用例」统一用这个等待；只关心 Agent 被创建（例如断言创建了**几个**、
+ * 或只是想 emit 事件）的用例仍然直接用 `until(() => host.list.created[0], …)`。
+ */
+async function untilInbox(host, count = 1, message = 'the message to reach the Agent') {
+  return until(() => (host.list.created[0]?.inbox.length >= count ? host.list.created[0] : undefined), message);
+}
+
 /** 造一条私聊入站事件（发送者固定为该测试 QQ 号）。 */
 function privateMessage(text) {
   return {
@@ -652,12 +668,8 @@ test('a private message becomes an Agent turn whose reply returns to QQ', async 
       message: [{ type: 'text', data: { text: '你好' } }],
     });
 
-    // 等到消息真的投进 Agent 的收件箱，而不是「Agent 对象刚被造出来」：create() 里还有
-    // 落盘会话记录的异步步骤，只看 created[0] 会在它写盘的那一刻就抢先断言（偶发失败）。
-    const agent = await until(
-      () => (host.list.created[0]?.inbox.length === 1 ? host.list.created[0] : undefined),
-      'the private message to reach the Agent',
-    );
+    // 等到消息真的投进 Agent 的收件箱（理由见 untilInbox）。
+    const agent = await untilInbox(host, 1, 'the private message to reach the Agent');
     assert.deepEqual(agent.options, { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' });
     assert.equal(agent.inbox.length, 1);
     assert.equal(agent.inbox[0].content[0].text, '你好');
@@ -715,7 +727,9 @@ test('a group message only reaches the Agent when the bot is mentioned', async (
 
     // `@bot你好` 必须只去掉 @ 段，而不能连带吃掉后面的问候语。
     onebot.push(group([{ type: 'at', data: { qq: SELF_ID, name: '小助手' } }, { type: 'text', data: { text: '你好' } }]));
-    const agent = await until(() => host.list.created[0], 'the group Agent to be created');
+    // 与上面那条私聊用例同一个道理：群里这条路上还要登记发言人、解环境上下文，
+    // 所以等到消息真的进了收件箱再断言（理由见 untilInbox）。
+    const agent = await untilInbox(host, 1, 'the group message to reach the Agent');
     assert.equal(agent.inbox[0].content[0].text, '你好');
     // 渠道提示里应带上群号，让 Agent 知道自己在哪个群说话。
     assert.ok(promptText(host, 'qq-bridge:channel').includes('100000001'));
@@ -758,7 +772,7 @@ test('a bare @ still reaches the Agent with a note instead of being dropped', as
   const { onebot, host } = await boot();
   try {
     onebot.push(mention(''));
-    const agent = await until(() => host.list.created[0], 'the bare mention to create the Agent');
+    const agent = await untilInbox(host, 1, 'the bare mention to create the Agent');
     assert.equal(agent.inbox[0].content[0].text, '（@了你一下，没有说别的）');
 
     // 一轮正常的回复照常发得出去（模型回个「？」是最自然的反应）。
@@ -775,7 +789,7 @@ test('whitespace-only group messages count as blank, and groupTrigger: all says 
   try {
     // `all` 模式没有 @ 这回事，替身不该说「@ 了你一下」。
     onebot.push(groupText('   '));
-    const agent = await until(() => host.list.created[0], 'the blank message to create the Agent');
+    const agent = await untilInbox(host, 1, 'the blank message to create the Agent');
     assert.equal(agent.inbox[0].content[0].text, '（一条空消息，没有正文）');
   } finally {
     await onebot.close();
@@ -787,7 +801,7 @@ test('a whitespace-only private message is answered instead of ignored', async (
   const { onebot, host } = await boot();
   try {
     onebot.push(privateMessage('  '));
-    const agent = await until(() => host.list.created[0], 'the blank private message to create the Agent');
+    const agent = await untilInbox(host, 1, 'the blank private message to create the Agent');
     assert.equal(agent.inbox[0].content[0].text, '（对方发来一条空消息，什么都没写）');
 
     completeTurn(host, agent, '？', 1);
@@ -818,7 +832,7 @@ test('a bare @ never reaches the /jm bypass', async () => {
   const { onebot, host } = await boot();
   try {
     onebot.push(mention(''));
-    const agent = await until(() => host.list.created[0], 'the bare mention to create the Agent');
+    const agent = await untilInbox(host, 1, 'the bare mention to create the Agent');
     await settle(60);
     assert.equal(agent.inbox[0].content[0].text, '（@了你一下，没有说别的）');
     // 旁路会直接回一句「用法：…」并发文件；这里既没有那条回复，也没有任何 send_*。
@@ -1366,7 +1380,7 @@ test('the reset command opens a new session instead of deleting the old one', as
   const { onebot, host, sessionsRoot } = await boot({ resetUsers: [String(PRIVATE_USER_ID)] });
   try {
     onebot.push(privateMessage('你好'));
-    const first = await until(() => host.list.created[0], 'the Agent to be created');
+    const first = await untilInbox(host, 1, 'the Agent to be created');
     // 假后端在 create 时已落地磁盘记录，先确认它存在。
     const storedDir = join(sessionsRoot, '--fake-project--', first.id);
     assert.ok(existsSync(storedDir));
@@ -1516,7 +1530,7 @@ test('an empty resetCommand disables the reset handling', async () => {
   const { onebot, host } = await boot({ resetCommand: '' });
   try {
     onebot.push(privateMessage('/reset'));
-    const agent = await until(() => host.list.created[0], 'the Agent to be created');
+    const agent = await untilInbox(host, 1, 'the Agent to be created');
     assert.equal(agent.inbox.length, 1);
     assert.equal(agent.inbox[0].content[0].text, '/reset');
     assert.deepEqual(host.list.disposed, []);
@@ -2084,7 +2098,7 @@ test('an automatic reply is burst into short messages', async () => {
   });
   try {
     onebot.push(privateMessage('在吗'));
-    const agent = await until(() => host.list.created[0], 'the Agent');
+    const agent = await untilInbox(host, 1, 'the Agent');
     const started = Date.now();
     completeTurn(host, agent, reply);
 
@@ -2108,7 +2122,7 @@ test('humanize: false restores the single-message reply', async () => {
   const { onebot, host } = await boot({ humanize: false, burstMaxChars: 12 });
   try {
     onebot.push(privateMessage('在吗'));
-    const agent = await until(() => host.list.created[0], 'the Agent');
+    const agent = await untilInbox(host, 1, 'the Agent');
     completeTurn(host, agent, reply);
     const sent = await until(() => sentTexts(onebot, 'send_private_msg')[0], 'the reply');
     assert.equal(sent, reply);
@@ -2290,7 +2304,7 @@ test('auto reply style quotes only when someone spoke in between', async () => {
   try {
     // 没人插话：一轮问答本来就看得出来在回谁，裸文本就够了。
     onebot.push(mention('在吗', { messageId: 4242 }));
-    const agent = await until(() => host.list.created[0], 'the group Agent');
+    const agent = await untilInbox(host, 1, 'the group Agent');
     completeTurn(host, agent, '在的');
     assert.equal(await until(() => sentTexts(onebot)[0], 'the plain reply'), '在的');
 
@@ -2365,7 +2379,7 @@ test('a multiline group reply becomes separate messages with the quote only on t
   const { onebot, host } = await boot({ replyStyle: 'quote' });
   try {
     onebot.push(mention('在吗', { messageId: 4242 }));
-    const agent = await until(() => host.list.created[0], 'the group Agent');
+    const agent = await untilInbox(host, 1, 'the group Agent');
     completeTurn(host, agent, '在的\n刚吃完\n你呢');
     const sent = await until(() => {
       const list = sentTexts(onebot);
@@ -2394,7 +2408,7 @@ test('a reply can @ somebody by nickname, and raw QQ numbers never reach the cha
   try {
     // 第一个人 @ 了它，第二个人的名字要靠环境上下文/自己发言进名单。
     onebot.push(mention('在吗', { messageId: 5001, userId: 100000003, name: 'tomori', card: 'kaguya' }));
-    const agent = await until(() => host.list.created[0], 'the group Agent');
+    const agent = await untilInbox(host, 1, 'the group Agent');
     completeTurn(host, agent, '[[@kaguya]] 在的', 1);
     const sent = await until(() => sentTexts(onebot)[0], 'the mentioned reply');
     assert.deepEqual(sent, [
@@ -2444,7 +2458,7 @@ test('the @ list is per conversation: a group member is not mentionable in a pri
   try {
     // 先在群里认识 kaguya（他 @ 了机器人）。
     onebot.push(mention('在吗', { messageId: 5101, userId: 100000003, name: 'tomori', card: 'kaguya' }));
-    await until(() => host.list.created[0], 'the group Agent');
+    await untilInbox(host, 1, 'the group Agent');
     // 私聊里对方是另一个人，kaguya 不在这个会话的名单里。
     onebot.push(privateMessage('你好'));
     const priv = await until(() => host.list.created.find((entry) => entry.id !== host.list.created[0].id), 'the private Agent');
@@ -2462,7 +2476,7 @@ test('an @ in the reply keeps the quote head in front of it', async () => {
   const { onebot, host } = await boot({ replyStyle: 'quote' });
   try {
     onebot.push(mention('在吗', { messageId: 5201, userId: 100000003, name: 'tomori', card: 'kaguya' }));
-    const agent = await until(() => host.list.created[0], 'the group Agent');
+    const agent = await untilInbox(host, 1, 'the group Agent');
     completeTurn(host, agent, '[[@kaguya]] 在的', 1);
     const sent = await until(() => sentTexts(onebot)[0], 'the reply');
     assert.deepEqual(sent, [
@@ -3226,7 +3240,7 @@ test('a reply that is only a sticker marker sends one image and no text at all',
   for (const humanize of [true, false]) {
     const { onebot, host } = await bootImages({ humanize });
     onebot.push(privateMessage('在吗'));
-    const agent = await until(() => host.list.created[0], 'the Agent');
+    const agent = await untilInbox(host, 1, 'the Agent');
 
     completeTurn(host, agent, '[[图片: .qq-stickers/笑死.png]]');
     const sent = await until(
@@ -3250,7 +3264,7 @@ test('a sticker written as a bare file name is found in the sticker directory', 
   for (const source of ['笑死', '笑死.png', '.qq-stickers/笑死.png']) {
     const { onebot, host } = await bootImages();
     onebot.push(privateMessage('在吗'));
-    const agent = await until(() => host.list.created[0], 'the Agent');
+    const agent = await untilInbox(host, 1, 'the Agent');
 
     completeTurn(host, agent, `[[图片: ${source}]]`);
     const sent = await until(
@@ -3269,7 +3283,7 @@ test('a sticker written as a bare file name is found in the sticker directory', 
 test('a sticker marker inside a reply keeps its place between the text parts', async () => {
   const { onebot, host } = await bootImages();
   onebot.push(privateMessage('在吗'));
-  const agent = await until(() => host.list.created[0], 'the Agent');
+  const agent = await untilInbox(host, 1, 'the Agent');
 
   completeTurn(host, agent, '先说我一句\n[[图片: .qq-stickers/笑死.png]]\n再补一句');
   const calls = await until(() => {
@@ -3284,7 +3298,7 @@ test('a sticker marker inside a reply keeps its place between the text parts', a
 test('a group sticker-only reply still carries the reply target, on the image itself', async () => {
   const { onebot, host } = await bootImages({ replyStyle: 'quote' }, {}, {});
   onebot.push(mention('来一张'));
-  const agent = await until(() => host.list.created[0], 'the group Agent');
+  const agent = await untilInbox(host, 1, 'the group Agent');
 
   completeTurn(host, agent, '[[图片: .qq-stickers/笑死.png]]');
   const sent = await until(() => onebot.calls.find((call) => call.action === 'send_group_msg'), 'the group message');
@@ -3296,7 +3310,7 @@ test('a group sticker-only reply still carries the reply target, on the image it
 test('a sticker that cannot be sent says so instead of going silent', async () => {
   const { onebot, host } = await bootImages();
   onebot.push(privateMessage('在吗'));
-  const agent = await until(() => host.list.created[0], 'the Agent');
+  const agent = await untilInbox(host, 1, 'the Agent');
 
   completeTurn(host, agent, '[[图片: .qq-stickers/nope.png]]');
   const sent = await until(
@@ -3317,7 +3331,7 @@ test('the marker stays literal text when image sending is off or whitelisted awa
   for (const { config, hostOptions } of cases) {
     const { onebot, host } = await bootImages(config, hostOptions);
     onebot.push(privateMessage('在吗'));
-    const agent = await until(() => host.list.created[0], 'the Agent');
+    const agent = await untilInbox(host, 1, 'the Agent');
     completeTurn(host, agent, '[[图片: .qq-stickers/笑死.png]]');
     const text = await until(() => sentTexts(onebot, 'send_private_msg')[0], 'the literal line');
     assert.equal(text, '[[图片: .qq-stickers/笑死.png]]');
@@ -3372,7 +3386,7 @@ test('an empty jmCommand lets the message through to the Agent', async () => {
   const { onebot, host } = await bootJm({ jmCommand: '' });
   onebot.push(privateMessage('/jm 422866'));
 
-  const agent = await until(() => host.list.created[0], 'the conversation Agent to be created');
+  const agent = await untilInbox(host, 1, 'the conversation Agent to be created');
   assert.equal(agent.inbox[0].content[0].text, '/jm 422866');
   assert.equal(onebot.calls.some((call) => call.action === 'upload_private_file'), false);
 });
@@ -3666,7 +3680,7 @@ test('a digest sweep summarizes a conversation that has something new', async ()
   const { onebot, host, cwd } = await bootMemory({ digestMinLines: 2, apiKeyRotate: false });
   onebot.push(privateMessage('第一条'));
   onebot.push(privateMessage('第二条'));
-  await until(() => host.list.created[0], 'the conversation Agent to be created');
+  await untilInbox(host, 1, 'the conversation Agent to be created');
 
   // 定时器是每天一次的「下一个 04:00」：不是固定周期，所以间隔必须落在
   // (0, 24h] 里，且大致等于「距下一个整点还有多久」。
