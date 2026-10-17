@@ -153,6 +153,12 @@ export function createSettings(config, defaultCwd) {
   const pokeReplyChance = Math.min(1, Math.max(0, Number(config.pokeReplyChance)));
   const pokeCooldownMs = msOf(config.pokeCooldownMs, 30000);
   const pokeDailyMax = msOf(config.pokeDailyMax, 20);
+  // 撤回：概率夹到 0~1（NaN 保持 NaN —— `recallAction` 里 `roll < NaN` 恒假 = 不补一句，
+  // 比「按一个莫名其妙的概率乱开口」安全）；其余三项是毫秒/次数，负数按 0 算（= 不限）。
+  const recallChance = Math.min(1, Math.max(0, Number(config.recallChance)));
+  const recallCooldownMs = msOf(config.recallCooldownMs, 60000);
+  const recallDailyMax = msOf(config.recallDailyMax, 5);
+  const recallMaxAgeMs = msOf(config.recallMaxAgeMs, 120000);
 
   // —— 主动说话 ——
   const proactiveIdleMs = msOf(config.proactiveIdleMs, 45 * 60 * 1000);
@@ -268,6 +274,10 @@ export function createSettings(config, defaultCwd) {
     pokeReplyChance,
     pokeCooldownMs,
     pokeDailyMax,
+    recallChance,
+    recallCooldownMs,
+    recallDailyMax,
+    recallMaxAgeMs,
     proactiveIdleMs,
     proactiveFreshMs,
     proactiveGapMs,

@@ -333,6 +333,43 @@ export function createMemory(deps) {
   }
 
   /**
+   * 一条消息被撤回时，在转录里追加一行 tombstone。
+   *
+   * 为什么是**追加**而不是删掉原来那行：转录是只追加的原料，删行要重写文件，既破坏
+   * 「写边界只有一处」（`memoryRelativePath`）的约定，也会让摘要状态（`lastDigestAt` /
+   * `memoryDirty`）跟着要改。留一行标记的好处是双向的：摘要 Agent 能看出「这句撤了、
+   * 别当事实」，而原文仍然在（群友自己回头查也查得到）。
+   *
+   * `kind: 'recall'` 让 `qq_transcript` 与 `renderTranscriptWindow` 都能一眼认出来；
+   * `text` 填一句话而不是空串 —— 两处渲染都是直接拼 `text`，空串会显示成「kaguya: 」。
+   * 措辞刻意是中性的：管理员替别人撤了话时，「撤回了自己上一条」是错的。
+   *
+   * 写失败只记 warn（`appendTranscript` 本来就是尽力而为），不影响那一轮回复。
+   *
+   * @param key - 会话 key（`group:<群号>` / `private:<QQ号>`）。
+   * @param info.messageId - 被撤回那条的 message_id（与转录里的 `id` 对得上）。
+   * @param info.userId - 被撤回那条的发送者。
+   * @param info.name - 当时的显示名。
+   * @param info.addressed - 那条当时是不是在叫它。
+   */
+  function noteRecall(key, info = {}) {
+    if (!memoryEnabled) return;
+    const date = localDate();
+    appendTranscript(key, {
+      at: Date.now(),
+      date,
+      kind: 'recall',
+      recall: String(info.messageId ?? ''),
+      user: String(info.userId ?? ''),
+      name: String(info.name ?? ''),
+      addressed: info.addressed === true,
+      text: '（这条消息后来被撤回了）',
+    }, date);
+    // 这也是一行新素材：摘要该看见它（`digestMinLines` 的门槛算的是「有新东西」）。
+    memoryDirty.set(key, (memoryDirty.get(key) ?? 0) + 1);
+  }
+
+  /**
    * 「今天已经过了摘要点、但这个会话今天还没摘要过」时补一次。
    *
    * 为什么不能只在启动时扫一遍：`conversations` 是运行时状态（重启即空），凌晨重启后
@@ -395,7 +432,10 @@ export function createMemory(deps) {
       const pad = (value) => String(value).padStart(2, '0');
       const stamp = `${pad(when.getHours())}:${pad(when.getMinutes())}`;
       const who = String(line.name ?? line.user ?? '?');
-      const tags = [line.kind === 'private' ? '私聊' : '群'];
+      // `kind: 'recall'` 是 tombstone（见 noteRecall）：一整行只标「撤回」，摘要 agent
+      // 一眼就能看出那条被撤了、别当事实。渲染窗口本来就是**一个会话**的行，所以不写
+      // 「群 / 私聊」也不丢信息。
+      const tags = [line.kind === 'recall' ? '撤回' : line.kind === 'private' ? '私聊' : '群'];
       if (line.addressed === true) tags.push('被叫到');
       if (line.command !== undefined) tags.push(`指令:${line.command}`);
       if (line.hasMedia === true) tags.push('带图');
@@ -1356,6 +1396,8 @@ export function createMemory(deps) {
     label: memoryLabel,
     /** handleEvent 每收到一条别人的消息调一次（后台追加，不等落盘）。 */
     rememberTranscript,
+    /** 收到撤回通知时调一次：在转录里追加一行「已撤回」标记（见 `noteRecall`）。 */
+    noteRecall,
     /** 渠道提示里那段记忆索引（原文 `memoryIndexText`）。 */
     indexText: memoryIndexText,
     /** 渠道提示里的表情包目录与热梗段（同步读数，见 `catalogState`）。 */

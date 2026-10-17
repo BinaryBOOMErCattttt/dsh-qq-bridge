@@ -59,6 +59,7 @@ import { builtinStyle, classifyReply, createStyle, planBubbles, renderStyleContr
 import { createPersona, renderPersona } from './persona.js';
 import { observationOf, renderObservation } from './modalities.js';
 import { pokeAction, pokeActionType, pokeNudge, pokeNotice } from './interactions.js';
+import { recallAction, recallLine, recallNudge, recallNotice } from './recall.js';
 import { fetchPageTitle, previewLine } from './links.js';
 import { decideGroupTurn, interjectBatchPrompt, interjectLine } from './speech-policy.js';
 import {
@@ -153,6 +154,22 @@ const STICKER_FAILURE_TTL_MS = 10 * 60 * 1000;
  * 大群的长期运行把这份缓冲撑大 —— 超了就丢最早登记的那个。
  */
 const PARTICIPANT_MAX = 64;
+
+/**
+ * 每个会话记住多少条「最近看见过的消息」（见 `recent` / `noteSeen`）。
+ *
+ * 撤回通常紧跟在消息之后：30 条大约是一两分钟的群聊量，够覆盖「刚发就撤」与
+ * 「聊了几句之后回去撤」这两种真实情形，又不会把不可信文本无限期留在内存里。
+ */
+const RECENT_MAX = 30;
+
+/**
+ * 「最近看见过」里每条正文最多留多少字。
+ *
+ * 只有 `recallTeaseQuote` 打开时才可能进提示词，其余时候只给日志用；截短是为了别让
+ * 一个刷屏的长消息在内存里留一整段（QQ 消息是不可信输入，能不长期留就不留）。
+ */
+const RECENT_TEXT_MAX = 80;
 
 /**
  * 默认的「群友口吻」，注入系统提示的 QQ 渠道小节（人设槽的兜底）。
@@ -295,13 +312,25 @@ export function apply(ctx, config) {
   /** `<sessionId>:<turn>` → 本轮已累积的 assistant 文本片段。 */
   const transcripts = new Map();
   /**
-   * 群号 → 群里的最近消息（`{ name, text }`，旧 → 新）。
+   * 群号 → 群里的最近消息（`{ id, name, text }`，旧 → 新）。
    *
    * 只记「不是发给机器人的」那些消息：真人回话前是先看着群里在聊什么，
    * 而不是只看到 @ 自己的那一句。缓冲单独按群号存，而不是挂在会话记录上 ——
    * 没被 @ 的消息不该因此凭空造出一条会话。
    */
   const ambient = new Map();
+  /**
+   * 会话 key → 最近看见过的消息（`{ id, userId, name, text, at, addressed, submitted,
+   * replied, recalled, action }`，旧 → 新）。
+   *
+   * **为什么要有这份账**：QQ 不提供「回查某条已撤回消息」的接口（`get_msg` 对撤掉的 id
+   * 要么报错、要么返回空，各实现还不一致），所以「他到底撤了哪句」只能在收到消息的那一刻
+   * 自己记下来 —— 撤回事件里只有一个 `message_id`。
+   *
+   * 与 `ambient` 同级、同样**不落盘**：重启之后撤回一条重启前的消息本来就无从谈起，
+   * 而把不可信文本长期留在内存之外的地方并不是我们想额外换来的东西。
+   */
+  const recent = new Map();
   /**
    * 群里「谁在说话」的三本账：插话序号 / 回答指向 / 热度窗口。
    *
@@ -1811,6 +1840,12 @@ export function apply(ctx, config) {
     conversation.activeInterposeSeq = 0;
     conversation.activeTurns = 0;
     conversation.pendingIntent = undefined;
+    // 撤回：上一轮那些消息连同「最近看见过」的账一起忘掉 —— 新开一轮不该拿上一轮的
+    // 撤回开玩笑（那已经是另一段对话里的事了）。
+    recent.delete(conversation.key);
+    conversation.recallAt = 0;
+    conversation.recallDay = '';
+    conversation.recallToday = 0;
     // 上一轮「那张表情没发出去」也一起忘：新一轮不该还惦记着上一轮想发的东西。
     conversation.stickerFailure = undefined;
     // 抽卡的累计也一起忘：新开一轮的第一句不该继承上一轮攒下的「保底」。
@@ -1935,6 +1970,16 @@ export function apply(ctx, config) {
       pokeAt: 0,
       pokeDay: '',
       pokeToday: 0,
+      /**
+       * 撤回调侃的记账（见 `handleRecall`）：`recallAt` 是上次开口的时刻（冷却用），
+       * `recallDay` / `recallToday` 是当天的次数（跨天就地归零，与 `poke*` 同一套路）。
+       *
+       * 只记「**补一句**」这件事：把本来就要发的那一轮改写成调侃不增加消息数，所以
+       * 不吃冷却与上限 —— 那两道闸管的是「真多发一条」。
+       */
+      recallAt: 0,
+      recallDay: '',
+      recallToday: 0,
       chimeTimer: undefined,
       chimeSeq: 0,
       chimeCount: 0,
@@ -2276,6 +2321,94 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 记一条「它看见过这个会话里的这句话」—— 撤回时唯一能回答「撤的是哪句」的账。
+   *
+   * 三条纪律，都是刻意与别的缓冲对齐的：
+   *
+   *   1. **必须在 `admit` 之前**：`admit` 会快照 `quote`（撤回时要清的是同一个对象），
+   *      而且 `admit === undefined` 的闲聊也要记 —— 撤回不认「有没有 @ 它」。
+   *      它在 `handleEvent` 里紧跟「这条是不是消息」的判定，于是所有提前 `return`
+   *      都在它后面，「刚发就撤」的那几十毫秒不会漏。
+   *   2. **准入边界照抄 `rememberTranscript`**（渠道开关 + 白名单）：不设这一道，等于
+   *      给没被允许的群/陌生人开了一个「把文本留在内存里」的入口。
+   *   3. **机器人自己的消息不记**：管理员撤了它的话是另一件事，混进来会让撤回判据把
+   *      「我的话被撤了」当成「别人撤了」。
+   *
+   * `text` 用**占位符**版本（`[图片]` / `[表情]`）：撤回时不会为它去下载媒体，而这段文字
+   * 默认根本不进提示词（只有 `recallTeaseQuote` 打开时才用），这里主要是给日志与可选引用。
+   *
+   * @param event - 已解码的 OneBot 事件。
+   * @param selfId - 机器人自己的 QQ 号。
+   */
+  function noteSeen(event, selfId) {
+    if (event?.post_type !== 'message') return;
+    if (selfId === '' || String(event.user_id ?? '') === String(selfId)) return;
+    const isGroup = event.message_type === 'group';
+    if (isGroup) {
+      if (!settings.groupChat) return;
+      const groupId = String(event.group_id);
+      if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(groupId)) return;
+    } else {
+      if (!settings.privateChat) return;
+      const userId = String(event.user_id);
+      if (settings.allowUsers.length > 0 && !settings.allowUsers.includes(userId)) return;
+    }
+    const message = event.message ?? event.raw_message;
+    const sender = event.sender ?? {};
+    // 这一段与 `admit` 里的「显式触发」逐字对齐：撤回时判的必须是**当时**那个结论，
+    // 不能重新猜一遍（两条判据一旦分开写，早晚会对不上）。
+    const addressed = isGroup
+      ? settings.groupTrigger === 'all'
+        || mentions(message, selfId)
+        || (settings.groupTrigger === 'prefix' && messageToText(message).trimStart().startsWith(settings.prefix))
+      // 私聊的每条消息本来都是「跟它说的」，与 `admit` 的私聊分支同口径。
+      : true;
+    const key = isGroup ? `group:${event.group_id}` : `private:${event.user_id}`;
+    const entry = {
+      id: String(event.message_id ?? ''),
+      userId: String(event.user_id ?? ''),
+      // 与正文里的 `昵称: 内容` 和 `[[@昵称]]` 用的是同一串字（群名片优先，见 userDisplayName）。
+      name: userDisplayName(sender, event.user_id),
+      text: messageToText(message, selfId).replace(/\s+/g, ' ').trim().slice(0, RECENT_TEXT_MAX),
+      at: Date.now(),
+      addressed,
+      // 三个进度/决定字段的语义要分清：`recalled` 是**事实**（去重）、`action` 是**决定**
+      // （这条不许投 / 投的时候换成撤回提示）、`submitted` / `replied` 是**进度**。
+      // 混成一个布尔值，「照常答、只是不引用」那条路就没法表达。
+      submitted: false,
+      replied: false,
+      recalled: false,
+      action: undefined,
+    };
+    const list = recent.get(key) ?? [];
+    list.push(entry);
+    if (list.length > RECENT_MAX) list.splice(0, list.length - RECENT_MAX);
+    recent.set(key, list);
+  }
+
+  /**
+   * 在「最近看见过」里按 `message_id` 找一条。
+   *
+   * id 一律 `String()` 再比：OneBot 实现有时给数字、有时给字符串（`toId` 同口径）。
+   * 找不到就是**没看见过** —— 那是一个有效状态（重启后、或者这条消息本来就落在窗口外），
+   * 不是错误。
+   *
+   * @param key - 会话 key。
+   * @param messageId - 撤回事件里的 `message_id`。
+   * @returns 账上的那一条；没有时 undefined。
+   */
+  function findRecent(key, messageId) {
+    const id = String(messageId ?? '');
+    if (id.length === 0) return undefined;
+    const list = recent.get(key);
+    if (list === undefined) return undefined;
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      if (list[index].id === id) return list[index];
+    }
+    return undefined;
+  }
+
+  /**
    * 把一条「不是发给机器人」的群消息记进环境缓冲。
    *
    * 只有被 admit 丢掉的消息才会走到这里：被 @ 的那条会作为 user message 进入会话，
@@ -2301,7 +2434,10 @@ export function apply(ctx, config) {
     const name = String(sender.card ?? sender.nickname ?? event.user_id ?? '某人');
     const lineChars = Math.max(1, Math.floor(Number(settings.ambientLineChars) || 120));
     const list = ambient.get(groupId) ?? [];
-    const entry = { name, text: text.slice(0, lineChars) };
+    // `id` 是为了「撤回时精确摘掉那一行」。删除必须按 id 或对象引用，**不能按文本比**：
+    // 下一行的 `hydrateAmbientMedia` 会把这个 `text` 异步改写成带本地路径的版本，
+    // 落盘前后文本不一样。
+    const entry = { id: String(event.message_id ?? ''), name, text: text.slice(0, lineChars) };
     list.push(entry);
     while (list.length > limit) list.shift();
     ambient.set(groupId, list);
@@ -3201,7 +3337,7 @@ export function apply(ctx, config) {
    * 已经被改写成带路径的版本。整条链路失败也只是继续显示朴素占位符。
    *
    * @param message - 那条闲聊消息的 `message` 字段。
-   * @param entry - 已推进 `ambient` 缓冲区的条目（`{ name, text }`，就地改写 `text`）。
+   * @param entry - 已推进 `ambient` 缓冲区的条目（`{ id, name, text }`，就地改写 `text`）。
    * @param lineChars - 单行字符上限（与初次渲染时用的是同一个值）。
    */
   async function hydrateAmbientMedia(message, entry, lineChars) {
@@ -3318,16 +3454,33 @@ export function apply(ctx, config) {
       const selfId = client.selfId;
       const entries = [];
       for (const item of batch) {
+        // 撤回的两种处理都在账上查：`action: 'drop'` 是「摘除的第二道」—— 这一批可能
+        // 已经被 splice 出来、正在异步下媒体，那时数组里已经没有它，摘不掉了。
+        const mark = findRecent(conversation.key, item.messageId);
+        if (mark?.action === 'drop') continue;
         // 本条自己的图和「它在回复的那条」里的图一起取：两件事互不依赖，串起来等只是白等。
         const [resolved, quote] = await Promise.all([mediaFor(item.message), resolveQuote(item.message)]);
+        // 再查一次：撤回可能就发生在这几十毫秒里（我们正在下媒体），而上面那次查是 await
+        // 之前 —— 一次不够，正是这段异步窗口逼出了「把 action 记在账上」这个设计。
+        if (mark?.action === 'drop') continue;
         // 引用成功时把 `[回复]` 占位符换成真正的引用前缀：否则模型会看到
         // 「（引用 kaguya: …）\n[回复]这啥」这种一半有内容、一半是噪音的正文。
         const rendered = new Map(resolved?.rendered ?? []);
         if (quote !== undefined) rendered.set(quote.index, '');
         // 活跃对话里接上的那句没有前缀可去：按前缀长度硬切会把「然后呢」切成「后呢」。
         const raw = messageToText(item.message, selfId, rendered.size > 0 ? rendered : undefined).trim();
-        const body = item.continued === true ? raw : dropPrefix(raw);
-        const composed = quote === undefined
+        // 改写成撤回提示：这一轮本来就为它开，模型在**同一轮**里看到「他 @ 了我又撤了」，
+        // 回一句就够 —— 不必先回一句正经的、再补一句调侃（那是两连发）。正文整个换掉，
+        // 连「他引用了谁」那一段也不接：被引用的那条正是已经不在的那条。
+        const rewritten = mark?.action === 'rewrite'
+          ? recallLine({
+              name: mark.name,
+              text: settings.recallTeaseQuote === true ? mark.text : undefined,
+              imageAllowed: imageAllowed(),
+            })
+          : undefined;
+        const body = rewritten ?? (item.continued === true ? raw : dropPrefix(raw));
+        const composed = rewritten !== undefined || quote === undefined
           ? body
           : body.length > 0
             ? `${quotePrefix(quote)}\n${body}`
@@ -3339,7 +3492,14 @@ export function apply(ctx, config) {
         // 裸 URL 可选地取一次标题（`linkPreview` 默认关：替群友访问任意 URL 是把部署机器的
         // 出口 IP 暴露给发链接的人，卡片消息不联网就能解析，已经够用）。
         const withLinks = await previewLinks(text);
-        entries.push({ name: item.name, id: item.userId, body: withLinks, blank: item.blankBody !== undefined && item.blankBody.length > 0 && withLinks === item.blankBody });
+        entries.push({
+          name: item.name,
+          id: item.userId,
+          body: withLinks,
+          // 投递之后要能对回账上那一条（`submitted` / `replied` 两个进度，见 handleRecall）。
+          messageId: String(item.messageId ?? ''),
+          blank: item.blankBody !== undefined && item.blankBody.length > 0 && withLinks === item.blankBody,
+        });
       }
       if (entries.length === 0) return;
       // 这一轮为什么轮到它：必须在渲染正文**之前**算出来（插话轮的正文要用它），
@@ -3364,8 +3524,15 @@ export function apply(ctx, config) {
         content: [{ type: 'text', text }],
         source: { kind: 'user' },
       });
+      // 只算**真正投进这一轮**的那些（被 `action: 'drop'` 摘掉的那条不在 entries 里）：
+      // `turn/end` 之后靠它把账上那几条标成「已回复」。
+      const batchIds = entries.map((entry) => entry.messageId).filter((id) => id.length > 0);
+      for (const id of batchIds) {
+        const mark = findRecent(conversation.key, id);
+        if (mark !== undefined) mark.submitted = true;
+      }
       // `blank`：这一批整批都是「空消息的替身」时，回复之后不挂补一句（那一轮没话题）。
-      submitted.set(userMessage.id, { key: conversation.key, quote: batchQuote(batch), intent, blank: entries.every((entry) => entry.blank === true) });
+      submitted.set(userMessage.id, { key: conversation.key, quote: batchQuote(batch), intent, batchIds, blank: entries.every((entry) => entry.blank === true) });
       agent.followup(userMessage);
     });
   }
@@ -3584,17 +3751,282 @@ export function apply(ctx, config) {
     });
   }
 
+  /**
+   * 撤回事件的准入：与 `handlePoke` / `rememberTranscript` 同一条纪律。
+   *
+   * 只看「这个渠道本身开没开、这个群/人允不允许」——`recallPrivate` 不在这里，
+   * 它管的是**行为层**（要不要把它当成一件值得回应的事），而安全层（清引用）对私聊
+   * 同样要做，否则私聊里引用一条已撤回的消息照样会把整条回复卡住（见 §1.4）。
+   *
+   * @param type - `'group'` / `'private'`。
+   * @param id - 群号或 QQ 号。
+   * @returns 这个渠道的撤回事件能不能进后续处理。
+   */
+  function recallInScope(type, id) {
+    if (type === 'group') {
+      if (!settings.groupChat) return false;
+      return settings.allowGroups.length === 0 || settings.allowGroups.includes(id);
+    }
+    if (!settings.privateChat) return false;
+    return settings.allowUsers.length === 0 || settings.allowUsers.includes(id);
+  }
+
+  /**
+   * 清掉「指向这条消息」的引用 —— **撤回事件里永远做，与任何模式无关**。
+   *
+   * 为什么这不是可选的优化，而是正确性：`quote` 对象在 `pending` 条目、`submitted`、
+   * `turnOwners` 里是**同一个引用**（`submitBatch` 用 `batchQuote(batch)` 取它，claim 时
+   * 整个 owner 对象搬到 `turnOwners`，`turn/end` 又原样交给 `sendToConversation`），
+   * 所以一次遍历就三处生效 —— 反过来说，**别复制新对象**，那会让清引用只清到一处。
+   *
+   * 只清 `messageId`、留着 `userId` 是刻意的：`quoteHead` 本来就有这条降级（「锚点没取到
+   * （撤回 / 实现不支持）时退化成 @ 说话人」），于是四档 `replyStyle` 全部自动正确。
+   *
+   * 不这么做会怎样（真实链路）：`sendOne` 失败时只记一条 warn 并返回 false，
+   * `sendParts` 的循环见到 false 就 `return` —— 这条回复**剩下的气泡一起不发**，
+   * 群里看到的是「它没理人」，日志里只有一行 warn。
+   *
+   * @param key - 会话 key。
+   * @param messageId - 被撤回的那条消息的 id。
+   */
+  function clearQuoteFor(key, messageId) {
+    const id = String(messageId ?? '');
+    if (id.length === 0) return;
+    const quotes = [];
+    for (const item of conversations.get(key)?.pending ?? []) quotes.push(item.quote);
+    for (const owner of submitted.values()) if (owner?.key === key) quotes.push(owner.quote);
+    for (const owner of turnOwners.values()) if (owner?.key === key) quotes.push(owner.quote);
+    for (const quote of quotes) {
+      if (quote !== undefined && String(quote.messageId) === id) quote.messageId = '';
+    }
+  }
+
+  /**
+   * 从攒批里摘掉一条。
+   *
+   * 摘空了就**只清定时器、绝不 flush**：`flushBatch` 对空数组会直接 return，但那样等于
+   * 白等一个窗口（而且读起来像是在「投递一个空批」）。
+   *
+   * 找不到也正常：这一批可能已经被 `flushBatch` 取走、正在 `submitBatch` 里异步下媒体，
+   * 那时数组里已经没有它了 —— 那种情况由账上的 `action: 'drop'` 兜住（见 `submitBatch`）。
+   *
+   * @param conversation - 目标会话（可能还没有会话记录）。
+   * @param messageId - 要摘掉的那条消息 id。
+   * @returns 真的从数组里摘掉了为 true。
+   */
+  function dropPending(conversation, messageId) {
+    if (conversation === undefined) return false;
+    const id = String(messageId ?? '');
+    const at = conversation.pending.findIndex((item) => String(item.messageId ?? '') === id);
+    if (at < 0) return false;
+    conversation.pending.splice(at, 1);
+    if (conversation.pending.length === 0 && conversation.batchTimer !== undefined) {
+      clearTimeout(conversation.batchTimer);
+      conversation.batchTimer = undefined;
+    }
+    return true;
+  }
+
+  /**
+   * 从群聊环境上下文里删掉这一行。
+   *
+   * 「假装没看到」必须连这里也一起删：没 @ 它的消息只进 `ambient`，不删的话模型下次
+   * 被 @ 时又在「群里最近的消息」里读到那句已经撤掉的话。
+   *
+   * **按 id 删，不能按文本比**：`hydrateAmbientMedia` 会把 `text` 异步改写成带本地路径的
+   * 版本，落盘前后文本不一样。
+   *
+   * @param groupId - 群号（私聊没有环境上下文）。
+   * @param messageId - 要删掉的那条消息 id。
+   */
+  function dropAmbient(groupId, messageId) {
+    if (groupId === undefined) return;
+    const id = String(messageId ?? '');
+    if (id.length === 0) return;
+    const list = ambient.get(String(groupId));
+    if (list === undefined) return;
+    const at = list.findIndex((item) => String(item.id ?? '') === id);
+    if (at >= 0) list.splice(at, 1);
+  }
+
+  /** 这个会话今天已经为撤回补了几句（跨天就地归零，与 `pokeTodayUsed` 同一套路）。 */
+  function recallTodayUsed(conversation) {
+    const today = localDate();
+    if (conversation.recallDay !== today) {
+      conversation.recallDay = today;
+      conversation.recallToday = 0;
+    }
+    return conversation.recallToday ?? 0;
+  }
+
+  /**
+   * 把「这一轮的回复真要发出去了」记到账上（`replied`）。
+   *
+   * 只算**真正投进这一轮**的那些（`batchIds` 来自 `entries`，被 `action: 'drop'` 摘掉的
+   * 那条不在里面）。SKIP / 出错 / 中止的分支不调它 —— 它没回过，nudge 里就不能说
+   * 「你已经回过了」。
+   *
+   * @param owner - `turnOwners` 里的那条归属记录。
+   */
+  function markReplied(owner) {
+    for (const id of owner?.batchIds ?? []) {
+      const entry = findRecent(owner.key, id);
+      if (entry !== undefined) entry.replied = true;
+    }
+  }
+
+  /**
+   * 撤回：OneBot v11 的 `notice` / `group_recall`（群）与 `friend_recall`（私聊）。
+   *
+   * 三层，前两层永远生效，第三层才是配置项：
+   *
+   *   1. **安全层** —— 清掉指向这条消息的引用。不做的话，一条引用已撤回消息的回复会在
+   *      发送时失败，并把**剩下所有气泡**一起吞掉（见 `clearQuoteFor`）。
+   *   2. **数据层** —— 在「最近看见过」的账里对出「撤的是哪句、谁发的、有没有 @ 过它」。
+   *      QQ 不给回查接口，这就是唯一的信息来源；查不到就只记一条 info（「没看见」是一个
+   *      有效状态，不是错误）。
+   *   3. **行为层** —— 由 `recallMode` / `recallAddressed` / `recallScope` 决定：投递前
+   *      摘除或改写成撤回提示，已经回过的按 `recallAction` 的闸门补一句。
+   *
+   * 记账刻意在**发出去之前**（与 poke / proactive 同一条规矩）：掷中即消耗，判成 SKIP 也算。
+   *
+   * @param event - 已解码的 OneBot 事件。
+   * @param selfId - 机器人自己的 QQ 号。
+   */
+  function handleRecall(event, selfId) {
+    const notice = recallNotice(event);
+    if (notice === undefined) return;
+    const type = notice.groupId !== undefined ? 'group' : 'private';
+    const id = type === 'group' ? notice.groupId : notice.userId;
+    if (!recallInScope(type, id)) return;
+    const key = `${type}:${id}`;
+
+    // ① 安全层：不管哪种模式、账上有没有，先清引用。
+    clearQuoteFor(key, notice.messageId);
+
+    // 私聊的**行为层**默认关（`recallPrivate`）：清引用照做，但不当成一件要回应的事。
+    if (type === 'private' && settings.recallPrivate !== true) return;
+
+    // ② 数据层。
+    const entry = findRecent(key, notice.messageId);
+    if (entry === undefined) {
+      report('info', `${key} 撤回了一条没见过的消息（${notice.messageId}）`);
+      return;
+    }
+    // 同一个撤回可能被重复上报：只处理一次（`action` 本身幂等，冷却再兜一层）。
+    if (entry.recalled === true) return;
+    entry.recalled = true;
+
+    const conversation = conversations.get(key);
+    const addressed = entry.addressed === true;
+    const mode = settings.recallMode;
+
+    // 长期记忆：留一行 tombstone（不影响回复；写失败只记 warn，见 memory.noteRecall）。
+    if (settings.recallMemoryMark === true) {
+      memory.noteRecall(key, {
+        messageId: notice.messageId,
+        userId: entry.userId,
+        name: entry.name,
+        addressed,
+      });
+    }
+
+    // ③ 投递决策（`off` 什么都不动）：还没进模型的，没 @ 它的一律摘；被 @ 的看
+    //    `recallAddressed`。已经投递的那条只能走「清引用 +（tease 时）补一句」。
+    if (mode !== 'off' && entry.submitted !== true) {
+      const drop = !addressed || settings.recallAddressed === 'drop';
+      if (drop) {
+        // 标记记在账上而不是只改 `pending` 数组：`submitBatch` 可能已经把这批 splice
+        // 出去、正在异步下媒体，那时数组里已经没有它了，但循环还没走到它。
+        entry.action = 'drop';
+        dropPending(conversation, notice.messageId);
+        dropAmbient(notice.groupId, notice.messageId);
+        report('info', `${key} 被撤回的那条不再投递（${addressed ? 'recallAddressed=drop' : '没有被 @'}）`);
+      } else if (mode === 'tease') {
+        // 改写只改「正文怎么渲染」，别的都不动：userId / name 留着（名单登记与 `[[@昵称]]`
+        // 照常），`intent` 仍按这一批算，引用那一路由 `clearQuoteFor` 兜住。
+        entry.action = 'rewrite';
+        report('info', `${key} 被 @ 的那条被撤回了，这一轮改成调侃`);
+      } else {
+        report('info', `${key} 被 @ 的那条被撤回了，照常回答（不引用）`);
+      }
+    }
+
+    // ④ 反应：只有 tease 会「补一句」；被 @ 的那条已经在改写里处理，不再叠一条。
+    if (mode !== 'tease') return;
+    if (conversation === undefined) return;
+    if (entry.submitted !== true && addressed) return;
+    const now = Date.now();
+    const decision = recallAction({
+      mode,
+      selfId: String(selfId),
+      messageId: notice.messageId,
+      userId: notice.userId,
+      operatorId: notice.operatorId,
+      seen: true,
+      addressed,
+      replied: entry.replied === true,
+      scope: settings.recallScope,
+      ageMs: now - (Number(entry.at) || 0),
+      maxAgeMs: settings.recallMaxAgeMs,
+      busy: busyWithTurn(conversation),
+      cooldownLeftMs: Math.max(0, (Number(conversation.recallAt) || 0) + settings.recallCooldownMs - now),
+      // 这个读数带「跨天就地归零」的副作用，所以只有走到这里才取 —— 判据本身是纯的。
+      todayCount: recallTodayUsed(conversation),
+      dailyMax: settings.recallDailyMax,
+      chance: settings.recallChance,
+      roll: Math.random(),
+    });
+    if (decision.act === 'none') {
+      report('info', `${describeConversation(conversation)} 撤回不调侃（${decision.reason}）`);
+      return;
+    }
+    // 先记账再发（与 poke / proactive 同一条规矩：掷中即消耗，SKIP 也算）。
+    conversation.recallAt = now;
+    conversation.recallToday = recallTodayUsed(conversation) + 1;
+    conversation.pendingIntent = 'recall';
+    enqueue(conversation, async () => {
+      try {
+        const agent = await ensureAgent(conversation);
+        const text = recallNudge({
+          name: entry.name,
+          // 默认连原文都不给它（`recallTeaseQuote`）：复述别人撤掉的话是最常见的社交事故。
+          text: settings.recallTeaseQuote === true ? entry.text : undefined,
+          replied: entry.replied === true,
+          imageAllowed: imageAllowed(),
+        });
+        const userMessage = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } });
+        // `proactive: true` 的三个现成语义正好都要：出错不道歉（没人问过它）、SKIP 全局
+        // 静默、不挂补一句（否则它会补一句再补一句）。
+        submitted.set(userMessage.id, {
+          key: conversation.key,
+          quote: { messageId: '', userId: '', seq: 0 },
+          proactive: true,
+          intent: 'recall',
+        });
+        agent.followup(userMessage);
+      } catch (error) {
+        report('warn', `recall turn for ${conversation.key} could not start: ${errorText(error)}`);
+      }
+    });
+  }
+
   /** 处理一条已解码的 OneBot 事件（由 OneBotClient 的 onEvent 调用）。 */
   function handleEvent(event) {
     const selfId = client.selfId;
     if (selfId === '') return;
-    // 通知事件（戳一戳）先于消息分流：以前这里第一行就把非 message 全丢了，
-    // 于是「有人戳了它一下」它完全收不到（§8.3）。
+    // 通知事件（戳一戳 / 撤回）先于消息分流：以前这里第一行就把非 message 全丢了，
+    // 于是「有人戳了它一下」（§8.3）与「有人撤回了刚说的话」它都完全收不到。
     if (event?.post_type === 'notice') {
-      handlePoke(event, selfId);
+      if (event.notice_type === 'group_recall' || event.notice_type === 'friend_recall') handleRecall(event, selfId);
+      else handlePoke(event, selfId);
       return;
     }
     if (event?.post_type !== 'message') return;
+    // 记一条「它看见过这句话」：QQ 不支持回查已撤回的消息，所以撤回事件里那个
+    // message_id 只能靠这份账还原成「谁说了什么」。必须在 `admit` 与所有提前 return
+    // **之前** —— 「刚发就撤」的时间窗只有几十毫秒，而且撤回不认「有没有 @ 它」。
+    noteSeen(event, selfId);
     // 先记「群里又有人说了一句」，`admit` 紧接着快照的序号才算上这条自己 ——
     // 快照与发送时读到的值相等就说明中间没有新消息，`auto` 便不引用。
     noteChatter(event, selfId);
@@ -3646,6 +4078,8 @@ export function apply(ctx, config) {
     holdForBatch(conversation, {
       message,
       quote,
+      // 撤回要对账的那把钥匙：摘除、改写、去重都靠它（账上的条目按 message_id 索引）。
+      messageId: String(event.message_id ?? ''),
       // 「活跃对话里接上的一句」正文里没有前缀可去（见 admit / dropPrefix）。
       continued: admitted.continued === true,
       intent: admitted.intent ?? 'addressed',
@@ -3731,10 +4165,14 @@ export function apply(ctx, config) {
     if (owner.proactive === true) {
       report('info', `→ ${conversation.key}: ${reply.slice(0, 120)}（主动）`);
       // 同一条「拟人」通道：拆短句 + 打字延迟。主动搭话没有可指向的消息，quote 为空。
+      markReplied(owner);
       void sendToConversation(conversation, reply, { human: true, quote: owner.quote, intent: owner.intent ?? 'proactive' });
       return;
     }
     report('info', `→ ${conversation.key}: ${reply.slice(0, 120)}（${intent}）`);
+    // 这一轮的回复真的要发出去了：账上那几条标成「已回复」，之后有人撤回时才说得出
+    // 「撤得有点晚，我都回了」。SKIP / 出错 / 中止的分支在前面就 return 了，不会走到这里。
+    markReplied(owner);
     // 自动回复走「拟人」通道：拆短句 + 打字延迟 + 引用/@ 对方。
     // 等这一轮真的发完再挂「过一会儿也许补一句」的定时器（见 scheduleChime）：
     // 补一句必须排在它这次回复**之后**，而且得等打完字才算「对方安静了」。

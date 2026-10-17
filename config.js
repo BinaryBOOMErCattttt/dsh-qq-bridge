@@ -52,8 +52,28 @@ export const Config = z.object({
   provider: z.string().default('').description('QQ 会话使用的模型服务商；留空使用默认'),
   model: z.string().default('').description('QQ 会话使用的模型；留空使用默认'),
   approvalPolicy: z.union(['never', 'inherit']).default('never').description('QQ 会话的工具审批策略：never 表示无人值守时一律拒绝需要审批的操作'),
-  agentPreset: z.string().default('').description('QQ 会话 Agent 挂载的 Agent 预设 id（本 bundle 自带 qq：只读文件 + 检索 + 联网）；留空表示用部署的默认预设；填 none 表示不挂载预设（QQ 会话将只有宿主平面的全局工具）'),
-  allowTools: z.array(z.string()).default([]).description('QQ 会话 Agent 可用的工具白名单（工具名）；留空表示不限制，非空时未列出的工具一律对 QQ 会话隐藏'),
+  agentPreset: z.string().default('qq').description('QQ 会话 Agent 挂载的 Agent 预设 id；默认 qq（本 bundle 自带：只读文件 + 检索 + 联网，没有 shell / 子代理）。留空表示用**部署的默认预设**（可能是带 shell 的 standard 预设 —— QQ 消息是不可信输入，别轻易这么配）；填 none 表示不挂载预设（QQ 会话只有宿主平面的全局工具）'),
+  allowTools: z
+    .array(z.string())
+    .default([
+      'read',
+      'read_image',
+      'glob',
+      'grep',
+      'web_search',
+      'web_fetch',
+      'skill',
+      'qq_memory',
+      'qq_transcript',
+      'qq_send_message',
+      'qq_send_image',
+      'qq_save_sticker',
+      'qq_list_conversations',
+      'qq_poke',
+    ])
+    .description(
+      'QQ 会话 Agent 可用的工具白名单（工具名）：默认只放开「只读文件 + 检索 + 联网 + 七个 qq_*」，没有 write / edit / bash —— QQ 消息是不可信输入。留空表示**不限制**（把这个 Agent 继承到的工具全给它，含预设里的一切）；写错的名字会被丢掉并记 warn（白名单只能收窄，不能凭空给出能力）',
+    ),
   resetCommand: z.string().default('/reset').description('新开一轮会话的指令：在 QQ 里单独发送该指令即生效（旧的会话留在磁盘上当存档，新的一轮从零开始）；留空表示禁用'),
   resetUsers: z.array(z.string()).default([]).description('允许使用 resetCommand 的 QQ 号白名单；留空表示**谁都不能**重置（群里任何一个人都能把会话记忆重置掉显然不合适，所以这一项默认就是关的）'),
   maxReplyChars: z.number().default(1500).description('单条 QQ 消息的最大字符数（协议上限），超出自动分段'),
@@ -83,8 +103,21 @@ export const Config = z.object({
   pokeReplyChance: z.number().default(0.7).description('pokeMode: random 时选择「回戳」的概率（0~1）：其余情况走一轮模型'),
   pokeCooldownMs: z.number().default(30000).description('同一个会话两次回应戳一戳之间至少隔多久（毫秒）：**防回戳死循环**，冷却里不管戳几下都只回一次'),
   pokeDailyMax: z.number().default(20).description('同一个会话一天最多回应几次戳一戳（本地日界线，重启归零）；0 = 不限'),
+  // ---- 被撤回的消息：假装没看到，或者调侃一下（见 README「被撤回的消息」）----
+  // 前两项是「行为」，后八项是它的闸门与开关；清理引用（不发一条指向已撤回消息的
+  // 回复）永远生效，不受这些开关影响。
+  recallMode: z.union(['off', 'ignore', 'tease']).default('ignore').description('有人撤回消息时怎么处理：off = 只做安全层（清掉指向它的引用、记忆里留个标记），行为上完全不变；ignore = 假装没看到（没 @ 它的那条不再投给模型，被 @ 的照常回答、只是不引用）；tease = 在此基础上多一种反应 —— 被 @ 的那条改写成一句调侃，已经回过的补一句'),
+  recallAddressed: z.union(['answer', 'drop']).default('drop').description('被 @ 的那条还没投出去就被撤回时还回不回：drop = 从待回批次里摘掉，真的不回（默认，等于「撤回 = 当没收到」）；answer = 照常回答、只是不引用（@ 是一次明确点名，摘掉等于点名了却不吭声 —— 想「撤回只影响引用」就选它；tease 时这一轮会改成调侃）'),
+  recallScope: z.union(['to-me', 'all']).default('to-me').description('tease 时调侃谁：to-me = 只调侃冲它来的、或它已经回过的（默认）；all = 群里别人撤回的闲聊也调侃一句 —— 那等于当着全群承认它每条都看，语义接近主动说话，打开前先想清楚'),
+  recallChance: z.number().default(0.5).description('tease 时补一句的概率（0~1）：够资格不等于一定开口，掷中了才补'),
+  recallCooldownMs: z.number().default(60000).description('同一个会话两次撤回调侃之间至少隔多久（毫秒）：群里「撤回测试」是常见行为，没有这道闸会被刷成复读机'),
+  recallDailyMax: z.number().default(5).description('同一个会话一天最多为撤回补几句（本地日界线，计数在内存里，重启归零）；0 = 不限'),
+  recallMaxAgeMs: z.number().default(120000).description('消息发出后多久之内撤回才值得提（毫秒）：太久的撤回接一句只像复读机；0 = 不限'),
+  recallTeaseQuote: z.boolean().default(false).description('调侃时要不要把被撤回的原文交给模型（默认不要）：复述别人撤掉的话是最常见的社交事故，而模型本来就有上下文'),
+  recallPrivate: z.boolean().default(true).description('私聊撤回（friend_recall）要不要处理：默认处理（撤回的那条还没投给模型就不回）。关掉 = 私聊里的撤回当没发生（照常回答，只是不引用那条）—— 私聊里调侃「你撤什么」很容易变成冒犯，所以 recallMode: tease 时这一项建议关'),
+  recallMemoryMark: z.boolean().default(true).description('被撤回的消息是否在长期记忆（转录）里追加一行「已撤回」标记：摘要时不会把它当成事实；关掉就是彻底的假装没看到'),
   // ---- 一次只回一轮：前后脚到的消息先攒一攒，再合成一条交给 Agent ----
-  batchWindowMs: z.number().default(1200).description('收到一条要回的消息后，先等这么久（毫秒）看还有没有下一条：群里几个人同时 @、或者一个人连发几句，都会攒成一条消息只回一轮；0 = 关闭（来一条回一条）'),
+  batchWindowMs: z.number().default(2000).description('收到一条要回的消息后，先等这么久（毫秒）看还有没有下一条：群里几个人同时 @、或者一个人连发几句，都会攒成一条消息只回一轮；0 = 关闭（来一条回一条）'),
   batchMaxWaitMs: z.number().default(5000).description('一直有人接着说时，一批最多攒这么久（毫秒）就必须发出去，避免机器人一直不吭声；小于 batchWindowMs 时按 batchWindowMs 算'),
   // ---- 以下为「像真人一样在群里说话」的开关，默认全部开启 ----
   ambientMessages: z.number().default(12).description('群聊里注入给 Agent 的最近消息条数（让它知道大家在聊什么，不只是被 @ 的那一句）；0 = 关闭'),
@@ -99,9 +132,10 @@ export const Config = z.object({
   repeatChance: z.number().default(1).description('真要复读时的概率（0~1）：1 = 每次都跟，调小可以让它偶尔不跟（下一条相同的消息会再掷一次）'),
   repeatImageTolerance: z.number().default(0.08).description('表情包「算是同一张」的宽松度：QQ 会把同一张表情包按发送者重新编码（字节不同、画面一样），所以字节不同时还会比一次缩略图指纹（16×16 dHash）—— 位差比例不超过这个值就算同一张，跟着复读。0 = 只认字节完全相同的图（关掉画面比对）；默认 0.08（实测同一张重新编码差 0%~2%，同一套画风只换了字的差 16%~23%）'),
   // ---- 主动说话：不等别人 @，自己偶尔在群里开个话头 ----
-  // 这一组默认**关闭**：它会主动给真人发消息，开不开、开给哪些群该由使用者决定。
+  // 这一组默认**开启**：它会主动给真人发消息，所以闸门必须一直在（时段 / 安静够久 / 不是
+  // 自言自语 / 群还活跃 / 距上次够久 / 当天没超次数 / 概率）。只想让它被动回话就设成 false。
   // 只对已经聊过的群生效（`conversations` 里有的群），私聊永远不会被主动打扰。
-  proactive: z.boolean().default(false).description('是否让机器人偶尔主动在群里说话（不等别人 @ 它）：默认关闭。只对**已经聊过的群**生效（有人 @ 过它、或它回过话的群），私聊永远不主动打扰；开了之后还要过「时段 / 安静够久 / 不是自言自语 / 群还活跃 / 距上次够久 / 当天没超次数 / 概率」这一串闸，详见 README「偶尔主动说话」'),
+  proactive: z.boolean().default(true).description('是否让机器人偶尔主动在群里说话（不等别人 @ 它）：默认开。只对**已经聊过的群**生效（有人 @ 过它、或它回过话的群），私聊永远不主动打扰；开口前还要过「时段 / 安静够久 / 不是自言自语 / 群还活跃 / 距上次够久 / 当天没超次数 / 概率」这一串闸（安静阈值默认 45 分钟，所以刚聊完的群不会插嘴），详见 README「偶尔主动说话」。只想让它被动回话就关掉'),
   proactiveCheckMs: z.number().default(10 * 60 * 1000).description('每隔多久看一次「有没有群值得主动搭句话」（毫秒）：这是「考虑」的节奏，不是说话频率 —— 每次醒来还要过一遍所有条件、再掷一次概率'),
   proactiveChance: z.number().default(0.35).description('每次检查时真的开口的概率（0~1）：0.35 ≈ 三次考虑里说一次，让开口的时刻不可预测；0 = 永不主动说话，1 = 一有机会就说'),
   proactiveIdleMs: z.number().default(45 * 60 * 1000).description('群里安静至少这么久才考虑搭话（毫秒）：正在聊的群不插嘴，等大家停了它才冒泡；0 = 不用等（一般只用于测试）'),
@@ -114,7 +148,7 @@ export const Config = z.object({
   // 上面的 proactive* 只在**冷场**时开口；这一组管的是「正聊着」的时候：被叫到之后
   // 接着说的话也算在跟它聊（activeFollow），以及它自己回完隔一会儿再补一句（activeChime*）。
   activeWindowMs: z.number().default(60 * 1000).description('「活跃对话」窗口（毫秒）：被 @ 到之后这么久之内，同一个人接着说的话算还在跟它聊；「多人搭话」也用它 —— 最近这么久里累计够 activeGroupLines 条、activeGroupSpeakers 个人说过话就进入搭话状态，之后群里谁接话都算数。0 = 整套关闭（既不免 @ 接话，也不补一句、不搭话）'),
-  activeFollow: z.boolean().default(false).description('活跃对话里**免 @ 接话**：被叫到之后的窗口内同一个人接着说的话也当成在跟它聊；群里聊热了（见 activeGroupLines）还会进入**多人搭话** —— 那时候谁接话都算数。够资格不等于就接：每句都按 activeTalkChance 一族的累计概率抽一次卡（默认关闭 —— 它放松了「群里只在被 @ 时才说话」这条默认约定，想更像真人再打开）；只在群聊生效，私聊本来就不需要 @'),
+  activeFollow: z.boolean().default(true).description('活跃对话里**免 @ 接话**：被叫到之后的窗口内同一个人接着说的话也当成在跟它聊；群里聊热了（见 activeGroupLines）还会进入**多人搭话** —— 那时候谁接话都算数。够资格不等于就接：每句都按 activeTalkChance 一族的累计概率抽一次卡。默认开，代价是它放松了「群里只在被 @ 时才说话」这条约定（不想让人看见它接闲聊就关掉）；只在群聊生效，私聊本来就不需要 @'),
   activeMaxTurns: z.number().default(10).description('一次一对一的活跃对话里最多考虑几条免 @ 消息（抽卡没抽中的也算一条）：够这么多条就要重新 @ 它一次；多人搭话不看这个，它的闸门是「够条数、够人数」。0 = 不限'),
   activeTalkChance: z.number().default(0.05).description('免 @ 搭话的**起始**概率（0~1，抽卡那套）：够资格（一对一窗口里同一个人接着说，或群里进了多人搭话）之后不是每句都接，而是先掷这个概率；每多一条没抽中的消息，下一次的概率就加上 activeTalkChanceStep（「保底」越攒越高），直到 activeTalkChanceMax 封顶。掷中、或者被明确 @ 到（不用抽直接回）之后归零重新攒。0 = 起步为 0（仍会随着没抽中往上攒）'),
   activeTalkChanceStep: z.number().default(0.1).description('每多一条**没抽中**的免 @ 消息，搭话概率增加多少（0~1）：这就是「越聊越可能接一句」的那一步；实际概率不超过 activeTalkChanceMax'),
@@ -129,7 +163,7 @@ export const Config = z.object({
   burstMaxChars: z.number().default(60).description('把一行长句拆开时的单条目标长度；0 = 不按长度拆（换行仍然分条）'),
   burstMaxParts: z.number().default(3).description('单行长句最多拆成几条；超出部分并进该行最后一条，避免刷屏'),
   burstMaxMessages: z.number().default(0).description('一轮回复最多发几条消息（连换行分出来的那些一起算）：1 = 永远只发一条（换行与长句都并进这一条，超出的用一个空格接上）；0 = 不限（默认，换行 = 分条）。注意「聊天型回复」另有上限 bubbleChatMax（见下），这里管的是信息型的长回复'),
-  burstSingleMaxChars: z.number().default(0).description('「聊天型 / 信息型」的字数门槛（去掉空白后算）：不超过它就按聊天处理，走 bubbleGamble 的气泡计划（有时 1 条、有时 2~3 条）；超过就按信息型完整发送（burstMaxChars / burstMaxParts / burstMaxMessages 照常生效）。0 = 用 bubbleGambleMaxChars 那个默认门槛'),
+  burstSingleMaxChars: z.number().default(100).description('「聊天型 / 信息型」的字数门槛（去掉空白后算）：不超过它就按聊天处理，走 bubbleGamble 的气泡计划（有时 1 条、有时 2~3 条）；超过就按信息型完整发送（burstMaxChars / burstMaxParts / burstMaxMessages 照常生效）。0 = 用 bubbleGambleMaxChars 那个门槛（80）'),
   readDelayMs: z.number().default(800).description('发出第一条前的「读消息」基础延迟（毫秒）'),
   charsPerSecond: z.number().default(15).description('模拟打字速度（字符/秒），用于按字数计算每条消息发出前的延迟'),
   minDelayMs: z.number().default(300).description('单条消息前延迟的下限（毫秒）'),

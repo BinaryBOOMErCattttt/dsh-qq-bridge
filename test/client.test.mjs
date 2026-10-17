@@ -11,7 +11,7 @@
  * 把页面展开成节点树，断言 `docs/settings-ui-redesign.md` §9 的那批契约：
  *
  *   1. 注册位置与注入面；
- *   2. 120 个字段在 6 个 tab 的合集里恰好各出现一次、不落「其它」；
+ *   2. 130 个字段在 6 个 tab 的合集里恰好各出现一次、不落「其它」；
  *   3. 每个分组恰属一个 tab（`tabOf` 对未知分组返回 undefined）；
  *   4. 控件映射：布尔 → `Switch`、枚举 → `<select>`、数字 / 文本 → `<input>`（官方字段行
  *      几何）、长文本 → `textarea`；工具条里的搜索框才是 primitives 的 `Input`；
@@ -380,7 +380,7 @@ function fieldsIn(tree) {
   return map;
 }
 
-/** 依次点过全部 tab，收集每个字段那一行（用来做「120 个字段各自的控件」这类断言）。 */
+/** 依次点过全部 tab，收集每个字段那一行（用来做「130 个字段各自的控件」这类断言）。 */
 function allFields(session) {
   const found = new Map();
   mountTree(session);
@@ -491,7 +491,7 @@ test('字段覆盖：schema 里每一项都上了页面、都有标签、都不�
   }
 });
 
-test('tab 映射：6 个 tab、14 个分组各属一个 tab、字段数加起来是 120', () => {
+test('tab 映射：6 个 tab、14 个分组各属一个 tab、字段数加起来是 130', () => {
   const { mod } = mount();
   const fields = mod.describeFields(new z(SCHEMA_JSON()));
 
@@ -521,10 +521,10 @@ test('tab 映射：6 个 tab、14 个分组各属一个 tab、字段数加起来
       .length;
   assert.deepEqual(
     Object.fromEntries(mod.TABS.map((tab) => [tab.id, countOf(tab)])),
-    { connect: 12, session: 23, persona: 19, group: 29, perception: 22, memory: 15 },
+    { connect: 12, session: 23, persona: 19, group: 29, perception: 32, memory: 15 },
     '字段数按设计 §3.1 分布',
   );
-  assert.equal(fields.length, 120, '合计 120 项');
+  assert.equal(fields.length, 130, '合计 130 项');
 });
 
 test('表单投影：6 个 tab 覆盖全部字段，每行带草稿状态与来源上下文', () => {
@@ -535,7 +535,7 @@ test('表单投影：6 个 tab 覆盖全部字段，每行带草稿状态与来�
   assert.equal(state.tabs.length, 6);
   assert.equal(state.shell.writable, true);
   const rows = state.tabs.flatMap((tab) => tab.sections.flatMap((section) => section.rows));
-  assert.equal(rows.length, 120, '投影必须覆盖全部字段');
+  assert.equal(rows.length, 130, '投影必须覆盖全部字段');
   for (const tab of state.tabs) {
     for (const section of tab.sections) {
       assert.ok(section.title.length > 0, `${section.id} 的区块标题不能空`);
@@ -551,10 +551,10 @@ test('表单投影：6 个 tab 覆盖全部字段，每行带草稿状态与来�
   }
 });
 
-test('控件映射：26 个布尔是 Switch、4 个枚举是 select、长文本是 textarea', () => {
+test('控件映射：29 个布尔是 Switch、7 个枚举是 select、长文本是 textarea', () => {
   const session = mount();
   const fields = allFields(session);
-  assert.equal(fields.size, 120, '六个 tab 加起来必须刚好是 120 行（每行只渲染一次）');
+  assert.equal(fields.size, 130, '六个 tab 加起来必须刚好是 130 行（每行只渲染一次）');
 
   const kinds = new Map();
   for (const [key, field] of fields) {
@@ -576,14 +576,17 @@ test('控件映射：26 个布尔是 Switch、4 个枚举是 select、长文本�
 
   const tally = {};
   for (const kind of kinds.values()) tally[kind] = (tally[kind] ?? 0) + 1;
-  assert.deepEqual(tally, { boolean: 26, choice: 4, long: 2, input: 88 }, '按 schema 的类型分布');
+  assert.deepEqual(tally, { boolean: 29, choice: 7, long: 2, input: 92 }, '按 schema 的类型分布');
 
   // 数字框带 `inputMode="numeric"`；列表行在输入框下面给 Pill 预览。
   assert.equal(controlIn(fields.get('proactiveChance'), isInput).props.inputMode, 'numeric');
-  const listField = fields.get('allowTools');
+  const listField = fields.get('allowUsers');
   assert.ok(controlIn(listField, isInput), '列表行仍然是输入框');
   const pills = nodes(listField, (node) => node.type === primitivesStub.Pill);
   assert.equal(pills.length, 0, '默认值空列表时不渲染 Pill 预览');
+  // `allowTools` 的默认值不再为空（14 个工具名）：每个都渲染成一个可点的 Pill。
+  const allowToolsPills = nodes(fields.get('allowTools'), (node) => node.type === primitivesStub.Pill);
+  assert.equal(allowToolsPills.length, 14, '工具白名单的默认值应当逐个渲染成 Pill');
 });
 
 test('草稿口径：布尔收 true / 是 / 1，空串是「恢复默认」，胡说是非法', () => {

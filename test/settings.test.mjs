@@ -29,7 +29,7 @@ function settings(overrides = {}, cwd = '/tmp') {
 
 test('默认配置原样落到 settings 上', () => {
   const s = settings();
-  assert.equal(s.batchWindowMs, 1200);
+  assert.equal(s.batchWindowMs, 2000);
   assert.equal(s.batchMaxWaitMs, 5000);
   assert.equal(s.maxReplyChars, 1500);
   assert.equal(s.activeWindowMs, 60 * 1000);
@@ -49,8 +49,8 @@ test('默认配置原样落到 settings 上', () => {
 test('攒批的 0 = 关闭（与「非法值退回默认」不是一回事）', () => {
   assert.equal(settings({ batchWindowMs: 0 }).batchWindowMs, 0);
   assert.equal(settings({ batchWindowMs: -5 }).batchWindowMs, 0);
-  // 负数与 NaN 都退到 0（关闭），**不是**退到默认的 1200：把「乱配」当成「关掉」
-  // 比当成「每 1.2 秒回一条」安全。
+  // 负数与 NaN 都退到 0（关闭），**不是**退到默认的 2000：把「乱配」当成「关掉」
+  // 比当成「每 2 秒回一条」安全。
   assert.equal(settings({ batchWindowMs: NaN }).batchWindowMs, 0);
   assert.equal(settings({ batchMaxWaitMs: NaN }).batchMaxWaitMs, 0);
 });
@@ -129,6 +129,30 @@ test('搭话抽卡的概率三项夹在 0~1，非法值保持 NaN（= 一句都�
   assert.ok(Number.isNaN(settings({ activeTalkChance: 'nonsense' }).activeTalkChance));
   assert.ok(Number.isNaN(settings({ activeTalkChanceStep: 'nonsense' }).activeTalkChanceStep));
   assert.ok(Number.isNaN(settings({ activeTalkChanceMax: 'nonsense' }).activeTalkChanceMax));
+});
+
+test('撤回调侃的四个数：概率夹在 0~1（NaN 保持 NaN = 不开口），毫秒/次数负数按 0 算', () => {
+  assert.equal(settings({ recallChance: -1 }).recallChance, 0);
+  assert.equal(settings({ recallChance: 5 }).recallChance, 1);
+  assert.equal(settings({ recallChance: 0.5 }).recallChance, 0.5);
+  // NaN 刻意不退回默认值：`roll < NaN` 恒假 = 一句都不补，比「按一个莫名其妙的概率乱开口」安全。
+  assert.ok(Number.isNaN(settings({ recallChance: 'nonsense' }).recallChance));
+  // 这三个是毫秒/次数，0 与负数都表示「不限」（与 pokeDailyMax 同口径）。
+  assert.equal(settings({ recallCooldownMs: -1 }).recallCooldownMs, 0);
+  assert.equal(settings({ recallDailyMax: -1 }).recallDailyMax, 0);
+  assert.equal(settings({ recallMaxAgeMs: -1 }).recallMaxAgeMs, 0);
+  assert.equal(settings({ recallCooldownMs: 'nonsense' }).recallCooldownMs, 60000);
+  assert.equal(settings({ recallDailyMax: 'nonsense' }).recallDailyMax, 5);
+  assert.equal(settings({ recallMaxAgeMs: 'nonsense' }).recallMaxAgeMs, 120000);
+  // 默认值：不调侃（`ignore`），但**撤回就当没收到** —— 还没投给模型的那条真的不回，
+  // 私聊也算；不给原文，只在转录里留一行标记。
+  const defaults = settings({});
+  assert.equal(defaults.recallMode, 'ignore');
+  assert.equal(defaults.recallAddressed, 'drop');
+  assert.equal(defaults.recallScope, 'to-me');
+  assert.equal(defaults.recallTeaseQuote, false);
+  assert.equal(defaults.recallPrivate, true);
+  assert.equal(defaults.recallMemoryMark, true);
 });
 
 test('拆条相关的 0 都得保住「不限」的含义', () => {

@@ -98,7 +98,7 @@
 不是模型不会聊，是**管线在保证它只回一条**：
 
 1. **一条消息 = 一轮 = 一条回复**。Harness 的收件箱每次只认领一条 user message；
-   `holdForBatch` 只是把 1.2 秒内到的多条合并成一条（`batchWindowMs`），
+   `holdForBatch` 只是把窗口内到的多条合并成一条（`batchWindowMs`，默认 2 秒），
    它合并的是「输入」，不是「输出」。所以回复天然只有一轮。
 2. **闲聊被配置强制并成一条**。`burstParts()`（`index.js:1231-1242`）在
    `text.replace(/\s+/g,'').length <= burstSingleMaxChars` 时把 `maxMessages` 压成 1；

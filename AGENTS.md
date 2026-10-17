@@ -22,15 +22,17 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 - **出站**：任何 DSH Agent 都能调 `qq_send_*` 主动发消息/图片；`[[图片: 路径]]` 按正文位置发；
   `qq_save_sticker` 把别人发的存进 `.qq-stickers/`（见 §6 表）。
 - **不走模型的旁路**：群里的**自动复读**（见 §4.C）。
-- **主动说话**（`proactive`，默认关）：群里安静下来后，插件往**该群自己的会话**里伪造一条提醒，
+- **主动说话**（`proactive`，默认开；闸门很多，见 §4.E）：群里安静下来后，插件往**该群自己的会话**里伪造一条提醒，
   让它带着环境上下文与长期记忆自己冒个泡（见 §4.E）。
-- **活跃对话**：一对一的免 @ 接话（`activeFollow`，默认关）、群聊热起来后的**多人搭话**
+- **活跃对话**：一对一的免 @ 接话（`activeFollow`，默认开）、群聊热起来后的**多人搭话**
   （`activeGroup*`）与「回完再补一句」（`activeChime*`）；见 §4.F。
 - **长期记忆**：消息落盘成转录，定时由**独立摘要会话**照 `.dsh/skills/` 的 skill 整理；聊天时用
   `qq_transcript` / `qq_memory` 查，`learn-meme` / `learn-sticker` / `moegirl` 学梗与查二次元梗
   （见 §4.D）。认知（语言）与表情包（图）是两个文件：`COGNITION.md` / `STICKERS.md`。
 - **人格与表达**：`cwd/.qq-persona/PERSONA.md`（是谁）与 `STYLE.md`（怎么说）热读；气泡计划在
   发送前一次决定发几个（见 §3 发送链路、§6）。
+- **被撤回的消息**（`recallMode`，默认 `ignore`）：清掉指向已撤回消息的引用（不做会让整条回复
+  发不出去），再按配置假装没看到 / 改写成调侃 / 已经回过的补一句（见 §4.I）。
 - **感知与运维**：戳一戳 / 卡片 / 视频封面 / 语音占位（`modalities.js` / `links.js` /
   `interactions.js`），以及跨平台 `scripts/ops.mjs doctor --json`（见 §11）。
 - **每天轮换模型凭据**（`apiKeyRotate`，默认开）：每天 04:00 从 `cwd/data/api-keys.txt` 挑一个
@@ -49,7 +51,7 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 ## 2. 文件地图
 
 ```
-index.js      3950 行  插件本体：运行时状态、事件路由、发送/准入/复读/存表情包/戳一戳/主动说话/活跃对话、连接生命周期
+index.js      4535 行  插件本体：运行时状态、事件路由、发送/准入/复读/存表情包/戳一戳/主动说话/活跃对话、连接生命周期
 persona.js      273 行  `PERSONA.md` 的解析与渲染：身份 / 背景 / 性格（底色 + 点缀）/ 场景；坏文件回退上一版
 style.js        278 行  表达层：气泡计划（发送前掷一次骰）、标点清洗、表达契约渲染；`STYLE.md` 的热读
 speech-policy.js 134 行  「这条群消息该不该进 Agent、以什么身份进」：intent（addressed / continued / interject / none）+ C 路四条排除
@@ -58,6 +60,7 @@ docfile.js       83 行  cwd 内的热读文档（同步 + `size:mtime` 缓存 +
 modalities.js   474 行  感知层：消息段 → `Observation` → 占位符（图片/表情/语音/视频/文件/卡片/转发）
 links.js        830 行  卡片解析 + URL 预览（SSRF 防护、重定向逐跳校验、大小/超时/内容类型上限）
 interactions.js 208 行  戳一戳的纯判据：该不该回、回戳还是走一轮、冷却 / 每日上限
+recall.js       270 行  被撤回的消息的纯判据：认事件、要不要补一句（12 条闸门）、两段伪造提醒的文案
 ops.js          913 行  运维的**纯计划**：平台识别、doctor findings、service/install 步骤、退出码
 scripts/ops.mjs 1671 行  运维执行器 + CLI（`doctor` / `status` / `restart` / `logs` / `install` / `napcat` / `migrate` / `cleanup` / `selftest`），`--json` + `--apply`
 scripts/migrate-cognition.mjs 364 行  老 `COGNITION.md` 的路径条目一次性迁到 `STICKERS.md`（画面指纹认图、默认 dry-run、写前备份）
@@ -66,11 +69,11 @@ mention.js      209 行  `[[@昵称]]` → OneBot `at` 段：纯函数解析 + �
 speaking-rules.js 330 行  「什么时候该主动开口」的纯判据（闸门 / 抽卡 / 补一句 / 私聊补一句）：普通入参 → 布尔
 util.js        269 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 写边界 / key 池解析与打码 / withinActiveHours 等（完整清单见本节末尾）
 filestore.js   108 行  「原子写 / 尽力而为读」（读不到返回空而不是抛错），记忆、转录、表情包都走它；`writeTextAtomicUtf16` 专给 Windows 那两个产物
-config.js      181 行  配置 schema（**唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段；**根上是 `.volatile()`**（设置页的前提，见 §5.12）
-settings.js    303 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
-client.js      1844 行  **浏览器半侧**（手写 bundle）：把 schema 投影成设置页自己的一页（`settings.section`），6 个 `TABS` / 14 个 `SECTIONS`；保存走 Host 的 settings 写路径（见 §5.12）
+config.js      215 行  配置 schema（**唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段；**根上是 `.volatile()`**（设置页的前提，见 §5.12）
+settings.js    313 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
+client.js      1890 行  **浏览器半侧**（手写 bundle）：把 schema 投影成设置页自己的一页（`settings.section`），6 个 `TABS` / 14 个 `SECTIONS`；保存走 Host 的 settings 写路径（见 §5.12）
 tools.js       635 行  宿主平面工具的**声明**（qq_send_* / qq_poke / qq_save_sticker / qq_list_conversations / qq_transcript / qq_memory），依赖由 index.js 显式传入
-memory.js     1240 行  长期记忆子系统：转录落盘、记忆文件读写（两个记忆工具的能力来源）、STICKERS.md 的追加、每日摘要循环；依赖由 index.js 显式传入
+memory.js     1414 行  长期记忆子系统：转录落盘、记忆文件读写（两个记忆工具的能力来源）、STICKERS.md 的追加、每日摘要循环；依赖由 index.js 显式传入
 onebot.js      637 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/@ 名单提取）；文本渲染委托 `modalities.js`
 media.js       327 行  入站媒体：QQ 的图/表情包 → 按内容哈希落盘 → 给模型 read_image 的本地路径
 image.js       149 行  出站图片：本地路径 / URL → 校验（大小、格式、目录越界）→ base64:// 段；收藏目录里的表情额外带 `sub_type: 1`（QQ 的「大表情」）
@@ -89,6 +92,7 @@ docs/{refactor-persona-style-perception,settings-ui-redesign,ops}.md  设计 / �
 test/bridge.test.mjs  集成测试：假 OneBot 服务端 + 假 Harness ctx（含假 timer），跑完整往返
 test/{persona,style,speech-policy,modalities,links,interactions,cognition,migrate-cognition,ops}.test.mjs
                       0.2.0 新增的纯函数测试：人设 / 气泡 / intent / 消息段 / SSRF / 戳一戳 / 认知 / 迁移 / 运维
+test/recall.test.mjs  撤回的纯判据：认事件 / 12 条闸门逐个翻 / 文案里必须有 SKIP、默认不给原文
 test/settings.test.mjs  配置归一化的契约测试（默认值 / 非法值 / 白名单不 trim 这类刻意的不对称）
 test/chatter.test.mjs   「谁在说话」三本账的**不变量**测试（合并两本账就会红的那种）
 test/speaking-rules.test.mjs 主动说话 / 免 @ 接话 / 搭话抽卡 / 补一句的判据：每个用例从「通过」的基准入参出发只翻一个字段
@@ -156,17 +160,18 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 | 顶部常量 | `CHANNEL_SECTION_ORDER=8950`、`PRESET_NONE`、`QUOTE_TEXT_CHARS`、`STICKER_PROMPT_MAX` | 调提示词用 |
 | 配置 schema | **不在这里**：在 `config.js`（第 136 行只是 `export { Config } from './config.js'`） | 唯一真相来源，`.description()` 就是 Web UI 上给用户看的文档 |
 | 配置的取值 | **不在这里**：`settings = createSettings(liveConfig(config), process.cwd())`（第 198 行）之后一律读 `settings.*` | 取默认值/夹紧/去空白都在 `settings.js`；`index.js` 里**没有一处**直接读 `config.xxx`。`liveConfig` 必须调：schema 是根 volatile（§5.12），`apply()` 拿到的是引用 |
-| 运行时状态 | 第 243–534 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / **`chatter`**（三本账，见 `chatter.js`；搬出去前叫 `chatterSeq` / `groupChatter` / `quoteSeq`）/ `repeatStates` / `mediaResolutions`（记忆的账已搬去 `memory.js`）；会话记录里还挂着 `sessionGeneration`（第几轮，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` / `activeInterposeSeq`（插话序号快照）与主动说话、活跃对话的记账（见 `blankConversation`） |
+| 运行时状态 | 第 243–534 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / **`chatter`**（三本账，见 `chatter.js`；搬出去前叫 `chatterSeq` / `groupChatter` / `quoteSeq`）/ `repeatStates` / `mediaResolutions`（记忆的账已搬去 `memory.js`）/ **`recent`**（「最近看见过什么」，见 §4.I；不落盘）；会话记录里还挂着 `sessionGeneration`（第几轮，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` / `activeInterposeSeq`（插话序号快照）与主动说话、活跃对话的记账（见 `blankConversation`） |
 | Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` `personaLines` `styleLines` `hardRules` | 见 §7。`channelPrompt` 是**槽位化**的：场景 → 人设 → 表达契约 → 记忆/热梗 → 能力 → 额外要求 → **硬性规则（最后）** |
 | 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` `conversationMentions` | 串行队列保证同一会话不乱序；`sendOne` 顺带记 `lastBotSpeakAt`；`replyPieces` 走「拆标记 → 拆条 → **气泡计划 + 标点清洗**」；`quoteHead` 只给第一个**文字**气泡挂指向（图永不挂；插话轮强制引用锚点）；正文里的 `[[@昵称]]` 在 `sendParts` 里换成 `at` 段 |
 | 会话管理 | `resetConversation` `conversationFor` `sessionIdFor` `resetMarkerDir` `loadConversationResetCounts` `writeConversationResetCount` `refreshSessionGeneration` | `/reset` 开新一轮（**不删旧会话**，代次 +1 并落盘），以及在线会话列表（新一轮时连主动说话的节奏一起清） |
 | 准入与复读 | `admit` `noteChatter` `touchActivity` `rememberAmbient` `registerParticipant` `maybeRepeat` `repeatStep` `sketchOf` `sameCandidate` | 白名单、群触发判定、环境上下文（**顺带登记「谁可以被 @」**）、复读状态机；`admit` 里的 A/C 抽卡与插话准入**收在 `speech-policy.js`**，这里只剩凑入参 + 记账 |
 | 戳一戳 | `handlePoke` `pokeBack` `pokeTodayUsed` | 通知事件（`notice/notify/poke`）；判据在 `interactions.js`，冷却 / 每日上限在会话记录上；回戳只打给戳它的人 |
+| 撤回 | `noteSeen` `findRecent` `handleRecall` `clearQuoteFor` `dropPending` `dropAmbient` `markReplied` | 通知事件（`notice/group_recall` / `friend_recall`）；判据在 `recall.js`；见 §4.I |
 | 主动说话 | `proactiveSweep` `proactiveEligible`（适配器）`proactiveSpeak` `proactiveNudge` `busyWithTurn` `proactiveTodayCount` | 见 §4.E；**闸门在 `speaking-rules.js`**（`proactiveEligible` / `proactiveSkip`），这里只是把会话记录凑成入参的适配器；`withinActiveHours`（util.js）是纯函数 |
 | 活跃对话 | `noteActiveMessage` `activeFollowAllows` / `activeTurnsLeft` / `activeTalkChance` / `activeTalkAllows` / `chimeAllows` / `chimeDelay` / `batchScale`（适配器）`groupTalkActive` `scheduleChime` `cancelChime` `runChime` `chimeSpeak` `chimeNudge` `chimeTodayUsed` | 见 §4.F；A（一对一免 @）与 C（多人搭话）在 `admit` 里判，够资格后共用一次抽卡（`talkMisses`）；倾听倍数在 `holdForBatch`，B（补一句）挂在 `turn/end` 之后 |
 | 攒批 | `enqueue` `holdForBatch` `flushBatch` `submitBatch` `renderBatch`；`batchWindow` / `batchCap` / `batchScale` 是 3 行适配器，算法在 `speaking-rules.js` | 前后脚到的消息合成一条再投给 Agent；多人搭话时窗口与上限同倍放大（见 §4.F） |
 | 媒体 | `resolveMessageMedia` `mediaFor` `resolveQuote` `hydrateAmbientMedia` | 环境上下文与复读**共用同一次下载**（`mediaResolutions` 这个 WeakMap 就是干这个的） |
-| 事件轮转 | `handleEvent`（约 77 行）+ 持久化事件路由 | 见 §4.A；`notice`（戳一戳）先于 `message` 分流（`handlePoke`）；`turn/end` 里按 `owner.proactive` / `owner.intent` 分流 |
+| 事件轮转 | `handleEvent`（约 77 行）+ 持久化事件路由 | 见 §4.A / §4.I；`notice`（戳一戳 / 撤回）先于 `message` 分流（`handlePoke` / `handleRecall`）；`turn/end` 里按 `owner.proactive` / `owner.intent` 分流 |
 | 长期记忆 | 只剩一行装配（`const memory = createMemory({ … })`）与三个调用点（`handleEvent` / `channelPrompt` / 生命周期） | 整个子系统在 `memory.js`（见 §4.D）；依赖表就在那一行里 |
 | 模型凭据轮换 | `rotateApiKey` `probeApiKey` | 见 §4.H；每天到点挑下一个探测通过的 key 交给 `ctx.credentials.set()`（**不用重启**）。时段/超时/探测地址在 `settings` 上 |
 | 工具装配 | `registerQqTools(ctx, { … })` | 一张**依赖表**：把上面那些函数递给 `tools.js`（记忆是 `memory.tools`，存表情包是 `saveSticker`，戳一戳是 `poke`）。工具声明在 `tools.js`，不在这里 |
@@ -199,12 +204,13 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 **插件入口**验，所以 `index.js` 里对这三个保留再导出（见上面的两条纪律）。
 `msUntilDailyHour` 尤其值得单独测边界（刚过点要排到明天，不能原地反复醒）。
 
-## 4. 八条数据流（改任何一条先读对应的那条）
+## 4. 九条数据流（改任何一条先读对应的那条）
 
 ### A. 入站消息 → Agent → QQ（主链路）
 
 ```
 QQ ─▶ NapCat ─ws─▶ OneBotClient.onEvent ─▶ handleEvent
+                                              │ noteSeen()：记「最近看见过什么」（撤回时唯一的信息源）
                                               │ admit()：白名单 / 渠道开关 / 群触发方式
                                               │ rememberTranscript()：记一行转录（长期记忆的原料）
                                               │ noteChatter + rememberAmbient（群环境上下文）
@@ -310,7 +316,7 @@ ctx.interval（排到下一个 digestAtHour，默认 04:00）─▶ runDigestSwe
 - **认不出来的行不删**：`parseCognition` / `parseStickerCatalog` 只记 warn；`qq_memory read`
   会把它们点出来（`readWarningNote`），`ops doctor` 也会（`COGNITION_UNPARSED` 等五条）。
 
-### E. 主动说话（`proactive`，默认关）
+### E. 主动说话（`proactive`，默认开）
 
 ```
 ctx.interval（每 proactiveCheckMs）─▶ proactiveSweep
@@ -406,8 +412,8 @@ turn/end（正常回复发完之后）
   只剩「凑入参 → 掷骰子 → 叫 chimeSpeak」。
 - **`chimeSeq` 是防漏的保险**：新消息（`noteActiveMessage`）与 `/reset`、插件卸载都会
   `cancelChime`，但正确性只依赖「编号对不对得上」，不依赖取消点记得 `clearTimeout`。
-- **`activeFollow` 默认关**（放松「群里只在被 @ 时才说话」，属于安全面 §5.6），改默认值要同步
-  README 配置表与「安全提醒」。
+- **`activeFollow` 默认开**（放松「群里只在被 @ 时才说话」，属于安全面 §5.6）：`false` 时
+  一对一的免 @ 接话与多人搭话一起关掉。改这个默认值要同步 README 配置表与「安全提醒」。
 - **`/reset` 要清热度窗口**（`chatter.forgetHeat`），两个序号刻意不清（理由写在 `forgetHeat`）。
 - **群聊的 B 需要 `proactive: true`**；**私聊的补一句不需要**（那是刻意的语义例外，见
   `privateAfterthoughtAllows` 的注释与 README「私聊补一句」）。
@@ -469,6 +475,38 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
 - **探测不通过就不写**（宁可不换，也不能把 bot 换成不可用的状态）；**key 来自环境变量时提前
   退场**（`describe()` 的 `writable: false`）；**池子文件必须在 `cwd` 内**。
 
+### I. 被撤回的消息（`recallMode`，默认 `ignore`）
+
+形态照抄戳一戳：**判据全在 `recall.js`，`index.js` 只凑入参、记账、投递**。三层 —— 安全层
+（清引用）与数据层（内存里的「最近看见过什么」账）**永远生效**，行为层才是配置项。
+完整规格见 `docs/recall.md`，用户视角见 README「被撤回的消息」。
+
+```
+message 分支最前面 ─▶ noteSeen（recent[key] 压一条：id / userId / name / text / at /
+                        addressed / submitted / replied / recalled / action）
+notice 分支 ─▶ handleRecall
+   ① recallInScope ─▶ ② clearQuoteFor（安全层，所有模式都做）
+   ─▶ ③ 私聊且 !recallPrivate → 停 ─▶ ④ findRecent（对不上只记 info，不是错误）
+   ─▶ ⑤ memory.noteRecall（转录追加 kind:"recall"）
+   ─▶ ⑥ 还没投递：!addressed 或 recallAddressed==='drop' → action='drop' +
+        dropPending + dropAmbient；addressed 且 tease → action='rewrite'
+   ─▶ ⑦ 只有 tease 继续：recallAction 的 12 条闸门 → 掷中先记账、再 enqueue 一条 nudge
+```
+
+不能踩的：
+
+- **清引用是正确性**：`quote` 在 `pending` / `submitted` / `turnOwners` 里是**同一个对象**
+  （`batchQuote` 取的就是 `admit` 快照那个，所以**别在别处复制新对象**）。不清的话，引用一条
+  已撤回消息的回复会在 `sendOne` 失败，而 `sendParts` 见到失败就 `return` —— 整条回复剩下的
+  气泡一起不发。只清 `messageId`、留 `userId`（`quoteHead` 的降级）。
+- **`noteSeen` 在 `admit` 与所有提前 `return` 之前**；**`action` 记在 `recent` 账上而不是只改
+  `pending` 数组**（那一批可能已被 splice 出去、正在 `submitBatch` 里异步下媒体）。
+- **`recalled` / `action` / `submitted` / `replied` 是四种东西，别合一个布尔**；`replied` 只在
+  `turn/end` 真要发回复时由 `markReplied` 置（`owner.batchIds` 只含真正投进这一轮的那些）。
+- **改写不另开一轮**（否则是两连发）；**在飞不补刀**；**管理员代撤 / 自己的消息被撤不调侃**。
+- **补一句要过闸门，改写不吃闸门**（它不多发消息）；nudge 用 `proactive: true`。
+- **`/reset` 清 `recent[key]` 与 `recallAt` / `recallToday`**；转录只追加 tombstone、不删行。
+
 ## 5. 必须知道的硬约束
 
 1. **改源码必须重启 Harness，停用/启用插件没用。**
@@ -493,7 +531,8 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
    `memoryDir` 必须在 `cwd` 内，配到外面代码会**记 warn 并自动停用**该功能
    （`insideDirectory` 校验），这是有意设计，别改成抛错。
 6. **QQ 消息是不可信输入。** 默认 `approvalPolicy: 'never'`（需要审批的操作直接拒绝）、
-   群消息默认只在被 @ 时触发（`activeFollow` 会在有窗口时放开这一点，所以它默认关）、
+   群消息默认只在被 @ 时触发（`activeFollow` 默认开会把这一点放宽到「窗口内接着说」与
+   「群里聊热了」，属于**刻意放松**的一条，见 README「安全提醒」）、
    `/reset` 默认**谁都不能用**（`resetUsers` 空 = 全关，见 §4.G）。
    任何扩大 QQ 侧能力的改动都要重新想一遍这一点。唯一能让 QQ 会话写盘的是
    `qq_save_sticker`（只写 `stickerDir` 内、文件名洗成单层、张数受 `stickerMaxFiles` 限制，
@@ -549,6 +588,7 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
 | 改群触发/白名单/复读 | index.js 的 `admit` / `maybeRepeat` 区块 |
 | 改回复的指向（引用 / @） | index.js 的 `quoteHead` + `admit` 里快照的 `chatter.anchor()` + `Config.replyStyle`；这个读数**含机器人自己发的话**（`noteSelf`），别换成只算别人的 `others()`，也别把 `noteOwnMessage` 那几处删了（NapCat 的 `reportSelfMessage: false`，自己发的话等不到回灌） |
 | 改「@ 人」的行为（标记语法 / 名单来源 / 认不出来怎么办） | `mention.js`（纯函数解析与名单查询）+ `Config` 里**没有**配置项 + index.js 的 `registerParticipant` / `conversationMentions` / `sendParts` 与 `admit` 里登记的 `sender.mentions` + `tools.js` 的 `qq_send_message` + 提示词里那两条 `[[@昵称]]` 硬要求；名字的显示口径（群名片优先）在 `onebot.js` 的 `userDisplayName`，**正文与名单必须来自同一个值** |
+| 改「被撤回的消息」 | `recall.js`（4 个纯函数）+ index.js 的 `handleRecall` 一族与 `submitBatch` 里的 `action` 分支 + `Config.recall*` + `memory.noteRecall` + README「被撤回的消息」（见 §4.I） |
 | 改「两张图算不算同一张」 | `perceptual.js`（指纹方案与阈值校准都写在文件头和 README「表情包那半边的账要算清」里）+ `Config.repeatImageTolerance` |
 | 改主动说话的闸门 | `speaking-rules.js` 的 `proactiveEligible`（五道闸门 + 两个节奏闸）+ 它的用例；index.js 那边只是适配器 |
 | 改主动说话的文案 / 流程 | index.js 的 `proactiveNudge` / `proactiveSweep` / `proactiveSpeak` + `Config` 的 `proactive*` + README「偶尔主动说话」（见 §4.E） |
@@ -586,7 +626,9 @@ workflow**。理由写在 patch 的注释里，其中一个是硬 bug 规避：`
 （「presets own local discovery」），所以预设里必须自己挂一份，QQ 会话才看得见
 `.dsh/skills`。`allowTools` 里也要留着 `skill`，否则模型拿到目录却打不开。
 
-`allowTools` 白名单在 `restrictAgentTools` 里生效，空数组 = 不限制。
+`allowTools` 白名单在 `restrictAgentTools` 里生效。**默认值不是空的**：14 个名字（只读文件 +
+检索 + 联网 + 七个 `qq_*`），所以 `qq` 预设里带的 `write` / `edit` 默认拿不到；显式写空数组才是
+「不限制」。名字写错会被丢掉并记 warn（白名单只能收窄）。
 
 ## 8. 测试与验证
 
@@ -604,8 +646,8 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
 `node scripts/dev-node-modules.mjs --from <DSH checkout>`；DSH 沙箱里 `node --test` 会
 `spawn EPERM`，改用同进程模式 `node --test --experimental-test-isolation=none "test/*.test.mjs"`。
 
-- 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**（基线：`test/` 下 **491** 个用例，
-  普通终端约 35 秒全过）。0.2.0 删掉 JM 之后**不再有「跳过」**：原先 13 条探针需要真 spawn
+- 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**（基线：`test/` 下 **542** 个用例，
+  普通终端约 45 秒全过）。0.2.0 删掉 JM 之后**不再有「跳过」**：原先 13 条探针需要真 spawn
   外部进程，沙箱里只能跳过，随 JM 一起删掉了。
 - 已知偶发：**全量同进程连跑**时偶尔红一条、且每次红的那条都不同（见过 `proactive` 节奏、
   `allowTools`、群聊图片、`qq_transcript` 四组的用例），单独跑永远绿 —— 是 `until` 轮询与真实
@@ -622,8 +664,9 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
   `bootKeyRotation` 那组；`napcat.js`/`desktop.js`→`napcat.test.mjs` / `desktop.test.mjs`；
   `util.js`/`filestore.js`→各自的用例；`client.js`（设置页）→`client.test.mjs`（它同时钉住
   「每个配置项都有分组」这条）；`persona.js`/`style.js`/`speech-policy.js`/`modalities.js`/
-  `links.js`/`interactions.js`/`cognition.js`/`ops.js`→同名 `test/<模块>.test.mjs`；
-  迁移脚本→`migrate-cognition.test.mjs`。
+  `links.js`/`interactions.js`/`recall.js`/`cognition.js`/`ops.js`→同名 `test/<模块>.test.mjs`；
+  撤回的端到端（三种位置 × 三种模式）→bridge 末尾 `bootRecall` 那组；迁移脚本→
+  `migrate-cognition.test.mjs`。
 - **读 `agent.inbox` 的用例要等 `untilInbox(host, n)`，别只等 `host.list.created[0]`**：假 Host 的
   `create()` 是如实照搬真宿主的 —— Agent 先记进 `created`，消息由插件**之后**才
   `agent.followup(...)` 投进去，而 `until` 是 20ms 轮询，于是会偶发地抢在投递之前断言
@@ -649,6 +692,8 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
       `test/cognition.test.mjs` + `test/bridge.test.mjs` 里搜索 `upsert` 的那组，并确认
       「整份重写丢行会被拒」「重复标题会被合并」两条仍然成立
 - [ ] 加/改了配置项 → 跑 `test/client.test.mjs`（分组别漏、标签别退化成字段名）
+- [ ] 动过引用链（`quote` / `clearQuoteFor` / `batchQuote`）→ 确认「清一处三处生效」，且
+      bridge 的 `bootRecall` 那组仍然绿（它们钉住「不许给已撤回的消息挂 reply 段」）
 
 ## 10. 常见坑速查
 

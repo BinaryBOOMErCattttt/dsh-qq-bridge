@@ -44,6 +44,7 @@
     "modalities.js",
     "links.js",
     "interactions.js",
+    "recall.js",
     "cognition.js",
     "docfile.js",
     "ops.js",
