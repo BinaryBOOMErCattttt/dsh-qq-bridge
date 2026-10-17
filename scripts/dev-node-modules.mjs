@@ -2,7 +2,7 @@
 /**
  * 给这个仓库铺一个能在 **Windows 上真的跑起来**的 `node_modules`。
  *
- * 为什么需要它：`README` / `AGENTS.md` 里记的开发者前提是一条软链
+ * 为什么需要它：`docs/development.md` / `AGENTS.md` 里记的开发者前提是一条软链
  *
  *     node_modules -> <dsh 安装目录>/node_modules
  *

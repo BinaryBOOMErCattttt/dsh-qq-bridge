@@ -1,14 +1,59 @@
-# 运维排查配方（`scripts/ops.mjs`）
+# 运维（`scripts/ops.mjs`）
 
-给 **agent 与人** 一起用的一页：先说 `doctor` 能回答什么，再给八个真实场景的排查顺序。
-命令都能加 `--json`（stdout 只有一个对象，`schema: 1`），也都能在你的 shell 里直接跑。
+> 一套命令覆盖 Linux systemd / Windows 桌面版 / 容器里的 NapCat。`doctor` 回答「哪儿坏了」，
+> `--json` 让 agent 只看结构化事实。下面还有八个真实场景的排查顺序，以及模型凭据的每日轮换。
+> 安装见 [install.md](install.md)，Windows 专有步骤见 [windows.md](windows.md)。
 
-> **`--apply` 默认关。** 写 `cwd` 之外的步骤（systemd unit、计划任务、NapCat 配置、桌面版
-> profile）都带 `requires: human | root`；不带 `--apply` 只打印计划，带了也只执行 `workspace`
-> 那批，剩下的把命令原样打给你复制。这是刻意的：agent 能自动的自动，不能自动的给出可复制的
-> 命令，而不是假装自动化然后静默失败。
->
-> 退出码：`0` 全部通过 / `1` 有 error 级 findings / `2` 需要人工或提权 / `3` 脚本自身出错。
+## 一键运维（`node scripts/ops.mjs`）
+
+三套部署（Linux systemd / Windows 桌面版 / 容器里的 NapCat）共用一条命令。它是给**人和
+agent** 一起用的：`--json` 时 stdout 只有一个对象，`schema: 1` 是协议版本号。
+
+```bash
+node scripts/ops.mjs doctor --json            # 我现在到底哪儿坏了？
+node scripts/ops.mjs status --json            # 在跑吗？连上了吗？最后 20 行日志
+node scripts/ops.mjs doctor --fix             # 只做 cwd 内的事（建 data/、写 .env.example）
+node scripts/ops.mjs logs -n 200              # journalctl / 日志文件 / docker logs，按平台
+node scripts/ops.mjs restart                  # systemd 重启；Windows 只重启能独立管理的部分
+node scripts/ops.mjs install --apply          # 写 unit / 计划任务 / profile（默认只给计划）
+node scripts/ops.mjs napcat config|start|autologin|webui
+node scripts/ops.mjs selftest --json          # 不需要外部依赖的自检（node 版本、目录、依赖）
+```
+
+输出长这样（`doctor --json`）：
+
+```json
+{
+  "schema": 1,
+  "ok": false,
+  "action": "doctor",
+  "platform": { "os": "linux", "systemd": true, "container": true, "elevated": false },
+  "findings": [
+    { "level": "error", "code": "ONEBOT_UNREACHABLE",
+      "message": "ws://127.0.0.1:3001 连不上",
+      "fix": "确认 napcat 容器在跑、端口映射到 3001",
+      "requires": "human" }
+  ],
+  "steps": [
+    { "id": "fix-ONEBOT_UNREACHABLE", "status": "planned", "requires": "human",
+      "command": "docker ps", "note": "先看 napcat 容器" }
+  ]
+}
+```
+
+**三条纪律**：
+
+- **退出码是接口的一部分**：`0` 全部通过；`1` 有 error 级 findings；`2` 需要人工或提权；
+  `3` 脚本自身出错。agent 只看 `findings[].level` 决定要不要找用户。
+- **`--apply` 默认关**：写 `cwd` 外的步骤（systemd unit、计划任务、NapCat 配置、profile）
+  一律带 `requires: human | root`，不带 `--apply` 只打印计划；带 `--apply` 也只执行
+  `workspace` 那批，剩下的把命令原样打给你。**不假装能重启桌面版**：Windows 上那一项就是
+  一句「请重启桌面版」和 `requires: human`，比静默失败诚实。
+- **幂等**：重复执行不重复写；写前备份（沿用 `napcat.js` / `desktop.js` 的备份约定）。
+
+`node scripts/napcat-setup.mjs` **保留为兼容入口**（肌肉记忆），内部走同一批计划函数。
+下面八个场景是给 agent 的排查配方（连不上、不回复、人设没生效、摘要没跑、key 没轮换、
+Windows 装了不加载、计划任务没起来、日志在哪）。
 
 ## 一条命令看全貌
 
@@ -42,7 +87,7 @@ node scripts/ops.mjs doctor --json
    就先修那两个（插件这边一切正常时，NapCat 没开 ws 服务器的现象就是「它永远不说话」）。
 2. `node scripts/ops.mjs logs -n 200`，找 `qq-bridge: connected`、`qq-bridge: ←`、`qq-bridge: →`。
    没有 `connected` 就是连接问题；有 `←` 没有 `→` 看下一节。
-3. 群消息是不是没 @ 它？默认 `groupTrigger: mention`；`activeFollow` 默认关。
+3. 群消息是不是没 @ 它？默认 `groupTrigger: mention`；`activeFollow` 默认开（窗口内接话另算）。
 4. `doctor` 里若有 `STALE_TOOL_ALLOWLIST`，`allowTools` 里可能写着不存在的工具 ——
    模型会拿着一份「推荐了却调不到」的工具清单。
 
@@ -120,6 +165,62 @@ Windows 上「重启」不能替你做：`restart` 只重启能独立管理的�
 
 插件自己的日志**同时**写 logger 与 stderr（`report()`），所以 journal / 终端里一定看得到
 `qq-bridge: …` 开头的行。
+
+## 每天轮换 API key（`apiKeyRotate`）
+
+一个 key 用得久了会碰到额度、限流或者单纯的「今天不太对劲」。这一节让它**每天凌晨 4:00
+自己换一把**：从你自己的 key 池里挑下一个**现在真的能用**的，写进 Harness 的凭据文件。
+
+**它换的是哪个 key**：`apiKeyRef`（默认 `DEEPSEEK_API_KEY`）—— 也就是 QQ 会话和 Web UI
+调模型时用的那一个。插件不碰别的东西。
+
+**key 池怎么建**：`apiKeyFile`（默认 `data/api-keys.txt`，相对 `cwd`，已在 `.gitignore` 里）
+是一个纯文本文件，一行一个 key：
+
+```text
+# data/api-keys.txt —— 一行一个 key，`#` 开头的行是注释
+sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+# 备注也可以单独写一行
+sk-cccccccccccccccccccccccccccccccc
+```
+
+池子的顺序**就是轮换顺序**：每次从「当前正在用的那个 key」的下一个开始，绕回开头。
+当前 key 不在池子里（手工填的、或者池子刚调整过）时从第一个开始。文件不存在、还没填 key、
+或者池子里只有当前这一个 —— 都什么都不做，只在日志里说一句该怎么办：
+
+```text
+qq-bridge: api key rotation (daily at 04:00): no key pool at data/api-keys.txt; put one key per line there to start rotating
+```
+
+**「尝试」体现在探测上**：候选 key 会先用 `apiKeyProbeUrl`（默认
+`https://api.deepseek.com/models`）GET 一下，**2xx 才算可用** —— 这个探测不消耗 token。
+探测不过就试池子里的下一个；全都不通过就**保留原来的 key**，只记一条 warn。所以池子里
+混进一把失效的 key 不会把 bot 换成不可用的状态，也不会每天卡在同一行上：
+
+```text
+qq-bridge: api key rotation: candidate sk-bbb…#3f2a91cd rejected (HTTP 401); trying the next one
+qq-bridge: api key rotation: switched DEEPSEEK_API_KEY from sk-aaa…#d1c0be27 to sk-ccc…#9ab41f02 (HTTP 200)
+```
+
+几个行为细节：
+
+- **立刻生效，不用重启**：Harness 的模型调用是每次请求都去解析凭据的，本地凭据层又是
+  监听文件的，所以换完当场就用新的；正在跑的那一轮不受影响。
+- **改的是 `$DSH_HOME/.credentials.yaml` 这一个全局凭据**，而这个文件是所有 profile
+  共用的 —— 也就是说它同时影响 Web UI。这是有意的（一把 key 通吃），但值得知道。
+- **key 来自启动环境时不换**：如果 `DEEPSEEK_API_KEY` 是从 shell / `EnvironmentFile`
+  传进来的，它的优先级高于凭据文件，写文件不会生效 —— 那种部署下插件只记一条 warn 说明
+  原因，而不是每天假装换成功。
+- **key 来自 `<cwd>/.env` 或 `$DSH_HOME/.env` 时照换**：凭据文件排在它们前面，写进去有效。
+- **`apiKeyRotateHour` 只是「几点试一次」**，不落盘「今天换过没有」：重启不会导致当天换
+  两次（定时器每次都算「距下一个整点还有多久」），但如果这个时刻正好在重启、那一轮就跳过，
+  第二天再换。
+- **日志里永远看不到完整的 key**：只打前 6 个字符 + 内容摘要前 8 位，例如
+  `sk-aaa…#d1c0be27`。
+- 想关掉：`apiKeyRotate: false`（启动日志里会写 `api key rotation is off`）。
+  想验证一次而不用等到凌晨 4 点：把 `apiKeyRotateHour` 设成**下一个整点**，重启即可
+  （定时器每次都按「距下一个整点还有多久」排期）。
 
 ## 迁移与清理
 

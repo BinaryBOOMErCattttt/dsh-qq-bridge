@@ -427,7 +427,7 @@ export function apply(ctx, config) {
   /** 表情包目录的展示路径（相对 cwd、正斜杠），就是模型该写进 qq_send_image 的那种写法。 */
   const stickerLabel = stickerInside ? relative(resolve(cwd), stickerRoot).split(sep).join('/') : undefined;
 
-  // ---- 人格与表达：两个热读文件 + 一组机器参数（见 README「人格与表达」）----
+  // ---- 人格与表达：两个热读文件 + 一组机器参数（见 docs/persona-style.md「人格与表达」）----
   //
   // 文件放 cwd（不放 memoryDir）：`qq_memory` 的写边界永远碰不到人设 —— 群里任何人能改
   // 人设就等于一次 prompt 注入。读取是同步 + 按 mtime 缓存（提示词 provider 是同步求值的，
@@ -486,7 +486,7 @@ export function apply(ctx, config) {
     channelSectionOrder: CHANNEL_SECTION_ORDER,
   });
 
-  // ---- 模型凭据：每天尝试轮换（见 README「每天轮换 API key」）------------------
+  // ---- 模型凭据：每天尝试轮换（见 docs/ops.md「每天轮换 API key」）------------------
   //
   // 为什么这件事能在这里做成：Harness 的模型调用是**每次请求**去解析凭据的
   // （llm-deepseek 的 resolveApiKey → ctx.credentials.resolve），而本地凭据层监听
@@ -1937,7 +1937,7 @@ export function apply(ctx, config) {
       proactiveDay: '',
       proactiveCount: 0,
       /**
-       * 「活跃对话」状态：这个会话是不是正跟人聊着（见 README「聊起来之后保持搭话」）。
+       * 「活跃对话」状态：这个会话是不是正跟人聊着（见 docs/proactive.md「聊起来之后保持搭话」）。
        *
        * `activeUntil` 是这次聊天的截止时刻（每接一句就往后滑），`activeSpeakerId` 是正在
        * 跟它聊的那个人 —— 群里只有这个人接着说的话才可能免 @ 算进来（别人插话就另说了）。
@@ -4311,7 +4311,7 @@ export function apply(ctx, config) {
   });
 
   // 用 ctx.effect 托管连接：插件卸载/停用时自动 dispose，不留悬挂的定时器与 socket。
-  // 注意：Loader 按 URL 缓存插件模块，改源码后必须重启进程才生效（见 README）。
+  // 注意：Loader 按 URL 缓存插件模块，改源码后必须重启进程才生效（见 docs/development.md）。
   ctx.effect(() => {
     client.start();
     return () => {

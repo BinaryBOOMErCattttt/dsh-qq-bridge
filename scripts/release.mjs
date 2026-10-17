@@ -127,7 +127,7 @@ function looksLikeNapcat(dir) {
 }
 
 /**
- * 找一个 NapCat 安装目录。顺序照着 README「目录、配置与文件都在哪」写：
+ * 找一个 NapCat 安装目录。顺序照着 docs/windows.md「目录、配置与文件都在哪」写：
  * 命令行给的 > 仓库根目录下的 > 上一级目录下的。找不到就明确报错，别猜。
  */
 function findNapcat(explicit) {

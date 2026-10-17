@@ -4,7 +4,7 @@
  * 这一层要回答的问题只有一个：**两张图是不是同一张画面**。之所以不能只比字节：
  * QQ 会把同一张表情包按发送者重新编码，实测同一张「寿来」在群里出现过
  * 94657B(progressive+Exif) / 131307B(baseline) / 79284B 三种字节形态，画面 SSIM ≥ 0.985
- * 却没有两份字节相同 —— 详见 perceptual.js 顶部的说明与 README「自动复读」。
+ * 却没有两份字节相同 —— 详见 perceptual.js 顶部的说明与 docs/repeat.md「自动复读」。
  *
  * 用例里的字节都是真编码（见 test/image-fixtures.mjs）：同一张画面的 PNG / baseline /
  * progressive / 重新编码 JPEG / 调色板 GIF / 动图 / 灰度 / 16bit / 透明，另一张画面 B，

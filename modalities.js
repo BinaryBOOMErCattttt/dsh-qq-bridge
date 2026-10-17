@@ -21,7 +21,7 @@
 import { parseCard } from './links.js';
 
 /**
- * 消息段的观测结果（见 docs/refactor-persona-style-perception.md §4.3）。
+ * 消息段的观测结果（见 docs/media.md 的占位符表）。
  *
  * 字段说明（`?` 表示可能没有）：
  *   - `kind`：归一化后的种类。`mface` 归成 `sticker`（商城表情），

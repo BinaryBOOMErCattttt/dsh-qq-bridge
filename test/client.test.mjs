@@ -8,7 +8,7 @@
  * 所以这里用最小的假 Host 把它跑一遍：假的 `window.__ModuleLoader__` 收下注册，
  * 假的 `require` 给出平台模块（react / jsx-runtime / ui-primitives 都是桩 —— 真
  * 浏览器 bundle 里有 CSS import，node 里加载不了），再用一个十几行的迷你渲染器
- * 把页面展开成节点树，断言 `docs/settings-ui-redesign.md` §9 的那批契约：
+ * 把页面展开成节点树，断言设置页的那批契约（清单见 `client.js` 顶部注释）：
  *
  *   1. 注册位置与注入面；
  *   2. 130 个字段在 6 个 tab 的合集里恰好各出现一次、不落「其它」；

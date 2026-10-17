@@ -53,6 +53,7 @@
     "locale/*.json",
     ".dsh/skills/*/SKILL.md",
     "README.md",
+    "docs/*.md",
     "scripts/*",
     "test/*.mjs",
     "deploy/*"

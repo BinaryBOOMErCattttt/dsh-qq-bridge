@@ -2,7 +2,7 @@
  * 出站图片 / 表情包：把「本地文件或 URL」变成能塞进 OneBot `image` 段的字节。
  *
  * 为什么走 `base64://` 而不是把本地路径交给 NapCat：NapCat 跑在容器里、插件跑在
- * 宿主机上，两边不是同一个文件系统 —— 交本地路径它读不到（README 里
+ * 宿主机上，两边不是同一个文件系统 —— 交本地路径它读不到（docs/media.md 里
  * `upload_private_file` 传路径被回「识别URL失败」是同一个原因，NapCat 的
  * `enableLocalFile2Url` 默认也是关的）。而 OneBot 的 image 段支持
  * `base64://<数据>`：NapCat 的 `Ti()`（发图/传文件共用的那个解析器）会把 base64

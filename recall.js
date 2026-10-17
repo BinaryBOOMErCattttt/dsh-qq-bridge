@@ -170,7 +170,7 @@ export function recallAction(input = {}) {
  * 而这一轮本来就是为它开的 —— 模型在**本来就要开的这一轮**里看到撤回，回一句就够。
  *
  * @param {{ name?: unknown, text?: unknown, imageAllowed?: unknown }} [input]
- *   `text` 只在 `recallTeaseQuote` 打开时给（默认不给原文，见 README 的安全那一节）。
+ *   `text` 只在 `recallTeaseQuote` 打开时给（默认不给原文，见 docs/security.md）。
  * @returns {string} 两行中文 user message 正文。
  */
 export function recallLine(input = {}) {

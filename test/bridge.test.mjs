@@ -4941,7 +4941,7 @@ test('.dsh/skills 下的每个 skill 都能被 skill-filesystem 发现', async (
   assert.deepEqual(
     dirs.map((entry) => entry.name).sort(),
     ['learn-meme', 'learn-sticker', 'message-digest', 'moegirl', 'update-cognition'],
-    '本地 skill 的清单变了就要同步这里（README 的 skill 表也一样）',
+    '本地 skill 的清单变了就要同步这里（docs/memory.md 的 skill 表也一样）',
   );
   for (const dir of dirs) {
     const text = await readFile(new URL(`${dir.name}/SKILL.md`, root), 'utf8');

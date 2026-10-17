@@ -5,7 +5,7 @@
  * 任何运行时，却有一百多条带中文 `.description()` 的字段（那些描述就是 Web UI 上给
  * 使用者看的文档）。混在运行时逻辑里时，改一个默认值要先翻过半屏的 if。
  *
- * 加配置项的三处同步（别漏）：这里的字段 + `index.js` 读数 + README 配置表。
+ * 加配置项的三处同步（别漏）：这里的字段 + `index.js` 读数 + docs/configuration.md 的配置表。
  *
  * @module @qqbot/dsh-plugin-qq/config
  */
@@ -103,7 +103,7 @@ export const Config = z.object({
   pokeReplyChance: z.number().default(0.7).description('pokeMode: random 时选择「回戳」的概率（0~1）：其余情况走一轮模型'),
   pokeCooldownMs: z.number().default(30000).description('同一个会话两次回应戳一戳之间至少隔多久（毫秒）：**防回戳死循环**，冷却里不管戳几下都只回一次'),
   pokeDailyMax: z.number().default(20).description('同一个会话一天最多回应几次戳一戳（本地日界线，重启归零）；0 = 不限'),
-  // ---- 被撤回的消息：假装没看到，或者调侃一下（见 README「被撤回的消息」）----
+  // ---- 被撤回的消息：假装没看到，或者调侃一下（见 docs/recall.md「被撤回的消息」）----
   // 前两项是「行为」，后八项是它的闸门与开关；清理引用（不发一条指向已撤回消息的
   // 回复）永远生效，不受这些开关影响。
   recallMode: z.union(['off', 'ignore', 'tease']).default('ignore').description('有人撤回消息时怎么处理：off = 只做安全层（清掉指向它的引用、记忆里留个标记），行为上完全不变；ignore = 假装没看到（没 @ 它的那条不再投给模型，被 @ 的照常回答、只是不引用）；tease = 在此基础上多一种反应 —— 被 @ 的那条改写成一句调侃，已经回过的补一句'),
@@ -135,7 +135,7 @@ export const Config = z.object({
   // 这一组默认**开启**：它会主动给真人发消息，所以闸门必须一直在（时段 / 安静够久 / 不是
   // 自言自语 / 群还活跃 / 距上次够久 / 当天没超次数 / 概率）。只想让它被动回话就设成 false。
   // 只对已经聊过的群生效（`conversations` 里有的群），私聊永远不会被主动打扰。
-  proactive: z.boolean().default(true).description('是否让机器人偶尔主动在群里说话（不等别人 @ 它）：默认开。只对**已经聊过的群**生效（有人 @ 过它、或它回过话的群），私聊永远不主动打扰；开口前还要过「时段 / 安静够久 / 不是自言自语 / 群还活跃 / 距上次够久 / 当天没超次数 / 概率」这一串闸（安静阈值默认 45 分钟，所以刚聊完的群不会插嘴），详见 README「偶尔主动说话」。只想让它被动回话就关掉'),
+  proactive: z.boolean().default(true).description('是否让机器人偶尔主动在群里说话（不等别人 @ 它）：默认开。只对**已经聊过的群**生效（有人 @ 过它、或它回过话的群），私聊永远不主动打扰；开口前还要过「时段 / 安静够久 / 不是自言自语 / 群还活跃 / 距上次够久 / 当天没超次数 / 概率」这一串闸（安静阈值默认 45 分钟，所以刚聊完的群不会插嘴），详见 docs/proactive.md「偶尔主动说话」。只想让它被动回话就关掉'),
   proactiveCheckMs: z.number().default(10 * 60 * 1000).description('每隔多久看一次「有没有群值得主动搭句话」（毫秒）：这是「考虑」的节奏，不是说话频率 —— 每次醒来还要过一遍所有条件、再掷一次概率'),
   proactiveChance: z.number().default(0.35).description('每次检查时真的开口的概率（0~1）：0.35 ≈ 三次考虑里说一次，让开口的时刻不可预测；0 = 永不主动说话，1 = 一有机会就说'),
   proactiveIdleMs: z.number().default(45 * 60 * 1000).description('群里安静至少这么久才考虑搭话（毫秒）：正在聊的群不插嘴，等大家停了它才冒泡；0 = 不用等（一般只用于测试）'),
@@ -144,7 +144,7 @@ export const Config = z.object({
   proactiveDailyMax: z.number().default(4).description('同一个群一天最多主动说几次（本地日界线；计数在内存里，重启后清零）'),
   proactiveFromHour: z.number().default(9).description('只在本地时间的这个小时之后主动说话（0~23）：真人凌晨不会突然在群里冒泡'),
   proactiveToHour: z.number().default(23).description('只在这个小时之前主动说话（0~23，不含该点）：与 proactiveFromHour 相同表示全天都可以；跨零点（如 22 → 3）也认'),
-  // ---- 活跃对话：聊起来之后保持搭话（见 README「聊起来之后保持搭话」）----
+  // ---- 活跃对话：聊起来之后保持搭话（见 docs/proactive.md「聊起来之后保持搭话」）----
   // 上面的 proactive* 只在**冷场**时开口；这一组管的是「正聊着」的时候：被叫到之后
   // 接着说的话也算在跟它聊（activeFollow），以及它自己回完隔一会儿再补一句（activeChime*）。
   activeWindowMs: z.number().default(60 * 1000).description('「活跃对话」窗口（毫秒）：被 @ 到之后这么久之内，同一个人接着说的话算还在跟它聊；「多人搭话」也用它 —— 最近这么久里累计够 activeGroupLines 条、activeGroupSpeakers 个人说过话就进入搭话状态，之后群里谁接话都算数。0 = 整套关闭（既不免 @ 接话，也不补一句、不搭话）'),
@@ -172,7 +172,7 @@ export const Config = z.object({
   replyStyle: z.union(['auto', 'plain', 'quote', 'at']).default('auto').description('群聊回复的指向方式：auto = 只在「回的那条后面又出现了消息（包括我自己发的）」时才引用（默认），quote = 引用被回复的那条消息，at = @ 对方，plain = 直接发；指向只挂在第一条上，私聊始终为 plain'),
   persona: z.string().default('').description('旧人设（回退用）：整段替换默认的「群友口吻」段落，可以写多行。人设优先读 personaFile 指向的文件（默认 cwd/.qq-persona/PERSONA.md）：那个文件存在且能解析时这一项不生效（启动日志会说明人设来自文件还是配置）；两者都没有才用插件内置的那份'),
   instructions: z.string().default('').description('额外要求：可以写多行，追加到 QQ 会话系统提示的末尾；与内置口吻叠加，不替换任何东西'),
-  // ---- 人格与表达：人设 = 「是谁」，风格 = 「怎么说」（见 README「人格与表达」）----
+  // ---- 人格与表达：人设 = 「是谁」，风格 = 「怎么说」（见 docs/persona-style.md「人格与表达」）----
   // 两者都放 cwd 里的文件，只有部署者能改（QQ 会话没有写权限）：群里任何人能改人设
   // 就等于一次 prompt 注入。文件是热读的（每次装配提示词现读），改完不用重启。
   personaFile: z.string().default('.qq-persona/PERSONA.md').description('人设文件，相对 cwd（必须落在 cwd 内）：分「身份 / 背景 / 性格 / 场景」四节，性格按「底色 / 点缀」分层。留空或文件不存在 = 用下面 persona 那一段（旧行为），再没有就用内置人设'),
@@ -192,7 +192,7 @@ export const Config = z.object({
   privateAfterthoughtChance: z.number().default(0.3).description('私聊补一句的概率（0~1）：静下来之后先掷这个，再开那一轮'),
   privateAfterthoughtIdleMs: z.number().default(15000).description('对方安静多久之后才考虑补一句（毫秒，会按 delayJitter 抖动）：太早补会像抢话'),
   privateAfterthoughtDailyMax: z.number().default(10).description('同一个私聊一天最多补几句（本地日界线，重启归零）；0 = 不限（不建议）'),
-  // ---- 长期记忆：聊天记录落盘 + 定时摘要 + 认知库（见 README「长期记忆」）----
+  // ---- 长期记忆：聊天记录落盘 + 定时摘要 + 认知库（见 docs/memory.md「长期记忆」）----
   memory: z.boolean().default(true).description('是否启用长期记忆：把聊天记录写进 memoryDir、每天在 digestAtHour 点让一个专用「摘要 Agent」写成摘要与认知，并提供 qq_transcript / qq_memory 工具（配套 skill 在 .dsh/skills/ 里）'),
   memoryDir: z.string().default('.qq-memory').description('长期记忆目录，相对 cwd（必须落在 cwd 内）：聊天记录、摘要、认知库都在这里；同时充当 qq_memory / qq_transcript 的写入边界'),
   memoryFileMaxBytes: z.number().default(32768).description('单个记忆文件的字节上限：超过时 qq_memory 的 write 会报错，append 也只按剩余空间写入，逼着摘要 Agent 保持精炼'),
@@ -202,9 +202,9 @@ export const Config = z.object({
   digestMaxChars: z.number().default(24000).description('一次摘要最多把多少字符的聊天记录喂给摘要 Agent：超出部分按最近优先截断（更早的内容留给上一次摘要）'),
   digestTimeoutMs: z.number().default(10 * 60 * 1000).description('单次摘要的硬超时（毫秒）：超时就把摘要 Agent 销毁（下次重开一个），避免一个卡住的 turn 让摘要永远不再发生'),
   digestCatchUp: z.boolean().default(true).description('是否补课：如果今天的摘要点已经过了、而某个会话在重启之后才有人说话（或者摘要那一刻进程正在重启），它一开口就补一次摘要，不用等到明天；关掉则只在 digestAtHour 点摘要'),
-  // ---- 每天轮换模型凭据（见 README「每天轮换 API key」）----
+  // ---- 每天轮换模型凭据（见 docs/ops.md「每天轮换 API key」）----
   // 池子是一个 cwd 里的纯文本文件而不是配置项：配置会显示在 Web UI 上、也会被复制粘贴到
-  // 别处，key 不该走那条路（见 README「安全提醒」）。
+  // 别处，key 不该走那条路（见 docs/security.md「安全提醒」）。
   apiKeyRotate: z.boolean().default(true).description('是否每天在 apiKeyRotateHour 点尝试把 apiKeyRef 指向的模型凭据换成 apiKeyFile 里的下一个 key：只在池子里还有「另一个探测通过的 key」时才真的改写凭据，池子文件不存在 / 只写了当前这一个 key 时什么都不做'),
   apiKeyRotateHour: z.number().default(4).description('每天几点尝试轮换模型凭据（本地时间，0~23）：默认凌晨 4 点，与长期记忆的摘要同一个时刻'),
   apiKeyFile: z.string().default('data/api-keys.txt').description('候选 API key 池：一行一个 key，`#` 开头的行是注释；相对 cwd（必须落在 cwd 内，否则整个轮换记 warn 并停用）。当前生效的 key 在池子里的下一个就是第一个候选'),

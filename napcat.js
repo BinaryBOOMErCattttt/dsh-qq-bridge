@@ -35,7 +35,7 @@
  * `websocket-server`）：`name / enable / host / port / messagePostFormat /
  * reportSelfMessage / token / enableForcePushEvent / debug / heartInterval`。
  * 其中 `reportSelfMessage: false` 是**必须**的：机器人自己发的消息不该作为事件回灌，
- * 否则它会把「自己刚说的话」当成别人说的，接自己的话（README 里有这一条）。
+ * 否则它会把「自己刚说的话」当成别人说的，接自己的话（docs/windows.md 里有这一条）。
  *
  * @module @qqbot/dsh-plugin-qq/napcat
  */

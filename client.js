@@ -12,13 +12,13 @@
  *
  *   1. **页面在哪里**：注册在 `settings.section`（侧栏「设置」左边那一列里的一页）。
  *      这是**有意**的偏差：一百多项配置埋进「设置 → 插件」的 tab 里会被彻底忽略，
- *      所以本插件保留顶级入口（见 docs/settings-ui-redesign.md 的 D1）。
+ *      所以本插件保留顶级入口（这是刻意的取舍，不挂到「设置 → 插件」下）。
  *   2. **页面长什么样**：这一页**不写死任何字段**，可编辑字段来自 Host 送过来的那份
  *      schema（`config.js` 的 Config 是根 volatile，`dsh-settings` 的 `volatileForm`
  *      把整份配置投影成表单 schema），标签与说明也来自 schema 上的 `.description()`。
  *      于是「加一个配置项」只需要改 `config.js` 一处 —— 设置页自动多出一行。
  *
- * 版式（`docs/settings-ui-redesign.md` 定稿）：**6 个下划线 tab + 单列扁平区块 +
+ * 版式（定稿）：**6 个下划线 tab + 单列扁平区块 +
  * 官方两种字段行**，不再有折叠卡片墙。`TABS` 负责分组（字段 → 分组见 `SECTIONS`），
  * `FIELD_HINTS` 给数字补只读量纲（`= 45 分钟`），`ENUM_LABELS` 给枚举取值配人话。
  * 布尔是 `Switch`（官方开关行），枚举是原生 `<select>`（Input 外观），其余是输入框 /

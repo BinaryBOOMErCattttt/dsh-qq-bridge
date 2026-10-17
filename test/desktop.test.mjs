@@ -9,7 +9,7 @@
  *   - **两处一起**：依赖与 `dsh.profile.bundles` 只写一处等于没装（插件不会加载），
  *     所以「只差一个」的状态必须能补上，而不是整个跳过。
  *
- * 不 spawn、不碰磁盘。脚本本身的端到端行为在 README 的 Windows 一节里手工验过。
+ * 不 spawn、不碰磁盘。脚本本身的端到端行为在 docs/windows.md里手工验过。
  *
  * 运行：node --test test/desktop.test.mjs
  */
