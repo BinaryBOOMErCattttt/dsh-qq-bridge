@@ -26,8 +26,6 @@ import { join, sep } from 'node:path';
 import { Config } from '../config.js';
 import {
   apiKeyFingerprint,
-  defaultJmFileHost,
-  defaultJmPython,
   errorText,
   hourLabel,
   isVolatileRef,
@@ -87,16 +85,6 @@ test('pathInside：补分隔符 + Windows 忽略大小写（同一个目录的�
   assert.equal(pathInside('D:\\repo\\media', 'D:\\repo\\media2\\a.jpg', 'win32'), false);
   // POSIX 下大小写是**有意义**的：不能为了迁就 Windows 把这条也放松掉。
   assert.equal(pathInside('/tmp/Mem', '/tmp/mem/x', 'linux'), false);
-});
-
-test('禁漫的平台默认值：Windows 与容器部署各按各的来', () => {
-  // venv 布局：POSIX `.venv/bin/python`，Windows `.venv\Scripts\python.exe`。
-  assert.equal(defaultJmPython('linux'), '.venv/bin/python');
-  assert.equal(defaultJmPython('darwin'), '.venv/bin/python');
-  assert.equal(defaultJmPython('win32'), '.venv/Scripts/python.exe');
-  // 文件服务绑定：容器部署走 docker 网桥，Windows 桌面版 NapCat 就是本机进程 → 回环。
-  assert.equal(defaultJmFileHost('linux'), '172.17.0.1');
-  assert.equal(defaultJmFileHost('win32'), '127.0.0.1');
 });
 
 test('memorySlug：会话 key → 磁盘目录名', () => {

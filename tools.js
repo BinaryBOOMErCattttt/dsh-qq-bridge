@@ -1,5 +1,5 @@
 /**
- * QQ 桥接的六个**宿主平面**工具。
+ * QQ 桥接的**宿主平面**工具。
  *
  * 它们从 `index.js` 的闭包里搬出来，是为了把「工具声明」这件纯排版的事与「运行时
  * 状态与策略」分开：六份 `defineTool` 内联在闭包里时占了 500 多行、最深处缩进到 20 层，
@@ -17,7 +17,6 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { chunkText } from './onebot.js';
 import { imageSegment, loadOutgoingImage } from './image.js';
-import { parseJmRef } from './jm.js';
 import { hasMentionMarker, mentionSegments } from './mention.js';
 
 /**
@@ -175,7 +174,7 @@ function qqSaveSticker(deps) {
   return defineTool({
     name: 'qq_save_sticker',
     description:
-      'Save one image (PNG/JPEG/WebP/GIF) into the QQ sticker directory so it becomes a reusable sticker you can send later — typically a meme someone just posted and asked you to keep, or a picture the conversation downloaded into the media cache. The bytes are validated (magic number, size limit, must be inside the working directory) and the name is sanitized; the extension comes from the image itself. Returns the sticker path to use with qq_send_image or the [[图片: …]] marker. An existing name is refused (never overwritten).',
+      'Save one image (PNG/JPEG/WebP/GIF) into the QQ sticker directory so it becomes a reusable sticker you can send later — typically a meme someone just posted and asked you to keep, or a picture the conversation downloaded into the media cache. Pass "meaning" (and optionally "scene") and the sticker catalogue STICKERS.md gets a matching row, so in every later prompt you see "名字（含义）" instead of a bare file name. The bytes are validated (magic number, size limit, must be inside the working directory) and the name is sanitized; the extension comes from the image itself. Returns the sticker path to use with qq_send_image or the [[图片: …]] marker. An existing name is refused (never overwritten).',
     parameters: {
       source: {
         type: 'string',
@@ -187,6 +186,14 @@ function qqSaveSticker(deps) {
         required: true,
         description: 'The sticker file name, without the extension — a short, meaningful name saying what it means ("委屈", "笑死", "摸摸头"). This name is what you will see in every prompt from now on, so it is worth getting right.',
       },
+      meaning: {
+        type: 'string',
+        description: 'One short sentence saying what the sticker means emotionally ("委屈、求安慰", "笑到不行、没眼看"). Written into STICKERS.md next to the name; without it the row goes to the "未收藏" (to-do) section instead, because a catalogue entry you cannot judge is useless.',
+      },
+      scene: {
+        type: 'string',
+        description: 'Optional: when to use it ("对方凶我 / 我装可怜时"). Also written into STICKERS.md.',
+      },
     },
     output: {
       schema: {
@@ -197,18 +204,87 @@ function qqSaveSticker(deps) {
           bytes: { type: 'integer', required: true },
           format: { type: 'string', required: true },
           source: { type: 'string', required: true },
+          catalog: { type: 'string' },
         },
       },
       render: (_args, value) => [
         {
           type: 'text',
-          text: `Saved ${value.source} as ${value.path} (${value.format}, ${value.bytes} bytes). Send it back with [[图片: ${value.path}]].`,
+          text: [
+            `Saved ${value.source} as ${value.path} (${value.format}, ${value.bytes} bytes). Send it back with [[图片: ${value.path}]].`,
+            value.catalog === undefined
+              ? 'No sticker catalogue was updated (long-term memory is off, or the catalogue write failed) — the file itself is saved.'
+              : `Sticker catalogue: ${value.catalog}`,
+          ].join('\n'),
         },
       ],
     },
     async execute(args) {
       if (deps.saveSticker === undefined) throw new Error('saving stickers is not available (the sticker directory is disabled, imageSend is off, or qq_save_sticker is not in allowTools)');
-      return deps.saveSticker(args.source, args.name);
+      return deps.saveSticker({ source: args.source, name: args.name, meaning: args.meaning, scene: args.scene });
+    },
+  });
+}
+
+/**
+ * 工具：qq_poke —— 戳一戳（双击头像）。
+ *
+ * 为什么单独给一个工具而不是塞进 qq_send_message：戳一戳是 OneBot 的独立动作
+ * （`send_poke`，个别实现叫 `group_poke` / `friend_poke`），没有正文；它表达的是
+ * 「我叫你一下」而不是「我说一句话」，混进文本工具会让模型以为要多写点什么。
+ *
+ * 安全：`target_id` / `user_id` 都是显式参数，**不接受**「最近跟我说话的人」这种推断
+ * —— 戳错了是冒犯，不像发错一句话那么好解释。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqPoke(deps) {
+  return defineTool({
+    name: 'qq_poke',
+    description:
+      'Poke somebody through QQ (the double-tap "戳一戳"). In a private chat this nudges that contact; in a group you must say which member to poke. Use it to get attention, not to say anything — if you have words, send a message instead.',
+    parameters: {
+      target_type: {
+        type: 'string',
+        enum: ['private', 'group'],
+        required: true,
+        description: 'private = a QQ contact; group = a group (then user_id is the member to poke).',
+      },
+      target_id: {
+        type: 'string',
+        required: true,
+        description: 'The QQ number for private targets, or the group number for group targets.',
+      },
+      user_id: {
+        type: 'string',
+        description: 'Required for group targets: the QQ number of the member to poke.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target_type: { type: 'string', required: true },
+          target_id: { type: 'string', required: true },
+          user_id: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [
+        { type: 'text', text: `Poked ${value.user_id} in ${value.target_type} ${value.target_id}.` },
+      ],
+    },
+    async execute(args) {
+      if (deps.poke === undefined) throw new Error('poking is not available in this deployment');
+      if (!deps.client.connected) throw new Error(`QQ bridge is not connected to ${deps.endpoint}; start NapCat or check the endpoint.`);
+      const type = args.target_type === 'group' ? 'group' : 'private';
+      const id = String(args.target_id ?? '').trim();
+      if (id.length === 0) throw new Error('qq_poke needs target_id');
+      const userId = type === 'group' ? String(args.user_id ?? '').trim() : id;
+      if (userId.length === 0) throw new Error('qq_poke needs user_id when poking a group member');
+      const ok = await deps.poke(type, id, userId);
+      if (!ok) throw new Error(`qq_poke could not poke ${userId} (the OneBot implementation rejected every poke action)`);
+      deps.report('info', `→ ${type === 'group' ? '群' : '私聊'} ${id}: 戳了 ${userId}`);
+      return { target_type: type, target_id: id, user_id: userId };
     },
   });
 }
@@ -339,87 +415,7 @@ function qqListConversations(deps) {
 }
 
 /**
- * 工具五：qq_jm_pdf —— 下载禁漫（JM）本子/单话，合并成 PDF，并发到 QQ。
- *
- * 从 QQ 会话里调用时可以不填目标：调用它的那个 Agent 对应的会话就是收件人
- * （`exec.agent.id` → 会话 key）。Web UI 里的主会话调用时必须显式给目标。
- * @param {object} deps - 见 `registerQqTools` 的说明。
- */
-function qqJmPdf(deps) {
-  return defineTool({
-    name: 'qq_jm_pdf',
-    description:
-      'Download a JM (18comic) album or chapter, merge every page into one PDF, and send that PDF to a QQ contact or group through the OneBot bridge. Accepts a bare JM id, "JM123456", or an 18comic album/photo URL. Called from inside a QQ conversation, the current conversation is the default recipient. Long: a whole multi-chapter album can take minutes, and the file upload itself is slow.',
-    parameters: {
-      id: {
-        type: 'string',
-        required: true,
-        description: 'JM album id or chapter id (digits), "JM123456", or a full 18comic album/photo URL.',
-      },
-      kind: {
-        type: 'string',
-        enum: ['auto', 'album', 'chapter'],
-        description: 'auto (default): the whole album when the id is an album id, otherwise just that chapter. album = every chapter merged into one PDF. chapter = only the chapter with this id.',
-      },
-      target_type: {
-        type: 'string',
-        enum: ['private', 'group'],
-        description: 'Where to send the PDF. Defaults to the QQ conversation this tool was called from.',
-      },
-      target_id: {
-        type: 'string',
-        description: 'QQ number (private) or group number (group) to send the PDF to. Defaults to the current QQ conversation.',
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          file_name: { type: 'string', required: true },
-          path: { type: 'string', required: true },
-          title: { type: 'string', required: true },
-          pages: { type: 'integer', required: true },
-          bytes: { type: 'integer', required: true },
-          chapters: { type: 'integer', required: true },
-          target_type: { type: 'string', required: true },
-          target_id: { type: 'string', required: true },
-        },
-      },
-      render: (_args, value) => [
-        {
-          type: 'text',
-          text:
-            `Downloaded ${value.title || value.file_name} (${value.chapters} chapter(s), ${value.pages} page(s), ${value.bytes} bytes) ` +
-            `into ${value.path} and sent ${value.file_name} to ${value.target_type} ${value.target_id}.`,
-        },
-      ],
-    },
-    async execute(args, exec) {
-      const ref = parseJmRef(args.id);
-      if (ref === undefined) throw new Error(`qq_jm_pdf could not find a JM id in "${args.id}"`);
-      const kind = args.kind ?? ref.kind;
-      // 收件人：显式给的优先；否则是调用它的那个 QQ 会话。
-      const { conversation, type: targetType, id: targetId } = deps.resolveTarget(args, exec, 'qq_jm_pdf');
-      const job = await deps.downloadJm({ conversation, ref: { id: ref.id, kind } });
-      const sent = await deps.sendJmFile(conversation, job);
-      if (!sent.ok) throw new Error(`downloaded ${job.name} but could not send it to QQ: ${sent.error}`);
-      return {
-        file_name: job.name,
-        path: job.path,
-        title: job.title,
-        pages: job.pages,
-        bytes: job.bytes,
-        chapters: job.chapters,
-        target_type: targetType,
-        target_id: String(targetId),
-      };
-    },
-  });
-}
-
-/**
- * 工具六：qq_transcript —— 查某个 QQ 会话的聊天记录（长期记忆的原料）。
+ * 工具五：qq_transcript —— 查某个 QQ 会话的聊天记录（长期记忆的原料）。
  *
  * 这是「想不起来就去查」的那条路：`ambientMessages` 只喂最近十来条，一旦真需要
  * 「上周三讨论的那个链接是什么」就必须能翻到更早的记录，而不是靠模型编。
@@ -518,7 +514,7 @@ function qqTranscript(deps) {
 }
 
 /**
- * 工具七：qq_memory —— 读/追加/覆盖记忆文件（`MEMORY.md` / `COGNITION.md` / `INDEX.md`）。
+ * 工具六：qq_memory —— 读/追加/覆盖记忆文件（`MEMORY.md` / `COGNITION.md` / `INDEX.md`）。
  *
  * 写路径被限制在 memoryDir 之内（`memoryRelativePath`），单个文件也有字节上限：
  * 记忆的价值在「精炼且总是被读到」，一个无限增长的文件只会把提示词撑爆。
@@ -530,7 +526,7 @@ function qqMemory(deps) {
   return defineTool({
     name: 'qq_memory',
     description:
-      'Read, append to, search, or overwrite a long-term memory file for the QQ bridge. All paths live under the memory directory and are relative to it, for example "conversations/group-100000001/MEMORY.md" (one conversation\'s memory, "write"/"append" create it if missing), "COGNITION.md" (shared knowledge about memes, slang, emoji and sticker meanings), or "INDEX.md" (the short index that is injected into every QQ agent\'s prompt — keep it to a handful of lines). Paths outside the memory directory are rejected.',
+      'Read, append to, search, or overwrite a long-term memory file for the QQ bridge. All paths live under the memory directory and are relative to it, for example "conversations/group-100000001/MEMORY.md" (one conversation\'s memory, "write"/"append" create it if missing), "COGNITION.md" (language memes / slang / homophones — never file paths), "STICKERS.md" (the sticker catalogue: name, meaning, scene and the saved file path), or "INDEX.md" (the short index that is injected into every QQ agent\'s prompt — keep it to a handful of lines). Paths outside the memory directory are rejected.',
     parameters: {
       action: {
         type: 'string',
@@ -614,15 +610,14 @@ function qqMemory(deps) {
  * @param {(conversation: object) => (name: string) => string | undefined} deps.mentionResolver -
  *   把 `[[@昵称]]` 里的昵称解析成 QQ 号（名单挂在会话记录上）。
  * @param {(source: string) => string} deps.resolveStickerSource - 把表情包文件名解析成路径。
- * @param {(source: string, name: string) => Promise<object>} [deps.saveSticker] -
- *   把一张图存进表情包目录（校验 + 清洗文件名 + 张数上限）；缺失 = 不注册 qq_save_sticker。
+ * @param {(options: object) => Promise<object>} [deps.saveSticker] -
+ *   把一张图存进表情包目录（校验 + 清洗文件名 + 张数上限 + 往 STICKERS.md 补一行）；
+ *   缺失 = 不注册 qq_save_sticker。
  * @param {boolean} deps.imageSend - `imageSend`，关掉时发图工具直接报错。
  * @param {number} deps.imageMaxBytes - 出站图片字节上限。
  * @param {() => object} deps.resolveRoute - 当前生效的模型路由（`qq_list_conversations` 回显）。
  * @param {Map<string, object>} deps.conversations - 已处理过的会话表。
  * @param {(key: string, generation: number) => string} deps.sessionIdFor - 会话 key + 轮次 → Session id。
- * @param {(options: object) => Promise<object>} deps.downloadJm - 下载并合并成 PDF。
- * @param {(conversation: object, job: object) => Promise<object>} deps.sendJmFile - 把 PDF 交给 QQ。
  * @param {object} [deps.memory] - 长期记忆的读写接口；缺失 = 不注册那两个工具。
  */
 export function registerQqTools(ctx, deps) {
@@ -631,8 +626,8 @@ export function registerQqTools(ctx, deps) {
   // 表情包目录不可用（没配 / 配到 cwd 外）或白名单里没有它时整个跳过：留一个必然报错的
   // 工具，只会让模型浪费一次调用去撞墙。
   if (deps.saveSticker !== undefined) ctx.tools.register(qqSaveSticker(deps));
+  ctx.tools.register(qqPoke(deps));
   ctx.tools.register(qqListConversations(deps));
-  ctx.tools.register(qqJmPdf(deps));
   if (deps.memory !== undefined) {
     ctx.tools.register(qqTranscript(deps));
     ctx.tools.register(qqMemory(deps));

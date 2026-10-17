@@ -410,7 +410,9 @@ test('scheduledTaskXml：登录触发 + 最高权限 + 会话内运行 + 无时�
 });
 
 test('计划任务的三条命令：注册要提权、查询与启动不提权', () => {
-  const install = scheduledTaskInstallPlan({ taskName: 'dsh-qq-bridge-napcat', xmlPath: 'C:\\a b\\task.xml' });
+  // 显式给 platform：这三个 plan 的默认值是「当前平台」，在 Linux 上跑测试时
+  // 不写就成了「不支持计划任务」，验不到 Windows 那三分支。
+  const install = scheduledTaskInstallPlan({ platform: 'win32', taskName: 'dsh-qq-bridge-napcat', xmlPath: 'C:\\a b\\task.xml' });
   assert.equal(install.command, 'powershell.exe');
   const script = decodePlan(install);
   assert.match(script, /schtasks\.exe \/Create \/TN 'dsh-qq-bridge-napcat' \/XML 'C:\\a b\\task\.xml' \/F/);
@@ -418,8 +420,9 @@ test('计划任务的三条命令：注册要提权、查询与启动不提权',
   assert.match(script, /exit \$LASTEXITCODE/);
   assert.match(install.describe, /UAC/);
   assert.match(scheduledTaskInstallPlan({ platform: 'linux', xmlPath: 'x' }).unsupported, /Windows/);
-  assert.match(scheduledTaskInstallPlan({ xmlPath: '' }).unsupported, /XML/);
-  assert.match(decodePlan(scheduledTaskDeletePlan({ taskName: 'x' })), /\/Delete \/TN 'x' \/F/);
+  assert.match(scheduledTaskInstallPlan({ platform: 'win32', xmlPath: '' }).unsupported, /XML/);
+  assert.match(scheduledTaskInstallPlan({ platform: 'win32', xmlPath: '' }).unsupported, /XML/);
+  assert.match(decodePlan(scheduledTaskDeletePlan({ platform: 'win32', taskName: 'x' })), /\/Delete \/TN 'x' \/F/);
   // 查询与启动都是直接调 schtasks（自己的任务自己看得见、自己跑得动），不用绕 PowerShell。
   assert.equal(scheduledTaskQueryPlan({ taskName: 'x' }).command, 'schtasks.exe');
   assert.deepEqual(scheduledTaskQueryPlan({ taskName: 'x' }).args, ['/Query', '/TN', 'x']);

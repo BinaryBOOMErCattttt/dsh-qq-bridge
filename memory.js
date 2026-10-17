@@ -31,17 +31,30 @@
  *   - **写边界只有一处**（`memoryRelativePath`，util.js 里的纯函数）：`qq_memory` 的写
  *     路径必须过它，`../` 与绝对路径都要被拒 —— QQ 消息是不可信输入。
  *   - **`memoryDir` 配到 `cwd` 外时记 warn 并整个停用**（工具都不注册、定时器都不挂），
- *     不是抛错 —— 与 `mediaDir` / `stickerDir` / `jmDir` 同一套路。
+ *     不是抛错 —— 与 `mediaDir` / `stickerDir` 同一套路。
  *
  * @module @qqbot/dsh-plugin-qq/memory
  */
 import { appendFile, mkdir } from 'node:fs/promises';
+import { readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { errorText, localDate, localStamp, memoryOneLine, memoryRelativePath, memorySlug, msUntilDailyHour, sessionIdFor } from './util.js';
 import { readJsonl, readTextOrUndefined, readdirOrEmpty, writeJsonAtomic, writeTextAtomic } from './filestore.js';
 import { collectMedia, messageToText } from './onebot.js';
 import { insideDirectory } from './image.js';
+import { appendStickerRow, hotCognitionLines, parseCognition, parseStickerCatalog, stickerCatalogLines } from './cognition.js';
+
+/** 认知库与表情包目录的文件名（都在 memoryDir 根下，与 INDEX.md 同级）。 */
+const COGNITION_FILE = 'COGNITION.md';
+const STICKERS_FILE = 'STICKERS.md';
+/** 表情包目录注入提示词的上限：与旧 STICKER_PROMPT_MAX 一致，别让目录把提示词撑爆。 */
+const STICKER_CATALOG_MAX = 40;
+/** 热梗段的上限：15 条 / 1200 字（见 cognition.js 的 hotCognitionLines）。 */
+const HOT_COGNITION_LIMIT = 15;
+const HOT_COGNITION_MAX_CHARS = 1200;
+/** 这两个文件每轮都要读：用 mtime+size 判定缓存，避免每次装配提示词都读两遍盘。 */
+const CATALOG_CACHE_MS = 5000;
 
 /** 索引片段（INDEX.md）最多这么大：它每次提示词装配都会被读一遍，不能无节制地长。 */
 const MEMORY_INDEX_MAX_CHARS = 4096;
@@ -101,8 +114,13 @@ export function createMemory(deps) {
   //
   //   conversations/<key>/{meta.json,log/YYYY-MM-DD.jsonl}   每个会话的聊天记录（原始事实）
   //   conversations/<key>/MEMORY.md                           这个群的长期记忆
-  //   COGNITION.md                                            跨会话的公共认知（梗 / 表情包含义）
+  //   COGNITION.md                                            跨会话的公共认知（梗 / 黑话 / 谐音 —— **只有文字**）
+  //   STICKERS.md                                             表情包目录（名字 / 含义 / 收藏后的路径）
   //   INDEX.md                                                两份索引的拼接，注入渠道提示
+  //
+  // 认知与表情包为什么是两个文件：键根本不同。梗的键是文字写法，表情包的键是收藏后的
+  // 文件名 —— 混在一个文件里时，表情包条目会拿 `.qq-media/<哈希>`（LRU 缓存，会过期）
+  // 当键，迟早变成一条死链。详见 `cognition.js` 的模块注释。
   //
   // 插件只负责**记**（每条入站消息同步落一行），**读/写**交给模型通过
   // qq_transcript / qq_memory 两个工具做 —— 好处是纯宿主平面工具，QQ 会话不用为了
@@ -255,7 +273,7 @@ export function createMemory(deps) {
    * 记忆不该成为绕过准入规则的后门。
    * @param event - 已解码的 OneBot 事件。
    * @param selfId - 机器人自己的 QQ 号。
-   * @param state - `handleEvent` 已有的判定结果 `{ admitted, jmCommand, reset }`。
+   * @param state - `handleEvent` 已有的判定结果 `{ admitted, reset }`。
    */
   function rememberTranscript(event, selfId, state) {
     if (!memoryEnabled) return;
@@ -286,7 +304,7 @@ export function createMemory(deps) {
         // 但标出来 —— 摘要时「它是被叫到才说话」和「它只是看着」是两种不同的事实。
         kind: isGroup ? 'group' : 'private',
         addressed: state.admitted !== undefined,
-        command: state.jmCommand !== undefined ? 'jm' : state.reset ? 'reset' : undefined,
+        command: state.reset ? 'reset' : undefined,
         id: String(event.message_id ?? ''),
         user: String(event.user_id ?? ''),
         name,
@@ -510,6 +528,81 @@ export function createMemory(deps) {
   let memoryIndexRefreshing = false;
 
   /**
+   * 认知库与表情包目录的同步读数（提示词装配用）。
+   *
+   * 为什么是**同步**：`SystemPrompt.section()` 的 text provider 每次装配都要重新求值，
+   * 没法 await（与表情包目录用同步 `readdir`、记忆索引用后台缓存是同一个理由）。两个
+   * 文件都有 `memoryFileMaxBytes` 兜底（默认 32KB），一次 `stat` + 命中缓存时零读取，
+   * 代价远小于为它再引入一套异步刷新与失效。
+   *
+   * 缓存键是两份文件的 `size:mtime`：摘要 Agent 刚写完新条目时，下一次装配就能看见，
+   * 不用等固定 TTL 过期。
+   *
+   * @returns `{ stickers: string[], hot: string[], catalog: boolean }`：
+   *   `stickers` 是「名字（含义）」行（没有目录文件时为空数组，调用方退回裸文件名），
+   *   `hot` 是热梗段，`catalog` 表示表情包目录文件到底有没有解析出条目。
+   */
+  function catalogState() {
+    if (!memoryEnabled) return { stickers: [], hot: [], catalog: false };
+    const read = (name) => {
+      const absolute = join(memoryBase, name);
+      try {
+        const info = statSync(absolute);
+        // 解析失败与空文件同义（下面两个纯函数对空串返回空结果），这里不额外抛。
+        if (info.size === 0) return { text: '', key: `${info.size}:${info.mtimeMs}` };
+        return { text: readFileSync(absolute, 'utf8'), key: `${info.size}:${info.mtimeMs}` };
+      } catch {
+        return { text: '', key: 'missing' };
+      }
+    };
+    const cognition = read(COGNITION_FILE);
+    const stickers = read(STICKERS_FILE);
+    const key = `${cognition.key}|${stickers.key}`;
+    if (key === catalogCache.key && Date.now() - catalogCache.at < CATALOG_CACHE_MS) return catalogCache.text;
+    const parsedStickers = parseStickerCatalog(stickers.text);
+    const parsedCognition = parseCognition(cognition.text);
+    // 一份文件写坏不能让提示词装配失败：坏条目在这里被丢掉，只留一条 warn 供排查。
+    for (const warning of [...parsedStickers.warnings, ...parsedCognition.warnings].slice(0, 3)) report('warn', warning);
+    const text = {
+      stickers: stickerCatalogLines(parsedStickers.collected, { max: STICKER_CATALOG_MAX }),
+      hot: hotCognitionLines(parsedCognition.entries, { limit: HOT_COGNITION_LIMIT, maxChars: HOT_COGNITION_MAX_CHARS }),
+      catalog: parsedStickers.collected.length > 0,
+    };
+    catalogCache = { at: Date.now(), key, text };
+    return text;
+  }
+
+  /** 上面那份同步读数的缓存（`{ at, key, text }`）。 */
+  let catalogCache = { at: 0, key: '', text: { stickers: [], hot: [], catalog: false } };
+
+  /**
+   * 给表情包目录追加一行（`qq_save_sticker` 存完图之后调）。
+   *
+   * 三条刻意的取舍：
+   *   - 走 `writeFile`（整份替换）而不是 append：新条目要落进「已收藏」区，而不是文件末尾——
+   *     `appendStickerRow` 是纯函数，负责算出替换后的全文；
+   *   - 失败**不回滚图片**：图已经落盘了，缺一行目录比丢图好（调用方只记 warn）；
+   *   - 没有含义就写进「未收藏」区：写进收藏区等于让提示词里出现一条选不出来的条目。
+   *
+   * @param {object} entry - `{ name, meaning, scene, path, look?, date?, confidence? }`。
+   * @returns `{ ok, section?, reason? }`：失败时 `reason` 是给日志的一句话。
+   */
+  async function appendStickerCatalog(entry) {
+    if (!memoryEnabled) return { ok: false, reason: 'memory is disabled' };
+    const current = (await readTextOrUndefined(join(memoryBase, STICKERS_FILE))) ?? '';
+    const hasMeaning = String(entry?.meaning ?? '').trim().length > 0;
+    const { text, section } = appendStickerRow(current, entry, { collected: hasMeaning });
+    try {
+      await writeMemoryFile(STICKERS_FILE, text, false);
+    } catch (error) {
+      return { ok: false, reason: errorText(error) };
+    }
+    // 下一次提示词装配立刻重读，别让「刚存的表情」等一个 TTL 才出现在目录里。
+    catalogCache = { at: 0, key: '', text: catalogCache.text };
+    return { ok: true, section };
+  }
+
+  /**
    * 解析 `qq_memory` 要操作的文件。
    *
    * 三种来源，按优先级：
@@ -542,7 +635,7 @@ export function createMemory(deps) {
   /** 记忆目录下已存在的文件（相对路径），按名称排序；没有时是空数组。 */
   async function listMemoryFiles() {
     const out = [];
-    for (const top of ['INDEX.md', 'COGNITION.md', 'digest.json']) {
+    for (const top of ['INDEX.md', COGNITION_FILE, STICKERS_FILE, 'digest.json']) {
       if ((await readTextOrUndefined(join(memoryBase, top))) !== undefined) out.push(`${memoryLabel}/${top}`);
     }
     for (const slug of await readdirOrEmpty(join(memoryBase, 'conversations'))) {
@@ -891,7 +984,7 @@ export function createMemory(deps) {
       '做法：',
       `1. 用 \`skill\` 工具加载 \`message-digest\` skill，按它写的流程做（它是这一步的准绳）。`,
       `2. 用 \`qq_transcript\` 读这个会话在这个时间窗里的记录${notice.queue && notice.queue.length > 0 ? `；本批还有其它会话排队（${notice.queue.join('、')}），它们各有自己的一轮，不用在这里处理` : ''}。`,
-      `3. 用 \`qq_memory\` 更新 \`conversations/${notice.slug}/MEMORY.md\`；只有出现**新的**梗或表情包含义时才动 \`COGNITION.md\`（加载 \`update-cognition\` skill 按它的规矩写）。`,
+      `3. 用 \`qq_memory\` 更新 \`conversations/${notice.slug}/MEMORY.md\`。遇到新东西先分诊：**只有文字**的梗 / 黑话 / 谐音走 \`learn-meme\` skill 写 \`COGNITION.md\`；**有图**的表情包走 \`learn-sticker\` skill（先收藏再写 \`STICKERS.md\`）；图文都有就两边互相写名字，不要在一个文件里写两遍。`,
       `4. 严格止步于 \`${memoryLabel}/\` 之内：不要读源码、不要改仓库里任何其它文件、不要发 QQ 消息。`,
       '',
       '如果这个时间窗里没有值得一提的内容，就什么都不写，回一句「无事」即可 —— 空摘要比编造的摘要好。',
@@ -1133,6 +1226,10 @@ export function createMemory(deps) {
     rememberTranscript,
     /** 渠道提示里那段记忆索引（原文 `memoryIndexText`）。 */
     indexText: memoryIndexText,
+    /** 渠道提示里的表情包目录与热梗段（同步读数，见 `catalogState`）。 */
+    catalog: catalogState,
+    /** `qq_save_sticker` 存完图之后调：把这一行追加进 STICKERS.md（失败只返回原因）。 */
+    appendSticker: appendStickerCatalog,
     /** 两个记忆工具是否可见（开关 + allowTools 白名单）。 */
     toolsAllowed: memoryToolsAllowed,
     /** 摘要定时器的装配（见上面的生命周期注释；index.js 在生命周期那一节调）。 */

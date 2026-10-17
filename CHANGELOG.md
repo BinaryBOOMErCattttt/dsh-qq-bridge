@@ -3,6 +3,181 @@
 版本号按[语义化版本](https://semver.org/lang/zh-CN/)走。0.x 阶段配置项与行为都可能变，
 每次改动以 `Config` 的 schema 与 README 为准。
 
+## 未发布（0.2.0，BREAKING）
+
+按 `docs/refactor-persona-style-perception.md` 做的四层拆分：**人格 / 表达 / 感知 / 运维**。
+一句话概括：把「你是谁」「怎么说」「看到了什么」「出事了怎么查」从 `index.js` 那一坨提示词与
+if 里拆成可单独测试、可单独回滚的模块。**升级前请读「BREAKING」那一段。**
+
+### BREAKING
+
+- **移除 JM（禁漫）下载旁路**。`jm.js`、`scripts/jm_download.py`、`qq_jm_pdf` 工具、`/jm` 指令、
+  15 个 `jm*` 配置项与 `test/jm.test.mjs` 全部删除；`package.json` 的 `exports["./jm.js"]` 与
+  `files` 里的 `jm.js`、`.gitignore` 里的 `.qq-jm/` 一并去掉。
+  - `cordis.patch.yml` 里残留的 `jm*` 会变成**惰性字段**（schemastery 对未知键透传），不会启动失败；
+    `allowTools` 里残留 `qq_jm_pdf` 时插件只记一条 warn（白名单里有不存在的工具名）。
+  - `/jm 422866` 不再是特殊指令，作为普通消息进模型（群里仍然要 @ 或满足触发条件）。
+  - **数据不删**：`.qq-jm/` 里的旧 PDF、`.venv/` 里的 jmcomic 依赖都原样留着。要清就显式跑
+    `node scripts/ops.mjs cleanup jm --apply`（只删 `.qq-jm/`，先列文件再生效，绝不碰 `.venv`）。
+- **`burstSingleMaxChars` 语义变了**：从「短回复强制并成一条」变成「聊天型 / 信息型的门槛」。
+  想要旧行为（闲聊永远一条）请用 `bubbleChatMax: 1` + `bubbleGamble: false`。
+- **短气泡句末的「。」会在发送前被剥掉**（`stripShortPeriod`，默认开）。只动句末唯一的一个
+  「。」；问号、感叹号、省略号、句中句号都不碰。
+- **图片不再挂引用**：整轮只有图时引用直接丢弃，有文字时引用只挂第一个**文字**气泡。
+
+### 人格与表达（新的两层）
+
+- **`persona.js` + `cwd/.qq-persona/PERSONA.md`**：人设只写「是谁」——身份 / 背景 / 性格 / 场景。
+  性格按 `名字｜底色/点缀｜强度｜触发条件｜表现｜禁忌` 一行一条，**底色最多一条**（始终在场，
+  是语气的地板不是台词），点缀按触发条件上场、一次最多演一个。旧配置 `persona` 在没有
+  `PERSONA.md` 时仍然生效；文件存在时它被忽略并记一条 info（避免两套人设叠加）。
+  文件写坏（半截、只剩标题）时退回上一版，再退回配置 / 内置人设 —— **人设写坏绝不让机器人不说话**。
+- **`style.js` + `cwd/.qq-persona/STYLE.md`**：表达只写「怎么说」——气泡、标点、表情、私聊 / 群聊。
+  机器参数（`bubble*` / `stripShortPeriod` / `interjectQuote`）在配置里，散文与参数互不解析。
+- **气泡计划（§6.4）**：一轮回复在**发送前**掷一次骰，决定发到第几个气泡（第一个永远发；
+  第二个 55%，之后每个 ×0.5；以问号结尾的追问钩子 ×1.3 封顶 0.9）。含图段不掷、信息型不掷
+  （超过门槛就完整发送），所以「要讲清楚的事」不会被骰子吞掉。发送途中对方又说话了，
+  聊天型剩下的气泡就不再发（信息型该讲完还得讲完）。
+- **私聊补一句（L2，默认开）**：回完对方、对方安静 15 秒后，最多再开一轮看看有没有想补充的
+  （可 SKIP）。它**不搭 `proactive` 那趟车**（那是群里主动开口的总开关），有自己的
+  `privateAfterthought*` 开关 / 概率 / 日上限；空消息、命令、出错、SKIP 之后的轮次不补，
+  对方在这期间接了话也不补。
+- **提示词槽位化**：场景 → 人设 → 表达契约 → 记忆索引 + 热梗 → 能力清单 → 额外要求 →
+  **硬性规则（最后，最高优先级）**。每条规则只出现一次；「绝不两拍」拆成两句（信息型的
+  「短 + 长」仍然禁止，聊天型的「短 + 短」允许）。
+- 本部署那份混着风格规则的 `persona` 已从 `cordis.patch.yml` 搬进 `.qq-persona/PERSONA.md`
+  与 `.qq-persona/STYLE.md`（蓝毛女仆人设拆成「身份 / 背景 / 温柔底色 / 傲娇点缀 / 场景」+
+  「总体 / 标点 / 表情包 / 私聊 / 群聊」）。
+
+### 群聊搭话（治「莫名其妙」）
+
+- **`speech-policy.js`**：把准入、A/C 抽卡、插话准入收成一个纯判据，返回 `intent`
+  （`addressed` / `continued` / `interject` / `none`）。`admit` 只剩「凑入参 + 记账」。
+- **插话的投递文案换了**：不再是 `kaguya: 晚上吃啥`（kaguya 并没有问它），而是
+  「（群里在聊天，这句不是叫你的。kaguya 说：晚上吃啥）」+「你要接就接这一句……不想接就只写
+  SKIP」。`speakerLine` 也按 intent 换措辞，不再一律说「刚跟你说话的人」。
+- **插话强制引用锚点**（`interjectQuote`，默认开）：引用的是 `admit` 时快照的具体
+  `message_id`，不再看 `replyStyle: auto` 的漂移判断（那个判断在「紧接着回」时恰好不引用，
+  于是插话裸奔）。引用发不出去 → 退化成 @ 说话人 → 再不行才裸文本，都记 warn。
+- **C 路准入收紧四条**：@ 了别人、命令、纯媒体（没有文字）、机器人自己 —— 一条都不接。
+
+### 认知与表情包分离
+
+- **`cognition.js`** + 两个文件：`COGNITION.md` 只装**语言**（梗 / 黑话 / 缩写 / 谐音，键是
+  文字写法含变体），`STICKERS.md` 装**表情包**（键是收藏后的文件名）。认知库里**不许出现
+  文件路径**，表情包目录里**不许出现 `.qq-media`**（那是会过期的缓存）。
+- `qq_save_sticker` 新增可选 `meaning` / `scene`：存完图顺手往 `STICKERS.md` 补一行；没给
+  `meaning` 时进「未收藏」待办区（不进提示词）。目录写失败**不回滚图片**。
+- 提示词里的表情包目录改成「名字（含义）」而不是裸文件名；新增「最近学的梗」段（最近 15 条
+  「置信：确认」，≤1200 字），谐音梗不用先 search 再答。
+- skill 拆分：新增 `learn-meme`（文字梗 → `COGNITION.md`）与 `learn-sticker`（表情包 →
+  先收藏再写 `STICKERS.md`）；`update-cognition` 保留为**一句话分诊**的兼容壳；
+  `message-digest` 的认知段落改成分诊写法。
+- 新增 `scripts/migrate-cognition.mjs`：把老 `COGNITION.md` 里「以路径为键」的条目一次性迁到
+  `STICKERS.md`（用画面指纹认同一张重新编码过的图；认不出就标「原图已过期」放进未收藏区）。
+  **默认 dry-run**，`--apply` 才写，写前备份，`--json` 给报告。
+
+### 感知层
+
+- **`modalities.js`**：消息段 → `Observation` → 占位符渲染。系统表情带名字、语音给时长、
+  视频给时长 + 封面路径、文件给大小、合并转发给条数、`json`/`xml` 卡片解析出标题 / 域名 / 链接。
+  `onebot.js` 的 `messageToText` 改为委托它（既有输出逐字节不变）。
+- **`links.js`**：卡片解析 + 可选的 URL 预览（`linkPreview` **默认关**）。SSRF 防护覆盖
+  scheme / userinfo / localhost / `*.local` / `*.internal` / 私有与保留网段 / 各种数值变形的
+  IPv4 / IPv6 回环与内网，每一跳重定向都重新校验；超时、字节上限、只收 `text/html`/`text/plain`。
+- **`interactions.js` + 戳一戳**：以前 `handleEvent` 第一行就把 `notice` 全丢了，现在被戳会回应。
+  `pokeMode` = `random`（默认，按 `pokeReplyChance` 回戳或走一轮）/ `poke` / `text` / `ignore`；
+  每个会话 `pokeCooldownMs` 冷却 + `pokeDailyMax` 每日上限（防两个机器人互戳）。
+  只回应**戳机器人自己**的，戳别人一律不记。新增 `qq_poke` 工具（群里必须显式指定戳谁）。
+- 视频只下封面（`videoCover` 默认开，`videoMaxBytes: 0` 不下载整段）；语音只做时长占位，
+  **不下载、不转写、不起任何外部进程**。
+
+### 运维
+
+- **`ops.js`（纯计划）+ `scripts/ops.mjs`（执行器）**：一套命令跨平台。
+  `doctor` / `status` / `restart` / `logs` / `install` / `uninstall` / `napcat` /
+  `migrate cognition` / `cleanup jm` / `selftest`，都支持 `--json`（stdout 只有一个对象，
+  版本号 `schema: 1`；人话走 stderr）。
+- 退出码：`0` 全部通过 / `1` 有 error 级 findings / `2` 需要人工或提权 / `3` 脚本自身出错。
+- `--apply` **默认关**：写 cwd 外的步骤（systemd unit、计划任务、NapCat 配置、profile）都带
+  `requires: human|root`，agent 默认只拿计划、把命令原样贴给人。幂等（写前备份，重复执行不重复写）。
+- 新增 `docs/ops.md`（给 agent 的排查配方）。
+
+### 配置
+
+新增 28 项，全部有中文 `.description()` 并在设置页分了组（「表达（STYLE.md / 气泡 / 标点 / 补一句）」
+与「感知与互动（链接 / 视频 / 戳一戳）」两张新卡片）：
+
+- 人格与表达：`personaFile` / `personaMaxChars` / `personaSceneOverlays` / `styleFile` /
+  `styleMaxChars` / `bubbleGamble` / `bubbleContinueChance` / `bubbleContinueDecay` /
+  `bubbleGambleMaxChars` / `bubbleChatMax` / `stripShortPeriod` / `shortPeriodMaxChars` /
+  `interjectQuote` / `privateAfterthought` / `privateAfterthoughtChance` /
+  `privateAfterthoughtIdleMs` / `privateAfterthoughtDailyMax`
+- 感知与互动：`linkPreview` / `linkPreviewTimeoutMs` / `linkPreviewMaxBytes` /
+  `linkAllowPrivateHosts` / `videoCover` / `videoMaxBytes` / `pokeReply` / `pokeMode` /
+  `pokeReplyChance` / `pokeCooldownMs` / `pokeDailyMax`
+
+### 设置页（跟着这次重构一起改）
+
+之前的设置页只是把新字段「塞」进了已有分组：页面结构没动、标签靠描述自动截、人设卡还把
+**已经失效的旧 `persona` 排在第一行**。这次补齐：
+
+- **人设卡改成「文件优先」的顺序**：`personaFile` / `personaMaxChars` / `personaSceneOverlays`
+  在前，旧 `persona` 与 `instructions` 在后。实现上顺手修了一个静默的坑：分组字段的顺序原来
+  由 schema 决定，`SECTIONS[].fields` 那份声明顺序只用来判归属 —— 现在显式清单说了算（前缀组
+  仍按 schema 顺序），于是「声明成文件优先」这件事才真的落到界面上。
+- **两张卡的标题与说明**：「人格与提示词（PERSONA.md 优先）」「表达（STYLE.md / 气泡 / 标点 /
+  补一句）」，展开时顶上多一行组说明（`personaNote` / `expressionNote`）：文件存在时哪一项不生效、
+  机器参数照常叠加。光看字段名看不出这层关系，而这正是重构后最容易踩的坑。
+- **修掉自动标签截出来的半句**：`stripShortPeriod` 原来是「短气泡句末的「」、`pokeReplyChance`
+  是「pokeMode」、`bubbleContinueDecay` / `personaSceneOverlays` / `apiKeyRotate` 等被截成半句。
+  补了 `LABEL_OVERRIDES`，并加了一条用例钉住「标签不以 `…` 或 `「` 结尾」。
+- **私聊 / 群聊的「补一句」不再撞名**：`activeChime*` 与 `privateAfterthought*` 原来都叫
+  「补一句前的安静时间 / 每天最多补几句」，现在分别标明「群里」「私聊」。
+- 插件在 Web UI 里的标题/描述（`locale/zh.json` / `en.json`）同步成重构后的四层说法。
+
+### 设置页重设计（6 个 tab / 搜索 / 官方控件）
+
+按 `docs/settings-ui-redesign.md`（v2 定稿）把 120 个字段从「14 张折叠卡片、默认只展开第一组、
+布尔与枚举都是文本框、数字没有量纲」改成可扫、可找、可理解的页面：
+
+- **6 个下划线 tab**：连接 / 会话 / 人格 / 群聊 / 感知 / 记忆（默认「连接」），14 个分组各归一个
+  tab（`TABS` / `tabOf`，测试钉住「每个分组恰属一个 tab、120 项合计分布 12/23/19/29/22/15」）。
+  卡片 chrome（`CARD_STYLE` / `groupHeader` / `openId`）全部删掉，改成**扁平区块**：标题 + 0.5px
+  分隔线 + 一行一个字段；只剩「人格」页的旧 `persona` 折进「兼容：旧 persona（文件存在时不生效）」。
+- **官方两种字段行**：布尔 → `Switch`（标题 + 说明在左、开关在右），枚举 → 原生 `<select>`
+  （Input 外观 + 箭头，人话在 `ENUM_LABELS`：`mention` → 「按 @ 提及」、`never` → 「一律拒绝
+  （无人值守）」……），数字 / 文本 → `Input`，`persona` / `instructions` → 多行框，白名单在输入框
+  下面给可点的 `Pill` 预览（点 × 删一个值）。「已覆盖 + 恢复默认」统一由 `FieldShell` 画，不再
+  每个控件一套 chrome。
+- **数字量纲**：`FIELD_HINTS` 白名单给毫秒 / 字节 / 字符 / 小时 / 概率 / 倍率补一句只读换算
+  （`proactiveIdleMs: 2700000` → 「= 45 分钟」、`digestAtHour: 4` → 「= 04:00」、
+  `mediaMaxBytes: 8388608` → 「= 8 MB」），输入框里仍是原始值、不做双向换算；测试反向钉住
+  「凡是名字以 `Ms`/`Bytes`/`Chars`/`Hour`/`Chance` 结尾的字段都必须命中 `FIELD_HINTS` 或 `NO_HINT`」。
+- **搜索**：按短标签 / 字段名 / `.description()` / 区块标题跨 tab 命中（`proactive`、
+  `proactive_idle_ms`、`攒批窗口` 都行），结果行本身可编辑、右侧 Tag 标出来源 tab，`Esc` 清空；
+  不做 `/` 快捷键。
+- **脏状态**：工具条显示「已改 N 项」（`overridden` 行数）与「只看已改」开关，两者可与搜索叠加；
+  有非法项时多一个「N 项待修正」。保存仍然只有 `SettingsForm` 底部那一个按钮（不吸底、不 Toast），
+  切 tab / 搜索 / 过滤都不丢草稿（模型只建一次）。
+- **无障碍与样式**：`role=tablist/tab/tabpanel` + roving tabindex + ←/→/Home/End；开关 / 输入 /
+  下拉在只读部署里全部 `disabled`；颜色一律走 `--dsw-*` token，样式是 factory 里注入的一段
+  `<style>`（官方插件同款做法，仍然零外部样式表 / 零构建），`prefers-reduced-motion` 下关掉
+  `<details>` 箭头的过渡。
+- **人设与表达页**：文件路径与预算在前、旧 `persona` 折进「兼容」、`instructions` 在正文；机器参数
+  按「气泡 / 标点 / 群聊 / 私聊」分了小标题，散文（`STYLE.md`）与参数互不解析。
+- `test/client.test.mjs` 从 13 条扩到 **28** 条（假模块系统 + 迷你渲染器把整页展开成节点树），
+  覆盖字段 / tab / 控件映射 / 草稿口径 / 搜索 / 只看已改 / 量纲 / 只读；全量基线 **476 → 491**。
+- `accessToken` 密钥化（D6）与人设文件编辑（P5）**本轮不做**，方案留在设计文档 §4.3 / 附录 B。
+
+### 测试
+
+- 基线从 **321** 变成 **476**：删掉 JM 的 19 条，新增 `persona` / `style` / `speech-policy` /
+  `modalities` / `links` / `interactions` / `cognition` / `migrate-cognition` / `ops` 九个纯函数
+  测试文件，以及桥接层的插话锚点 / 准入收紧 / 气泡计划 / 私聊补一句 / 戳一戳 / 链接预览 /
+  视频封面 / 语音占位等端到端用例。
+- **沙箱里不再有「13 条跳过」**：那 13 条全是为 JM 的真 spawn 准备的探针，随 JM 一起删掉了。
+
 ## 0.1.1 — 2026-10-15
 
 修 Windows 桌面版**安装流程**里实测出来的一批毛病。全部在「NapCat 那一侧 / 安装 / 文档 / 测试」

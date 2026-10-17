@@ -9,27 +9,24 @@
  * @module qq-bridge/onebot
  */
 
+/**
+ * 感知层的纯函数搬去了 `modalities.js`（见该模块头部的理由）。
+ * 这里 import 是为了 `collectMedia` 的标签与 `messageToText` 的渲染；
+ * 同时**再导出** `mediaLabel` / `mediaPlaceholder`：`index.js` / `memory.js` /
+ * `test/bridge.test.mjs` 一直是从本模块取这两个名字的，搬走实现不该动调用方。
+ */
+import { mediaLabel, mediaPlaceholder, renderMessage } from './modalities.js';
+
+// 再导出：`index.js` / `memory.js` / `test/bridge.test.mjs` 一直从本模块取这两个名字，
+// 搬走实现不该动调用方（AGENTS.md §3「往外搬模块」第 2 条）。
+export { mediaLabel, mediaPlaceholder };
+
 /** 重连退避的下限与上限（毫秒）。 */
 const RETRY_MIN_MS = 1000;
 const RETRY_MAX_MS = 30000;
 
 /** API 调用的默认超时（毫秒）：超时即 reject，避免调用方永久挂起。 */
 const CALL_TIMEOUT_MS = 15000;
-
-/**
- * 归一化图片/表情包自带的 `summary`。
- *
- * QQ 会给「动画表情」这种图配一句 `[动画表情]` 的占位摘要，商城表情给的则是表情名。
- * 去掉方括号、折掉换行、截个长度，让它能安全地塞进一行上下文里。
- * @param summary - 段里的 `summary` 字段。
- * @returns 可读标签；没有可用内容时为空串。
- */
-export function mediaLabel(summary) {
-  const text = String(summary ?? '').replace(/\s+/g, ' ').trim();
-  if (text.length === 0) return '';
-  const stripped = text.replace(/^\[+|\]+$/g, '').trim();
-  return stripped.slice(0, 40);
-}
 
 /**
  * 收集一条消息里所有可以落到本地的媒体段。
@@ -65,68 +62,6 @@ export function collectMedia(message) {
 }
 
 /**
- * 媒体段的替身文本：模型看到的「这里有张图」以及它该去读哪个文件。
- *
- * 三种情况分开写，因为它们对模型的含义完全不同：
- *   - 有本地路径 → 可以 `read_image` 真的看图；
- *   - 明确取文件失败 → 别去读一个不存在的路径，也别假装看见了；
- *   - 只是顺带提及（群聊环境上下文，不做下载）→ 朴素占位符。
- * @param media - {@link collectMedia} 给出的媒体描述。
- * @param localPath - 已落盘的相对路径；空串表示没有。
- * @param reason - 失败原因；给出时附在占位符里。
- * @returns 例如 `[图片(动画表情): .qq-media/ab12….gif]`。
- */
-export function mediaPlaceholder(media, localPath = '', reason = '') {
-  const kind = media?.kind === 'mface' ? '表情包' : '图片';
-  const label = typeof media?.label === 'string' && media.label.length > 0 ? `(${media.label})` : '';
-  if (typeof localPath === 'string' && localPath.length > 0) return `[${kind}${label}: ${localPath}]`;
-  if (typeof reason === 'string' && reason.length > 0) return `[${kind}${label} 没能取到文件: ${reason}]`;
-  return `[${kind}${label}]`;
-}
-
-/**
- * 把单个 OneBot 消息段渲染成模型能读懂的纯文本。
- * 图片/语音等非文本内容用方括号占位，让模型知道「这里有个东西」但不至于读到空串。
- * @param segment - 一个 `{ type, data }` 消息段。
- * @param replacement - 可选：该段已被替换成的文本（媒体落盘后的路径形式）。
- * @returns 该段的可读替身文本。
- */
-function segmentToText(segment, replacement) {
-  if (typeof replacement === 'string') return replacement;
-  const type = segment?.type;
-  const data = segment?.data ?? {};
-  switch (type) {
-    case 'text':
-      return typeof data.text === 'string' ? data.text : '';
-    case 'at':
-      return data.qq === 'all' ? '@全体成员' : `@${data.name ?? data.qq ?? '某人'}`;
-    case 'image':
-      return mediaPlaceholder({ kind: 'image', label: mediaLabel(data.summary) });
-    case 'mface':
-      return mediaPlaceholder({ kind: 'mface', label: mediaLabel(data.summary) });
-    case 'face':
-      return '[表情]';
-    case 'reply':
-      return '[回复]';
-    case 'record':
-      return '[语音]';
-    case 'video':
-      return '[视频]';
-    case 'file':
-      return `[文件 ${data.name ?? ''}]`.trim();
-    case 'json':
-    case 'xml':
-      return '[卡片消息]';
-    case 'forward':
-      return '[合并转发]';
-    case 'poke':
-      return '[戳一戳]';
-    default:
-      return type === undefined ? '' : `[${type}]`;
-  }
-}
-
-/**
  * 把 OneBot 的 `message` 字段拍平成纯文本。
  * @param message - 消息段数组（array 上报格式）或原始字符串（CQ 码格式）。
  * @param skipAtId - 可选：指定某个 QQ 号的 `at` 段被丢弃而不是渲染；
@@ -138,14 +73,9 @@ function segmentToText(segment, replacement) {
  * @returns 可读的消息文本。
  */
 export function messageToText(message, skipAtId, media) {
-  if (typeof message === 'string') return message;
-  if (!Array.isArray(message)) return '';
-  return message
-    .map((segment, index) => {
-      if (skipAtId !== undefined && segment?.type === 'at' && String(segment?.data?.qq) === String(skipAtId)) return '';
-      return segmentToText(segment, media instanceof Map ? media.get(index) : undefined);
-    })
-    .join('');
+  // 实现本体在感知层：这里只保留老的位置参数签名（`index.js` / `memory.js` 都在用），
+  // 输出与搬走前逐字节一致。
+  return renderMessage(message, { skipAtId, media });
 }
 
 /**

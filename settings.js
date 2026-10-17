@@ -20,9 +20,7 @@
  *
  * @module @qqbot/dsh-plugin-qq/settings
  */
-import { fileURLToPath } from 'node:url';
 import { DEFAULT_IMAGE_MAX_BYTES } from './image.js';
-import { defaultJmFileHost, defaultJmPython } from './util.js';
 
 /**
  * `setTimeout` 能表达的最大延迟。
@@ -122,6 +120,40 @@ export function createSettings(config, defaultCwd) {
     : 0;
   const delayJitter = Math.min(1, Math.max(0, Number(config.delayJitter) || 0));
 
+  // —— 人格与表达（文件路径只去空白，越界校验在 index.js）——
+  const personaFile = trimmed(config.personaFile);
+  const personaMaxChars = Math.max(200, Math.floor(Number(config.personaMaxChars) || 0) || 4000);
+  const personaSceneOverlays = config.personaSceneOverlays !== false;
+  const styleFile = trimmed(config.styleFile);
+  const styleMaxChars = Math.max(200, Math.floor(Number(config.styleMaxChars) || 0) || 2000);
+  const bubbleGamble = config.bubbleGamble !== false;
+  // 概率三项：夹到 0~1，NaN 保持 NaN（与 activeTalkChance 同口径：NaN 进判据时 `roll < NaN`
+  // 恒假 = 不追加第二个气泡，是比「按随机数乱来」更安全的失败方向）。
+  const bubbleContinueChance = Math.min(1, Math.max(0, Number(config.bubbleContinueChance)));
+  const bubbleContinueDecay = Math.min(1, Math.max(0, Number(config.bubbleContinueDecay)));
+  const bubbleGambleMaxChars = Math.max(0, Math.floor(Number(config.bubbleGambleMaxChars) || 0));
+  const bubbleChatMax = Math.max(1, Math.floor(Number(config.bubbleChatMax) || 0) || 3);
+  const stripShortPeriod = config.stripShortPeriod !== false;
+  const shortPeriodMaxChars = Math.max(1, Math.floor(Number(config.shortPeriodMaxChars) || 0) || 40);
+  const interjectQuote = config.interjectQuote !== false;
+  const privateAfterthought = config.privateAfterthought !== false;
+  const privateAfterthoughtChance = Math.min(1, Math.max(0, Number(config.privateAfterthoughtChance)));
+  const privateAfterthoughtIdleMs = msOf(config.privateAfterthoughtIdleMs, 15000);
+  const privateAfterthoughtDailyMax = msOf(config.privateAfterthoughtDailyMax, 10);
+
+  // —— 感知与互动 ——
+  const linkPreview = config.linkPreview === true;
+  const linkPreviewTimeoutMs = Math.max(1000, Math.floor(Number(config.linkPreviewTimeoutMs) || 0) || 8000);
+  const linkPreviewMaxBytes = Math.max(1024, Math.floor(Number(config.linkPreviewMaxBytes) || 0) || 524288);
+  const linkAllowPrivateHosts = config.linkAllowPrivateHosts === true;
+  const videoCover = config.videoCover !== false;
+  // 0 是**明确的不下载**（默认），非法值也并到 0：视频整段下载本来就不该随手打开。
+  const videoMaxBytes = Math.max(0, Math.floor(Number(config.videoMaxBytes) || 0));
+  const pokeReply = config.pokeReply !== false;
+  const pokeReplyChance = Math.min(1, Math.max(0, Number(config.pokeReplyChance)));
+  const pokeCooldownMs = msOf(config.pokeCooldownMs, 30000);
+  const pokeDailyMax = msOf(config.pokeDailyMax, 20);
+
   // —— 主动说话 ——
   const proactiveIdleMs = msOf(config.proactiveIdleMs, 45 * 60 * 1000);
   const proactiveFreshMs = msOf(config.proactiveFreshMs, 24 * 60 * 60 * 1000);
@@ -157,18 +189,6 @@ export function createSettings(config, defaultCwd) {
     return Number.isFinite(value) && value > 1 ? value : 1;
   })();
 
-  // —— 禁漫下载 ——
-  const jmCommand = trimmed(config.jmCommand);
-  // 留空表示用插件自带的脚本；这里解析成绝对路径，省得 jm 服务再关心 import.meta.url。
-  const jmScript = trimmed(config.jmScript).length > 0
-    ? config.jmScript
-    : fileURLToPath(new URL('./scripts/jm_download.py', import.meta.url));
-  // 这两个默认值**随平台变**，所以不能在 schema 里写死（`.default()` 只能是常量）：
-  // schema 里留空，这里补上按平台算出来的那个值。取值口径写在 util.js 的两个纯函数上
-  // （`defaultJmPython` / `defaultJmFileHost`），那边有用例钉着。
-  const jmPython = trimmed(config.jmPython).length > 0 ? trimmed(config.jmPython) : defaultJmPython();
-  const jmFileHost = trimmed(config.jmFileHost).length > 0 ? trimmed(config.jmFileHost) : defaultJmFileHost();
-
   // —— 长期记忆 ——
   const memoryOn = config.memory !== false;
   const memorySearchHits = Math.max(1, Math.floor(Number(config.memorySearchHits) || 40));
@@ -190,7 +210,7 @@ export function createSettings(config, defaultCwd) {
 
   return {
     // schema 里已经是对的类型、也没有再加工余地的字段直接透传（`approvalPolicy`、
-    // `groupChat`、`replyStyle`、`media*`、`jm*` 的其余项等等）。
+    // `groupChat`、`replyStyle`、`media*` 的其余项等等）。
     ...config,
     cwd,
     provider,
@@ -221,6 +241,33 @@ export function createSettings(config, defaultCwd) {
     burstMaxMessages,
     burstSingleMaxChars,
     delayJitter,
+    personaFile,
+    personaMaxChars,
+    personaSceneOverlays,
+    styleFile,
+    styleMaxChars,
+    bubbleGamble,
+    bubbleContinueChance,
+    bubbleContinueDecay,
+    bubbleGambleMaxChars,
+    bubbleChatMax,
+    stripShortPeriod,
+    shortPeriodMaxChars,
+    interjectQuote,
+    privateAfterthought,
+    privateAfterthoughtChance,
+    privateAfterthoughtIdleMs,
+    privateAfterthoughtDailyMax,
+    linkPreview,
+    linkPreviewTimeoutMs,
+    linkPreviewMaxBytes,
+    linkAllowPrivateHosts,
+    videoCover,
+    videoMaxBytes,
+    pokeReply,
+    pokeReplyChance,
+    pokeCooldownMs,
+    pokeDailyMax,
     proactiveIdleMs,
     proactiveFreshMs,
     proactiveGapMs,
@@ -240,10 +287,6 @@ export function createSettings(config, defaultCwd) {
     activeChimeMax,
     activeChimeDailyMax,
     activeGroupBatchScale,
-    jmCommand,
-    jmScript,
-    jmPython,
-    jmFileHost,
     memoryOn,
     memorySearchHits,
     memoryFileMaxBytes,

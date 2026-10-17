@@ -19,7 +19,6 @@ import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import yaml from 'js-yaml';
 import { Config, apply, inject, liveConfig, parseApiKeyPool, sessionIdFor, withinActiveHours } from '../index.js';
-import { spawnAvailable } from '../jm.js';
 import { blankMessageLabel, collectMedia, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
@@ -535,64 +534,9 @@ function sentTexts(onebot, action = 'send_group_msg') {
 }
 
 /**
- * 造一个假的「python 解释器」：**用 Node 当解释器**跑一个按 jm_download.py 的
- * JSON Lines 协议说话的脚本，并真的在 `--out` 目录里落一个 PDF。
- *
- * 为什么不是 shell 脚本（本文件早先的写法）：桌面版跑在 Windows 上，那边既没有
- * `/bin/sh` 也不认 shebang，`.sh` 假脚本会让 `/jm` 这条链路在那台机器上根本起不来
- * —— 而这条链路恰恰是「必须真的 spawn 一次」才验证得到的那部分。
- * `node <script> --out …` 与 `python <script> --out …` 的参数形状一致，插件侧看不出区别。
- *
- * 为什么要连进程一起测：spawn / 超时 / 并发键 / 文件服务这些才是这条链路上最容易
- * 出错的地方，只有把假脚本真的 spawn 起来才验证得到。
- *
- * @param dir - 放脚本的目录（会作为插件的 cwd）。
- * @param options.body - `'ok'` = 正常下载；`'fail'` = 回一个失败结果；其余字符串当作错误信息。
- * @param options.delayMs - 脚本先睡多久（用来验证「同一个会话不能并发下载」）。
- * @returns `{ python, script }`：解释器（Node 自己）与假脚本的绝对路径。
- */
-async function writeFakeJmPython(dir, { body = 'ok', delayMs = 0 } = {}) {
-  const script = join(dir, 'fake-jm-python.mjs');
-  const lines = [
-    `import { writeFileSync } from 'node:fs';`,
-    `import { join } from 'node:path';`,
-    `const at = (name) => { const i = process.argv.indexOf(name); return i === -1 ? undefined : process.argv[i + 1]; };`,
-    `const out = at('--out');`,
-    `const say = (value) => process.stdout.write(JSON.stringify(value) + '\\n');`,
-  ];
-  if (delayMs > 0) lines.push(`await new Promise((done) => setTimeout(done, ${Math.round(delayMs)}));`);
-  if (body === 'ok') {
-    lines.push(`say({ event: 'meta', id: '422866', title: 'Test Book', author: 'tester', chapters: 2, pages: 3 });`);
-    lines.push(`const pdf = join(out, 'Test Book.pdf');`);
-    lines.push(`writeFileSync(pdf, '%PDF-1.4 fake');`);
-    lines.push(`say({ event: 'result', ok: true, pdf, pages: 3, bytes: 13, title: 'Test Book', kind: 'album', chapters: 2 });`);
-  } else {
-    lines.push(`say({ event: 'result', ok: false, error: ${JSON.stringify(body === 'fail' ? '本子不存在' : body)} });`);
-  }
-  await writeFile(script, `${lines.join('\n')}\n`, 'utf8');
-  return { python: process.execPath, script };
-}
-
-/**
- * 起一个开了禁漫下载的插件实例：cwd 是新的临时目录（PDF 就落在里面），
- * `jmPython` 指向假脚本，文件服务绑 127.0.0.1（测试里没有 docker 网桥）。
- */
-async function bootJm(config = {}, hostOptions = {}, onebotOptions = {}) {
-  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-jm-'));
-  const fake = await writeFakeJmPython(cwd, config.__python ?? {});
-  const { __python, ...rest } = config;
-  const booted = await boot(
-    { cwd, jmDir: '.qq-jm', jmPython: fake.python, jmScript: fake.script, jmFileHost: '127.0.0.1', ...rest },
-    hostOptions,
-    onebotOptions,
-  );
-  return { ...booted, cwd, python: fake.python, script: fake.script };
-}
-
-/**
  * 所有起过的插件实例：用例结束时统一收尾。
  *
- * 插件会持有 OneBot socket（以及禁漫下载的、给 NapCat 取文件的 HTTP 服务），
+ * 插件会持有 OneBot socket（以及主动说话、补一句那些短定时器），
  * 测试里没人卸载插件，这些监听中的句柄会让**测试进程**一直不退出 —— 所以这里
  * 统一在 `after` 里把每个实例的 `ctx.effect` 销毁回调跑一遍、关掉假服务端。
  */
@@ -624,7 +568,20 @@ async function boot(config = {}, hostOptions = {}, onebotOptions = {}) {
   // 用 Config() 过一遍真实 schema，测试里传的配置因此也顺带验证了默认值合并。
   // 延迟一律压到 0：拟人节奏不该让测试多等几秒，需要验证时序的用例自己覆盖。
   // 攒批窗口同理：默认关掉，要验证「几个人同时 @ 只回一轮」的用例自己给一个小窗口。
-  apply(host.ctx, Config({ endpoint: onebot.endpoint, cwd, readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, batchWindowMs: 0, ...config }));
+  //
+  // **气泡掷骰也默认关掉**：默认配置下它按概率决定发 1~3 个气泡，那会让「这条回复应该
+  // 是两条消息」这类断言随机翻车。气泡计划本身由专门那一组用例用概率 0/1 钉死
+  // （见 `the bubble plan sends a 1..N prefix of the chat bubbles`）。
+  apply(host.ctx, Config({
+    endpoint: onebot.endpoint,
+    cwd,
+    readDelayMs: 0,
+    minDelayMs: 0,
+    maxDelayMs: 0,
+    batchWindowMs: 0,
+    bubbleGamble: false,
+    ...config,
+  }));
   // 先登记再启动：`start()` 跑的是 `ctx.effect` 的回调（OneBot 连接、摘要与主动说话的
   // 定时器），它可能抛错 —— 例如插件漏声明 inject 时的 cordis 检查。抛错时这个实例也
   // 必须进收尾清单，否则刚起的假 OneBot 服务端会一直挂着监听，让整个测试文件停不下来
@@ -828,15 +785,15 @@ test('blankReply: false restores dropping messages that have no text', async () 
   }
 });
 
-/** 空消息不能被当成指令：`@bot` + `/jm …` 是两回事，空 @ 永远只走模型。 */
-test('a bare @ never reaches the /jm bypass', async () => {
+/** 空消息不能被当成指令：单纯的 `@bot` 永远只走模型，不触发任何旁路。 */
+test('a bare @ reaches the model instead of a command bypass', async () => {
   const { onebot, host } = await boot();
   try {
     onebot.push(mention(''));
     const agent = await untilInbox(host, 1, 'the bare mention to create the Agent');
     await settle(60);
     assert.equal(agent.inbox[0].content[0].text, '（@了你一下，没有说别的）');
-    // 旁路会直接回一句「用法：…」并发文件；这里既没有那条回复，也没有任何 send_*。
+    // 旁路会直接回一句「用法：…」；这里既没有那条回复，也没有任何 send_*。
     assert.deepEqual(sentTexts(onebot), []);
   } finally {
     await onebot.close();
@@ -1290,12 +1247,12 @@ test('the bundled patch declares the narrowed preset the plugin mounts', async (
 
   // 白名单只能收窄、不能授予：每个放开的工具名都要能在这个预设里找到出处。
   // 本插件的工具是**宿主平面**的全局工具（不在预设里），所以直接算作出处：
-  //   - qq_send_* / qq_jm_pdf：一直注册；
+  //   - qq_send_* / qq_poke / qq_list_conversations：一直注册；
   //   - qq_save_sticker：表情包目录可用时才注册（白名单里有它、但目录配到 cwd 外时，
   //     插件只是不注册那个工具 —— 这与「白名单挡掉」是两条独立的路，见 tools.js）；
   //   - qq_transcript / qq_memory：memory 开着时才注册；
   //   - skill：由预设里的 tool-skill 提供。
-  const provided = new Set(['qq_send_message', 'qq_send_image', 'qq_save_sticker', 'qq_list_conversations', 'qq_jm_pdf', 'skill']);
+  const provided = new Set(['qq_send_message', 'qq_send_image', 'qq_save_sticker', 'qq_list_conversations', 'qq_poke', 'skill']);
   if (bridge.config.memory !== false) for (const name of ['qq_transcript', 'qq_memory']) provided.add(name);
   if (names.includes('@deepseek-ai/dsh-tool-fs')) for (const name of ['read', 'read_image', 'write', 'edit']) provided.add(name);
   if (names.includes('@deepseek-ai/dsh-tool-fs-search')) for (const name of ['glob', 'grep']) provided.add(name);
@@ -1326,8 +1283,6 @@ test('the bundled patch reads the QQBOT_* variables the Windows setup script wri
     cwd: 'QQBOT_CWD',
     napcatDir: 'QQBOT_NAPCAT_DIR',
     napcatAutoConfig: 'QQBOT_NAPCAT_AUTOCONFIG',
-    jmPython: 'QQBOT_JM_PYTHON',
-    jmFileHost: 'QQBOT_JM_FILE_HOST',
   };
   for (const [field, variable] of Object.entries(expected)) {
     const value = bridge.config[field];
@@ -2107,7 +2062,8 @@ test('an automatic reply is burst into short messages', async () => {
       const list = sentTexts(onebot, 'send_private_msg');
       return list.length === 3 ? list : undefined;
     }, 'the burst to be delivered');
-    assert.deepEqual(sent, ['今天天气不错。', '要不出去走走？', '顺便吃个饭吧！']);
+    // 短气泡句末的「。」在发送前被剥掉（stripShortPeriod）；问号/感叹号不动。
+    assert.deepEqual(sent, ['今天天气不错', '要不出去走走？', '顺便吃个饭吧！']);
     // 每一条都在目标长度内（整体不超协议上限自然更没问题）。
     assert.ok(sent.every((part) => part.length <= 12));
     // 两条间隔 × 30ms：证明「打字延迟」真的按配置生效，而不是一口气发完。
@@ -2179,21 +2135,24 @@ test('burstMaxMessages: 1 collapses a whole reply into a single message', async 
   }
 });
 
-// 用例十六·补二：burstSingleMaxChars —— 日常闲聊并成一条，真要展开时才拆成多条短句。
-// 这是默认的口味：模型爱把一句话写成「短句 + 长句」两拍，靠长度门槛而不是提示词压住。
-test('burstSingleMaxChars keeps chit-chat to one message and splits long answers', async () => {
+// 用例十六·补二：`burstSingleMaxChars` 现在的语义是「聊天型 / 信息型的门槛」。
+// 聊天型走气泡计划（发几个由骰子/配置决定），信息型照常拆 —— 不再强制并成一条。
+// 想要旧行为（闲聊永远一条）就是 `bubbleChatMax: 1` + `bubbleGamble: false`（§11.2）。
+test('burstSingleMaxChars is the chat/informational threshold, not a force-one switch', async () => {
   const options = {
     burstMaxChars: 12,
     burstMaxParts: 3,
     burstMaxMessages: 0, // 长回复不封顶：该拆几条拆几条
     burstSingleMaxChars: 20,
+    bubbleChatMax: 1,
+    bubbleGamble: false,
     readDelayMs: 0,
     minDelayMs: 0,
     maxDelayMs: 0,
     delayJitter: 0,
   };
 
-  // 短回复（去掉空白 5 字 < 20）：换行写的两段也并成一条。
+  // 聊天型 + 旧行为兼容档：换行写的两段并成一条（内容还在，只是并条）。
   const short = await boot(options);
   try {
     short.onebot.push(privateMessage('在吗'));
@@ -2205,7 +2164,7 @@ test('burstSingleMaxChars keeps chit-chat to one message and splits long answers
     await short.onebot.close();
   }
 
-  // 长回复（去掉空白 28 字 > 20）：换行照旧分条，一行一条短句（这就是「需要深入时多条短句」）。
+  // 信息型（去掉空白 28 字 > 门槛 20）：换行照旧分条，一行一条短句。
   const long = '今天天气不错\n要不要出去走走\n顺便吃个饭吧\n附近新开的店还不错';
   const deep = await boot(options);
   try {
@@ -2223,35 +2182,66 @@ test('burstSingleMaxChars keeps chit-chat to one message and splits long answers
   }
 });
 
-// 用例十六·补三：两条「反人机」硬要求必须在渠道提示里，而且换成自定义 persona 也照样生效：
-//   ① 一条回复只有一个形状（要么短、要么长）—— 压住「短句 + 长句」两拍；
-//   ② 是 / 否题只回一个是 / 否 ——「知不知道」这种别接一段解释。
-test('the channel prompt carries the anti-robot reply rules', async () => {
-  const plain = await boot({});
+// 气泡计划（§6.4）：聊天型回复在**发送前**掷一次骰，决定发到第几个。
+// 用概率 1 / 0 把骰子钉死，别让用例靠运气。
+test('the bubble plan sends a 1..N prefix of the chat bubbles', async () => {
+  const base = { readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0 };
+  const reply = '在的\n刚吃完\n你呢';
+
+  // 概率 1：三个气泡都发（bubbleChatMax 默认 3）。
+  const all = await boot({ ...base, bubbleGamble: true, bubbleContinueChance: 1, bubbleContinueDecay: 1 });
   try {
-    plain.onebot.push(privateMessage('在吗'));
-    await until(() => plain.host.list.created[0], 'the Agent');
-    const text = promptText(plain.host, 'qq-bridge:channel');
-    assert.match(text, /一条回复只有一个形状/);
-    assert.match(text, /是 \/ 否题就回一个是 \/ 否/);
-    assert.match(text, /知不知道/);
+    all.onebot.push(privateMessage('在吗'));
+    const agent = await until(() => all.host.list.created[0], 'the first Agent');
+    completeTurn(all.host, agent, reply);
+    const sent = await until(() => {
+      const list = sentTexts(all.onebot, 'send_private_msg');
+      return list.length === 3 ? list : undefined;
+    }, 'three bubbles');
+    assert.deepEqual(sent, ['在的', '刚吃完', '你呢']);
   } finally {
-    await plain.onebot.close();
+    await all.onebot.close();
   }
 
-  // 自定义 persona 会整段替换内置那份口吻，但这两条硬要求挂在「硬性要求」里，必须还在；
-  // 同时内置 persona 的那句「像真人群友一样」应当已经不在了（证明确实被替换）。
-  const custom = await boot({ persona: '你是个普通群友，说话随意。' });
+  // 概率 0：只发第一个（第一个永远发 —— 绝不出现「话说一半、连开头都没有」）。
+  const one = await boot({ ...base, bubbleGamble: true, bubbleContinueChance: 0 });
   try {
-    custom.onebot.push(privateMessage('在吗'));
-    await until(() => custom.host.list.created[0], 'the Agent');
-    const text = promptText(custom.host, 'qq-bridge:channel');
-    assert.match(text, /一条回复只有一个形状/);
-    assert.match(text, /是 \/ 否题就回一个是 \/ 否/);
-    assert.ok(text.includes('你是个普通群友，说话随意。'));
-    assert.ok(!text.includes('像真人群友一样'));
+    one.onebot.push(privateMessage('在吗'));
+    const agent = await until(() => one.host.list.created[0], 'the second Agent');
+    completeTurn(one.host, agent, reply);
+    await until(() => sentTexts(one.onebot, 'send_private_msg')[0], 'the single bubble');
+    assert.deepEqual(sentTexts(one.onebot, 'send_private_msg'), ['在的']);
   } finally {
-    await custom.onebot.close();
+    await one.onebot.close();
+  }
+
+  // 关掉骰子：模型写几个就发几个。
+  const off = await boot({ ...base, bubbleGamble: false });
+  try {
+    off.onebot.push(privateMessage('在吗'));
+    const agent = await until(() => off.host.list.created[0], 'the third Agent');
+    completeTurn(off.host, agent, reply);
+    const sent = await until(() => {
+      const list = sentTexts(off.onebot, 'send_private_msg');
+      return list.length === 3 ? list : undefined;
+    }, 'all bubbles with the gamble off');
+    assert.deepEqual(sent, ['在的', '刚吃完', '你呢']);
+  } finally {
+    await off.onebot.close();
+  }
+});
+
+// 标点清洗：短气泡句末的「。」在发送前剥掉；长气泡保留正常标点。
+test('stripShortPeriod removes the trailing full stop of a short bubble', async () => {
+  const { onebot, host } = await boot({ readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0, shortPeriodMaxChars: 40 });
+  try {
+    onebot.push(privateMessage('在吗'));
+    const agent = await until(() => host.list.created[0], 'the Agent');
+    completeTurn(host, agent, '在的。');
+    await until(() => sentTexts(onebot, 'send_private_msg')[0], 'the reply');
+    assert.deepEqual(sentTexts(onebot, 'send_private_msg'), ['在的']);
+  } finally {
+    await onebot.close();
   }
 });
 
@@ -2377,6 +2367,8 @@ test("auto reply style also counts the bot's own replies in between", async () =
 
 // 用例十七之三：一次回复里的换行拆成多条独立消息，且引用只挂在第一条上。
 test('a multiline group reply becomes separate messages with the quote only on the first', async () => {
+  // 关掉气泡掷骰：这条用例验的是「换行 = 分条 + 引用只挂第一个文字气泡」，
+  // 骰子会决定「发到第几个」，那是另一组用例（见 bubble plan 那一组）。
   const { onebot, host } = await boot({ replyStyle: 'quote' });
   try {
     onebot.push(mention('在吗', { messageId: 4242 }));
@@ -3194,7 +3186,7 @@ test('the channel prompt offers qq_send_image and lists the sticker pack', async
   // 白名单挡掉这个工具时，提示词里一个字都不能再提它。
   const off = await bootImages(
     { allowTools: ['read'] },
-    { knownTools: ['qq_send_message', 'qq_send_image', 'qq_list_conversations', 'qq_jm_pdf', 'read'] },
+    { knownTools: ['qq_send_message', 'qq_send_image', 'qq_list_conversations', 'read'] },
   );
   off.onebot.push(privateMessage('在吗'));
   await until(() => off.host.list.created[0], 'the second Agent');
@@ -3296,16 +3288,17 @@ test('a sticker marker inside a reply keeps its place between the text parts', a
   assert.equal(calls[2].params.message, '再补一句');
 });
 
-test('a group sticker-only reply still carries the reply target, on the image itself', async () => {
+test('an image never carries the reply target, and a sticker-only reply drops the quote', async () => {
+  // §6.6：引用只挂第一个**文字**气泡，图段永不挂；整轮只有图时引用直接丢弃。
+  // 「表情本身就是一个反应」，给它挂一条引用反而像在慎重地回复某句话。
   const { onebot, host } = await bootImages({ replyStyle: 'quote' }, {}, {});
   onebot.push(mention('来一张'));
   const agent = await untilInbox(host, 1, 'the group Agent');
 
   completeTurn(host, agent, '[[图片: .qq-stickers/笑死.png]]');
   const sent = await until(() => onebot.calls.find((call) => call.action === 'send_group_msg'), 'the group message');
-  assert.equal(sent.params.message[0].type, 'reply');
-  assert.equal(sent.params.message[0].data.id, '7000');
-  assert.equal(sent.params.message[1].type, 'image');
+  assert.equal(sent.params.message.length, 1, '只有图，没有任何前面挂的段');
+  assert.equal(sent.params.message[0].type, 'image');
 });
 
 test('a sticker that cannot be sent says so instead of going silent', async () => {
@@ -3339,196 +3332,6 @@ test('the marker stays literal text when image sending is off or whitelisted awa
     assert.equal(onebot.calls.some((call) => Array.isArray(call.params.message)), false);
     assert.doesNotMatch(promptText(host, 'qq-bridge:channel'), /\[\[图片/);
   }
-});
-
-// ---- 禁漫（JM）下载 → PDF → 发到 QQ -----------------------------------------
-// 这些用例把假 python 真的 spawn 起来：spawn / 协议解析 / 并发键 / 一次性 URL /
-// 上传参数都是真代码，只有「下载」这一步是假的。
-//
-// 所以它们**顺带**成了「这个环境能不能起子进程」的探针：DSH 自己的沙箱禁止带管道的子进程
-// （实测 `spawn EPERM`），那时这几条不但会红，还会各自挂满 5 秒的 `until` 超时。判据用
-// `jm.js` 导出的 `spawnAvailable`（同一个事实：带管道的 spawn），起不来就跳过并说明原因。
-// 不依赖 spawn 的那几条（用法提示、`jmCommand: ''`、`jmDownload: false`）照常跑。
-const JM_SKIP = spawnAvailable ? false : '这个环境不能起带管道的子进程（DSH 沙箱），跳过需要真 spawn 的 /jm 用例';
-
-/** 与 `spawnTest` 同一套用法：能 spawn 就正常跑，不能就带原因跳过。 */
-function jmTest(name, body) {
-  return test(name, { skip: JM_SKIP }, body);
-}
-
-jmTest('the /jm command downloads a PDF and uploads it without an Agent turn', async () => {
-  const { onebot, host } = await bootJm();
-  onebot.push(privateMessage('/jm 422866'));
-
-  const texts = await until(
-    () => (sentTexts(onebot, 'send_private_msg').length >= 3 ? sentTexts(onebot, 'send_private_msg') : undefined),
-    'the ack / meta / done messages',
-  );
-  assert.match(texts[0], /收到，去下 jm422866/);
-  assert.match(texts[1], /找到了：《Test Book》（2 话 · 3 页）/);
-  assert.match(texts[2], /下好了/);
-  // 车号是明确任务：不该为它建 Agent 会话、烧 token。
-  assert.equal(host.list.created.length, 0);
-
-  const upload = onebot.calls.find((call) => call.action === 'upload_private_file');
-  assert.ok(upload, 'the PDF must be uploaded');
-  assert.equal(upload.params.user_id, '100000002');
-  assert.equal(upload.params.name, 'Test Book.pdf');
-  assert.match(upload.params.file, /^http:\/\/127\.0\.0\.1:\d+\/f\/[0-9a-f]{32}\//);
-  // NapCat 拿着这个 URL 真的能把文件拉走 —— 这是「容器里取宿主机文件」的关键一步。
-  const served = await fetch(upload.params.file);
-  assert.equal(served.status, 200);
-  assert.equal(await served.text(), '%PDF-1.4 fake');
-});
-
-test('a bare /jm answers with the usage instead of downloading', async () => {
-  const { onebot, host } = await bootJm();
-  onebot.push(privateMessage('/jm'));
-
-  const texts = await until(
-    () => (sentTexts(onebot, 'send_private_msg').length > 0 ? sentTexts(onebot, 'send_private_msg') : undefined),
-    'the usage hint',
-  );
-  assert.match(texts[0], /用法：\/jm <车号/);
-  assert.equal(onebot.calls.some((call) => call.action === 'upload_private_file'), false);
-  assert.equal(host.list.created.length, 0);
-});
-
-test('an empty jmCommand lets the message through to the Agent', async () => {
-  const { onebot, host } = await bootJm({ jmCommand: '' });
-  onebot.push(privateMessage('/jm 422866'));
-
-  const agent = await untilInbox(host, 1, 'the conversation Agent to be created');
-  assert.equal(agent.inbox[0].content[0].text, '/jm 422866');
-  assert.equal(onebot.calls.some((call) => call.action === 'upload_private_file'), false);
-});
-
-test('jmDownload: false turns the command into a refusal, not a silent drop', async () => {
-  const { onebot, host } = await bootJm({ jmDownload: false });
-  onebot.push(privateMessage('/jm 422866'));
-
-  const texts = await until(
-    () => (sentTexts(onebot, 'send_private_msg').length > 0 ? sentTexts(onebot, 'send_private_msg') : undefined),
-    'the refusal',
-  );
-  assert.match(texts[0], /禁漫下载没开/);
-  assert.equal(host.list.created.length, 0);
-});
-
-jmTest('the /jm command uploads a group file when it is used in a group', async () => {
-  const { onebot } = await bootJm();
-  onebot.push(mention('/jm 422866'));
-
-  const upload = await until(
-    () => onebot.calls.find((call) => call.action === 'upload_group_file'),
-    'the group file upload',
-  );
-  assert.equal(upload.params.group_id, '100000001');
-  assert.equal(upload.params.folder, '');
-  assert.equal(upload.params.name, 'Test Book.pdf');
-  assert.match(upload.params.file, /^http:\/\/127\.0\.0\.1:\d+\/f\//);
-});
-
-jmTest('a second /jm in the same conversation is told to wait', async () => {
-  const { onebot } = await bootJm({ __python: { delayMs: 1500 } });
-  onebot.push(privateMessage('/jm 422866'));
-  await until(
-    () => sentTexts(onebot, 'send_private_msg').some((text) => /收到，去下/.test(text)),
-    'the first acknowledgement',
-  );
-  // 等第一个任务真的登记进并发键（ack 发出与 run() 之间只差几个微任务）。
-  await new Promise((resolve) => setTimeout(resolve, 150));
-  onebot.push(privateMessage('/jm 413446'));
-
-  const texts = await until(
-    () => {
-      const list = sentTexts(onebot, 'send_private_msg');
-      return list.some((text) => /还在下上一本/.test(text)) ? list : undefined;
-    },
-    'the busy answer',
-  );
-  assert.match(texts.join('\n'), /还在下上一本/);
-  // 第二个车号不该被下下来：只允许一条上传。
-  await until(() => onebot.calls.some((call) => call.action === 'upload_private_file'), 'the first upload');
-  assert.equal(onebot.calls.filter((call) => call.action === 'upload_private_file').length, 1);
-});
-
-jmTest('a failed download reports the reason back to QQ', async () => {
-  const { onebot } = await bootJm({ __python: { body: '这本有 146 话，超过上限 20；请指定单话' } });
-  onebot.push(privateMessage('/jm 400222'));
-
-  const texts = await until(
-    () => {
-      const list = sentTexts(onebot, 'send_private_msg');
-      return list.some((text) => /没下成/.test(text)) ? list : undefined;
-    },
-    'the failure message',
-  );
-  assert.match(texts.join('\n'), /没下成：.*146 话/);
-  assert.equal(onebot.calls.some((call) => call.action === 'upload_private_file'), false);
-});
-
-jmTest('a PDF that cannot be uploaded is reported instead of silently lost', async () => {
-  const { onebot } = await bootJm({}, {}, { uploadFails: '群文件上传需要管理员权限' });
-  onebot.push(privateMessage('/jm 422866'));
-
-  const texts = await until(
-    () => {
-      const list = sentTexts(onebot, 'send_private_msg');
-      return list.some((text) => /文件发不出去/.test(text)) ? list : undefined;
-    },
-    'the upload failure message',
-  );
-  assert.match(texts.join('\n'), /文件发不出去：.*管理员权限/);
-});
-
-jmTest('qq_jm_pdf sends the PDF to the QQ conversation the calling Agent belongs to', async () => {
-  const { onebot, host } = await bootJm();
-  onebot.push(privateMessage('帮我下这本'));
-  const agent = await until(() => host.list.created[0], 'the conversation Agent');
-
-  const tool = host.tools.get('qq_jm_pdf');
-  assert.ok(tool, 'qq_jm_pdf should be registered');
-  const value = await tool.execute({ id: 'https://18comic.vip/photo/422866/' }, { agent });
-
-  assert.equal(value.target_type, 'private');
-  assert.equal(value.target_id, '100000002');
-  assert.equal(value.file_name, 'Test Book.pdf');
-  assert.equal(value.pages, 3);
-  assert.equal(value.chapters, 2);
-  assert.match(value.path, /[\\/]\.qq-jm[\\/]Test Book\.pdf$/);
-  const upload = onebot.calls.find((call) => call.action === 'upload_private_file');
-  assert.equal(upload.params.user_id, '100000002');
-  assert.equal(upload.params.name, 'Test Book.pdf');
-});
-
-jmTest('qq_jm_pdf needs an explicit target when no QQ conversation owns the call', async () => {
-  const { onebot, host } = await bootJm();
-  const tool = host.tools.get('qq_jm_pdf');
-
-  await assert.rejects(() => tool.execute({ id: '422866' }, {}), /target_type and target_id/);
-  const value = await tool.execute({ id: '422866', kind: 'chapter', target_type: 'group', target_id: '100000001' }, {});
-  assert.equal(value.target_type, 'group');
-  assert.equal(value.target_id, '100000001');
-  const upload = onebot.calls.find((call) => call.action === 'upload_group_file');
-  assert.equal(upload.params.group_id, '100000001');
-  assert.equal(upload.params.name, 'Test Book.pdf');
-  await assert.rejects(() => tool.execute({ id: '不是一个车号' }, {}), /could not find a JM id/);
-});
-
-test('the channel prompt offers qq_jm_pdf unless the tool whitelist hides it', async () => {
-  const on = await bootJm();
-  on.onebot.push(privateMessage('在吗'));
-  await until(() => on.host.list.created[0], 'the first Agent');
-  assert.match(promptText(on.host, 'qq-bridge:channel'), /qq_jm_pdf/);
-
-  const off = await bootJm(
-    { allowTools: ['read'] },
-    { knownTools: ['qq_send_message', 'qq_list_conversations', 'qq_jm_pdf', 'read'] },
-  );
-  off.onebot.push(privateMessage('在吗'));
-  await until(() => off.host.list.created[0], 'the second Agent');
-  assert.doesNotMatch(promptText(off.host, 'qq-bridge:channel'), /qq_jm_pdf/);
 });
 
 // ---- 长期记忆：转录 → 工具 → 定时摘要 -------------------------------------------------
@@ -3801,7 +3604,7 @@ test('the channel prompt carries the memory index once it exists', async () => {
   assert.match(text, /长期记忆的索引/);
 });
 
-/** memoryDir 配到 cwd 外面时整个功能停用（与 mediaDir / stickerDir / jmDir 一致）。 */
+/** memoryDir 配到 cwd 外面时整个功能停用（与 mediaDir / stickerDir 一致）。 */
 test('memory is disabled when memoryDir leaves cwd', async () => {
   const outside = await mkdtemp(join(tmpdir(), 'qq-bridge-outside-'));
   // 这条用例断言的是「一个周期定时器都不该挂」：API key 轮换的定时器与记忆无关
@@ -4393,7 +4196,12 @@ test('activeFollow: a followed message keeps its text intact in prefix mode', as
 
 /** B：它回完之后对方安静一小会儿，它可能再补一句 —— 私聊也可以。 */
 test('activeChime: it adds one more line into the lull after its reply', async () => {
-  const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 30 });
+  // 私聊走 L2（`privateAfterthought*`），不再借群聊那套 activeChime 参数。
+  const { onebot, host } = await bootActive({
+    proactive: true,
+    privateAfterthoughtIdleMs: 30,
+    privateAfterthoughtChance: 1,
+  });
   onebot.push(privateMessage('在吗'));
   const agent = await until(() => host.list.created[0], 'the private Agent');
   await until(() => agent.inbox.length >= 1, 'the message');
@@ -4417,7 +4225,11 @@ test('activeChime: it adds one more line into the lull after its reply', async (
 
 /** B：判成 SKIP 就一个字都不发。 */
 test('activeChime: a SKIP keeps the lull silent', async () => {
-  const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 30 });
+  const { onebot, host } = await bootActive({
+    proactive: true,
+    privateAfterthoughtIdleMs: 30,
+    privateAfterthoughtChance: 1,
+  });
   onebot.push(privateMessage('在吗'));
   const agent = await until(() => host.list.created[0], 'the private Agent');
   await until(() => agent.inbox.length >= 1, 'the message');
@@ -4430,17 +4242,58 @@ test('activeChime: a SKIP keeps the lull silent', async () => {
   assert.equal(sentTexts(onebot, 'send_private_msg').length, 1, 'SKIP must not be sent');
 });
 
-/** B：没有 proactive 这个总开关就不补 —— 它是「允许主动发消息」的唯一开关。 */
-test('activeChime needs the proactive master switch', async () => {
+/** B：群聊的补一句仍然需要 `proactive` 这个总开关（它是「允许主动发消息」的开关）。 */
+test('activeChime in a group needs the proactive master switch', async () => {
   const { onebot, host } = await bootActive({ activeChimeIdleMs: 30 });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent');
+  await until(() => agent.inbox.length >= 1, 'the message');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the reply');
+
+  await settle(200);
+  assert.equal(agent.inbox.length, 1, 'without proactive a group is not chimed into');
+});
+
+/** L2：私聊补一句**不**搭 `proactive` 那趟车 —— 它默认就是开的（§6.5 的语义例外）。 */
+test('the private afterthought is on by default and does not need proactive', async () => {
+  const { onebot, host } = await bootActive({ privateAfterthoughtIdleMs: 30, privateAfterthoughtChance: 1 });
   onebot.push(privateMessage('在吗'));
   const agent = await until(() => host.list.created[0], 'the private Agent');
   await until(() => agent.inbox.length >= 1, 'the message');
   completeTurn(host, agent, '在的', 1);
   await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the reply');
 
+  // proactive 关着（bootActive 默认不打开），私聊照样会补一句。
+  await until(() => agent.inbox.length >= 2, 'the private follow-up turn');
+  assert.match(agent.inbox[1].content[0].text, /你已经回过话/);
+  assert.match(agent.inbox[1].content[0].text, /SKIP/);
+  completeTurn(host, agent, '对了，你昨天说的那个事后来怎么样了', 2);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 2, 'the follow-up to go out');
+});
+
+/** L2：空消息（只是一个空格 / 单纯 @）之后的轮次不补 —— 那一轮本来就没有话题。 */
+test('a reply to an empty private message does not schedule an afterthought', async () => {
+  const { onebot, host } = await bootActive({ privateAfterthoughtIdleMs: 20, privateAfterthoughtChance: 1 });
+  onebot.push(privateMessage('   '));
+  const agent = await until(() => host.list.created[0], 'the private Agent');
+  await until(() => agent.inbox.length >= 1, 'the empty message');
+  completeTurn(host, agent, '？', 1);
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the reply');
   await settle(200);
-  assert.equal(agent.inbox.length, 1, 'without proactive nothing is sent unprompted');
+  assert.equal(agent.inbox.length, 1, 'an empty message is not a topic to add to');
+});
+
+/** L2：出错的那一轮不补一句（没人问过它，也别在事后追一句）。 */
+test('an errored private turn does not schedule an afterthought', async () => {
+  const { onebot, host } = await bootActive({ privateAfterthoughtIdleMs: 20, privateAfterthoughtChance: 1 });
+  onebot.push(privateMessage('在吗'));
+  const agent = await untilInbox(host, 1, 'the private Agent');
+  host.list.emit('agent/inbox/claimed', { agent, message: agent.inbox[0], turn: 1 });
+  host.list.emit('session/event', { id: agent.id }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'error' } } });
+  await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the error notice');
+  await settle(200);
+  assert.equal(agent.inbox.length, 1, 'no afterthought after an error');
 });
 
 /** B：群里中间有人插话时不要硬补一句（那会儿话头已经不是它的了）。 */
@@ -4476,7 +4329,11 @@ test('activeChime: in a group it adds its line when nobody else speaks', async (
 
 /** B：对方再说话会把挂着的「补一句」作废（一条消息只对应一次机会）。 */
 test('activeChime: a new message from the other side cancels the pending follow-up', async () => {
-  const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 60 });
+  const { onebot, host } = await bootActive({
+    proactive: true,
+    privateAfterthoughtIdleMs: 60,
+    privateAfterthoughtChance: 1,
+  });
   onebot.push(privateMessage('第一句'));
   const agent = await until(() => host.list.created[0], 'the private Agent');
   await until(() => agent.inbox.length >= 1, 'the first message');
@@ -4498,9 +4355,9 @@ test('activeChime: a new message from the other side cancels the pending follow-
 test('activeChime: activeChimeDailyMax caps the day', async () => {
   const { onebot, host } = await bootActive({
     proactive: true,
-    activeChimeIdleMs: 30,
-    activeChimeMax: 5,
-    activeChimeDailyMax: 1,
+    privateAfterthoughtIdleMs: 30,
+    privateAfterthoughtChance: 1,
+    privateAfterthoughtDailyMax: 1,
   });
   onebot.push(privateMessage('第一句'));
   const agent = await until(() => host.list.created[0], 'the private Agent');
@@ -4524,7 +4381,11 @@ test('activeChime: activeChimeDailyMax caps the day', async () => {
 
 /** `/reset` 会把「还聊着」也忘掉：新开一轮之后不会再补一句。 */
 test('/reset forgets the active exchange as well', async () => {
-  const { onebot, host } = await bootActive({ proactive: true, activeChimeIdleMs: 40 });
+  const { onebot, host } = await bootActive({
+    proactive: true,
+    privateAfterthoughtIdleMs: 40,
+    privateAfterthoughtChance: 1,
+  });
   onebot.push(privateMessage('在吗'));
   const agent = await until(() => host.list.created[0], 'the private Agent');
   await until(() => agent.inbox.length >= 1, 'the message');
@@ -4604,7 +4465,12 @@ test('group talk: once a few people have been chatting, anyone can talk without 
   // 第 4 句（@ 的那条 + 这 3 条）踩到门槛：从这一条起群聊算「热起来了」，谁接话都算。
   onebot.push(groupText('那到底行不行', { messageId: 7103, userId: 10001, card: 'soyo' }));
   await until(() => agent.inbox.length >= 2, 'the group talk message to reach the Agent');
-  assert.equal(agent.inbox[1].content[0].text, '那到底行不行');
+  // 插话（C 路）的投递文案是**元信息 + 锚点 + SKIP 出口**（§7.2）：不写清「这句不是叫你的」，
+  // 模型会按「回答 soyo」组织语言，群里看到的就是答非所问。
+  const interject = agent.inbox[1].content[0].text;
+  assert.match(interject, /群里在聊天，这句不是叫你的/);
+  assert.match(interject, /soyo 说：那到底行不行/);
+  assert.match(interject, /SKIP/);
 
   // 门槛过了之后，换一个人、甚至同一个人再说，都还在搭话状态里。
   onebot.push(groupText('我觉得行', { messageId: 7104, userId: 10002, card: 'rana' }));
@@ -4796,7 +4662,7 @@ test('搭话抽卡：多人搭话里也不是每条都回，攒够概率才接',
   // 连丢一条之后概率涨到 1：换一个人接话也算（C 路「谁接话都算数」）。
   onebot.push(groupText('丙', { messageId: 7633, userId: 10001, card: 'soyo' }));
   await until(() => agent.inbox.length >= 2, 'the next group-talk message to hit the roll');
-  assert.equal(agent.inbox[1].content[0].text, '丙');
+  assert.match(agent.inbox[1].content[0].text, /soyo 说：丙/);
 });
 
 test('搭话抽卡：这段对话凉了之后累计清零，不把保底留到下一场聊天', async () => {
@@ -4838,8 +4704,8 @@ test('.dsh/skills 下的每个 skill 都能被 skill-filesystem 发现', async (
   const dirs = (await readdir(root, { withFileTypes: true })).filter((entry) => entry.isDirectory());
   assert.deepEqual(
     dirs.map((entry) => entry.name).sort(),
-    ['message-digest', 'moegirl', 'update-cognition'],
-    '本地 skill 的清单变了就要同步这里（README「三个 skill」那张表也一样）',
+    ['learn-meme', 'learn-sticker', 'message-digest', 'moegirl', 'update-cognition'],
+    '本地 skill 的清单变了就要同步这里（README 的 skill 表也一样）',
   );
   for (const dir of dirs) {
     const text = await readFile(new URL(`${dir.name}/SKILL.md`, root), 'utf8');
@@ -5141,3 +5007,255 @@ test('napcatAutoConfig writes the missing server with a backup and asks for a Na
 // 在 boot() 之后再改配置又赶不上那次自检。它由 test/napcat.test.mjs 的
 // `repairNapcat` → `action: 'ok'`（幂等、不产生第二个备份）覆盖。
 
+
+// ---- 插话的锚点与准入（§7.1 / §7.3 / §7.5）------------------------------------
+
+/**
+ * 起一个「群已经聊热、插话必中」的实例，并让它被 @ 过一次（这样会话记录与一对一窗口都在）。
+ * @returns `{ onebot, host, agent }`：已经回完一轮的实例。
+ */
+async function bootHotGroup(overrides = {}) {
+  const { onebot, host } = await bootActive({
+    activeGroupLines: 3,
+    activeGroupSpeakers: 2,
+    activeTalkChance: 1,
+    ...overrides,
+  });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the first reply');
+  return { onebot, host, agent };
+}
+
+test('插话轮强制引用锚点：紧挨着回也照样引用它要接的那一句', async () => {
+  const { onebot, host, agent } = await bootHotGroup();
+  // 两个不同的人把热度顶过门槛（第 4 句才够热），第三句是那条被接的锚点。
+  onebot.push(groupText('晚上吃啥', { messageId: 7101, userId: 10001, card: 'soyo' }));
+  onebot.push(groupText('随便', { messageId: 7102, userId: 10002, card: 'rana' }));
+  await until(() => agent.inbox.length >= 2, 'the interject turn');
+  const interject = agent.inbox[1].content[0].text;
+  assert.match(interject, /这句不是叫你的/);
+  assert.match(interject, /rana 说：随便/);
+
+  completeTurn(host, agent, '火锅吧', 2);
+  const sent = await until(() => sentTexts(onebot)[1], 'the interject reply');
+  // 引用的必须正是锚点那条 message_id（不是「最近一条」，也不受 replyStyle: auto 的漂移判断影响）。
+  assert.deepEqual(sent, [
+    { type: 'reply', data: { id: '7102' } },
+    { type: 'text', data: { text: '火锅吧' } },
+  ]);
+});
+
+test('插话不接 @ 了别人的消息（那是别人在跟别人说话）', async () => {
+  const { onebot, host, agent } = await bootHotGroup();
+  onebot.push(groupText('晚上吃啥', { messageId: 7101, userId: 10001, card: 'soyo' }));
+  // 这一条 @ 的是 rana，不是机器人：热度早就够了，但它不该被当成「可以插一句」。
+  onebot.push(groupMessage(
+    [{ type: 'at', data: { qq: '10002', name: 'rana' } }, { type: 'text', data: { text: ' 你看这个' } }],
+    { messageId: 7102, userId: 10001, card: 'soyo' },
+  ));
+  await settle(120);
+  assert.equal(agent.inbox.length, 1, 'a message meant for somebody else is not an invitation');
+});
+
+test('插话不接命令，也不接纯媒体（没有可接的话头）', async () => {
+  const { onebot, host, agent } = await bootHotGroup();
+  onebot.push(groupText('晚上吃啥', { messageId: 7101, userId: 10001, card: 'soyo' }));
+  // 命令：即使群里正热，`/reset` 也不该被「插话」顺手执行（更不该进模型）。
+  onebot.push(groupText('/reset', { messageId: 7102, userId: 10001, card: 'soyo' }));
+  // 纯媒体：正文只有 `[图片]` 这个占位符，没有文字锚点。
+  onebot.push(groupMessage([{ type: 'image', data: { file: 'x.png', url: '' } }], { messageId: 7103, userId: 10002, card: 'rana' }));
+  await settle(150);
+  assert.equal(agent.inbox.length, 1, 'a command and a media-only message are not interjected into');
+});
+
+// ---- 感知与互动：戳一戳 / 链接 / 视频封面 / 语音（§8）------------------------
+
+/** 造一条戳一戳的通知事件（OneBot v11 的 notice/notify/poke）。 */
+function pokeNotice({ userId = 100000002, targetId = SELF_ID, groupId, name = 'iroha' } = {}) {
+  return {
+    post_type: 'notice',
+    notice_type: 'notify',
+    sub_type: 'poke',
+    user_id: userId,
+    target_id: targetId,
+    ...(groupId === undefined ? {} : { group_id: groupId }),
+    sender: { nickname: name },
+  };
+}
+
+test('戳一戳：回戳那个戳它的人，冷却之内不再重复', async () => {
+  const { onebot, host } = await boot({ pokeMode: 'poke', pokeCooldownMs: 60_000 });
+  onebot.push(pokeNotice());
+  const poke = await until(() => onebot.calls.find((call) => call.action === 'send_poke'), 'the poke back');
+  // 回戳只打给戳它的人（user_id），从不打给别人。
+  assert.equal(String(poke.params.user_id), '100000002');
+  // 冷却期里再戳几下也只回一次 —— 防两个机器人互戳的关键一道闸。
+  onebot.push(pokeNotice());
+  onebot.push(pokeNotice());
+  await settle(120);
+  assert.equal(onebot.calls.filter((call) => call.action === 'send_poke').length, 1);
+  await onebot.close();
+});
+
+test('戳一戳：只回应戳机器人的，别人互相戳不关它的事', async () => {
+  const { onebot } = await boot({ pokeMode: 'poke' });
+  onebot.push(pokeNotice({ userId: 10001, targetId: 10002, groupId: 100000001 }));
+  await settle(120);
+  assert.equal(onebot.calls.filter((call) => call.action === 'send_poke').length, 0);
+  await onebot.close();
+});
+
+test('戳一戳：pokeMode text 走一轮模型，正文说清「不是正式提问」并给 SKIP 出口', async () => {
+  const { onebot, host } = await boot({ pokeMode: 'text' });
+  onebot.push(pokeNotice());
+  const agent = await untilInbox(host, 1, 'the poke turn');
+  const text = agent.inbox[0].content[0].text;
+  assert.match(text, /戳了你一下/);
+  assert.match(text, /SKIP/);
+  // 戳一戳不是「插件自作主张」：这句话本来就是转告一个真人动作，说明来源反而更清楚。
+  assert.match(text, /不是正式提问/);
+  await onebot.close();
+});
+
+test('linkPreview：打开后把裸 URL 换成「标题 + 域名」，内网地址默认不抓', async () => {
+  const page = await startImageServer(Buffer.from('<html><head><title>示例标题</title></head></html>'), {
+    contentType: 'text/html; charset=utf-8',
+  });
+  try {
+    const off = await boot({ linkPreview: false });
+    off.onebot.push(privateMessage(`看这个 ${page.url()}/a`));
+    const offAgent = await untilInbox(off.host, 1, 'the url message without preview');
+    assert.match(offAgent.inbox[0].content[0].text, /https?:\/\/127\.0\.0\.1/);
+    assert.equal(page.hits.length, 0, '默认关时一个请求都不该发');
+    await off.onebot.close();
+
+    const on = await boot({ linkPreview: true, linkAllowPrivateHosts: true });
+    on.onebot.push(privateMessage(`看这个 ${page.url()}/b`));
+    const onAgent = await untilInbox(on.host, 1, 'the url message with preview');
+    assert.match(onAgent.inbox[0].content[0].text, /\[链接: 【示例标题】/);
+    assert.ok(page.hits.includes('/image/b'), `server hits: ${page.hits.join(',')}`);
+    await on.onebot.close();
+  } finally {
+    await page.close();
+  }
+});
+
+test('视频只下封面：正文给出时长与封面路径，整段不下载', async () => {
+  const cover = await startImageServer(TINY_PNG);
+  try {
+    const { onebot, host } = await boot({ videoCover: true });
+    onebot.push({
+      post_type: 'message',
+      message_type: 'private',
+      user_id: 100000002,
+      sender: { nickname: 'iroha' },
+      message: [{ type: 'video', data: { duration: 12, thumb: cover.url('/thumb') } }],
+    });
+    const agent = await untilInbox(host, 1, 'the video message');
+    const text = agent.inbox[0].content[0].text;
+    assert.match(text, /\[视频 12 秒 · 封面: \.qq-media\/[0-9a-f]+\.png\]/);
+    assert.ok(cover.hits.includes('/thumb'));
+    await onebot.close();
+  } finally {
+    await cover.close();
+  }
+});
+
+test('语音只做时长占位：不下载文件、也不起任何进程', async () => {
+  const { onebot, host } = await boot();
+  onebot.push({
+    post_type: 'message',
+    message_type: 'private',
+    user_id: 100000002,
+    sender: { nickname: 'iroha' },
+    message: [{ type: 'record', data: { duration: 3, file: 'abc.amr', url: 'https://example.invalid/x.amr' } }],
+  });
+  const agent = await untilInbox(host, 1, 'the voice message');
+  assert.equal(agent.inbox[0].content[0].text, '[语音 3 秒]');
+  await onebot.close();
+});
+
+// ---- 人格与表达的提示词槽位（P3）-----------------------------------------------
+
+/** 造一份人设文件与一份表达文件（放在一个临时 cwd 的 `.qq-persona/` 下）。 */
+async function bootWithPersona(config = {}, hostOptions = {}, onebotOptions = {}) {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-persona-'));
+  await mkdir(join(cwd, '.qq-persona'), { recursive: true });
+  await writeFile(join(cwd, '.qq-persona', 'PERSONA.md'), [
+    '## 身份',
+    '- 名字：小栞',
+    '## 性格',
+    '- [x] 温柔｜底色｜0.8｜别人难受时｜先接住情绪',
+    '- [x] 傲娇｜点缀｜0.5｜被夸时｜嘴硬一句就结束',
+    '## 场景',
+    '### 私聊',
+    '- 私聊场景标记',
+    '### 群聊',
+    '- 群聊场景标记',
+  ].join('\n'), 'utf8');
+  await writeFile(join(cwd, '.qq-persona', 'STYLE.md'), [
+    '## 总体',
+    '- 表达文件标记：一条回复一两个气泡',
+    '## 群聊',
+    '- 群聊表达标记',
+  ].join('\n'), 'utf8');
+  const booted = await boot({ cwd, ...config }, hostOptions, onebotOptions);
+  return { ...booted, cwd };
+}
+
+test('PERSONA.md 优先于配置 persona，且按场景选段', async () => {
+  const group = await bootWithPersona({ persona: '配置里那段人设' });
+  try {
+    group.onebot.push(mention('在吗'));
+    const agent = await untilInbox(group.host, 1, 'the group Agent');
+    const prompt = promptText(group.host, 'qq-bridge:channel');
+    assert.match(prompt, /【身份】名字：小栞/);
+    assert.match(prompt, /【底色｜始终在场】别人难受时 → 温柔/);
+    assert.match(prompt, /【场景｜群聊】群聊场景标记/);
+    assert.doesNotMatch(prompt, /私聊场景标记/, '群聊轮不该带私聊的场景段');
+    assert.doesNotMatch(prompt, /配置里那段人设/, '文件存在时配置 persona 被忽略（不叠加）');
+    assert.equal(agent.inbox.length, 1);
+    // 表达契约来自 STYLE.md。
+    assert.match(prompt, /表达文件标记/);
+    assert.match(prompt, /群聊表达标记/);
+  } finally {
+    await group.onebot.close();
+  }
+
+  // 私聊轮选私聊那段场景。
+  const priv = await bootWithPersona();
+  try {
+    priv.onebot.push(privateMessage('在吗'));
+    await untilInbox(priv.host, 1, 'the private Agent');
+    const prompt = promptText(priv.host, 'qq-bridge:channel');
+    assert.match(prompt, /【场景｜私聊】私聊场景标记/);
+    assert.doesNotMatch(prompt, /群聊场景标记/);
+  } finally {
+    await priv.onebot.close();
+  }
+});
+
+test('提示词槽位：硬性规则在最后（最高优先级），且表达契约在记忆之前', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(privateMessage('在吗'));
+    await untilInbox(host, 1, 'the Agent');
+    const prompt = promptText(host, 'qq-bridge:channel');
+    const at = (needle) => {
+      const index = prompt.indexOf(needle);
+      assert.ok(index >= 0, `提示词里应当有「${needle}」`);
+      return index;
+    };
+    // 顺序：场景/人设 → 表达契约 → 记忆 → 能力 → **硬性要求（最后）**。
+    assert.ok(at('怎么说话（表达契约）') < at('硬性要求（最高优先级'));
+    assert.ok(at('硬性要求（最高优先级') > at('需要主动给其他人或群发消息'));
+    assert.ok(at('一条回复只有一个形状') > at('硬性要求（最高优先级'), '「一条回复只有一个形状」属于硬性要求那一节（在它之后）');
+    // 表情包目录提示跟着 allowTools 走（默认不限制时应当出现「你自己的表情包」或空目录提示）。
+    assert.ok(prompt.includes('硬性要求（最高优先级：人设、表达规则与上面任何一段冲突时，以本节为准）'));
+  } finally {
+    await onebot.close();
+  }
+});

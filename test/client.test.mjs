@@ -7,18 +7,24 @@
  *
  * 所以这里用最小的假 Host 把它跑一遍：假的 `window.__ModuleLoader__` 收下注册，
  * 假的 `require` 给出平台模块（react / jsx-runtime / ui-primitives 都是桩 —— 真
- * 浏览器 bundle 里有 CSS import，node 里加载不了），然后断言四件真正会坏掉的事：
+ * 浏览器 bundle 里有 CSS import，node 里加载不了），再用一个十几行的迷你渲染器
+ * 把页面展开成节点树，断言 `docs/settings-ui-redesign.md` §9 的那批契约：
  *
- *   1. **注册位置**：`settings.section` + 条目 id（写错就等于页面根本不出现）；
- *   2. **字段覆盖**：schema 里的每一个配置项都必须在页面上出现一次、且不在「其它」
- *      分组里（漏一个 = 界面上改不了这一项），标签不能是空串；
- *   3. **分组是折叠的**：默认只展开第一组、点标题才渲染那一组的字段（一条条平铺出来
- *      正是这次要避免的乱）；
- *   4. **草稿的读写口径**：布尔 / 数组 / 枚举三类字段自己实现的 spec，必须能把
- *      `true`/`是`、逗号分隔、枚举字面量解析成 set，把空串解析成 clear，把胡说挡住。
+ *   1. 注册位置与注入面；
+ *   2. 120 个字段在 6 个 tab 的合集里恰好各出现一次、不落「其它」；
+ *   3. 每个分组恰属一个 tab（`tabOf` 对未知分组返回 undefined）；
+ *   4. 控件映射：布尔 → `Switch`、枚举 → `<select>`、数字 / 文本 → `<input>`（官方字段行
+ *      几何）、长文本 → `textarea`；工具条里的搜索框才是 primitives 的 `Input`；
+ *   5. 草稿口径：开关写 `'true'` / `'false'`、枚举写字面量、列表逗号分隔、空串 = 清空；
+ *   6. 切 tab 不丢草稿、搜索命中四个来源且结果可编辑、`只看已改` 与搜索可叠加；
+ *   7. 量纲 hint 齐全且跟着草稿走；枚举文案全覆盖；只读时全部 `disabled`。
+ *
+ * 迷你渲染器只展开带 `qqComponent` 记号的函数组件：primitives 的控件在测试里是桩，
+ * 展开成桩的内部结构就看不到控件本身了（而那正是要断言的形状）。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import z from '@deepseek-ai/schemastery';
 import { Config } from '../config.js';
@@ -36,34 +42,42 @@ globalThis.window = {
 await import('../client.js');
 delete globalThis.window;
 
+// ---- 假 react -----------------------------------------------------------------------
+
 /**
- * 假 react：`useSyncExternalStore` 与 `useState` 各留一个单槽实现。
- *
- * 这是「假 StrictMode」的等价物：不排队重渲染，只把 setter 的入参记下来，
- * 于是用例可以像 React 那样「调 setter → 再渲染一次」地驱动折叠/展开。
- *
- * 单槽的「没初始化」不能用 `undefined` 表示 —— 本页的折叠状态本来就允许被
- * setter 设成 `undefined`（全部收起），拿它当哨兵会让「点了两次」变成
- * 「从没点过」。所以另给一个 `UNSET`。
+ * `useState` 的槽位实现：**位置**对应 hook（React 的规则），槽位跨渲染保留。
+ * 每次渲染前把索引归零（`BEGIN_RENDER`），于是「调 setter → 再渲染一次」就
+ * 等价于 React 的重渲染。为什么不按组件实例分槽：测试里整棵树是一次同步渲染，
+ * 位置稳定就够用，而按实例分会把桩写成一个小 React。
  */
-const UNSET = Symbol('unset');
-const reactHooks = { store: undefined, state: UNSET };
+let hookSlots = [];
+let hookIndex = 0;
+
+function resetHooks() {
+  hookSlots = [];
+  hookIndex = 0;
+}
+
 const reactStub = {
-  useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
   useState: (initial) => {
-    if (reactHooks.state === UNSET) {
-      reactHooks.state = typeof initial === 'function' ? initial() : initial;
-    }
-    return [reactHooks.state, (next) => { reactHooks.state = next; }];
+    const index = hookIndex++;
+    if (!(index in hookSlots)) hookSlots[index] = typeof initial === 'function' ? initial() : initial;
+    return [
+      hookSlots[index],
+      (next) => {
+        hookSlots[index] = typeof next === 'function' ? next(hookSlots[index]) : next;
+      },
+    ];
   },
 };
+
 const jsxRuntimeStub = {
   Fragment: 'Fragment',
   jsx: (type, props) => ({ type, props }),
   jsxs: (type, props) => ({ type, props }),
 };
 
-/** 假的 ui-primitives：只保留本页面用到的那几个入口，行为与文档一致。 */
+/** 假的 ui-primitives：只保留本页面用到的那几个入口，props 口径与真组件一致。 */
 const primitivesStub = {
   settingsTextField: (field) => ({
     field,
@@ -81,24 +95,83 @@ const primitivesStub = {
   }),
   SettingsForm: 'SettingsForm',
   SettingsValueField: 'SettingsValueField',
-  /** 只留这一页真正会调的那几个方法；字段的暂存交给真 primitives（浏览器里）。 */
-  SettingsFormModel: class {
+  Switch: function Switch(props) {
+    return { type: 'Switch', props };
+  },
+  Input: function Input(props) {
+    return { type: 'Input', props };
+  },
+  Pill: function Pill(props) {
+    return { type: 'Pill', props };
+  },
+  Tag: function Tag(props) {
+    return { type: 'Tag', props };
+  },
+  IconSearchOutlineRegular: function IconSearchOutlineRegular(props) {
+    return { type: 'IconSearch', props };
+  },
+  IconInfoOutlineRegular: function IconInfoOutlineRegular(props) {
+    return { type: 'IconInfo', props };
+  },
+  /**
+   * 一个有最小行为的假表单模型：草稿（staged）、覆盖、非法、清除各按 primitives
+   * 的口径（`field()` 返回 `text / overridden / invalid`）。真实的
+   * `SettingsFormModel` 在浏览器里，但它 import CSS modules，node 里加载不了。
+   */
+  SettingsFormModel: class FakeSettingsFormModel {
     constructor(scope, specs) {
       this.scope = scope;
-      this.specs = specs;
+      this.specs = new Map(specs.map((spec) => [spec.field, spec]));
+      this.staged = new Map();
+      this.listeners = new Set();
+    }
+    writeOf(key, text) {
+      if (text.trim() === '') return { kind: 'clear' };
+      return this.specs.get(key).parse(text);
     }
     shell() {
-      return { available: true, writable: true, dirty: false, invalid: false, saving: false, failed: false };
+      const invalid = [...this.staged.entries()].some(([key, staged]) => staged.clear !== true && this.writeOf(key, staged.text) === undefined);
+      return { available: true, writable: this.scope.writable, dirty: this.staged.size > 0, invalid, saving: false, failed: false };
     }
-    field() {
-      return { text: '', overridden: false, invalid: false };
+    field(key) {
+      const staged = this.staged.get(key);
+      if (staged !== undefined) {
+        if (staged.clear === true) return { text: '', overridden: false, invalid: false };
+        const write = this.writeOf(key, staged.text);
+        return { text: staged.text, overridden: write?.kind === 'set', invalid: write === undefined };
+      }
+      const spec = this.specs.get(key);
+      return { text: spec.format(this.scope.values[key]), overridden: this.scope.overrides.has(key), invalid: false };
     }
     bind(project) {
-      const snapshot = project();
-      return { getSnapshot: () => snapshot, subscribe: () => () => {} };
+      this.project = project;
+      const model = this;
+      this.store = {
+        snapshot: project(),
+        getSnapshot() {
+          return model.store.snapshot;
+        },
+        subscribe: () => () => {},
+      };
+      return this.store;
+    }
+    publish() {
+      if (this.store !== undefined) this.store.snapshot = this.project();
     }
     actions() {
-      return { edit() {}, resetField() {}, save() {}, discard() {} };
+      const model = this;
+      return {
+        edit(key, text) {
+          model.staged.set(key, { text });
+          model.publish();
+        },
+        resetField(key) {
+          model.staged.set(key, { text: '', clear: true });
+          model.publish();
+        },
+        save() {},
+        discard() {},
+      };
     }
     dispose() {}
   },
@@ -111,15 +184,62 @@ const fakeRequire = (id) => {
   throw new Error(`意外的平台模块请求：${id}`);
 };
 
+// ---- 迷你渲染器 ---------------------------------------------------------------------
+
+/** 展开带 `qqComponent` 记号的函数组件；primitives 的桩原样留在树上供断言。 */
+function renderNode(node) {
+  if (node === null || node === undefined) return node;
+  if (Array.isArray(node)) return node.map(renderNode);
+  if (typeof node !== 'object') return node;
+  if (typeof node.type === 'function' && node.type.qqComponent === true) return renderNode(node.type(node.props));
+  if (node.props === undefined || node.props.children === undefined) return node;
+  return { ...node, props: { ...node.props, children: renderNode(node.props.children) } };
+}
+
+/** 依次访问树里所有节点（只走 `children`，不碰 style / help 之类的数据）。 */
+function walk(node, visit) {
+  if (node === null || node === undefined) return;
+  if (Array.isArray(node)) {
+    for (const child of node) walk(child, visit);
+    return;
+  }
+  if (typeof node !== 'object') return;
+  visit(node);
+  walk(node.props?.children, visit);
+}
+
+function nodes(tree, predicate) {
+  const found = [];
+  walk(tree, (node) => {
+    if (predicate(node)) found.push(node);
+  });
+  return found;
+}
+
+/** 节点里的可见文本（用于「标签 / Tag 文案 / 空状态」这类断言）。 */
+function textOf(node) {
+  if (node === null || node === undefined) return '';
+  if (typeof node === 'string') return node;
+  if (typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join('');
+  if (typeof node === 'object') return textOf(node.props?.children);
+  return '';
+}
+
 // ---- 假的客户端 Host ---------------------------------------------------------------
 
-/** 当前 profile 条目 id 对应的设置命名空间视图：schema 用真 Config 的 toJSON。 */
-function namespaceView() {
+/** schema 与默认值都来自真 `Config`：页面上的字段表就是它投影出来的。 */
+const SCHEMA_JSON = () => JSON.parse(JSON.stringify(Config.toJSON()));
+const SCHEMA_DICT = () => SCHEMA_JSON().refs[SCHEMA_JSON().uid].dict;
+const SCHEMA_KEYS = () => Object.keys(SCHEMA_DICT());
+const DEFAULT_VALUES = () => JSON.parse(JSON.stringify(Config({}).get()));
+
+function namespaceView(host) {
   return {
     ns: 'qq-bridge',
     autoGenerate: true,
-    schema: JSON.parse(JSON.stringify(Config.toJSON())),
-    value: JSON.parse(JSON.stringify(Config({}).get())),
+    schema: SCHEMA_JSON(),
+    value: host.scope.values,
     user: {},
     base: {},
     secrets: [],
@@ -129,20 +249,19 @@ function namespaceView() {
 }
 
 /** 一个最小的客户端上下文：只实现 client.js 用到的那些服务。 */
-function makeClientHost() {
+function makeClientHost(options = {}) {
   const host = {
     dictionaries: new Map(),
     registrations: [],
     slotInjects: [],
     disposed: [],
     scope: {
-      written: [],
+      values: options.values ?? DEFAULT_VALUES(),
+      overrides: new Set(options.overrides ?? []),
+      writable: options.writable ?? true,
       getSnapshot: () => ({ status: 'ready', value: {}, base: {}, user: {}, writable: true, revision: 1, mode: 'host' }),
       subscribe: () => () => {},
-      mutate: async (ops) => {
-        host.scope.written.push(ops);
-        return true;
-      },
+      mutate: async () => true,
     },
     ctx: {
       effect(body) {
@@ -161,7 +280,7 @@ function makeClientHost() {
       settingsSchema: { rehydrate: (serialized) => new z(serialized) },
       configForms: {
         describe: () => ({
-          getSnapshot: () => ({ status: 'ready', view: { namespaces: [namespaceView()], writable: true, hasDocument: true } }),
+          getSnapshot: () => ({ status: 'ready', view: { namespaces: [namespaceView(host)], writable: true, hasDocument: true } }),
           subscribe: () => () => {},
           ensure: () => Promise.resolve(),
         }),
@@ -188,78 +307,113 @@ function makeClientHost() {
   return host;
 }
 
-/** 跑一遍 apply()，把这一页的注册与注入面拿回来。 */
-function mountPage() {
-  const host = makeClientHost();
-  registration.factory(fakeRequire);
-  // 上面那句建了 module.exports 的副本，这里再取一次真正的导出面。
+// ---- 会话：一次 apply() + 一棵可重渲染的树 -------------------------------------------
+
+function mount(options = {}) {
+  const host = makeClientHost(options);
   const mod = registration.factory(fakeRequire);
   mod.apply(host.ctx);
   return { host, mod, page: host.registrations[0] };
 }
 
-/**
- * 渲染页面根组件（框架平时通过 slot props 注入的那些东西在这里手工给），
- * 模拟「组件第一次挂载」：`useState` 的单槽实现先清空，折叠状态从默认值开始。
- */
-function mountTree(page, mod, extra = {}) {
-  reactHooks.state = UNSET;
-  return rerender(page, mod, extra);
+/** 当前语言的 `t`：用真实的 zh / en 字典，并插上 `{count}` / `{tab}` 占位符。 */
+function translator(host, locale = 'zh') {
+  const dict = host.dictionaries.get('settings.qq')?.[locale] ?? {};
+  return (key, params) => {
+    let text = typeof dict[key] === 'string' ? dict[key] : key;
+    for (const [name, value] of Object.entries(params ?? {})) text = text.split(`{${name}}`).join(String(value));
+    return text;
+  };
 }
 
-/**
- * 再渲染一次，沿用上一次的 `useState` 槽 —— 等价于 React 在 setter 之后的重渲染，
- * 折叠 / 展开就是靠它驱动的。
- */
-function rerender(page, mod, extra = {}) {
+/** 渲染一页（迷你渲染器把 `QQ_BRIDGE` 当组件展开）。 */
+function render(session, extra = {}) {
+  hookIndex = 0;
+  const { host, mod, page } = session;
   const face = page.options.inject();
-  return mod.QQ_BRIDGE({
-    t: (key) => key,
-    view: 'page',
-    locale: 'zh',
-    useQqSettings: (selector) => selector(face.hooks.qqSettings.getSnapshot()),
-    edit: face.edit,
-    resetField: face.resetField,
-    save: face.save,
-    discard: face.discard,
-    ...extra,
+  return renderNode({
+    type: mod.QQ_BRIDGE,
+    props: {
+      t: extra.t ?? translator(host, extra.locale ?? 'zh'),
+      view: extra.view ?? 'page',
+      locale: extra.locale ?? 'zh',
+      useQqSettings: (selector) => selector(face.hooks.qqSettings.getSnapshot()),
+      edit: extra.edit ?? face.edit,
+      resetField: extra.resetField ?? face.resetField,
+      save: face.save,
+      discard: face.discard,
+    },
   });
 }
 
-/** 从 SettingsForm 的 children 里挖出所有分组的卡片节点（每组一个 `section`）。 */
-function groupCards(tree) {
-  const page = tree.props.children;
-  const list = page.props.children.find((child) => child.type === 'div' && Array.isArray(child.props.children));
-  return list.props.children;
+/** 第一次挂载：清空 hook 槽，等价于 React 的首次渲染。 */
+function mountTree(session, extra = {}) {
+  resetHooks();
+  return render(session, extra);
 }
 
-/** 一组卡片里的字段控件（收起时是空数组）。 */
-function fieldsOf(card) {
-  const body = card.props.children.find((child) => child?.type === 'div');
-  if (body === undefined) return [];
-  return body.props.children.filter((child) => child.type === 'SettingsValueField');
+/** 再渲染一次，沿用槽位 —— 等价于 React 在 setter 之后的重渲染。 */
+function rerender(session, extra = {}) {
+  return render(session, extra);
 }
 
-/** 一组卡片里的**全部**控件：长文本那几项是自定义控件，`fieldsOf` 认不出来。 */
-function controlsOf(card) {
-  const body = card.props.children.find((child) => child?.type === 'div');
-  return body === undefined ? [] : body.props.children;
+/** 页面里的 tab 按钮（按可见短标签找，断言不依赖 id 的拼法）。 */
+function tabNode(tree, label) {
+  return nodes(tree, (node) => node.props?.role === 'tab' && textOf(node) === label)[0];
 }
 
-/** 按分组 id 找出那张卡片（展开与否都找得到，全是组名时也在）。 */
-function cardOf(tree, id) {
-  return groupCards(tree).find((card) => headOf(card).props['aria-controls'] === `qq-group-${id}`);
+/** 切到某个 tab（点一下，再渲染）。 */
+function openTab(session, label) {
+  const tree = rerender(session);
+  const tab = tabNode(tree, label);
+  assert.ok(tab, `找不到「${label}」这个 tab`);
+  tab.props.onClick();
+  return rerender(session);
 }
 
-/** 一组卡片的标题行。 */
-function headOf(card) {
-  return card.props.children[0];
+/** 页面上当前渲染出来的字段行（按 key 索引；tab 只渲染当前那一个）。 */
+function fieldsIn(tree) {
+  const map = new Map();
+  for (const node of nodes(tree, (candidate) => candidate.props?.['data-field'] !== undefined)) {
+    map.set(node.props['data-field'], node);
+  }
+  return map;
 }
 
-// ---- 用例 -------------------------------------------------------------------------
+/** 依次点过全部 tab，收集每个字段那一行（用来做「120 个字段各自的控件」这类断言）。 */
+function allFields(session) {
+  const found = new Map();
+  mountTree(session);
+  for (const tab of session.mod.TABS) {
+    const tree = openTab(session, tab.label);
+    for (const [key, node] of fieldsIn(tree)) found.set(key, node);
+  }
+  return found;
+}
+
+/** 某个字段行里的控件节点。 */
+function controlIn(field, predicate) {
+  return nodes(field, predicate)[0];
+}
+
+// 字段行的输入框是原生 `<input>`（官方 fields.module.css 的几何）；工具条里的搜索框才是
+// primitives 的 `Input`（它自带前置放大镜），两者在断言里要分开认。
+const isInput = (node) => node.type === 'input';
+const isSearch = (node) => node.type === primitivesStub.Input;
+const isSwitch = (node) => node.type === primitivesStub.Switch;
+const isSelect = (node) => node.type === 'select';
+const isTextarea = (node) => node.type === 'textarea';
+const isHint = (node) => node.type === 'p' && node.props.className === 'qq-hint';
+const isInvalid = (node) => node.type === 'p' && node.props.className === 'qq-invalid';
+const tagsIn = (field) => nodes(field, (node) => node.type === primitivesStub.Tag);
+const resetIn = (field) => nodes(field, (node) => node.type === 'button' && node.props.className === 'qq-reset')[0];
+const helpButtonIn = (field) => nodes(field, (node) => node.type === 'button' && node.props.className === 'qq-helpButton')[0];
+
+// ---- 用例 ---------------------------------------------------------------------------
 
 test('浏览器半侧的注册形状：工厂 ID、必到服务、页面挂在设置面板的 section 位上', () => {
-  const { host, mod, page } = mountPage();
+  const session = mount();
+  const { host, mod, page } = session;
 
   assert.equal(registration.id, '@qqbot/dsh-plugin-qq', '工厂 ID 必须等于包名（客户端模块系统按它认这一行）');
   assert.deepEqual(mod.inject, ['slots', 'locale', 'configForms', 'settingsSchema']);
@@ -271,14 +425,14 @@ test('浏览器半侧的注册形状：工厂 ID、必到服务、页面挂在�
   assert.deepEqual(host.slotInjects, ['settings.section']);
 
   assert.ok(page, 'apply() 必须注册一页设置');
-  assert.equal(page.options.name, 'settings.section', '配置页住在设置面板里，不再挂在插件页的组合包卡片下');
+  assert.equal(page.options.name, 'settings.section', '配置页住在设置面板里，不在插件页的组合包卡片下');
   assert.equal(page.options.id, 'qq-bridge', 'id 是 profile 条目 id，写错页面就不出现');
   assert.equal(page.options.locale, 'settings.qq');
-  assert.equal(page.options.label(), 'navTitle', '导航标题来自本页字典');
+  assert.equal(page.options.label(), 'navTitle', '导航标题来自本页字典（测试里的 bind 是回显 key）');
 });
 
 test('注入面：hooks 里的 observable 与四个表单动作都在', () => {
-  const { page } = mountPage();
+  const { page } = mount();
   const face = page.options.inject();
 
   assert.equal(typeof face.hooks.qqSettings.getSnapshot, 'function');
@@ -288,13 +442,43 @@ test('注入面：hooks 里的 observable 与四个表单动作都在', () => {
   }
 });
 
-test('字段覆盖：schema 里每一项都上了页面、都有标签、都不落进「其它」', () => {
-  const { mod, page } = mountPage();
-  const fields = mod.describeFields(new z(JSON.parse(JSON.stringify(Config.toJSON()))));
-  const keys = fields.map((row) => row.key);
-  const schemaKeys = Object.keys(Config.toJSON().refs[Config.toJSON().uid].dict);
+test('字典：zh / en 键集完全一致、非空，且旧版的 key 都删干净了', () => {
+  const { host } = mount();
+  const dicts = host.dictionaries.get('settings.qq');
+  assert.ok(dicts, '必须注册 settings.qq 字典');
+  const zhKeys = Object.keys(dicts.zh).sort();
+  const enKeys = Object.keys(dicts.en).sort();
+  assert.deepEqual(zhKeys, enKeys, 'zh / en 必须一一对应（缺一个就会把 key 露到页面上）');
+  for (const key of zhKeys) {
+    assert.ok(dicts.zh[key].length > 0, `zh.${key} 不能是空串`);
+    assert.ok(dicts.en[key].length > 0, `en.${key} 不能是空串`);
+  }
+  // 设计 §3.2 定稿的页面 chrome 文案。
+  for (const key of [
+    'title',
+    'intro',
+    'notice',
+    'searchPlaceholder',
+    'searchEmpty',
+    'changedCount',
+    'onlyChanged',
+    'invalidCount',
+    'tabsLabel',
+    'sectionOf',
+  ]) {
+    assert.ok(zhKeys.includes(key), `缺少字典 key：${key}`);
+  }
+  for (const key of ['envNotice', 'groupsHint', 'changed']) {
+    assert.ok(!zhKeys.includes(key), `旧 key 应当删掉：${key}`);
+  }
+});
 
-  assert.deepEqual([...keys].sort(), [...schemaKeys].sort(), '页面字段必须与 schema 字段一一对应');
+test('字段覆盖：schema 里每一项都上了页面、都有标签、都不落进「其它」', () => {
+  const { mod } = mount();
+  const fields = mod.describeFields(new z(SCHEMA_JSON()));
+  const keys = fields.map((row) => row.key);
+
+  assert.deepEqual([...keys].sort(), [...SCHEMA_KEYS()].sort(), '页面字段必须与 schema 字段一一对应');
   assert.equal(new Set(keys).size, keys.length, '同一个字段不能出现两次');
 
   const orphans = fields.filter((row) => row.section.id === 'other').map((row) => row.key);
@@ -303,29 +487,109 @@ test('字段覆盖：schema 里每一项都上了页面、都有标签、都不�
   for (const row of fields) {
     assert.ok(row.label.length > 0 && row.label !== row.key, `${row.key} 的标签不该退化成字段名`);
     assert.ok(row.description.length > 0, `${row.key} 必须带 .description()（它就是界面上的说明）`);
+    assert.ok(row.invalidLabel.length > 0, `${row.key} 必须有非法值的提示文案`);
   }
 });
 
-test('表单投影：分组里的行数加起来正好是全部字段，每组标题非空', () => {
-  const { page } = mountPage();
-  const state = page.options.inject().hooks.qqSettings.getSnapshot();
+test('tab 映射：6 个 tab、14 个分组各属一个 tab、字段数加起来是 120', () => {
+  const { mod } = mount();
+  const fields = mod.describeFields(new z(SCHEMA_JSON()));
 
-  assert.ok(state.sections.length > 0);
-  const rows = state.sections.flatMap((section) => section.rows);
-  assert.equal(rows.length, Object.keys(Config({}).get()).length, '投影必须覆盖全部字段');
-  for (const section of state.sections) {
-    assert.ok(section.title.length > 0 && section.rows.length > 0);
-    for (const row of section.rows) {
-      assert.equal(typeof row.state.text, 'string');
-      assert.equal(typeof row.invalidLabel, 'string');
-      assert.ok(row.invalidLabel.length > 0, `${row.key} 必须有非法值的提示文案`);
+  assert.deepEqual(
+    mod.TABS.map((tab) => tab.id),
+    ['connect', 'session', 'persona', 'group', 'perception', 'memory'],
+  );
+  assert.equal(mod.TABS.length, 6);
+  for (const tab of mod.TABS) {
+    assert.ok(tab.label.length > 0 && tab.title.length > 0, `${tab.id} 的短标签与全称都要有`);
+    assert.ok(tab.sections.length > 0, `${tab.id} 至少要有一个区块`);
+  }
+
+  for (const section of mod.SECTIONS) {
+    const owners = mod.TABS.filter((tab) => tab.sections.includes(section.id));
+    assert.equal(owners.length, 1, `分组 ${section.id} 必须恰好属于一个 tab`);
+  }
+  const mapped = mod.TABS.flatMap((tab) => tab.sections);
+  assert.deepEqual([...mapped].sort(), mod.SECTIONS.map((section) => section.id).sort(), '没有分组被漏掉');
+  assert.equal(mod.tabOf('repeat').id, 'group');
+  assert.equal(mod.tabOf('apikey').id, 'memory');
+  assert.equal(mod.tabOf('other'), undefined, 'tabOf 对未知分组返回 undefined（别静默丢字段）');
+
+  const countOf = (tab) =>
+    tab.sections
+      .flatMap((sectionId) => fields.filter((row) => row.section.id === sectionId))
+      .length;
+  assert.deepEqual(
+    Object.fromEntries(mod.TABS.map((tab) => [tab.id, countOf(tab)])),
+    { connect: 12, session: 23, persona: 19, group: 29, perception: 22, memory: 15 },
+    '字段数按设计 §3.1 分布',
+  );
+  assert.equal(fields.length, 120, '合计 120 项');
+});
+
+test('表单投影：6 个 tab 覆盖全部字段，每行带草稿状态与来源上下文', () => {
+  const session = mount();
+  mountTree(session);
+  const state = session.page.options.inject().hooks.qqSettings.getSnapshot();
+
+  assert.equal(state.tabs.length, 6);
+  assert.equal(state.shell.writable, true);
+  const rows = state.tabs.flatMap((tab) => tab.sections.flatMap((section) => section.rows));
+  assert.equal(rows.length, 120, '投影必须覆盖全部字段');
+  for (const tab of state.tabs) {
+    for (const section of tab.sections) {
+      assert.ok(section.title.length > 0, `${section.id} 的区块标题不能空`);
+      assert.ok(section.rows.length > 0);
+      for (const row of section.rows) {
+        assert.equal(typeof row.state.text, 'string', `${row.key} 的草稿必须是文本`);
+        assert.ok(row.invalidLabel.length > 0, `${row.key} 要有非法提示`);
+        assert.equal(row.tabId, tab.id, `${row.key} 要带上来源 tab`);
+        assert.equal(row.tabLabel, tab.label);
+        assert.equal(row.sectionTitle, section.title);
+      }
     }
   }
 });
 
+test('控件映射：26 个布尔是 Switch、4 个枚举是 select、长文本是 textarea', () => {
+  const session = mount();
+  const fields = allFields(session);
+  assert.equal(fields.size, 120, '六个 tab 加起来必须刚好是 120 行（每行只渲染一次）');
+
+  const kinds = new Map();
+  for (const [key, field] of fields) {
+    const kind = field.props['data-kind'];
+    if (controlIn(field, isSwitch) !== undefined) kinds.set(key, 'boolean');
+    else if (controlIn(field, isSelect) !== undefined) kinds.set(key, 'choice');
+    else if (controlIn(field, isTextarea) !== undefined) kinds.set(key, 'long');
+    else if (controlIn(field, isInput) !== undefined) kinds.set(key, 'input');
+    else kinds.set(key, 'missing');
+
+    if (kind === 'boolean') assert.equal(kinds.get(key), 'boolean', `${key} 是布尔，应当渲染 Switch`);
+    if (kind === 'choice') assert.equal(kinds.get(key), 'choice', `${key} 是枚举，应当渲染 select`);
+    if (kind === 'number') assert.equal(kinds.get(key), 'input', `${key} 是数字，应当渲染输入框`);
+    if (kind === 'text') {
+      assert.ok(['input', 'long'].includes(kinds.get(key)), `${key} 是文本，应当渲染输入框或多行框`);
+    }
+    if (field.props['data-layout'] === 'inline') assert.equal(kinds.get(key), 'boolean', '只有开关行走官方开关行');
+  }
+
+  const tally = {};
+  for (const kind of kinds.values()) tally[kind] = (tally[kind] ?? 0) + 1;
+  assert.deepEqual(tally, { boolean: 26, choice: 4, long: 2, input: 88 }, '按 schema 的类型分布');
+
+  // 数字框带 `inputMode="numeric"`；列表行在输入框下面给 Pill 预览。
+  assert.equal(controlIn(fields.get('proactiveChance'), isInput).props.inputMode, 'numeric');
+  const listField = fields.get('allowTools');
+  assert.ok(controlIn(listField, isInput), '列表行仍然是输入框');
+  const pills = nodes(listField, (node) => node.type === primitivesStub.Pill);
+  assert.equal(pills.length, 0, '默认值空列表时不渲染 Pill 预览');
+});
+
 test('草稿口径：布尔收 true / 是 / 1，空串是「恢复默认」，胡说是非法', () => {
-  const { mod } = mountPage();
-  const spec = (key) => mod.specFor(key, new z(JSON.parse(JSON.stringify(Config.toJSON()))).dict[key]);
+  const { mod } = mount();
+  const schema = new z(SCHEMA_JSON());
+  const spec = (key) => mod.specFor(key, schema.dict[key]);
 
   const proactive = spec('proactive');
   assert.equal(proactive.format(true), 'true');
@@ -338,8 +602,8 @@ test('草稿口径：布尔收 true / 是 / 1，空串是「恢复默认」，�
 });
 
 test('草稿口径：白名单是逗号分隔（中英文都认），空串清空', () => {
-  const { mod } = mountPage();
-  const node = new z(JSON.parse(JSON.stringify(Config.toJSON()))).dict.allowTools;
+  const { mod } = mount();
+  const node = new z(SCHEMA_JSON()).dict.allowTools;
   const spec = mod.specFor('allowTools', node);
 
   assert.equal(spec.format(['read', 'grep']), 'read, grep');
@@ -350,8 +614,8 @@ test('草稿口径：白名单是逗号分隔（中英文都认），空串清�
 });
 
 test('草稿口径：枚举只认 union 里列出的值', () => {
-  const { mod } = mountPage();
-  const schema = new z(JSON.parse(JSON.stringify(Config.toJSON())));
+  const { mod } = mount();
+  const schema = new z(SCHEMA_JSON());
   const spec = mod.specFor('groupTrigger', schema.dict.groupTrigger);
 
   assert.deepEqual(spec.parse('all'), { kind: 'set', value: 'all' });
@@ -360,8 +624,100 @@ test('草稿口径：枚举只认 union 里列出的值', () => {
   assert.deepEqual(spec.parse(''), { kind: 'clear' });
 });
 
+test('开关与 select 的写入口径：走 props.edit，写的是草稿文本', () => {
+  const session = mount();
+  const events = [];
+  const tree = mountTree(session, {
+    edit: (key, text) => events.push([key, text]),
+  });
+
+  const privateChat = fieldsIn(tree).get('privateChat');
+  const toggle = controlIn(privateChat, isSwitch);
+  assert.equal(toggle.props.checked, true, 'privateChat 默认 true');
+  toggle.props.onChange(false);
+  toggle.props.onChange(true);
+
+  const groupTrigger = fieldsIn(tree).get('groupTrigger');
+  const select = controlIn(groupTrigger, isSelect);
+  assert.equal(select.props.value, 'mention', '默认值来自 schema（跟真模型一致）');
+  select.props.onChange({ target: { value: 'all' } });
+
+  assert.deepEqual(events, [
+    ['privateChat', 'false'],
+    ['privateChat', 'true'],
+    ['groupTrigger', 'all'],
+  ]);
+});
+
+test('枚举文案：每个枚举字段的每个取值都有的人话，映射里没有 schema 之外的字段', () => {
+  const { mod } = mount();
+  const fields = mod.describeFields(new z(SCHEMA_JSON()));
+  const enums = fields.filter((row) => row.kind === 'choice');
+
+  assert.deepEqual(
+    enums.map((row) => row.key).sort(),
+    Object.keys(mod.ENUM_LABELS).sort(),
+    '枚举字段与 ENUM_LABELS 必须一一对应（多一个/少一个都红）',
+  );
+  for (const row of enums) {
+    assert.ok(row.choices.length >= 2, `${row.key} 至少两个取值`);
+    assert.deepEqual(
+      [...row.choices].sort(),
+      Object.keys(mod.ENUM_LABELS[row.key]).sort(),
+      `${row.key} 的每个取值都要有文案`,
+    );
+    for (const choice of row.choices) {
+      const label = mod.labelForEnum(row.key, choice);
+      assert.ok(label.length > 0 && label !== choice, `${row.key}=${choice} 的文案不能退化成字面量`);
+    }
+    assert.equal(mod.labelForEnum(row.key, '不存在的值'), '不存在的值', '认不出来的取值原样返回');
+  }
+});
+
+test('量纲：FIELD_HINTS 覆盖所有 Ms/Bytes/Chars/Hour/Chance 字段，hint 跟着草稿走', () => {
+  const { mod } = mount();
+  const keys = SCHEMA_KEYS();
+  const suffix = /(Ms|Bytes|Chars|Hour|Chance)$/;
+
+  for (const key of keys.filter((name) => suffix.test(name))) {
+    assert.ok(
+      Object.hasOwn(mod.FIELD_HINTS, key) || mod.NO_HINT.has(key),
+      `${key} 命中了量纲后缀，必须在 FIELD_HINTS 或 NO_HINT 里`,
+    );
+  }
+  for (const key of [...Object.keys(mod.FIELD_HINTS), ...mod.NO_HINT]) {
+    assert.ok(keys.includes(key), `${key} 不在 schema 里（配置改名后这里会红）`);
+  }
+
+  assert.equal(mod.hintFor('proactiveIdleMs', 2700000), '= 45 分钟');
+  assert.equal(mod.hintFor('proactiveIdleMs', 60000), '= 1 分钟');
+  assert.equal(mod.hintFor('mediaTimeoutMs', 1200), '= 1.2 秒');
+  assert.equal(mod.hintFor('mediaMaxBytes', 8 * 1024 * 1024), '= 8 MB');
+  assert.equal(mod.hintFor('memoryFileMaxBytes', 8963968), '= 8.5 MB');
+  assert.equal(mod.hintFor('digestAtHour', 4), '= 04:00');
+  assert.equal(mod.hintFor('personaMaxChars', 4000), '= 4000 字');
+  assert.equal(mod.hintFor('proactiveChance', 0.35), '= 35%');
+  assert.equal(mod.hintFor('activeGroupBatchScale', 2), '= ×2');
+  assert.equal(mod.hintFor('accessToken', 'whatever'), '', '没有白名单条目就没有量纲提示');
+  assert.equal(mod.hintFor('proactiveIdleMs', ''), '', '空草稿不猜');
+
+  // 页面上的 hint 是「原 hint · 量纲」，而且草稿一改就跟着变（编辑器里仍是原始值）。
+  const session = mount();
+  mountTree(session);
+  const tree = render(session);
+  const toolbar = nodes(tree, (node) => node.props?.className === 'qq-toolbar')[0];
+  const search = controlIn(toolbar, isSearch);
+  search.props.onChange({ target: { value: 'proactiveIdleMs' } });
+  let field = fieldsIn(rerender(session)).get('proactiveIdleMs');
+  assert.match(textOf(nodes(field, isHint)[0]), /分钟/, 'hint 里要有人类可读的量纲');
+  assert.match(textOf(nodes(field, isHint)[0]), /= 45 分钟/);
+  controlIn(field, isInput).props.onChange({ target: { value: '60000' } });
+  field = fieldsIn(rerender(session)).get('proactiveIdleMs');
+  assert.match(textOf(nodes(field, isHint)[0]), /= 1 分钟/, '改草稿后量纲要立刻跟着变');
+});
+
 test('标签：优先 schema 上的 comment，其次覆盖表，最后从描述里取一段', () => {
-  const { mod } = mountPage();
+  const { mod } = mount();
 
   assert.equal(mod.labelOf('batchWindowMs', { meta: { description: '收到一条要回的消息后，先等…' } }), '攒批窗口（毫秒）');
   assert.equal(mod.labelOf('anything', { meta: { comment: '手写的标签', description: '描述：…' } }), '手写的标签');
@@ -370,170 +726,382 @@ test('标签：优先 schema 上的 comment，其次覆盖表，最后从描述�
   assert.equal(mod.deriveLabel('**加粗**也照取：后面的说明', 'x'), '加粗也照取');
 });
 
-test('组件真的能渲染：SettingsForm 里一组一张折叠卡片，默认只展开第一组', () => {
-  const { page, mod } = mountPage();
-  const state = page.options.inject().hooks.qqSettings.getSnapshot();
-  const events = [];
+test('重构新增的字段在设置页上有像样的短标签（不截成半句、不退化成字段名）', () => {
+  const { mod } = mount();
+  const fields = mod.describeFields(new z(SCHEMA_JSON()));
+  const label = (key) => fields.find((row) => row.key === key).label;
 
-  // 框架平时会把 hooks 里的 observable 绑成 useQqSettings（useSyncExternalStore），
-  // 这里换成一个直接读快照的实现，于是组件能当纯函数调。
-  const tree = mountTree(page, mod, {
-    edit: (key, text) => events.push(['edit', key, text]),
-    resetField: (key) => events.push(['reset', key]),
-    save: () => events.push(['save']),
-    discard: () => events.push(['discard']),
-  });
+  assert.equal(label('persona'), '旧人设（PERSONA.md 不存在时用）');
+  assert.equal(label('personaFile'), '人设文件（优先）');
+  assert.equal(label('personaSceneOverlays'), '按场景叠加人设四段');
+  assert.equal(label('stripShortPeriod'), '短气泡剥句末句号');
+  assert.equal(label('interjectQuote'), '插话强制引用锚点');
+  assert.equal(label('pokeReplyChance'), '回戳的概率');
+  assert.equal(label('bubbleContinueDecay'), '每多一个气泡的保留系数');
+  assert.equal(label('apiKeyRotate'), '每天轮换 API key');
+  assert.equal(label('endpoint'), 'OneBot WebSocket 地址');
 
-  assert.equal(tree.type, 'SettingsForm', '根节点必须是 primitives 的 SettingsForm（它带保存按钮与只读提示）');
-  const cards = groupCards(tree);
-  assert.equal(cards.length, state.sections.length, '每一组都要有一张卡片');
-
-  // 折叠是这一页的核心：默认只有第一组把字段渲染出来。
-  assert.equal(fieldsOf(cards[0]).length, state.sections[0].rows.length, '第一组默认展开');
-  for (const card of cards.slice(1)) {
-    assert.equal(fieldsOf(card).length, 0, '其余组默认收起（收起时不渲染字段）');
+  for (const row of fields) {
+    assert.ok(!row.label.endsWith('…'), `${row.key} 的标签被截断：${row.label}`);
+    assert.ok(!row.label.endsWith('「'), `${row.key} 的标签被截成半句：${row.label}`);
   }
-
-  const rows = cards.flatMap((card) => fieldsOf(card));
-  assert.equal(rows.length, state.sections[0].rows.length, '默认页面上只有第一组的字段');
-  for (const row of rows) {
-    assert.equal(row.type, 'SettingsValueField');
-    assert.match(row.props.id, new RegExp(`^${mod.FIELD_ID_PREFIX}`));
-    assert.ok(row.props.label.length > 0);
-    assert.equal(typeof row.props.onEdit, 'function');
-    assert.equal(typeof row.props.onReset, 'function');
-    assert.equal(row.props.help.label, 'helpLabel');
-  }
-
-  // 编辑与重置要带着字段名回到注入的动作上（键名写错 = 改了别的字段）。
-  rows[0].props.onEdit('新值');
-  rows[0].props.onReset();
-  const firstKey = state.sections[0].rows[0].key;
-  assert.deepEqual(events, [['edit', firstKey, '新值'], ['reset', firstKey]]);
-
-  // 点标题：那一组展开（假 useState 会把新状态留在槽里，下一次渲染就用它）。
-  headOf(cards[1]).props.onClick();
-  const reopened = rerender(page, mod);
-  const reopenedCards = groupCards(reopened);
-  assert.equal(fieldsOf(reopenedCards[0]).length, 0, '点开第二组时第一组要收起');
-  assert.equal(fieldsOf(reopenedCards[1]).length, state.sections[1].rows.length, '第二组应当展开');
-  assert.equal(headOf(reopenedCards[1]).props['aria-expanded'], 'true');
-  assert.equal(headOf(reopenedCards[0]).props['aria-expanded'], 'false');
-  assert.equal(headOf(reopenedCards[1]).props['aria-controls'], `qq-group-${state.sections[1].id}`);
-
-  // 再点一次同一个标题：这一组收起，页面上一个字段都不渲染（回到「全是组名」的总览）。
-  headOf(reopenedCards[1]).props.onClick();
-  const collapsed = rerender(page, mod);
-  assert.equal(groupCards(collapsed).flatMap((card) => fieldsOf(card)).length, 0);
-  assert.equal(headOf(groupCards(collapsed)[1]).props['aria-expanded'], 'false');
-
-  // summary 视图只给一行简介（设置面板的导航项在缺描述时会问它）。
-  reactHooks.state = UNSET;
-  assert.equal(rerender(page, mod, { view: 'summary' }), 'intro');
 });
 
-test('人设单独一张卡片：persona / instructions 是多行输入框，不和别的字段挤在一起', () => {
-  const { mod, page } = mountPage();
-  const fields = mod.describeFields(new z(JSON.parse(JSON.stringify(Config.toJSON()))));
-  const sectionOfKey = (key) => fields.find((row) => row.key === key).section;
+test('页面骨架：标题 / 简介 / 通知 / 工具条 / 6 个 tab / 只渲染当前 tab 的区块', () => {
+  const session = mount();
+  const tree = mountTree(session);
 
-  // 两张卡片：这一段里只有人设与额外要求，而它们也不在「QQ 会话与 Agent」那堆开关里。
-  assert.equal(sectionOfKey('persona').id, 'persona');
-  assert.equal(sectionOfKey('instructions').id, 'persona');
-  assert.equal(sectionOfKey('persona').title, '人设与提示词');
-  const personaSection = mod.SECTIONS.find((section) => section.id === 'persona');
-  assert.deepEqual(personaSection.fields, ['persona', 'instructions']);
-  const agentSection = mod.SECTIONS.find((section) => section.id === 'agent');
-  assert.ok(!agentSection.fields.includes('persona') && !agentSection.fields.includes('instructions'));
+  assert.equal(tree.type, 'SettingsForm', '根节点必须是 primitives 的 SettingsForm（它带保存按钮与只读提示）');
+  assert.equal(textOf(nodes(tree, (node) => node.props?.className === 'qq-title')[0]), 'QQ Bridge');
+  assert.match(textOf(nodes(tree, (node) => node.props?.className === 'qq-intro')[0]), /分成六页/);
+  assert.match(textOf(nodes(tree, (node) => node.props?.className === 'qq-notice')[0]), /cordis\.patch\.yml/);
 
-  // 「多行」是一条白名单，不是「字符串字段都算」：其余文本字段仍然是单行控件。
-  assert.equal(fields.find((row) => row.key === 'persona').long, true);
-  assert.equal(fields.find((row) => row.key === 'instructions').long, true);
-  assert.equal(fields.find((row) => row.key === 'allowTools').long, false);
-
-  // 展开那一组：两个字段都得渲染成自定义的多行控件（假的 useState 是单槽的，这里
-  // 直接把它预置成这一组的 id，等于「用户点开了这一组的标题」）。
-  reactHooks.state = 'persona';
-  const card = cardOf(rerender(page, mod), 'persona');
-  assert.ok(card, '人设要有自己的一张折叠卡片');
-  const controls = controlsOf(card);
+  const tabs = nodes(tree, (node) => node.props?.role === 'tab');
   assert.deepEqual(
-    controls.map((control) => control.props.id),
-    ['qq-config-persona', 'qq-config-instructions'],
+    tabs.map((node) => textOf(node)),
+    ['连接', '会话', '人格', '群聊', '感知', '记忆'],
   );
-  for (const control of controls) assert.equal(control.type, mod.LongTextField);
+  assert.equal(tabs[0].props['aria-selected'], true, '默认打开「连接」');
+  assert.equal(tabs[0].props.tabIndex, 0, '只有当前 tab 是 tab stop（roving tabindex）');
+  assert.equal(tabs[1].props.tabIndex, -1);
+  assert.equal(tabs[1].props['aria-controls'], 'qq-tabpanel-session');
+  assert.equal(textOf(nodes(tree, (node) => node.props?.role === 'tablist')[0].props['aria-label']), '配置分类');
+  const panel = nodes(tree, (node) => node.props?.role === 'tabpanel')[0];
+  assert.equal(panel.props.id, 'qq-tabpanel-connect');
+  assert.equal(panel.props['aria-labelledby'], 'qq-tab-connect');
+
+  // 连接 tab = 连接与运行环境 + 准入与触发，正好两个扁平区块。
+  const sections = nodes(panel, (node) => node.type === 'section');
+  assert.deepEqual(
+    sections.map((node) => textOf(nodes(node, (child) => child.type === 'h3')[0])),
+    ['连接与运行环境', '准入与触发'],
+  );
+  assert.deepEqual(fieldsIn(tree).size, 12, '连接 tab 有 12 个字段');
+
+  // 键盘 ←/→/Home/End 换 tab（事件里没有 DOM，focus 挪不动但切换必须生效）。
+  const key = (name) => ({ key: name, preventDefault() {} });
+  tabs[0].props.onKeyDown(key('ArrowRight'));
+  assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[1].props['aria-selected'], true);
+  nodes(rerender(session), (node) => node.props?.role === 'tab')[1].props.onKeyDown(key('End'));
+  assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[5].props['aria-selected'], true);
+  nodes(rerender(session), (node) => node.props?.role === 'tab')[5].props.onKeyDown(key('Home'));
+  assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[0].props['aria-selected'], true);
+  nodes(rerender(session), (node) => node.props?.role === 'tab')[0].props.onKeyDown(key('ArrowLeft'));
+  assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[5].props['aria-selected'], true, '← 从第一个绕回最后一个');
+});
+
+test('人格页：文件参数在上、旧 persona 折进「兼容」、额外要求在正文', () => {
+  const session = mount({ values: { ...DEFAULT_VALUES(), persona: '第一行\n第二行' } });
+  mountTree(session);
+  const tree = openTab(session, '人格');
+
+  const section = nodes(tree, (node) => node.type === 'section')[0];
+  assert.equal(textOf(nodes(section, (node) => node.type === 'h3')[0]), '人格与提示词（PERSONA.md 优先）');
+  assert.equal(
+    textOf(nodes(section, (node) => node.props?.className === 'qq-sectionNote')[0]),
+    '人设优先读 cwd 里的 .qq-persona/PERSONA.md：那个文件存在且能解析时，「旧人设」这一项不再生效（启动日志里会写明人设来自文件还是配置）。',
+  );
+
+  // 字段顺序：文件参数在前，然后是折叠块，最后是额外要求。
+  const order = nodes(section, (node) => node.props?.['data-field'] !== undefined).map((node) => node.props['data-field']);
+  assert.deepEqual(order, ['personaFile', 'personaMaxChars', 'personaSceneOverlays', 'persona', 'instructions']);
+
+  const disclosure = nodes(section, (node) => node.type === 'details')[0];
+  assert.ok(disclosure, '旧 persona 要折进「兼容」的 <details>');
+  assert.equal(textOf(nodes(disclosure, (node) => node.type === 'summary')[0]), '兼容：旧 persona（文件存在时不生效）');
+  assert.deepEqual(
+    nodes(disclosure, (node) => node.props?.['data-field'] !== undefined).map((node) => node.props['data-field']),
+    ['persona'],
+    '折叠块里只有旧 persona',
+  );
+
+  const persona = fieldsIn(tree).get('persona');
+  const textarea = controlIn(persona, isTextarea);
+  assert.equal(textarea.props.value, '第一行\n第二行', '多行框必须原样保留换行');
+  assert.ok(textarea.props.rows >= 6);
+  assert.equal(controlIn(fieldsIn(tree).get('instructions'), isTextarea) !== undefined, true, '额外要求也是多行框');
+  assert.equal(nodes(section, (node) => node.props?.className === 'qq-sectionNote').length, 1);
+});
+
+test('表达页：机器参数按 气泡 / 标点 / 群聊 / 私聊 分了小标题', () => {
+  const session = mount();
+  mountTree(session);
+  const tree = openTab(session, '人格');
+  const sections = nodes(tree, (node) => node.type === 'section');
+  const expression = sections[1];
+  assert.equal(textOf(nodes(expression, (node) => node.type === 'h3')[0]), '表达（STYLE.md / 气泡 / 标点 / 补一句）');
+
+  const subTitles = nodes(expression, (node) => node.props?.className === 'qq-subTitle').map((node) => textOf(node));
+  assert.deepEqual(subTitles, ['气泡', '标点', '群聊', '私聊']);
+  const order = nodes(expression, (node) => node.props?.['data-field'] !== undefined).map((node) => node.props['data-field']);
+  assert.deepEqual(order.slice(0, 2), ['styleFile', 'styleMaxChars'], '散文（文件）在最前面');
+  assert.deepEqual(order.slice(-4), [
+    'privateAfterthought',
+    'privateAfterthoughtChance',
+    'privateAfterthoughtIdleMs',
+    'privateAfterthoughtDailyMax',
+  ]);
+});
+
+test('覆盖标记与恢复默认：行上有 Tag 与按钮，点恢复默认会回到注入的动作上', () => {
+  const session = mount({ overrides: ['endpoint'] });
+  const events = [];
+  const tree = mountTree(session, { resetField: (key) => events.push(['reset', key]) });
+
+  const field = fieldsIn(tree).get('endpoint');
+  const tags = tagsIn(field);
+  assert.equal(tags.length, 1);
+  assert.equal(tags[0].props.tone, 'neutral');
+  assert.equal(textOf(tags[0]), '已覆盖');
+  const reset = resetIn(field);
+  assert.ok(reset, '覆盖过的字段要有「恢复默认」');
+  assert.equal(textOf(reset), '恢复默认');
+  reset.props.onClick();
+  assert.deepEqual(events, [['reset', 'endpoint']]);
+
+  // 没有覆盖的字段不摆这套 chrome。
+  assert.equal(tagsIn(fieldsIn(tree).get('accessToken')).length, 0);
+  assert.equal(resetIn(fieldsIn(tree).get('accessToken')), undefined);
+});
+
+test('切 tab 不丢草稿：改一项 → 切走 → 切回，草稿还在', () => {
+  const session = mount();
+  mountTree(session);
+
+  let tree = render(session);
+  const input = controlIn(fieldsIn(tree).get('endpoint'), isInput);
+  input.props.onChange({ target: { value: 'ws://example.test:9999' } });
+
+  tree = render(session);
+  assert.equal(controlIn(fieldsIn(tree).get('endpoint'), isInput).props.value, 'ws://example.test:9999');
+
+  tree = openTab(session, '会话');
+  assert.equal(fieldsIn(tree).has('endpoint'), false, '切走之后那一页的字段不再渲染');
+  tree = openTab(session, '连接');
+  assert.equal(
+    controlIn(fieldsIn(tree).get('endpoint'), isInput).props.value,
+    'ws://example.test:9999',
+    '模型只建一次，切 tab 不重建（草稿不丢）',
+  );
+});
+
+test('搜索：按标签 / 字段名 / 描述 / 区块标题命中，跨 tab，结果行可编辑', () => {
+  const session = mount();
+  const events = [];
+  let tree = mountTree(session, { edit: (key, text) => events.push([key, text]) });
+  const search = controlIn(nodes(tree, (node) => node.props?.className === 'qq-toolbar')[0], isSearch);
+
+  const searchFor = (query) => {
+    search.props.onChange({ target: { value: query } });
+    return rerender(session, { edit: (key, text) => events.push([key, text]) });
+  };
+
+  // 字段名（驼峰与下划线都命中 —— 搜索前会去掉空白 / `_` / `-`）。
+  tree = searchFor('proactiveIdleMs');
+  assert.deepEqual([...fieldsIn(tree).keys()], ['proactiveIdleMs']);
+  tree = searchFor('proactive_idle_ms');
+  assert.deepEqual([...fieldsIn(tree).keys()], ['proactiveIdleMs']);
+
+  // 短标签。
+  tree = searchFor('攒批窗口');
+  assert.ok(fieldsIn(tree).has('batchWindowMs'), '标签也能搜');
+
+  // 区块标题：自动复读那一组的所有字段。
+  tree = searchFor('自动复读');
+  assert.ok(fieldsIn(tree).size >= 8, '按区块标题命中整组');
+  assert.ok(fieldsIn(tree).has('repeat'));
+
+  // 描述里的词（跨 tab）。
+  tree = searchFor('白名单');
+  const whitelist = [...fieldsIn(tree).keys()];
+  assert.ok(whitelist.includes('allowUsers') && whitelist.includes('allowTools'));
+  const tabLabels = new Set(
+    nodes(tree, (node) => node.type === primitivesStub.Tag && node.props.tone === 'outline').map((node) => textOf(node)),
+  );
+  assert.ok(tabLabels.has('连接') && tabLabels.has('会话'), '搜索结果右侧的 Tag 要标出来源 tab');
+
+  // 结果行本身可编辑，且仍走同一份草稿（props.edit）。
+  const field = fieldsIn(tree).get('allowUsers');
+  controlIn(field, isInput).props.onChange({ target: { value: '10001, 10002' } });
+  assert.deepEqual(events, [['allowUsers', '10001, 10002']]);
+
+  // 空结果有条文案，没有插画。
+  tree = searchFor('不存在的配置项');
+  assert.deepEqual([...fieldsIn(tree).keys()], []);
+  assert.equal(
+    textOf(nodes(tree, (node) => node.props?.className === 'qq-empty')[0]),
+    '没有匹配的配置项。可以搜字段名（如 proactiveChance）或描述里的词。',
+  );
+
+  // Esc 清空搜索，回到分组视图。
+  const input = controlIn(nodes(tree, (node) => node.props?.className === 'qq-toolbar')[0], isSearch);
+  const event = { key: 'Escape', preventDefault() {} };
+  input.props.onKeyDown(event);
+  tree = rerender(session);
+  assert.equal(fieldsIn(tree).size, 12, '清空搜索回到当前 tab 的分组视图');
+
+  // 点 tab = 清空搜索并切过去。
+  tree = searchFor('proactive');
+  assert.ok(fieldsIn(tree).size > 0);
+  tabNode(tree, '群聊').props.onClick();
+  tree = rerender(session);
+  assert.equal(
+    controlIn(nodes(tree, (node) => node.props?.className === 'qq-toolbar')[0], isSearch).props.value,
+    '',
+    '搜索框被清空',
+  );
+  assert.equal(nodes(tree, (node) => node.props?.role === 'tabpanel')[0].props.id, 'qq-tabpanel-group');
+});
+
+test('脏状态：已改计数、只看已改、与搜索叠加、非法项计数', () => {
+  const session = mount({ overrides: ['proactive', 'batchWindowMs'] });
+  let tree = mountTree(session);
+  const toolbar = () => nodes(render(session), (node) => node.props?.className === 'qq-toolbar')[0];
+  const changedTag = () =>
+    nodes(toolbar(), (node) => node.type === primitivesStub.Tag && node.props.tone === 'neutral')[0];
+  const onlyChanged = () => nodes(toolbar(), (node) => node.type === primitivesStub.Pill)[0];
+
+  assert.equal(textOf(changedTag()), '已改 2 项');
+  assert.equal(onlyChanged().props.disabled, false);
+  assert.equal(onlyChanged().props.active, false);
+
+  // 打开「只看已改」：当前 tab（连接）里只剩准入组的 proactive… 不在这页 —— 换到群聊。
+  onlyChanged().props.onClick();
+  tree = openTab(session, '群聊');
+  assert.deepEqual([...fieldsIn(tree).keys()], ['proactive'], '只剩改过的那一行');
+  assert.equal(onlyChanged().props.active, true);
+
+  // 与搜索叠加：先按覆盖过滤，再按查询过滤。
+  const search = controlIn(toolbar(), isSearch);
+  search.props.onChange({ target: { value: 'batch' } });
+  tree = rerender(session);
+  assert.deepEqual([...fieldsIn(tree).keys()], ['batchWindowMs'], '「只看已改」先过滤掉没改过的行，搜索再命中');
+  search.props.onChange({ target: { value: 'proactive' } });
+  tree = rerender(session);
+  assert.deepEqual([...fieldsIn(tree).keys()], ['proactive']);
+
+  // 恢复默认之后计数减 1；两个都没了之后「只看已改」自动放开、计数 Tag 消失。
+  const field = fieldsIn(tree).get('proactive');
+  resetIn(field).props.onClick();
+  tree = rerender(session);
+  assert.equal(textOf(nodes(toolbar(), (node) => node.type === primitivesStub.Tag && node.props.tone === 'neutral')[0]), '已改 1 项');
+  // 那一行已经从「只看已改」里消失，换搜另一个再恢复。
+  controlIn(toolbar(), isSearch).props.onChange({ target: { value: 'batchWindowMs' } });
+  tree = rerender(session);
+  resetIn(fieldsIn(tree).get('batchWindowMs')).props.onClick();
+  tree = rerender(session);
+  assert.equal(
+    nodes(toolbar(), (node) => node.type === primitivesStub.Tag && node.props.tone === 'neutral').length,
+    0,
+    '没有覆盖行时隐藏计数',
+  );
+  assert.equal(onlyChanged().props.disabled, true, '「只看已改」置灰不可点');
+
+  // 非法项：草稿校验不过时工具条给出「N 项待修正」。
+  const numberInput = controlIn(fieldsIn(openTab(session, '会话')).get('batchWindowMs'), isInput);
+  numberInput.props.onChange({ target: { value: '不久' } });
+  tree = rerender(session);
+  const invalidTag = nodes(toolbar(), (node) => node.type === primitivesStub.Tag && node.props.tone === 'danger')[0];
+  assert.equal(textOf(invalidTag), '1 项待修正');
+  assert.equal(isInvalidValid(tree), true, '那一行的提示要变成错误样式');
+
+  // 改回一个合法值：「只看已改」不应当因为「刚才还是 0 项」而偷偷回到打开状态。
+  controlIn(fieldsIn(tree).get('batchWindowMs'), isInput).props.onChange({ target: { value: '2000' } });
+  tree = rerender(session);
+  assert.equal(textOf(nodes(toolbar(), (node) => node.type === primitivesStub.Tag && node.props.tone === 'neutral')[0]), '已改 1 项');
+  assert.ok(fieldsIn(tree).size > 1, '过滤保持关闭：这一页的字段都还在');
+});
+
+/** 当前页面上是不是有非法提示（`qq-invalid`）。 */
+function isInvalidValid(tree) {
+  return nodes(tree, isInvalid).length > 0;
+}
+
+test('只读部署：开关 / 输入框 / select / 多行框 / Pill 全部 disabled', () => {
+  const session = mount({ writable: false, overrides: ['endpoint'] });
+  mountTree(session);
+  let tree = render(session);
+
+  for (const [key, field] of fieldsIn(tree)) {
+    const controls = nodes(field, (node) => isInput(node) || isSwitch(node) || isSelect(node) || isTextarea(node) || node.type === primitivesStub.Pill);
+    for (const control of controls) {
+      assert.equal(control.props.disabled, true, `${key} 的控件在只读部署里必须 disabled`);
+    }
+  }
+  const reset = resetIn(fieldsIn(tree).get('endpoint'));
+  assert.equal(reset.props.disabled, true, '「恢复默认」也要 disabled');
+
+  tree = openTab(session, '人格');
+  assert.equal(controlIn(fieldsIn(tree).get('persona'), isTextarea).props.disabled, true);
+});
+
+test('列表行：输入框在，Pill 预览能删掉一个值', () => {
+  const session = mount({ values: { ...DEFAULT_VALUES(), allowGroups: ['10001', '10002'] } });
+  const events = [];
+  const tree = mountTree(session, { edit: (key, text) => events.push([key, text]) });
+
+  const field = fieldsIn(tree).get('allowGroups');
+  assert.equal(controlIn(field, isInput).props.value, '10001, 10002');
+  const pills = nodes(field, (node) => node.type === primitivesStub.Pill);
+  assert.deepEqual(pills.map((node) => textOf(node)), ['10001 ×', '10002 ×']);
+  pills[0].props.onClick();
+  assert.deepEqual(events, [['allowGroups', '10002']], '点 Pill 的 × 删掉那一个值');
 });
 
 test('多行控件：换行原样保留、编辑与恢复默认可达、ⓘ 能展开说明', () => {
-  const { mod } = mountPage();
-  // 假的 useState 是一根模块级单槽：这里当「组件刚挂载」用，先把槽清干净，
-  // 否则会继承上一个用例留在里面的展开状态。
-  reactHooks.state = UNSET;
+  const session = mount({ values: { ...DEFAULT_VALUES(), persona: '第一行\n第二行' }, overrides: ['persona'] });
   const events = [];
-  const props = {
-    id: 'qq-config-persona',
-    label: '人设（群友口吻）',
-    hint: '留空 = 用插件内置的那份',
-    help: { label: 'helpLabel', content: '说明' },
-    text: '第一行\n第二行',
-    overridden: true,
-    invalid: false,
-    disabled: false,
-    overriddenLabel: 'overridden',
-    resetLabel: 'reset',
-    invalidLabel: 'invalid',
-    placeholder: '留空 = 内置',
-    onEdit: (text) => events.push(['edit', text]),
-    onReset: () => events.push(['reset']),
-  };
+  mountTree(session);
+  let tree = openTab(session, '人格');
 
-  const field = mod.LongTextField(props);
-  const textarea = field.props.children[1];
-  assert.equal(textarea.type, 'textarea', '多行框才是 `<textarea>`（单行 `<input>` 看不到整段人设）');
+  let field = fieldsIn(tree).get('persona');
+  const textarea = controlIn(field, isTextarea);
   assert.equal(textarea.props.value, '第一行\n第二行', '换行必须原样保留');
-  assert.ok(textarea.props.rows >= 6);
-  assert.equal(textarea.props.placeholder, '留空 = 内置');
-  assert.equal(textarea.props.disabled, false);
   textarea.props.onChange({ target: { value: '改过的\n人设' } });
-  assert.deepEqual(events, [['edit', '改过的\n人设']], '编辑要走注入的 onEdit（草稿与校验都在那边）');
+  tree = rerender(session, { edit: (key, text) => events.push(['edit', key, text]) });
+  field = fieldsIn(tree).get('persona');
+  controlIn(field, isTextarea).props.onChange({ target: { value: '改过的\n人设' } });
+  assert.deepEqual(events, [['edit', 'persona', '改过的\n人设']], '编辑要走注入的动作（草稿与校验都在那边）');
 
-  // 「已覆盖」那一行里的恢复默认：按钮被点到时要回到注入的 onReset 上。
-  const head = field.props.children[0];
-  const badges = head.props.children.find((child) => child?.type === 'span');
-  assert.ok(badges, '覆盖过的人设要显示「已覆盖」与恢复默认');
-  const reset = badges.props.children.find((child) => child?.type === 'button');
-  reset.props.onClick();
-  assert.deepEqual(events.at(-1), ['reset']);
-
-  // ⓘ 是这一页唯一的「完整说明」入口（配置项名也在里面），展开要走 aria-expanded。
-  const helpButton = head.props.children.find((child) => child?.type === 'button');
+  // ⓘ 是完整说明的入口（配置项名也在里面），展开要走 aria-expanded。
+  const helpButton = helpButtonIn(field);
   assert.equal(helpButton.props['aria-expanded'], false);
   helpButton.props.onClick();
-  const expanded = mod.LongTextField(props);
-  assert.equal(expanded.props.children[0].props.children.find((child) => child?.type === 'button').props['aria-expanded'], true);
-  assert.equal(expanded.props.children.at(-1).props.role, 'region', '展开后要出现说明区');
+  tree = rerender(session);
+  field = fieldsIn(tree).get('persona');
+  assert.equal(helpButtonIn(field).props['aria-expanded'], true);
+  const panel = nodes(field, (node) => node.props?.role === 'region')[0];
+  assert.ok(panel, '展开后要出现说明区');
+  assert.match(textOf(panel), /配置项: persona/, '说明里有配置项名');
 });
 
-test('多行控件的非法提示：填了非法值就说清楚，边框走错误色', () => {
-  const { mod } = mountPage();
-  const field = mod.LongTextField({
-    id: 'qq-config-persona',
-    label: '人设',
-    hint: '留空 = 用内置的那份',
-    text: '',
-    invalid: true,
-    disabled: false,
-    invalidLabel: '请填文本；留空表示使用默认值',
-    overriddenLabel: 'overridden',
-    resetLabel: 'reset',
-    onEdit() {},
-    onReset() {},
-  });
+test('非法值：输入框 aria-invalid、提示走错误色，文案来自字典', () => {
+  const session = mount();
+  mountTree(session);
+  let tree = openTab(session, '群聊');
+  const input = controlIn(fieldsIn(tree).get('proactiveCheckMs'), isInput);
+  input.props.onChange({ target: { value: '十分钟' } });
+  tree = rerender(session);
 
-  const textarea = field.props.children[1];
-  assert.equal(textarea.props['aria-invalid'], true);
-  assert.match(textarea.props.style.borderColor, /state-error-primary/);
-  const message = field.props.children[2];
-  assert.equal(message.props.children, '请填文本；留空表示使用默认值');
+  const field = fieldsIn(tree).get('proactiveCheckMs');
+  const control = controlIn(field, isInput);
+  assert.equal(control.props['aria-invalid'], true);
+  assert.match(control.props['aria-describedby'], /qq-config-proactiveCheckMs-message/);
+  assert.equal(textOf(nodes(field, isInvalid)[0]), '请填数字；留空表示使用默认值');
+  assert.equal(nodes(field, isHint).length, 0, '错误与 hint 只显示一个');
 });
 
+test('summary 视图：导航项问它时只回一行简介', () => {
+  const session = mount();
+  resetHooks();
+  assert.equal(render(session, { view: 'summary' }), 'QQ 桥接的全部配置，按用途分成六页；改完在底部一次保存。');
+});
+
+test('旧版的卡片 chrome 与折叠状态都删干净了（源码里搜不到它们的名字）', () => {
+  const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  for (const gone of ['CARD_STYLE', 'CARD_HEAD_STYLE', 'CARD_BODY_STYLE', 'groupHeader', 'openId', 'groupsHint', 'envNotice', 'DOT_STYLE', 'CHEVRON_STYLE']) {
+    assert.ok(!source.includes(gone), `client.js 里不该再有 ${gone}`);
+  }
+  assert.ok(source.includes('TABS'), 'tab 映射必须写在 client.js 里');
+  assert.ok(source.includes('FIELD_HINTS'), '量纲白名单必须写在 client.js 里');
+});

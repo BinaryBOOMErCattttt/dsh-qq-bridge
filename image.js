@@ -42,7 +42,7 @@ function reasonOf(error) {
  * 本来就是这个部署的沙箱边界，没理由为了发张图把它捅开。
  *
  * 实现搬到了 `util.js` 的 `pathInside`：这条判定不只服务出站图片，记忆目录、
- * 表情包目录、禁漫目录的沙箱校验用的是同一条规矩（含 Windows 的大小写语义）。
+ * 表情包目录的沙箱校验用的是同一条规矩（含 Windows 的大小写语义）。
  * 这里保留同名导出，是为了不让 `memory.js` / `index.js` 与既有测试跟着改一圈。
  * @param root - 已解析的绝对目录。
  * @param target - 已解析的绝对路径。

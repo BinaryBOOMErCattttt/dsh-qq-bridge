@@ -290,3 +290,51 @@ export function batchCap(maxWaitMs, window, scale) {
   const scaled = base > 0 ? Math.round(base * scale) : 0;
   return scaled > window ? scaled : window;
 }
+
+/**
+ * 私聊「补一句」的闸门（L2，见设计文档 §6.5）。
+ *
+ * 它与群聊的 `chimeAllows` 是**两套语义**，所以刻意分成两个函数：
+ *
+ *   - 群聊的补一句属于「主动说话」家族，第一道闸就是 `proactive === true`；
+ *   - 私聊的补一句是「刚跟一个人聊完，看还有没有想补充的」，**不该被群里那个总开关
+ *     连坐**（`proactive` 的文案与风险模型都是「在群里开话头」）。所以它有自己的开关
+ *     `privateAfterthought` 与自己的日上限，而且**默认开**。
+ *
+ * 五道闸门一条不少（少一条都会变成骚扰）：
+ *   1. 只私聊 —— 群聊的补一句仍归 B 路（`activeChime*`），别混；
+ *   2. 编号还对得上（后来的消息会把旧定时器作废）；
+ *   3. 没有待投的批次、也没有在飞的 turn（插进去就是抢话）；
+ *   4. **对方没有接着说话**（`lastBotSpeakAt > lastActiveAt`）：对方接了话，那一句自己会
+ *      走正常回复，这次补一句就该让位；
+ *   5. 这一条用户消息之后还没补过（一次用户消息最多补一句，不连锁）；
+ *   6. 当天没到 `dailyMax`（0 = 不限）；
+ *   7. 概率掷中。
+ *
+ * @param {object} input
+ * @param {boolean} input.enabled - `privateAfterthought`。
+ * @param {string} input.type - 会话类型，只认 `'private'`。
+ * @param {boolean} input.seqMatches - 编号与挂定时器时一致。
+ * @param {boolean} input.hasQueuedBatch - 有待投批次或攒批定时器。
+ * @param {boolean} input.busy - 有 turn 在飞。
+ * @param {number} input.chimeCount - 这一条用户消息之后已补了几句。
+ * @param {number} input.chimeToday - 今天已补几句。
+ * @param {number} input.dailyMax - `privateAfterthoughtDailyMax`（0 = 不限）。
+ * @param {number} input.lastBotSpeakAt / input.lastActiveAt - 两个时刻。
+ * @param {number} input.chance - `privateAfterthoughtChance`。
+ * @param {number} input.roll - 已掷好的 0~1 随机数。
+ * @returns {boolean} 可以补一句时为 true。
+ */
+export function privateAfterthoughtAllows(input) {
+  if (input.enabled !== true) return false;
+  if (input.type !== 'private') return false;
+  if (input.seqMatches !== true) return false;
+  if (input.hasQueuedBatch || input.busy) return false;
+  // 「一次用户消息最多补一句」是硬规则（不是配置）：补完再补就成了自言自语。
+  if ((Number(input.chimeCount) || 0) >= 1) return false;
+  const dailyMax = Number(input.dailyMax) || 0;
+  if (dailyMax > 0 && (Number(input.chimeToday) || 0) >= dailyMax) return false;
+  if ((Number(input.lastBotSpeakAt) || 0) <= (Number(input.lastActiveAt) || 0)) return false;
+  const chance = clampChance(input.chance);
+  return chance > 0 && input.roll < chance;
+}

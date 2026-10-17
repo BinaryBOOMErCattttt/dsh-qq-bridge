@@ -6,7 +6,7 @@
  * turn 结束后，把最后一条有文本的 assistant 回复发回 QQ。
  *
  * 出站（Agent → QQ）：注册全局工具，任何 Harness Agent 都能主动发 QQ
- * 消息、发图片/表情包、按需查询当前在线的好友/群列表，以及把禁漫本子下成 PDF 发过去。
+ * 消息、发图片/表情包、把群友发的那张存成表情包，以及按需查询当前在线的好友/群列表。
  *
  * 复读（QQ → QQ）：群里连着出现同一条消息时，插件自己跟着复读一句（同一张表情包也会被
  * 原样发回去），不经过 Agent（见 `maybeRepeat`）—— 复读机的笑点就在「原样接上」，
@@ -37,7 +37,6 @@ import { OneBotClient, atMentions, blankMessageLabel, chunkText, collectMedia, f
 import { createMediaStore } from './media.js';
 import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
-import { createJmService, parseJmRef } from './jm.js';
 import { endpointTarget, findNapcatDir, repairNapcat } from './napcat.js';
 import { registerQqTools } from './tools.js';
 import { createSettings, MAX_TIMER_MS } from './settings.js';
@@ -45,18 +44,23 @@ import { createChatter } from './chatter.js';
 import { buildMentionResolver, hasMentionMarker, mentionSegments } from './mention.js';
 import {
   activeFollowAllows as activeFollowAllowsRule,
-  activeTalkAllows as activeTalkAllowsRule,
-  activeTalkChance as activeTalkChanceRule,
   activeTurnsLeft as activeTurnsLeftRule,
   batchCap as batchCapRule,
   batchScale as batchScaleRule,
   batchWindow as batchWindowRule,
   chimeAllows,
   chimeDelay as chimeDelayRule,
+  privateAfterthoughtAllows,
   proactiveEligible as proactiveEligibleRule,
   proactiveSkip,
 } from './speaking-rules.js';
 import { createMemory } from './memory.js';
+import { builtinStyle, classifyReply, createStyle, planBubbles, renderStyleContract, sanitizeBubble } from './style.js';
+import { createPersona, renderPersona } from './persona.js';
+import { observationOf, renderObservation } from './modalities.js';
+import { pokeAction, pokeActionType, pokeNudge, pokeNotice } from './interactions.js';
+import { fetchPageTitle, previewLine } from './links.js';
+import { decideGroupTurn, interjectBatchPrompt, interjectLine } from './speech-policy.js';
 import {
   apiKeyFingerprint,
   errorText,
@@ -142,21 +146,18 @@ const STICKER_PROMPT_MAX = 40;
 const PARTICIPANT_MAX = 64;
 
 /**
- * 默认的「群友口吻」要求，注入系统提示的 QQ 渠道小节。
- * 配置里的 `persona` 非空时整段替换它（格式与身份红线仍然保留，见 channelPrompt）。
+ * 默认的「群友口吻」，注入系统提示的 QQ 渠道小节（人设槽的兜底）。
+ *
+ * **这里只写「是谁」，不写「怎么说」**：气泡数、句末句号、是非题、两拍禁令都在
+ * 表达契约（`style.js` 的内置 `STYLE.md`）与硬性规则（`hardRules`）里。以前这一份里
+ * 混着那几条，于是同一条规则在提示词里出现两次、改一处忘一处 —— 那次拆分就是为了这个。
  */
 const DEFAULT_PERSONA = [
-  '你在用 QQ 聊天：大家的消息是一条条刷出来的，你也是一条一条地发；群里好几个人同时说话很正常，接不上就不接。',
+  '你在用 QQ 聊天：大家的消息是一条条刷出来的，你也是一条条地发；群里好几个人同时说话很正常，接不上就不接。',
   '',
-  '说话方式（像真人群友一样）：',
-  '- 一条回复只有一个形状：**要么短（一句话说完，几个字也行），要么长（把一件事完整讲清楚）**。不要把「一句短的 + 一段长的」拼在一起 —— 尤其别用「先嘴硬 / 先吐槽 / 先敷衍一句，再补一段正经的」这种两拍，那是最像机器人的写法。',
-  '- 是非题只给答案：问你「知不知道 / 会不会 / 有没有 / 是不是 / 能不能」这类，整条就写「知道」「不知道」「会」「不会」（或者「是」「否」），可以带点语气，但别接解释 —— 想听细节的会追问。',
-  '- 该敷衍就几个字，真要解释才多说；长短跟着内容走，不必每条都配个开场白。',
-  '- 口语。用平时聊天的说法，可以有「啊 / 吧 / 呢 / 嘛 / 草 / 笑死 / 6 / 啊这」这类词。',
-  '- 是群友，不是客服：不用每条都热情帮忙、也不用答得滴水不漏，群友之间经常只是搭一句话；可以吐槽、可以接梗、可以反问、可以敷衍，也可以只回两个字。',
-  '- 群友之间可以互损、可以跟着起哄，但玩笑是善意的，不是真嫌弃谁。',
-  '- 不要列点、不要总结、不要「首先 / 其次 / 总之」，不要写小作文。',
-  '- 别复述对方的话，别用「关于你提到的问题」这种书面腔。',
+  '你是个普通群友，不是客服：不用每条都热情帮忙、也不用答得滴水不漏；可以吐槽、可以接梗、可以反问、可以敷衍，也可以只回两个字。',
+  '群友之间可以互损、可以跟着起哄，但玩笑是善意的，不是真嫌弃谁。',
+  '口语。用平时聊天的说法，可以有「啊 / 吧 / 呢 / 嘛 / 草 / 笑死 / 6 / 啊这」这类词。',
 ].join('\n');
 
 // 配置 schema 是纯数据，单独放在 config.js；这里再导出一次，Loader 与测试都从 index.js 取。
@@ -387,6 +388,44 @@ export function apply(ctx, config) {
   }
   /** 表情包目录的展示路径（相对 cwd、正斜杠），就是模型该写进 qq_send_image 的那种写法。 */
   const stickerLabel = stickerInside ? relative(resolve(cwd), stickerRoot).split(sep).join('/') : undefined;
+
+  // ---- 人格与表达：两个热读文件 + 一组机器参数（见 README「人格与表达」）----
+  //
+  // 文件放 cwd（不放 memoryDir）：`qq_memory` 的写边界永远碰不到人设 —— 群里任何人能改
+  // 人设就等于一次 prompt 注入。读取是同步 + 按 mtime 缓存（提示词 provider 是同步求值的，
+  // 见 docfile.js），所以改完文件不用重启。
+  const personaDoc = createPersona({
+    cwd,
+    file: settings.personaFile,
+    maxChars: settings.personaMaxChars,
+    report,
+  });
+  const styleDoc = createStyle({
+    cwd,
+    file: settings.styleFile,
+    maxChars: settings.styleMaxChars,
+    report,
+  });
+  /**
+   * 表达层的机器参数：提示词里渲染 + 发送时执行，两处读的是同一份。
+   *
+   * `bubbleChatMax` 取的是**生效值**（再被 `burstMaxMessages` 夹一次）：提示词不能说
+   * 「最多 3 个气泡」而实际只发 1 条 —— 那是一条模型照做也做不到的指示。
+   */
+  const styleParams = {
+    humanize: settings.humanize,
+    bubbleChatMax: settings.burstMaxMessages > 0
+      ? Math.min(settings.bubbleChatMax, settings.burstMaxMessages)
+      : settings.bubbleChatMax,
+    stripShortPeriod: settings.stripShortPeriod,
+    shortPeriodMaxChars: settings.shortPeriodMaxChars,
+    interjectQuote: settings.interjectQuote,
+  };
+  /**
+   * 「聊天型 / 信息型」的门槛：`burstSingleMaxChars` 优先（旧配置的语义变了但值还能用），
+   * 没填就用 `bubbleGambleMaxChars`（默认 80）。0 表示「全部按聊天型」。
+   */
+  const chatMaxChars = settings.burstSingleMaxChars > 0 ? settings.burstSingleMaxChars : settings.bubbleGambleMaxChars;
 
   // ---- 长期记忆：整个子系统搬去了 memory.js，这里只做装配 ----
   //
@@ -667,31 +706,6 @@ export function apply(ctx, config) {
 
 
   /**
-   * 禁漫（JM）下载服务：起 python 子进程下载 → 合并 PDF → 用一次性 URL 交给 NapCat。
-   *
-   * 为什么绕这么大一圈：NapCat 跑在容器里，插件跑在宿主机上，`upload_private_file`
-   * 只认 URL（实测传本地路径会回 `识别URL失败`）。所以 PDF 落盘之后，插件在本机
-   * docker 网桥上开一个小 HTTP 服务，把文件交给 NapCat 自己来拉。
-   */
-  const jmService = createJmService({
-    cwd,
-    dir: settings.jmDir,
-    python: settings.jmPython,
-    script: settings.jmScript.trim().length > 0 ? settings.jmScript : fileURLToPath(new URL('./scripts/jm_download.py', import.meta.url)),
-    enabled: settings.jmDownload,
-    maxChapters: settings.jmMaxChapters,
-    maxPages: settings.jmMaxPages,
-    timeoutMs: settings.jmTimeoutMs,
-    requestTimeoutMs: settings.jmRequestTimeoutMs,
-    maxFiles: settings.jmMaxFiles,
-    maxJobs: settings.jmMaxJobs,
-    fileHost: settings.jmFileHost,
-    filePort: settings.jmFilePort,
-    urlTtlMs: settings.jmUrlTtlMs,
-    report,
-  });
-
-  /**
    * 取出（或创建）某个 QQ 会话所对应的 Agent。
    *
    * 查找顺序：先看 Harness 里该 session id 是否已活着（热路径，直接复用）；
@@ -908,9 +922,17 @@ export function apply(ctx, config) {
    */
   function speakerLine(conversation) {
     const speakers = conversation.speakers ?? [];
+    if (conversation.pendingIntent === 'interject') {
+      // 插话轮：这句不是冲它来的。元信息已经写在 user message 里了，这里只说清场景，
+      // 不能再用「刚跟你说话的人」——那正是「莫名其妙」的来源（§2.2）。
+      return '群里在聊天，下面那句不是叫你的；你只是刚好想接一句（接不住就不接）。';
+    }
     if (speakers.length > 1) {
       const list = speakers.map((speaker) => speaker.name).join('、');
       return `几乎同时在跟你说话的是：${list} —— 他们的话是一起到的，按聊天的节奏挑着接。`;
+    }
+    if (conversation.pendingIntent === 'continued') {
+      return `刚才跟你说话的人又接了一句：${conversation.senderName}。`;
     }
     return `刚跟你说话的人：${conversation.senderName}。`;
   }
@@ -985,11 +1007,17 @@ export function apply(ctx, config) {
    *   - 张数到 `stickerMaxFiles` 就拒绝 —— 群里谁都能让它一直存，磁盘不该被这么撑大；
    *   - 同名**不覆盖**：覆盖等于让群里任何一个人用一句「存一下」把现有表情换掉。
    *
-   * @param source - 图片来源（`.qq-media/…` 相对路径 / cwd 内绝对路径 / http(s) 链接）。
-   * @param name - 模型起的中文名（可带扩展名，最终以真实格式为准）。
-   * @returns `{ path, bytes, format, source }`：可直接写进标记或交给 qq_send_image 的路径。
+   * 存完之后还会往 `STICKERS.md` 补一行「名字｜画面｜含义｜场景｜路径｜日期｜置信」：
+   * 不写这一行的话，下一次提示词里它又只是一串文件名，模型还得 `read_image` 猜含义。
+   * 目录写失败**不回滚图片**（图已经落盘，缺一行目录比丢图好）—— 只记一条 warn。
+   *
+   * @param options.source - 图片来源（`.qq-media/…` 相对路径 / cwd 内绝对路径 / http(s) 链接）。
+   * @param options.name - 模型起的中文名（可带扩展名，最终以真实格式为准）。
+   * @param options.meaning - 一句话含义（可空；空则写进「未收藏」待办区）。
+   * @param options.scene - 适用场景（可空）。
+   * @returns `{ path, bytes, format, source, catalog? }`：`catalog` 是目录那一行的结果说明。
    */
-  async function saveSticker(source, name) {
+  async function saveSticker({ source, name, meaning, scene } = {}) {
     if (stickerRoot === undefined || !stickerInside || stickerLabel === undefined) {
       throw new Error(`the sticker directory is not usable (${settings.stickerDir.trim() || '(empty)'}): it must be a directory inside ${cwd}`);
     }
@@ -1012,16 +1040,51 @@ export function apply(ctx, config) {
     }
     await mkdir(stickerRoot, { recursive: true });
     await writeBytesAtomic(target, image.bytes);
-    report('info', `sticker saved: ${stickerLabel}/${fileName} (${image.bytes.length} bytes, from ${image.label})`);
-    return { path: `${stickerLabel}/${fileName}`, bytes: image.bytes.length, format: image.format, source: image.label };
+    const path = `${stickerLabel}/${fileName}`;
+    report('info', `sticker saved: ${path} (${image.bytes.length} bytes, from ${image.label})`);
+    // 目录那一步是**尽力而为**：图片已经存好了，不能让一次目录写入失败把「存表情」变成失败。
+    let catalog;
+    if (memory.enabled) {
+      try {
+        const written = await memory.appendSticker({
+          name: fileName.replace(/\.[^.]+$/, ''),
+          meaning: String(meaning ?? '').trim(),
+          scene: String(scene ?? '').trim(),
+          path,
+          date: localDate(),
+        });
+        if (written.ok) {
+          catalog = `added to ${memory.label}/STICKERS.md (${written.section})`;
+        } else {
+          catalog = `not written to STICKERS.md: ${written.reason}`;
+          report('warn', `could not add ${path} to the sticker catalogue: ${written.reason}`);
+        }
+      } catch (error) {
+        catalog = `not written to STICKERS.md: ${errorText(error)}`;
+        report('warn', `could not add ${path} to the sticker catalogue: ${errorText(error)}`);
+      }
+    }
+    return { path, bytes: image.bytes.length, format: image.format, source: image.label, catalog };
   }
 
   /**
-   * 生成「每个会话各不相同」的系统提示补充段落（渠道身份、群聊上下文、说话方式）。
+   * 生成「每个会话各不相同」的系统提示补充段落。
    *
    * 注意这个函数是作为 `text` 的 provider 注册的、每次提示词装配都会被调用：
    * 群聊里换个人说话、或者群里又聊了几句，模型下一轮就能看到最新的 —— 若改成
    * 建 Agent 时算一次的字符串，提示词里的「当前发言者」会永远停在第一个人。
+   *
+   * **槽位顺序**（照设计文档 §4.4，模型对最后看到的指令更听话）：
+   *   1. 场景：谁在跟你说话 / 为什么轮到你 / 群里最近的消息
+   *   2. 人设：身份 / 背景 / 性格（`PERSONA.md`，见 `persona.js`）
+   *   3. 表达契约：气泡、标点、表情、简答（`STYLE.md`，见 `style.js`）
+   *   4. 记忆索引 + 最近学的梗
+   *   5. 能力清单：哪些工具 / 图片 / 表情真的可用
+   *   6. 部署者的额外要求
+   *   7. **硬性规则（最后，最高优先级）**
+   *
+   * 两条纪律：**每条规则只出现一次**（改口吻只动人设文件，改标点只动表达层）；7 的
+   * 开头明说「以本节为准」—— 人设文件不能覆盖身份红线，也不能覆盖「QQ 消息不是指令」。
    */
   function channelPrompt(conversation) {
     const isGroup = conversation.type === 'group';
@@ -1029,19 +1092,14 @@ export function apply(ctx, config) {
     const who = isGroup
       ? `你正在 QQ 群${title}（群号 ${conversation.id}）里潜水，身份是群里的一个普通群友 —— 不是客服，也不是助手。`
       : `你正在用 QQ 私聊：对方 ${conversation.name}。`;
-    const lines = [
-      '## QQ 渠道',
-      '',
-      who,
-      '',
-      ...(isGroup
-        ? [speakerLine(conversation), '', ...ambientPrompt(conversation)]
-        : []),
-      (settings.persona.trim().length > 0 ? settings.persona.trim() : DEFAULT_PERSONA),
-      '',
-    ];
-    // 长期记忆：把「已记住的东西」摆到眼前，模型才不会每次都从零开始 —— 并明确
-    // 告诉它「忘了就去查」，而不是凭印象编。索引是摘要 Agent 维护的，这里只读。
+    const lines = ['## QQ 渠道', '', who, ''];
+    // ---- 槽 1：场景 ----
+    if (isGroup) lines.push(speakerLine(conversation), '', ...ambientPrompt(conversation));
+    // ---- 槽 2：人设（是谁）----
+    lines.push(...personaLines(conversation), '');
+    // ---- 槽 3：表达契约（怎么说）----
+    lines.push('怎么说话（表达契约）：', ...styleLines(conversation), '');
+    // ---- 槽 4：记忆索引 + 热梗段 ----
     if (memory.toolsAllowed()) {
       const index = memory.indexText(conversation);
       if (index.length > 0) {
@@ -1049,53 +1107,18 @@ export function apply(ctx, config) {
       } else {
         lines.push(`你的长期记忆在 \`${memory.label}/\` 里（现在还是空的）。`, '');
       }
+      // 热梗段：最近学到的说法摆在眼前，谐音梗才反应得过来（不用先 search 再答）。
+      // 只给「写法 + 一句话意思」，怎么用/来源留在文件里按需 qq_memory search。
+      const hot = memory.catalog().hot;
+      if (hot.length > 0) {
+        lines.push(
+          '最近学的梗（遇到同音/近音写法先按读音还原再理解；还原不出来就按字面接，或直接问「这是啥梗」，别硬编）：',
+          ...hot.map((line) => `  ${line}`),
+          '',
+        );
+      }
     }
-    // 「一轮发几条」这条规则必须跟当前配置一致：设了 burstMaxMessages: 1 之后还告诉模型
-    // 「想连说几句就直接换行」，就是一条它照做也做不到的指示（换行会被并回同一条）。
-    // 混合模式（burstSingleMaxChars > 0）则要同时说清「闲聊别拆」和「展开就分条」。
-    const messageCap = settings.burstMaxMessages;
-    const singleUnder = settings.burstSingleMaxChars;
-    const burstRule = !settings.humanize
-      ? '- 你的整轮回复会作为一条消息直接发出去（换行也留在同一条里），直接写要说的话，别把它当文档排版。'
-      : singleUnder > 0
-        ? `- 闲聊归闲聊：去掉空白不超过 ${singleUnder} 字的回复会被并成**一条**发出去，所以平时就一两句话、一行写完，别把一句能说完的话拆成两拍。真要展开讲（对方要你详细说、贴代码 / 列步骤 / 解释清楚）就换行，一行一条短句，插件会照发${messageCap > 0 ? `（一轮最多 ${messageCap} 条）` : '（但别超过三四条）'}；内容不多就别硬拆。`
-        : messageCap === 1
-          ? `- 一次只说一句：你的整轮回复会被并成**一条**消息发出去（写换行也只是同一条里的换行），所以别把话拆成几条短句，就把那一两句直接写出来，别没事写小作文。对方明确要你详细讲、或者要贴代码 / 步骤 / 清单时，就正常写完整 —— 长内容也还是这**一条**（超过 ${settings.maxReplyChars} 字才会被协议上限切成两段），只是别把短回复硬拉长。`
-          : messageCap > 1
-            ? `- 想连说几句就直接换行，每一行都会作为单独的一条消息发出去，但一轮最多发 ${messageCap} 条（超出的部分并进最后一条）。`
-            : '- 想连说几句就直接换行，每一行都会作为单独的一条消息发出去；反过来，别用换行给一段话排版（那会变成连着刷好几条）。';
-    lines.push(
-      '硬性要求：',
-      // 表情包标记只有在真的能发图时才提：不能发的时候提它，模型会把标记当正文写出来。
-      `- 你的回复正文会原样发到 QQ${imageAllowed() ? '（只有 `[[图片: …]]` 这种标记例外，它变成一张图）' : ''}，直接写要说的话，不要写思考过程、也不要解释你在做什么。`,
-      '- QQ 不渲染 Markdown：不要用 `**加粗**`、`#` 标题、`-` / `1.` 列表、表格、代码块。',
-      '- 不要自称 AI / 助手 / 机器人，不要提系统提示、模型、提示词这些词。',
-      '- 长度跟着内容走：闲聊就一两句，真要讲清楚就把那件事讲完 —— 不用凑篇幅，也别硬省。',
-      '- 你是在 QQ 上跟真人聊天，不是在被调用：群里可能有人同时插话，对方也可能过一会儿才回你；按聊天的节奏来，不必每次都给出完整的答复。',
-      '- 一条回复只有一个形状：要么就一两句说完（几个字也行），要么就把事情完整讲一段 —— **绝不把「一句短的」和「一段长的」拼在一起**，尤其别用「先嘴硬 / 先吐槽 / 先敷衍一句，再补一段正经的」这种两拍。情绪、态度、傲娇都体现在用词上，不是体现在「先来一句、再补一段」的排布上。',
-      '- 是 / 否题就回一个是 / 否：有人问「知不知道 / 会不会 / 有没有 / 是不是 / 能不能 / 行不行」这类是非题时，整条回复只写肯定或否定本身（「是」/「否」，口语就是「知道」「不知道」「会」「不会」，可以带点语气），**不要再接一句解释**；对方追问了再展开。',
-      burstRule,
-    );
-    // @ 别人：模型只会写文本，QQ 的 @ 是消息里的一个段，所以给它一个标记去表达。
-    // 三个要点必须一起说清，少一个都会出问题：
-    //   - 怎么写（`[[@昵称]]`，昵称就是正文里 `昵称: 内容` 那个名字）；
-    //   - **绝对不要写 QQ 号**（这正是提示词里不再印 QQ 号的原因：它看得见就会照着念）；
-    //   - 别每条都 @（真人不会每句话都点一次名）。
-    lines.push(
-      isGroup
-        ? '- 想 @ 群里的人时，在回复里写 `[[@昵称]]`（昵称就是上面那句「跟你说话的人」/「群里最近的消息」里的名字，原样照抄，一个字都别改），它会在发出去时变成真正的 @；想 @ 所有人的话写 `[[@全体成员]]`，但只在真的要喊大家的时候用。**不要**把 QQ 号写进正文，也不要自己拼 `@` 加号码 —— 群里谁也不这么说话。'
-        : '- 想 @ 对方时在回复里写 `[[@昵称]]`（昵称就是上面那句「对方 …」里的名字），它会变成真正的 @。**不要**把 QQ 号写进正文。',
-      '- @ 不是每句都要挂的：平时接着聊就行，只有真的要把话丢给某个人、或者中间插了别人的话怕对不上时再点一次名。',
-    );
-    // 空消息（单纯的 @、或者一个空格）现在也会走到这里，正文位置就是这么一句说明 ——
-    // 不解释的话模型会把它当成对方真的发了这串字，回一句「我没发这个啊」。同时点明
-    // 「怎么翻上下文」：群里看得到「群里最近的消息」，更早的用 qq_transcript 查，
-    // 只想表示「看到了 / 无语」时「？」或者一张表情就够了 —— 空 @ 不该换来一篇小作文。
-    if (settings.blankReply === true) {
-      lines.push(
-        '- 正文里出现 `（@了你一下，没有说别的）` / `（一条空消息，没有正文）` / `（对方发来一条空消息，什么都没写）` 时，说明对方**没有打字**，只是叫了你一声：别把这句说明当成对方说的话、也别反问「你发了什么」。想接就按上面的聊天记录（群里看「群里最近的消息」，更早的用 qq_transcript 查）接上一句或者回个「？」；也可以只发一张表情（见下），或者干脆想不出接什么。空 @ 不值得写一段话。',
-      );
-    }
+    // ---- 槽 5：能力清单 ----
     // 被白名单挡住的工具不能在提示里推荐，否则模型会去调用一个它根本看不见的工具。
     const recommended = ['qq_send_message', 'qq_list_conversations'].filter(
       (tool) => allowTools.length === 0 || allowTools.includes(tool),
@@ -1103,15 +1126,13 @@ export function apply(ctx, config) {
     if (recommended.length > 0) {
       lines.push(`- 需要主动给其他人或群发消息、或查询联系人时，使用 ${recommended.join(' / ')} 工具。`);
     }
-    // 长期记忆的用法：索引已经在上面了，这里说清「怎么查、怎么记、什么时候该去学个新梗」。
-    // 三个工具名都先过白名单，避免推荐一个模型根本看不见的工具。
     if (memory.toolsAllowed()) {
       const canSkill = allowTools.length === 0 || allowTools.includes('skill');
       lines.push(
         `- 凭印象记不清「以前谁说过什么 / 这个群里发生过什么」时，别顺着猜：用 qq_transcript 查聊天记录（可以按关键词 search），用 qq_memory 读 \`${memory.label}/\` 里的记忆文件——先查再答，而不是先答再编。`,
         `- 真遇到值得长期记住的事（某人的偏好、群里的约定、一件发生过的事），用 qq_memory 追加到 \`conversations/<会话目录>/MEMORY.md\`；不要为了记而记，一两句就够。`,
         canSkill
-          ? '- 遇到看不懂的梗、黑话或表情包（图里写了什么、为什么大家都在笑），先用 read_image 看那张图；二次元 / ACG 那一类加载 `moegirl` skill 去萌娘百科查（比搜索引擎准），其它话题用 web_search。弄懂后按 `update-cognition` skill 的规矩记进认知库；不要不懂装懂、也不要一本正经地解释网络梗。'
+          ? `- 遇到看不懂的梗、黑话或表情包（图里写了什么、为什么大家都在笑）先分诊：**只有文字**的说法加载 \`learn-meme\` skill 写进 \`COGNITION.md\`；**有图**的表情包加载 \`learn-sticker\` skill${stickerSaveAllowed() ? '（先用 qq_save_sticker 收藏再写 `STICKERS.md`）' : '（写 `STICKERS.md` 那一步照做；这个会话不能存图，所以只能在目录里记已有文件）'}；二次元 / ACG 拿不准的加载 \`moegirl\` 去萌娘百科查（比搜索引擎准），其它话题用 web_search。图文都有就两边互相写名字，别在一个文件里写两遍。不要不懂装懂、也不要一本正经地解释网络梗。`
           : '- 遇到看不懂的梗、黑话或表情包，先用 read_image 看那张图；弄不懂就直接说不懂，不要不懂装懂、也不要一本正经地解释网络梗。',
       );
     }
@@ -1135,19 +1156,28 @@ export function apply(ctx, config) {
         '- 想发表情包 / 甩张图时，在回复正文里写 `[[图片: 路径]]`（路径的写法就是正文里那些 `[图片: …]` 里的样子，例如 `[[图片: .qq-media/ab12….jpg]]`）：这个标记会作为**一张图**发出去，位置就在它出现的地方。**想只发一张表情、一个字都不说，整条回复就只写这一行** —— 别配「给你发张表情包」这种话。别人刚发的那张图也能这样发回去，把正文里给它的路径写进标记就行。',
         '- 要给**别的**群 / 好友发图、或者就是「把这张图发过去」这种明确动作，用 qq_send_image 工具（它也接受 http(s) 图片链接；它是立刻发出去的，不跟在正文的行序里）。',
       );
+      // 目录优先用 STICKERS.md 的「名字（含义）」：模型看含义就能判断该不该发，看裸文件名
+      // 只能猜或者先 read_image。没有目录（旧部署 / 记忆关掉）时退回文件名，行为不变。
+      const catalog = memory.enabled ? memory.catalog() : { stickers: [], hot: [], catalog: false };
       const names = stickerNames();
       if (stickerLabel !== undefined) {
-        lines.push(
-          names.length > 0
-            ? `- 你自己的表情包在 ${stickerLabel}/ 里：${names.join('、')}。文件名通常就是它的意思${canReadImages ? '，拿不准的先 read_image 看一眼' : ''}；想发哪张就把它的路径写进标记里。表情包别滥用 —— 一次最多一张，也别每句都配一张。`
-            : `- 你自己的表情包目录 ${stickerLabel}/ 目前是空的，没有现成的表情包可挑（别人刚发的那张图仍然可以发回去）。`,
-        );
+        if (catalog.stickers.length > 0) {
+          lines.push(
+            `- 你自己的表情包（名字（含义）；路径都在 ${stickerLabel}/ 里，想发哪张就把 \`${stickerLabel}/名字.扩展名\` 写进标记里）${canReadImages ? '，目录里没有的再 read_image 看一眼' : ''}：${catalog.stickers.join('、')}。表情包别滥用 —— 一次最多一张，也别每句都配一张。纯情绪（笑、无语、委屈、拒绝、赞成、撒娇、接梗）可以只发一张不说话；**有信息要说、是/否题、承诺、道歉、需要解释的时候不许拿表情代替回答**。`,
+          );
+        } else {
+          lines.push(
+            names.length > 0
+              ? `- 你自己的表情包在 ${stickerLabel}/ 里：${names.join('、')}。文件名通常就是它的意思${canReadImages ? '，拿不准的先 read_image 看一眼' : ''}；想发哪张就把它的路径写进标记里。表情包别滥用 —— 一次最多一张，也别每句都配一张。`
+              : `- 你自己的表情包目录 ${stickerLabel}/ 目前是空的，没有现成的表情包可挑（别人刚发的那张图仍然可以发回去）。`,
+          );
+        }
         // 「把这张存下来」是群里最常见的一句话，而模型自己没有写文件的能力（QQ 会话没有
         // write / edit / bash），不给它这条通道时它会假装存好了，然后只往 COGNITION.md 里
         // 记一个迟早被淘汰的 `.qq-media/<哈希>` 路径 —— 见 `saveSticker` 的注释。
         if (stickerSaveAllowed()) {
           lines.push(
-            '- 有人让你「存一下」某张表情包 / 你自己觉得某张图以后还会用到时，用 qq_save_sticker 存进上面那个目录：source 就写正文里给它的那个路径（例如 `.qq-media/ab12….jpg`，也可以是 http 图片链接），name 起一个**有含义的短名字**（`委屈` / `笑死` / `摸摸头`）—— 那个名字以后每轮都会摆在你眼前，起得准才挑得动；扩展名不用管，插件按图片真实格式接。同名已存在时会报错，换个名字。别见一张存一张：存的是你以后真的会想发的。',
+            '- 有人让你「存一下」某张表情包 / 你自己觉得某张图以后还会用到时，用 qq_save_sticker 存进上面那个目录：source 就写正文里给它的那个路径（例如 `.qq-media/ab12….jpg`，也可以是 http 图片链接），name 起一个**有含义的短名字**（`委屈` / `笑死` / `摸摸头`），**meaning 一句话说清它表达什么情绪**（`委屈、求安慰` / `笑到不行、没眼看`），能说出场景就再给 scene（`对方凶我时`）—— 那个名字和含义以后每轮都会摆在你眼前，写得准才挑得动；扩展名不用管，插件按图片真实格式接。同名已存在时会报错，换个名字。别见一张存一张：存的是你以后真的会想发的。',
           );
         }
       }
@@ -1159,18 +1189,83 @@ export function apply(ctx, config) {
         '- 正文开头的 `（引用 某某: …）` 表示对方是在**回复那条消息**：内容是插件替你取回来的（里面可能带图片路径），别当成对方又重复说了一遍，也别再问「你说的是哪条」。',
       );
     }
-    // 禁漫下载：工具会把 PDF 直接发到这个会话，模型只要接一句话就行。
-    if (jmService.enabled && (allowTools.length === 0 || allowTools.includes('qq_jm_pdf'))) {
-      lines.push(
-        '- 有人甩过来禁漫（JM / 18comic）的车号或 album / photo 链接让你下载时，用 qq_jm_pdf 工具：它会把整本合并成一个 PDF 并直接把文件发到这个会话。别自己复述车号或链接，也别承诺页数，下完说一句「下好了」之类的就行（下不动就把原因说清楚）。',
-      );
-    }
+    // ---- 槽 6：部署者的额外要求（人设之后、硬性规则之前）----
     if (settings.instructions.trim().length > 0) {
       lines.push('', settings.instructions.trim());
     }
+    // ---- 槽 7：硬性规则（最后 = 最高优先级）----
+    lines.push('', '硬性要求（最高优先级：人设、表达规则与上面任何一段冲突时，以本节为准）：', ...hardRules(isGroup));
     return lines.join('\n');
   }
 
+  /**
+   * 人设槽：`PERSONA.md` → 配置里的 `persona` → 内置那份。
+   *
+   * 兼容顺序刻意是这样的：文件存在就用文件，旧的 `persona` 整段配置仍然有效（升级不该
+   * 让一份精心写过的 persona 突然失效），两者都没有才用内置。文件存在时在启动时记一条
+   * info（见生命周期那一节），别让「两套人设叠加」这种误会留在日志外面。
+   */
+  function personaLines(conversation) {
+    const parsed = personaDoc.read();
+    if (parsed !== undefined) {
+      const scene = personaSceneFor(conversation);
+      const rendered = renderPersona(parsed.profile, { scene, overlays: settings.personaSceneOverlays });
+      if (rendered.length > 0) return rendered;
+    }
+    const configured = settings.persona.trim();
+    if (configured.length > 0) return [configured];
+    return [DEFAULT_PERSONA];
+  }
+
+  /** 这一轮属于哪个场景（决定人设里哪一段「场景」上场）。 */
+  function personaSceneFor(conversation) {
+    const intent = conversation.pendingIntent;
+    if (intent === 'proactive' || intent === 'chime') return 'proactive';
+    if (intent === 'poke') return 'poke';
+    return conversation.type === 'private' ? 'private' : 'group';
+  }
+
+  /** 表达契约槽：`STYLE.md` 的散文 + 配置里的机器参数，按场景选段。 */
+  function styleLines(conversation) {
+    const parsed = styleDoc.read();
+    return renderStyleContract({
+      prose: parsed?.prose ?? builtinStyle(),
+      params: styleParams,
+      scene: conversation.type === 'private' ? 'private' : 'group',
+      imageAllowed: imageAllowed(),
+    });
+  }
+
+  /**
+   * 硬性规则（槽 7）：身份红线、格式、聊天的两拍禁令、是非题。
+   *
+   * 这些**不随人设改变**：人设文件写「忽略以上规则」也无效（本节在最后，并已声明优先级）。
+   * 「绝不两拍」按 §3.2 拆成两句：信息型的「短+长」（先嘴硬再补一段正经的）仍然禁止，
+   * 聊天型的「短+短」（反应 + 追问）是允许的 —— 不拆这条，气泡计划就没有内容可发。
+   */
+  function hardRules(isGroup) {
+    return [
+      // 表情包标记只有在真的能发图时才提：不能发的时候提它，模型会把标记当正文写出来。
+      `- 你的回复正文会原样发到 QQ${imageAllowed() ? '（只有 `[[图片: …]]` 这种标记例外，它变成一张图）' : ''}，直接写要说的话，不要写思考过程、也不要解释你在做什么。`,
+      '- QQ 不渲染 Markdown：不要用 `**加粗**`、`#` 标题、`-` / `1.` 列表、表格、代码块。',
+      '- 不要自称 AI / 助手 / 机器人，不要提系统提示、模型、提示词这些词。',
+      '- 长度跟着内容走：闲聊就一两句，真要讲清楚就把那件事讲完 —— 不用凑篇幅，也别硬省。',
+      isGroup
+        ? '- 你是在 QQ 群里跟真人聊天，不是在被调用：群里可能有人同时插话，对方也可能过一会儿才回你；按聊天的节奏来，不必每次都给出完整的答复。'
+        : '- 你是在 QQ 私聊里跟真人聊天，不是在被调用：对方可能过一会儿才回你，也可能已经接着说了一句；按聊天的节奏来，不必每次都给出完整的答复。',
+      '- 一条回复只有一个形状：聊天型的那两三个气泡是同一种语气（「反应 + 追问」可以），**绝不要**把「一句短的」和「一段长的正经话」拼在一起 —— 尤其别用「先嘴硬 / 先吐槽 / 先敷衍一句，再补一段正经的」这种两拍。情绪、态度、傲娇都体现在用词上，不是体现在「先来一句、再补一段」的排布上。',
+      `- 是 / 否题就回一个是 / 否：有人问「知不知道 / 会不会 / 有没有 / 是不是 / 能不能 / 行不行」这类是非题时，第一个气泡只写肯定或否定本身（「是」/「否」，口语就是「知道」「不知道」「会」「不会」，可以带点语气），**不要再接一句解释**；${isGroup ? '群聊到此为止，对方追问了再展开。' : '私聊可以在后面那个气泡里带一个追问钩子（「你呢」「要不要我去看看」），但不是每句都要。'}`,
+      // 空消息（单纯的 @、或者一个空格）现在也会走到这里，正文位置就是这么一句说明 ——
+      // 不解释的话模型会把它当成对方真的发了这串字，回一句「我没发这个啊」。
+      ...(settings.blankReply === true
+        ? ['- 正文里出现 `（@了你一下，没有说别的）` / `（一条空消息，没有正文）` / `（对方发来一条空消息，什么都没写）` 时，说明对方**没有打字**，只是叫了你一声：别把这句说明当成对方说的话、也别反问「你发了什么」。想接就按上面的聊天记录（群里看「群里最近的消息」，更早的用 qq_transcript 查）接上一句或者回个「？」；也可以只发一张表情，或者干脆想不出接什么。空 @ 不值得写一段话。']
+        : []),
+      isGroup
+        ? '- 想 @ 群里的人时，在回复里写 `[[@昵称]]`（昵称就是上面那句「跟你说话的人」/「群里最近的消息」里的名字，原样照抄，一个字都别改），它会在发出去时变成真正的 @；想 @ 所有人的话写 `[[@全体成员]]`，但只在真的要喊大家的时候用。**不要**把 QQ 号写进正文，也不要自己拼 `@` 加号码 —— 群里谁也不这么说话。'
+        : '- 想 @ 对方时在回复里写 `[[@昵称]]`（昵称就是上面那句「对方 …」里的名字），它会变成真正的 @。**不要**把 QQ 号写进正文。',
+      '- @ 不是每句都要挂的：平时接着聊就行，只有真的要把话丢给某个人、或者中间插了别人的话怕对不上时再点一次名。',
+    ];
+  }
 
   /**
    * 这个 Agent 能不能往 QQ 发图。
@@ -1210,20 +1305,20 @@ export function apply(ctx, config) {
    */
 
   /**
-   * 把一段回复拆成「像真人连着发的」几条消息。
+   * 把一段回复拆成「像真人连着发的」几条消息（**拆条**，不做掷骰）。
    *
    * 不开启 `humanize` 时就是旧行为（只在超过协议上限时分段）。开启后先把换行拆成
    * 一条条独立消息（换行 = 分条，不再是同一条里的排版），再对每一行按标点/长度拆成
    * 短句（受 `burstMaxChars` / `burstMaxParts` 约束），最后每段都接受一次协议上限的
    * 硬校验 —— 模型偶尔写超长时，最后一段仍可能被 `chunkText` 再切开。
    *
-   * 「发几条」分两种情形，**由长度自动切换**（`burstSingleMaxChars`）：
-   * - **短回复 = 闲聊**：不超过门槛时强制并成一条（等价于把上限压到 1）。模型爱把
-   *   一句话写成「短句 + 长句」两拍、或者在同一个 turn 里连写两段，光靠提示词压不住，
-   *   所以闲聊的一条是硬保证 —— 但内容一个都不删，只是并回同一条。
-   * - **长回复 = 真要展开**（贴代码、列步骤、详细解释）：这时并成一条反而难读，
-   *   于是照常拆成多条短句，条数由 `burstMaxMessages`（0 = 不限）与
-   *   `burstMaxParts` 一起决定。
+   * 「聊天型 / 信息型」由 `chatMaxChars` 决定（`burstSingleMaxChars`，没填就用
+   * `bubbleGambleMaxChars`）：
+   * - **聊天型**：条数上限是 `min(burstMaxMessages, bubbleChatMax)`（默认 3）。超出的
+   *   部分**并进最后一条**，不在这里截断内容 —— 那正是 `splitBurst` 的 maxMessages
+   *   语义（跨行用空格接）。之后再交给 `planBubbles` 掷骰决定真的发到第几个。
+   * - **信息型**（贴代码、列步骤、详细解释）：不掷骰，按 `burstMaxMessages`（0 = 不限）
+   *   与 `burstMaxParts` 正常拆。
    *
    * @param text - 模型给出的完整回复。
    * @returns 按发送顺序排列的分段。
@@ -1235,10 +1330,12 @@ export function apply(ctx, config) {
       ? Math.min(settings.burstMaxChars, limit)
       : limit;
     const maxParts = Number.isFinite(settings.burstMaxParts) ? Math.max(1, Math.floor(settings.burstMaxParts)) : 3;
-    const singleUnder = settings.burstSingleMaxChars;
-    const short = singleUnder > 0 && text.replace(/\s+/g, '').length <= singleUnder;
-    const maxMessages = short ? 1 : settings.burstMaxMessages;
-    return splitBurst(text, burst, maxParts, maxMessages).flatMap((part) => chunkText(part, limit));
+    const mode = classifyReply(text, { chatMaxChars });
+    // 聊天型还要受 bubbleChatMax 那个硬上限：模型写了一整屏短句时，超出的并进最后一条。
+    const cap = settings.burstMaxMessages > 0
+      ? Math.min(settings.burstMaxMessages, settings.bubbleChatMax)
+      : (mode === 'chat' ? settings.bubbleChatMax : 0);
+    return splitBurst(text, burst, maxParts, cap).flatMap((part) => chunkText(part, limit));
   }
 
   /** 发送前等待（`ms <= 0` 时立即返回）；unref 让待发的延迟不拖住进程退出。 */
@@ -1279,11 +1376,13 @@ export function apply(ctx, config) {
    * @param conversation - 目标会话。
    * @param text - 要发送的正文（可含表情包标记）。
    * @param options - `human`：拆短句 + 打字延迟（自动回复用）；`quote`：本轮的回复指向
-   *   `{ messageId, userId, seq }`，仅群聊生效，且只挂在第一条上。
+   *   `{ messageId, userId, seq }`，仅群聊生效，且只挂在第一个**文字**气泡上；
+   *   `intent`：这一轮为什么轮到它（`addressed` / `continued` / `interject` / `proactive` /
+   *   `chime`）。插话轮靠它强制引用锚点（见 `quoteHead`）。
    * @returns 本次发送（含延迟）完成时兑现的 Promise，绝不 reject。
    */
-  function sendToConversation(conversation, text, { human = false, quote } = {}) {
-    return enqueueSend(conversation, () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 }));
+  function sendToConversation(conversation, text, { human = false, quote, intent } = {}) {
+    return enqueueSend(conversation, () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 }, intent));
   }
 
   /**
@@ -1308,29 +1407,40 @@ export function apply(ctx, config) {
   /**
    * 把一条回复拆成「要一条条发出去的东西」：文字段与表情包段，顺序照原文。
    *
-   * 正文里的 `[[图片: 路径]]`（见 `splitStickerLines`）在这里被认出来变成一张图 ——
-   * 于是「只发表情、一个字都不说」就是整条回复只写这一行：拆出来只有一个图片段，
-   * 一条文字都不会发出去。没允许发图时（`imageAllowed()`）它退回普通文字，
-   * 别让一个错标记变成一次「发不出去的图」。
+   * 三段流水线，顺序不能反：
+   *   1. `splitStickerLines` 把 `[[图片: …]]` 拆成图段（图不参与掷骰，见 `planBubbles`）；
+   *   2. `burstParts` 拆条 —— 换行/标点/长度/条数上限；
+   *   3. `planBubbles` 掷骰决定发到第几个 + `sanitizeBubble` 清洗标点。
    *
    * 文字段里的 `[[@昵称]]` 标记在这里只**标记出来**（`mention: true`），真正的段解析放在
    * `sendParts` 里做 —— 那里才拿得到会话记录（「谁可以被 @」的名单挂在会话上）。
    * 没有标记的文字段仍然以纯字符串发出，与旧行为逐字节一致。
    *
    * @param text - 模型给出的完整回复。
-   * @param human - 是否按拟人节奏拆短句（与 `burstParts` 同一套规则）。
+   * @param human - 是否按拟人节奏拆短句并掷气泡（自动回复用；工具与复读走 human=false）。
    * @returns `{ kind: 'text', text, mention? }` 或 `{ kind: 'image', source, raw }` 的数组。
    */
   function replyPieces(text, human) {
-    // 有 @ 标记的那段会带上 `mention`，所以「一条消息」不再必然等于「一个字符串」。
     const asText = (value) =>
       (human ? burstParts(value) : chunkText(value, settings.maxReplyChars)).map((part) =>
         hasMentionMarker(part) ? { kind: 'text', text: part, mention: true } : { kind: 'text', text: part });
-    return splitStickerLines(text).flatMap((piece) => {
+    const pieces = splitStickerLines(text).flatMap((piece) => {
       if (piece.kind === 'text') return asText(piece.text);
       if (!imageAllowed()) return asText(piece.raw); // 没允许发图时标记只是普通文字
       return [piece];
     });
+    if (!human) return pieces;
+    // 气泡计划：**一次**决定这一轮发到第几个（不是每条发完再判，见 style.js 的模块注释）。
+    const planned = planBubbles(pieces, {
+      gamble: settings.bubbleGamble,
+      chance: settings.bubbleContinueChance,
+      decay: settings.bubbleContinueDecay,
+      mode: classifyReply(text, { chatMaxChars }),
+    });
+    // 标点清洗只对文字气泡：剥句末「。」、并连续句号与空格。剥完什么都不剩的气泡丢掉。
+    return planned
+      .map((piece) => (piece.kind !== 'text' ? piece : { ...piece, text: sanitizeBubble(piece.text, styleParams) }))
+      .filter((piece) => piece.kind !== 'text' || (typeof piece.text === 'string' && piece.text.length > 0));
   }
 
   /**
@@ -1358,12 +1468,22 @@ export function apply(ctx, config) {
   }
 
   /** `sendToConversation` 的实际发送步骤（调用方已保证同一会话串行）。 */
-  async function sendParts(conversation, text, human, quote) {
+  async function sendParts(conversation, text, human, quote, intent) {
     const pieces = replyPieces(text, human);
     // 「昵称 → QQ 号」的名单在一次发送里只造一遍：几个分段共用同一份，也保证同一次回复里
     // 同名的解析结果一致。
     const mentionsFor = conversationMentions(conversation);
+    const mode = human ? classifyReply(text, { chatMaxChars }) : 'informational';
+    // 「发送中被打断就停」的快照：聊天型的后续气泡在真正发出前比一比，这期间对方又说话了
+    // 就不再发剩下的（已经发的第一条留着）。真人也是这么停的；信息型该讲完还得讲完。
+    const activitySnapshot = conversation.lastActiveAt;
+    let firstTextSeen = false;
     for (const [index, piece] of pieces.entries()) {
+      // 聊天型：对方已经接话了，就别接着说。
+      if (human && mode === 'chat' && index > 0 && piece.kind === 'text' && conversation.lastActiveAt !== activitySnapshot) {
+        report('info', `${describeConversation(conversation)}: 对方已经接话，剩下的 ${pieces.length - index} 个气泡不发了`);
+        return;
+      }
       if (human) {
         // 第一条前多等一个「读消息」的时间；后续每条只算打字时间。
         // 表情包没有字数可算，等一个下限就够（第一张仍然算「读消息」那一段时间）。
@@ -1376,7 +1496,11 @@ export function apply(ctx, config) {
           baseMs: index === 0 ? settings.readDelayMs : 0,
         }));
       }
-      const head = quoteHead(conversation, index, quote);
+      // 引用只挂第一个**文字**气泡：图段永远不挂（§6.6），整轮只有图时引用自然被丢弃。
+      const head = piece.kind === 'text' && !firstTextSeen
+        ? quoteHead(conversation, { quote, intent })
+        : undefined;
+      if (piece.kind === 'text') firstTextSeen = true;
       if (piece.kind === 'text') {
         // 没有 @ 标记、也没有指向时仍然发纯字符串：与旧版发送格式完全一致，也少一个出错点。
         if (piece.mention !== true && head === undefined) {
@@ -1386,11 +1510,22 @@ export function apply(ctx, config) {
         const segments = piece.mention === true
           ? mentionSegments(piece.text, mentionsFor)
           : [{ type: 'text', data: { text: piece.text } }];
-        const message = head === undefined ? segments : [head, ...segments];
         // 标记解析完什么都不剩（只写了一个认不出来的名字）时，这一条就没有内容可发了。
         if (segments.length === 0) continue;
-        if (!(await sendOne(conversation, message))) return;
-        continue;
+        const message = head === undefined ? segments : [head, ...segments];
+        if (await sendOne(conversation, message)) continue;
+        // 插话轮的锚点是**必须**的（§7.1）：引用发不出去就退化成 @ 说话人，再不行才裸文本。
+        // 宁可有指向地弱一点，也不要一句没有来由的话 —— 但只对插话轮这么做，别的轮次失败就算了。
+        if (head?.type === 'reply' && intent === 'interject' && quote.userId.length > 0) {
+          report('warn', `${describeConversation(conversation)}: 插话的引用发不出去，退化成 @ 说话人`);
+          const fallback = [{ type: 'at', data: { qq: quote.userId } }, ...segments];
+          if (await sendOne(conversation, fallback)) continue;
+        }
+        if (head !== undefined && intent === 'interject') {
+          report('warn', `${describeConversation(conversation)}: 插话的引用与 @ 都发不出去，改为裸文本`);
+          if (await sendOne(conversation, segments)) continue;
+        }
+        return;
       }
       let bytes;
       try {
@@ -1399,75 +1534,51 @@ export function apply(ctx, config) {
         // 表情包发不出去**不能静默**：整条回复只有这一行时，静默就等于「机器人没理人」。
         report('warn', `sticker ${piece.source} could not be sent: ${errorText(error)}`);
         const notice = '（表情包没发出去）';
-        if (!(await sendOne(conversation, head === undefined ? notice : [head, { type: 'text', data: { text: notice } }]))) return;
+        if (!(await sendOne(conversation, notice))) return;
         continue;
       }
-      const segment = imageSegment(bytes);
-      if (!(await sendOne(conversation, head === undefined ? [segment] : [head, segment]))) return;
+      // 图不挂引用、也没有可算的打字时间（延迟只留 index 0 的那个「读消息」）。
+      // `imageSegment` 返回的是**一个段**，`message` 要的是段数组（旧写法就是 [segment]）。
+      if (!(await sendOne(conversation, [imageSegment(bytes)]))) return;
     }
   }
 
   /**
-   * 本轮回复第一条上的「指向」段（引用 / @）。
+   * 本轮回复第一个**文字**气泡上的「指向」段（引用 / @）。
    *
-   * 只有群聊的**第一条**才带指向：真人不会每条都 @ 一遍，引用刷屏也很烦。
+   * 三条规则，顺序不能反：
+   *   1. **插话轮强制引用锚点**（`interjectQuote`，§7.1）：不再看 `replyStyle: auto`
+   *      的漂移判断 —— 那个判断在「紧接着回」时恰好不引用，而插话几乎总是紧接着回，
+   *      于是群里看到一句没头没尾的话。引用的是 `admit` 时快照下来的**具体 message_id**；
+   *   2. `replyStyle: quote` / `at` 照旧；
+   *   3. `auto` 只在「我回的那条后面又出现了消息」时才引用 —— **包括我自己刚发出去的话**
+   *      （上一轮的回复、复读、主动搭话）：紧挨着回时引用是纯噪音，一轮问答本来就看得出来
+   *      在回谁；被后来的话挤远了才需要点名，不然看的人对不上话头。
+   *
    * @param conversation - 目标会话。
-   * @param index - 在本轮分段里的序号（0 = 第一条）。
-   * @param quote - 被回复消息的 `{ messageId, userId, seq }`。
+   * @param options.quote - 被回复消息的 `{ messageId, userId, seq }`。
+   * @param options.intent - 这一轮为什么轮到它（见 `speech-policy.js`）。
    * @returns 要挂在前面的段；不需要指向时 undefined。
    */
-  function quoteHead(conversation, index, quote) {
-    if (index !== 0 || conversation.type !== 'group') return undefined;
+  function quoteHead(conversation, { quote, intent } = {}) {
+    const target = quote ?? { messageId: '', userId: '', seq: 0 };
+    if (conversation.type !== 'group') return undefined;
+    if (intent === 'interject' && settings.interjectQuote) {
+      if (target.messageId.length > 0) return { type: 'reply', data: { id: target.messageId } };
+      // 锚点没取到（撤回 / 实现不支持）时退化成 @ 说话人：有个指向总比裸奔好。
+      if (target.userId.length > 0) return { type: 'at', data: { qq: target.userId } };
+      return undefined;
+    }
+    if (intent === 'interject' && target.userId.length > 0) return { type: 'at', data: { qq: target.userId } };
     const style = settings.replyStyle;
     if (style === 'auto') {
-      // 只在「我回的那条后面又出现了消息」时才引用 —— **包括我自己刚发出去的话**
-      // （上一轮的回复、复读、主动搭话）：紧挨着回时引用是纯噪音，一轮问答本来就看得出来
-      // 在回谁；被后来的话挤远了才需要点名，不然看的人对不上话头。
-      const drifted = typeof quote.seq === 'number' && chatter.anchor(conversation.id) > quote.seq;
-      if (!drifted || quote.messageId.length === 0) return undefined;
-      return { type: 'reply', data: { id: quote.messageId } };
+      const drifted = typeof target.seq === 'number' && chatter.anchor(conversation.id) > target.seq;
+      if (!drifted || target.messageId.length === 0) return undefined;
+      return { type: 'reply', data: { id: target.messageId } };
     }
-    if (style === 'quote' && quote.messageId.length > 0) return { type: 'reply', data: { id: quote.messageId } };
-    if (style === 'at' && quote.userId.length > 0) return { type: 'at', data: { qq: quote.userId } };
+    if (style === 'quote' && target.messageId.length > 0) return { type: 'reply', data: { id: target.messageId } };
+    if (style === 'at' && target.userId.length > 0) return { type: 'at', data: { qq: target.userId } };
     return undefined;
-  }
-
-  // ---- 禁漫（JM）下载 → PDF → 发到 QQ ----------------------------------------
-  // `/jm <车号|链接>` 指令与 `qq_jm_pdf` 工具走的是同一条链路：下载（jm.js 里的
-  // python 子进程）→ 拿一次性 URL 交给 NapCat 上传。区别只在于「谁点的」和
-  // 「要不要先回一句」。
-
-  /**
-   * 指令匹配器：`jmCommand` 里的斜杠可有可无（群聊 `groupTrigger: prefix` 会把
-   * 开头的 `/` 当触发前缀吃掉，两种写法都得认识）。
-   */
-  const jmCommandPattern = (() => {
-    const command = settings.jmCommand.trim();
-    if (command.length === 0) return undefined;
-    const bare = command.replace(/^\/+/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`^/?${bare}(?:\\s+|$)`, 'i');
-  })();
-
-  /**
-   * 读一条「直接下载」指令。
-   * @param text - 已 trim 的正文。
-   * @returns `{ rest }`（命中指令，`rest` 是指令后面的参数）或 `{ rest, ref }`；没命中时 undefined。
-   */
-  function readJmCommand(text) {
-    if (jmCommandPattern === undefined) return undefined;
-    const match = jmCommandPattern.exec(text);
-    if (match === null) return undefined;
-    const rest = text.slice(match[0].length).trim();
-    return { rest, ref: rest.length > 0 ? parseJmRef(rest) : undefined };
-  }
-
-  /** 把 `meta` 事件渲染成一句人话（标题 / 话数 / 页数）。 */
-  function describeJm(meta) {
-    const title = typeof meta?.title === 'string' && meta.title.length > 0 ? `《${meta.title}》` : `jm${meta?.id ?? ''}`;
-    const extra = [];
-    if (Number(meta?.chapters) > 1) extra.push(`${meta.chapters} 话`);
-    if (Number(meta?.pages) > 0) extra.push(`${meta.pages} 页`);
-    return extra.length > 0 ? `${title}（${extra.join(' · ')}）` : title;
   }
 
   /**
@@ -1482,7 +1593,7 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 解析出站工具（`qq_send_message` / `qq_send_image` / `qq_jm_pdf`）该发给谁。
+   * 解析出站工具（`qq_send_message` / `qq_send_image`）该发给谁。
    *
    * 优先用显式给的 `target_type` / `target_id`；没给就看调用它的 Agent 是不是某个
    * QQ 会话的 Agent —— 从 QQ 会话里调用时，「发回当前会话」才是最自然的默认值，
@@ -1506,95 +1617,6 @@ export function apply(ctx, config) {
       ? fromAgent
       : targetConversation(type, id);
     return { conversation, type, id };
-  }
-
-  /**
-   * 把 PDF 交给 NapCat 发到 QQ。
-   *
-   * NapCat 在容器里、插件在宿主机上，只能给它一个 URL 让它自己来拉（传本地路径会
-   * 回 `识别URL失败`，因为容器里根本没有那个文件）。群文件还要机器人有上传权限，
-   * 失败时如实把原因带回去，由调用方决定怎么措辞。
-   * @returns `{ ok: true }` 或 `{ ok: false, error }`。
-   */
-  async function sendJmFile(conversation, job) {
-    let url;
-    try {
-      url = await jmService.serve(job.path, job.name);
-    } catch (error) {
-      return { ok: false, error: `file server: ${errorText(error)}` };
-    }
-    const group = conversation.type === 'group';
-    const action = group ? 'upload_group_file' : 'upload_private_file';
-    // 群文件接口允许带 folder；NapCat 接受空串，显式给一个免得别的实现报缺参。
-    const params = group
-      ? { group_id: conversation.id, file: url, name: job.name, folder: '' }
-      : { user_id: conversation.id, file: url, name: job.name };
-    try {
-      await client.call(action, params, settings.jmUploadTimeoutMs);
-      // 传进群里的这份 PDF 也是一条「我自己发的消息」（见 `noteOwnMessage`）。
-      noteOwnMessage(conversation.type, conversation.id);
-      report('info', `jm: uploaded ${job.name} (${job.bytes} bytes) to ${conversation.key}`);
-      return { ok: true };
-    } catch (error) {
-      const reason = errorText(error);
-      report('warn', `jm: ${action} to ${conversation.key} failed: ${reason}`);
-      return { ok: false, error: reason };
-    }
-  }
-
-  /**
-   * 跑一次「下载 + 发送」。下载本身在 jm.js 里（python 子进程 + 并发键）。
-   * @param options.conversation - 目标会话。
-   * @param options.ref - `{ id, kind }`。
-   * @param options.onMeta - 拿到元信息时回调（进度提示用）。
-   * @returns 下载结果（含 `path` / `name` / `pages` / `bytes` / `title`）。
-   */
-  async function downloadJm({ conversation, ref, onMeta }) {
-    if (!jmService.enabled) {
-      throw new Error('禁漫下载没启用（检查 jmDownload / jmDir / jmPython / jmScript）');
-    }
-    if (jmService.isRunning(conversation.key)) {
-      const busy = new Error('这个会话已经有一个下载在跑了');
-      busy.code = 'JM_BUSY';
-      throw busy;
-    }
-    return jmService.run({ id: ref.id, kind: ref.kind, key: conversation.key, onMeta });
-  }
-
-  /**
-   * `/jm <车号>` 的完整直线：先回一句「收到」，拿到元信息再回一句「找到了」，
-   * 下完把 PDF 发上去。全程不进 Agent —— 车号是明确的任务，没必要让模型参与。
-   * 任何失败都变成一句人话回给 QQ（这条链路是无人值守的）。
-   */
-  async function runJmCommand(conversation, ref, quote) {
-    if (!jmService.enabled) {
-      await sendToConversation(conversation, '（禁漫下载没开：jmDownload 关了，或者 jmDir / jmPython 配得不对）', { quote });
-      return;
-    }
-    if (jmService.isRunning(conversation.key)) {
-      await sendToConversation(conversation, '（还在下上一本，等下）', { quote });
-      return;
-    }
-    await sendToConversation(conversation, `收到，去下 jm${ref.id} 了…`, { quote });
-    try {
-      const job = await downloadJm({
-        conversation,
-        ref,
-        // 元信息一到就先报一句：整本可能下十几分钟，不能让群里干等。
-        onMeta: (meta) => {
-          void sendToConversation(conversation, `找到了：${describeJm(meta)}，下完直接发文件`);
-        },
-      });
-      const sent = await sendJmFile(conversation, job);
-      if (sent.ok) await sendToConversation(conversation, `下好了：${describeJm({ id: ref.id, title: job.title, chapters: job.chapters, pages: job.pages })}`);
-      else await sendToConversation(conversation, `下好了，但文件发不出去：${sent.error}`);
-    } catch (error) {
-      if (error?.code === 'JM_BUSY') {
-        await sendToConversation(conversation, '（还在下上一本，等下）');
-        return;
-      }
-      await sendToConversation(conversation, `没下成：${errorText(error)}`);
-    }
   }
 
   /**
@@ -1670,6 +1692,7 @@ export function apply(ctx, config) {
     conversation.activeSpeakerId = '';
     conversation.activeInterposeSeq = 0;
     conversation.activeTurns = 0;
+    conversation.pendingIntent = undefined;
     // 抽卡的累计也一起忘：新开一轮的第一句不该继承上一轮攒下的「保底」。
     conversation.talkMisses = 0;
     conversation.chimeCount = 0;
@@ -1725,6 +1748,12 @@ export function apply(ctx, config) {
        */
       sessionGeneration: 0,
       /**
+       * 这一轮为什么轮到它（`addressed` / `continued` / `interject` / `proactive` / `chime` /
+       * `poke`）。`submitBatch` 在投递前写入，`channelPrompt` 与 `speakerLine` 读它，
+       * `turn/end` 清掉 —— 漏清的话下一轮会披着上一轮的意图说话。
+       */
+      pendingIntent: undefined,
+      /**
        * 「群里最后一条**别人的**消息」是什么时候到的（含没 @ 机器人的闲聊）。
        *
        * 主动说话靠它判断「这个群现在是不是没人说话了」：只有安静下来才轮到它开口，
@@ -1770,6 +1799,14 @@ export function apply(ctx, config) {
        * `chimeCount` 是对方这一句之后已经补了几句（受 activeChimeMax 约束，收到新消息归零）；
        * `chimeDay` / `chimeToday` 是当天的补一句计数（受 activeChimeDailyMax 约束）。
        */
+      /**
+       * 戳一戳的记账（见 `handlePoke`）：`pokeAt` 是上次回应它的时刻（冷却用），
+       * `pokeDay` / `pokeToday` 是当天的回应次数（跨天就地归零，与主动说话同一套路）。
+       * 冷却与上限都只在内存里：重启归零是可接受的，而且重启后第一下就回一次反而正常。
+       */
+      pokeAt: 0,
+      pokeDay: '',
+      pokeToday: 0,
       chimeTimer: undefined,
       chimeSeq: 0,
       chimeCount: 0,
@@ -1927,51 +1964,63 @@ export function apply(ctx, config) {
       const blank = preview.length === 0 && explicit && !prefixed;
       if (preview.length === 0 && !blank) return undefined;
       if (blank && settings.blankReply !== true) return undefined;
-      // 活跃对话：没被叫到，但同一个人正在跟它聊，接着说的这句也算。（只认**已经存在**
-      // 的会话 —— 闲聊不该因为「窗口」把某个群变成「处理过」的群。）
+      // 这一条要不要接、以什么身份接 —— 判据全在 `speech-policy.js`（纯函数，可单测）。
+      // 这里只做两件事：把会话记录与 chatter 的读数凑成入参；按结论记账。
+      //   - `existing`：只认**已经存在**的会话（闲聊不该因为「窗口」把某个群变成处理过的群）；
+      //   - `groupTalkActive`：C 路的热度（纯查询，不存状态）；
+      //   - `activeFollowAllows`：A 路的七条判据。
       const existing = conversations.get(`group:${groupId}`);
-      // 多人搭话：这个群最近自己聊热了（够条数、够人数），那之后谁接话都算数 —— 这也是
-      // 「有人插话就进入多人搭话」的落点：插话的人与那句话本身就记在 chatter 的热度窗口里，
-      // 大家说得够多就整体升级，而不是像一对一那样被一句话打断。
-      //
-      // 它**不**消耗 `activeMaxTurns`：那个上限是防「一个人揪着它刷屏」的，而这里的闸门
-      // 本身就是「窗口里够条数、够人数」—— 大家一停，窗口自己就空了。再叠一层轮数上限，
-      // 只会让它在最热闹的时候接几句就哑掉（那正是搭话状态该起作用的时候）。
       const groupTalk = !explicit && existing !== undefined && groupTalkActive(groupId);
       const followed = !explicit && existing !== undefined && activeFollowAllows(existing, userId, message, selfId);
-      // 够资格 ≠ 就接：A/C 两路共用的这一抽（见 speaking-rules.js 的 activeTalkChance）。
-      // 每够资格一次掷一回「越攒越高」的概率，没掷中就把连丢计数 +1，下一次更接近上限；
-      // 掷中、或者被明确 @ 到之后归零重新攒。这样群里几个人正聊着时，它不会每条都回，
-      // 也不会一直装死 —— 频率落在一个可调的概率曲线上。
-      const talkEligible = groupTalk || followed;
-      const talkChance = talkEligible
-        ? activeTalkChanceRule(
-          settings.activeTalkChance,
-          settings.activeTalkChanceStep,
-          settings.activeTalkChanceMax,
-          existing.talkMisses,
-        )
-        : 0;
-      const continued = activeTalkAllowsRule({ eligible: talkEligible, chance: talkChance, roll: Math.random() });
-      if (talkEligible) {
+      // C 路的四条排除要拿到的「这条消息长什么样」：
+      //   - `hasText`：纯媒体（只有图/表情/语音）没有可接的话头，锚点必须是文字；
+      //   - `isCommand`：命令不该被「插话」顺手执行；
+      //   - `mentionsOthers`：@ 了别人的句子是别人在说话。
+      const decision = decideGroupTurn({
+        explicit,
+        blank,
+        existing: existing !== undefined,
+        followAllowed: followed,
+        groupHot: groupTalk,
+        mentionsOthers: mentionsOthers(message, selfId),
+        // 命令判定用剥前缀**之前**的正文：`groupTrigger: prefix` 会把开头的 `/` 吃掉。
+        isCommand: rawText.startsWith('/') || (resetCommand.length > 0 && preview.toLowerCase() === resetCommand),
+        // 「有没有文字」要按**消息段**判，不能看渲染后的正文：纯图消息的正文是
+        // `[图片]`，那是占位符不是话头，插话的锚点必须是真人写下的字。
+        hasText: Array.isArray(message)
+          ? message.some((segment) => segment?.type === 'text' && String(segment?.data?.text ?? '').trim().length > 0)
+          : String(message ?? '').trim().length > 0,
+        selfMessage: String(event.user_id ?? '') === String(selfId),
+        misses: existing?.talkMisses ?? 0,
+        chance: settings.activeTalkChance,
+        chanceStep: settings.activeTalkChanceStep,
+        chanceMax: settings.activeTalkChanceMax,
+        roll: Math.random(),
+      });
+      const intent = decision.intent;
+      const continued = intent === 'continued' || intent === 'interject';
+      if (existing !== undefined) {
         const who = describeConversation(existing);
-        if (continued) {
+        if (intent === 'continued' || intent === 'interject') {
           existing.talkMisses = 0;
-          report('info', `${who} 免 @ 搭话抽中（概率 ${Math.round(talkChance * 100)}%）：接这一句`);
-        } else {
+          report('info', `${who} ${decision.reason === 'follow' ? '免 @ 搭话抽中' : '插话抽中'}（概率 ${Math.round(decision.chance * 100)}%）：${intent}`);
+        } else if (decision.eligible) {
           existing.talkMisses = (Number(existing.talkMisses) || 0) + 1;
-          // A 路没抽中也算「人还在跟它说话」：窗口照滑、免 @ 轮数照扣。不这样的话，
-          // 60 秒的窗口会在概率攒够之前先过期，或者把「这次没接」当成「这段断了」，
-          // 那条路就名存实亡了。（C 路不扣轮数 —— 它的闸门本来就是「够条数、够人数」。）
+          // A 路没抽中也算「人还在跟它说话」：窗口照滑、免 @ 轮数照扣。不然 60 秒的窗口
+          // 会在概率攒够之前先过期，或者把「这次没接」当成「这段断了」。
+          // （C 路不扣轮数 —— 它的闸门本来就是「够条数、够人数」。）
           if (followed) noteActiveMessage(existing, userId, true);
-          report('info', `${who} 免 @ 搭话没抽中（概率 ${Math.round(talkChance * 100)}%，已连丢 ${existing.talkMisses} 条）：这一句不接`);
+          report('info', `${who} 搭话没抽中（概率 ${Math.round(decision.chance * 100)}%，已连丢 ${existing.talkMisses} 条，原因 ${decision.reason}）：这一句不接`);
+        } else if (decision.reason === 'not-eligible' && existing.talkMisses) {
+          // 既不在一对一窗口里、群也没聊热：这段对话凉了，累计清零，下次重新从起始概率攒
+          // —— 不然半小时前攒下的「保底」会在一段全新的聊天开头突然炸出来。
+          existing.talkMisses = 0;
         }
-      } else if (!explicit && existing !== undefined && existing.talkMisses) {
-        // 既不在一对一窗口里、群也没聊热：这段对话凉了，累计清零，下次重新从起始概率攒
-        // —— 不然半小时前攒下的「保底」会在一段全新的聊天开头突然炸出来。
-        existing.talkMisses = 0;
+        if (decision.reason === 'not-eligible' || decision.reason === 'roll') {
+          // 被排除的那几条（@ 别人 / 命令 / 纯媒体）也不该悄悄「接」，这里统一在下面返回。
+        }
       }
-      if (!explicit && !continued) return undefined;
+      if (intent === 'none' && !explicit) return undefined;
       // 空消息的说明在这里算**一次**、往下传给 `submitBatch`：那边是媒体落盘后重新渲染
       // 的正文（`at` 段同样会被剔掉，仍然是空），若让它自己再拼一句，就得把「有没有 @」
       // 这件事也带下去，多一份要同步维护的状态（第一版正是这么写的，@ 与空消息的措辞串了）。
@@ -1993,6 +2042,8 @@ export function apply(ctx, config) {
         preview: blank ? blankBody : preview,
         blankBody,
         continued,
+        // 为什么轮到它（见 speech-policy.js）：addressed / continued / interject。
+        intent: explicit ? 'addressed' : intent,
         // 这次该怎么称呼他：`submitBatch` 把它交给模型（正文里的 `昵称:` 与它逐字一致），
         // 模型回话时写 `[[@昵称]]` 就能把这个人 @ 出来。
         displayName,
@@ -2029,6 +2080,7 @@ export function apply(ctx, config) {
       preview,
       blankBody,
       continued: false,
+      intent: 'addressed',
       displayName,
       // 私聊始终是 plain，`seq` 只是让 quote 的字段形状保持一致。
       quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: 0 },
@@ -2063,7 +2115,7 @@ export function apply(ctx, config) {
    * `reportSelfMessage: false`（`onebot11_<QQ>.json` 的 websocketServers），自己发出去的话
    * 一条都不会回来 —— 而「我回的那条被我自己后来的话挤远了」恰恰是最需要点名的情况
    * （上一轮的回复、复读、主动搭话都算）。所以出站这几条路（`sendOne`、两个发送工具、
-   * JM 上传）各记一次，不依赖任何回灌配置。
+
    * @param type - `'group'` / `'private'`（私聊不挂指向，直接不记）。
    * @param id - 群号。
    */
@@ -2521,6 +2573,8 @@ export function apply(ctx, config) {
   function proactiveSpeak(conversation, now) {
     conversation.proactiveCount = proactiveTodayCount(conversation) + 1;
     conversation.lastProactiveAt = now;
+    // 人设的「主动搭话」场景段读它（`personaSceneFor`）；turn/end 会清掉。
+    conversation.pendingIntent = 'proactive';
     const quietMs = Math.max(0, now - (Number(conversation.lastActiveAt) || now));
     report('info', `${describeConversation(conversation)} 已经安静 ${Math.round(quietMs / 60000)} 分钟，主动开个话头`);
     enqueue(conversation, async () => {
@@ -2537,6 +2591,7 @@ export function apply(ctx, config) {
           key: conversation.key,
           quote: { messageId: '', userId: '', seq: 0 },
           proactive: true,
+          intent: 'proactive',
         });
         agent.followup(userMessage);
       } catch (error) {
@@ -2710,8 +2765,11 @@ export function apply(ctx, config) {
    *
    * 掐着表 20 秒整补一句比不补还像机器人；复用打字延迟那个抖动比例，不额外加配置。
    */
-  function chimeDelay() {
-    return chimeDelayRule(settings.activeChimeIdleMs, settings.delayJitter, Math.random());
+  function chimeDelay(conversation) {
+    // 私聊用 `privateAfterthoughtIdleMs`（15 秒），群聊用 `activeChimeIdleMs`（20 秒）：
+    // 两套节奏的语义不同（一个是对着一个具体的人，一个是在群里插一句），别互相借。
+    const idle = conversation?.type === 'private' ? settings.privateAfterthoughtIdleMs : settings.activeChimeIdleMs;
+    return chimeDelayRule(idle, settings.delayJitter, Math.random());
   }
 
   /**
@@ -2725,9 +2783,16 @@ export function apply(ctx, config) {
    * 同一性质），生命周期由 `ctx.effect` 的收尾统一清掉，不需要额外的调度框架。
    * @param conversation - 刚回完话的会话。
    */
-  function scheduleChime(conversation) {
-    if (!proactiveEnabled) return; // 总开关：不允许主动发消息就什么都不挂
-    if (settings.activeWindowMs <= 0 || settings.activeChimeIdleMs <= 0 || settings.activeChimeMax <= 0) return;
+  function scheduleChime(conversation, owner) {
+    // 空消息（单纯的 @、一个空格）之后的轮次不补：那一轮本来就没有话题可言。
+    if (owner?.blank === true) return;
+    if (conversation.type === 'private') {
+      // 私聊补一句（L2）：只受它自己的开关约束 —— 不该被群聊那个 `proactive` 总开关连坐。
+      if (settings.privateAfterthought !== true || settings.privateAfterthoughtIdleMs <= 0) return;
+    } else {
+      if (!proactiveEnabled) return; // 群聊补一句属于「主动说话」家族
+      if (settings.activeWindowMs <= 0 || settings.activeChimeIdleMs <= 0 || settings.activeChimeMax <= 0) return;
+    }
     cancelChime(conversation);
     // 先取消（编号 +1）再抓编号：这条定时器因此是「目前唯一有效」的那一个。
     const seq = conversation.chimeSeq;
@@ -2738,7 +2803,7 @@ export function apply(ctx, config) {
       } catch (error) {
         report('warn', `chime check failed: ${errorText(error)}`);
       }
-    }, chimeDelay());
+    }, chimeDelay(conversation));
     timer.unref?.();
     conversation.chimeTimer = timer;
   }
@@ -2764,6 +2829,25 @@ export function apply(ctx, config) {
    */
   function runChime(conversation, seq) {
     const now = Date.now();
+    // 私聊：五道闸门在 `privateAfterthoughtAllows` 里（不看 activeUntil，也不看 proactive）。
+    if (conversation.type === 'private') {
+      const allowed = privateAfterthoughtAllows({
+        enabled: settings.privateAfterthought === true,
+        type: conversation.type,
+        seqMatches: conversation.chimeSeq === seq,
+        hasQueuedBatch: conversation.pending.length > 0 || conversation.batchTimer !== undefined,
+        busy: busyWithTurn(conversation),
+        chimeCount: conversation.chimeCount,
+        chimeToday: chimeTodayUsed(conversation),
+        dailyMax: settings.privateAfterthoughtDailyMax,
+        lastBotSpeakAt: conversation.lastBotSpeakAt,
+        lastActiveAt: conversation.lastActiveAt,
+        chance: settings.privateAfterthoughtChance,
+        roll: Math.random(),
+      });
+      if (allowed) chimeSpeak(conversation, now);
+      return;
+    }
     const allowed = chimeAllows({
       seqMatches: conversation.chimeSeq === seq,
       proactiveEnabled,
@@ -2800,6 +2884,7 @@ export function apply(ctx, config) {
   function chimeSpeak(conversation, now) {
     conversation.chimeCount = (conversation.chimeCount ?? 0) + 1;
     conversation.chimeToday = chimeTodayUsed(conversation) + 1;
+    conversation.pendingIntent = 'chime';
     const silenceSec = Math.max(1, Math.round((now - (Number(conversation.lastActiveAt) || now)) / 1000));
     report('info', `${describeConversation(conversation)} 对话还热着（对方安静了约 ${silenceSec} 秒），主动补一句`);
     enqueue(conversation, async () => {
@@ -2814,6 +2899,7 @@ export function apply(ctx, config) {
           key: conversation.key,
           quote: { messageId: '', userId: '', seq: 0 },
           proactive: true,
+          intent: 'proactive',
         });
         agent.followup(userMessage);
       } catch (error) {
@@ -2842,6 +2928,7 @@ export function apply(ctx, config) {
       '注意：',
       '- 别重复你刚说过的话，也别把那句换个说法再说一遍；',
       '- 别提前面这条提醒，也别说「你怎么不说话了」这种旁白；一条就够。',
+      '- 对方没接话，别追问太紧：没什么想说的就 SKIP，这很正常。',
     ].join('\n');
   }
 
@@ -2861,7 +2948,20 @@ export function apply(ctx, config) {
    */
   async function resolveMessageMedia(message) {
     if (!mediaStore.enabled) return undefined;
-    const items = collectMedia(message);
+    const items = [...collectMedia(message)];
+    // 视频**只下封面**（默认开，`videoMaxBytes: 0` 表示不下载整段）：整段视频模型读不了
+    // （read_image 只认图片），下它既花带宽又没用；封面是唯一能看见的一帧。
+    if (settings.videoCover && Array.isArray(message)) {
+      message.forEach((segment, index) => {
+        if (segment?.type !== 'video') return;
+        const data = segment.data ?? {};
+        const url = typeof data.thumb === 'string' && data.thumb.length > 0
+          ? data.thumb
+          : (typeof data.cover === 'string' ? data.cover : '');
+        if (url.length === 0) return;
+        items.push({ index, kind: 'video', label: '', url, file: '', declaredBytes: undefined });
+      });
+    }
     if (items.length === 0) return undefined;
     const rendered = new Map();
     const outcomes = new Map();
@@ -2874,12 +2974,21 @@ export function apply(ctx, config) {
         if (outcome.path !== undefined) {
           fetched += 1;
           report('info', `media: ${item.kind}${item.label.length > 0 ? ` "${item.label}"` : ''} → ${outcome.path} (${outcome.bytes} bytes)`);
-          rendered.set(item.index, mediaPlaceholder(item, outcome.path));
+          if (item.kind === 'video') {
+            // 视频的占位符由 modalities 统一渲染（时长 + 封面路径），别在这里另写一份格式。
+            const observation = observationOf(message[item.index], { index: item.index });
+            observation.meta = { ...observation.meta, coverPath: outcome.path };
+            rendered.set(item.index, renderObservation(observation));
+          } else {
+            rendered.set(item.index, mediaPlaceholder(item, outcome.path));
+          }
           return;
         }
         // 取不到不是错误路径上的意外：消息照常投递，只是模型看到的是一句「这里本来有张图」。
         report('warn', `media: could not fetch ${item.kind}${item.label.length > 0 ? ` "${item.label}"` : ''}: ${outcome.error}`);
-        rendered.set(item.index, mediaPlaceholder(item, '', outcome.error));
+        // 视频封面失败时**不**把错误写进正文：视频本身还在，写「封面没能取到文件」
+        // 只会让模型以为这个视频坏了。占位符保持 `[视频 N 秒]` 即可。
+        if (item.kind !== 'video') rendered.set(item.index, mediaPlaceholder(item, '', outcome.error));
       }),
     );
     return { rendered, fetched, outcomes };
@@ -3092,10 +3201,21 @@ export function apply(ctx, config) {
         // 一道防线）：绝不能给模型递一条空消息 —— 它会以为出了一条没有内容的消息。
         const text = composed.length > 0 ? composed : (item.blankBody ?? '');
         if (text.length === 0) continue;
-        entries.push({ name: item.name, id: item.userId, body: text });
+        // 裸 URL 可选地取一次标题（`linkPreview` 默认关：替群友访问任意 URL 是把部署机器的
+        // 出口 IP 暴露给发链接的人，卡片消息不联网就能解析，已经够用）。
+        const withLinks = await previewLinks(text);
+        entries.push({ name: item.name, id: item.userId, body: withLinks, blank: item.blankBody !== undefined && item.blankBody.length > 0 && withLinks === item.blankBody });
       }
       if (entries.length === 0) return;
-      const text = renderBatch(entries);
+      // 这一轮为什么轮到它：必须在渲染正文**之前**算出来（插话轮的正文要用它），
+      // 写进会话记录，提示词（场景 / 人设的场景段）与发送侧（插话强制引用）读同一个值。
+      const intent = batchIntent(batch);
+      conversation.pendingIntent = intent;
+      // 插话轮的投递文案与普通回复**不同**（§7.2）：`kaguya: 晚上吃啥` 会让模型以为
+      // kaguya 在问它，群里看到的却是答非所问。所以先说清「这不是叫你的」，再给 SKIP 出口。
+      const text = intent === 'interject'
+        ? interjectBody(entries)
+        : renderBatch(entries);
       const names = [...new Set(entries.map((entry) => entry.name))].join('、');
       report('info', `← ${describeConversation(conversation)} ${names}${entries.length > 1 ? `（${entries.length} 条）` : ''}: ${text.slice(0, 120)}`);
       // 发言人：提示词里要说得清「现在是谁在跟你说话」，所以几个人的话都记下来。
@@ -3109,9 +3229,26 @@ export function apply(ctx, config) {
         content: [{ type: 'text', text }],
         source: { kind: 'user' },
       });
-      submitted.set(userMessage.id, { key: conversation.key, quote: batchQuote(batch) });
+      // `blank`：这一批整批都是「空消息的替身」时，回复之后不挂补一句（那一轮没话题）。
+      submitted.set(userMessage.id, { key: conversation.key, quote: batchQuote(batch), intent, blank: entries.every((entry) => entry.blank === true) });
       agent.followup(userMessage);
     });
+  }
+
+  /**
+   * 一批消息的「为什么轮到它」。
+   *
+   * 一批里可能混着「被叫到」与「窗口里接上的一句」：只要有一条是被明确叫到的，
+   * 这一轮就是 `addressed`（模型得把它当成有人在跟它说话）；全是接话的才是 `continued`。
+   * `interject` 由 `speech-policy` 判出来，单独带在条目上（见 `admit` 的返回）。
+   * @param batch - 这一批 `{ intent }`。
+   * @returns `intent` 字符串。
+   */
+  function batchIntent(batch) {
+    const intents = batch.map((entry) => entry.intent ?? 'addressed');
+    if (intents.includes('interject')) return 'interject';
+    if (intents.includes('addressed')) return 'addressed';
+    return intents[0] ?? 'addressed';
   }
 
   /**
@@ -3126,6 +3263,56 @@ export function apply(ctx, config) {
     const senders = new Set(batch.map((entry) => entry.userId));
     if (senders.size === 1) return batch[batch.length - 1].quote;
     return { messageId: '', userId: '', seq: 0 };
+  }
+
+  /**
+   * 插话轮的正文：元信息 + 锚点那句 + 「想接就接 / 不想接就 SKIP」。
+   *
+   * 只有一条时把「谁说的、说了什么」直接写进元信息（那就是锚点）；多条时元信息说一次、
+   * 下面照常列「谁：什么」—— 否则每一行都套一句提醒，模型更容易只挑最后一句。
+   * @param entries - `{ name, body }`，按到达顺序。
+   * @returns user message 正文。
+   */
+  function interjectBody(entries) {
+    const allowed = imageAllowed();
+    if (entries.length === 1) {
+      return interjectLine(entries[0].name, entries[0].body, allowed);
+    }
+    const lines = entries.map((entry) => `${entry.name}: ${entry.body.replace(/\s+/g, ' ').trim()}`);
+    return [...interjectBatchPrompt(allowed), ...lines].join('\n');
+  }
+
+  /**
+   * 把正文里的裸 URL 换成「【标题】 — 域名 链接」（`linkPreview` 打开时才做）。
+   *
+   * 三条边界都是「不可信输入」那条线上的：
+   *   - 一条消息最多抓 **2** 个链接：不然一条刷屏消息能拖住整轮投递；
+   *   - SSRF / 大小 / 超时 / 重定向全部由 `links.js` 兜住（见那边的模块注释）；
+   *   - 抓到的标题是**数据**，原样放在方括号里渲染 —— 和 QQ 消息一样，不是指令。
+   * 抓失败（内网、超时、不是 HTML）就保留原 URL：宁可没有标题，也不要丢链接。
+   * @param text - 已渲染好的正文。
+   * @returns 替换后的正文（没有 URL 或开关关着时原样返回）。
+   */
+  async function previewLinks(text) {
+    if (!settings.linkPreview) return text;
+    const urls = [...new Set(String(text).match(/https?:\/\/[^\s<>"'（）()【】]+/g) ?? [])]
+      // 句末标点常常被粘在 URL 后面（「看这个 https://a.b/x。」），别把它们算进链接。
+      .map((url) => url.replace(/[。，、；：！？…]+$/, ''))
+      .filter((url) => url.length > 0)
+      .slice(0, 2);
+    if (urls.length === 0) return text;
+    let out = String(text);
+    for (const url of urls) {
+      const result = await fetchPageTitle(url, {
+        timeoutMs: settings.linkPreviewTimeoutMs,
+        maxBytes: settings.linkPreviewMaxBytes,
+        allowPrivateHosts: settings.linkAllowPrivateHosts,
+      });
+      const line = previewLine(result);
+      if (line === undefined) continue;
+      out = out.split(url).join(line);
+    }
+    return out;
   }
 
   /**
@@ -3146,11 +3333,133 @@ export function apply(ctx, config) {
     return [note, ...lines].join('\n');
   }
 
+  /** 这个会话今天已经回应了几次戳一戳（跨天就地归零）。 */
+  function pokeTodayUsed(conversation) {
+    const today = localDate();
+    if (conversation.pokeDay !== today) {
+      conversation.pokeDay = today;
+      conversation.pokeToday = 0;
+    }
+    return conversation.pokeToday ?? 0;
+  }
+
+  /**
+   * 让 OneBot 真的戳一下：不同实现的动作名不一样（`send_poke` / `group_poke` / `friend_poke`），
+   * 所以这里按顺序试，第一个成功的算数。
+   *
+   * 只打给**戳它的人**：`userId` 来自事件、是不可信输入，但这里唯一用它做的事是
+   * 「回戳那个发起戳一戳的人」—— 不回戳第三人（群里别人互相戳，跟它无关）。
+   * @returns 成功时为 true。
+   */
+  async function pokeBack(type, id, userId) {
+    const group = type === 'group';
+    const params = group ? { group_id: Number(id), user_id: Number(userId) } : { user_id: Number(userId) };
+    const attempts = [
+      ['send_poke', params],
+      [group ? 'group_poke' : 'friend_poke', params],
+    ];
+    for (const [action, payload] of attempts) {
+      try {
+        await client.call(action, payload);
+        return true;
+      } catch (error) {
+        report('info', `poke: ${action} not available (${errorText(error)}), trying the next form`);
+      }
+    }
+    report('warn', `poke: no poke action worked for ${type}:${id}`);
+    return false;
+  }
+
+  /**
+   * 戳一戳：OneBot v11 的 `notice` / `notify` / `poke`（§8.3）。
+   *
+   * 只有戳的是**机器人自己**才进判定；戳别人一律不记（群里互相戳跟它无关，记了只是噪音）。
+   * 三种回应由 `pokeMode` 决定（随机回戳 / 走一轮模型 / 不回），冷却与每日上限在
+   * `interactions.js` 的纯判据里，这里只负责凑入参、记账、发出去。
+   *
+   * **防回戳死循环**：同一个会话 `pokeCooldownMs` 内只回一次，不管戳了几下 —— 两个机器
+   * 人互相戳起来时，这是唯一真正管用的那道闸。
+   */
+  function handlePoke(event, selfId) {
+    if (settings.pokeReply !== true) return;
+    const notice = pokeNotice(event);
+    if (notice === undefined) return;
+    const type = pokeActionType(notice.groupId !== undefined ? 'group' : 'private');
+    const id = type === 'group' ? String(notice.groupId) : String(notice.userId);
+    if (type === 'group') {
+      if (!settings.groupChat) return;
+      if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(id)) return;
+    } else {
+      if (!settings.privateChat) return;
+      if (settings.allowUsers.length > 0 && !settings.allowUsers.includes(String(notice.userId))) return;
+    }
+    const sender = event.sender ?? {};
+    const displayName = userDisplayName(sender, notice.userId);
+    const conversation = conversationFor(type, id, {
+      userId: notice.userId,
+      userName: displayName,
+      name: displayName,
+    });
+    // 戳一戳也算「这个会话有人活动」：主动说话据此判断群是否安静下来了。
+    conversation.lastActiveAt = Date.now();
+    const now = Date.now();
+    const decision = pokeAction({
+      selfId,
+      targetId: notice.targetId,
+      userId: notice.userId,
+      mode: settings.pokeMode,
+      chance: settings.pokeReplyChance,
+      roll: Math.random(),
+      cooldownLeftMs: Math.max(0, (Number(conversation.pokeAt) || 0) + settings.pokeCooldownMs - now),
+      todayCount: pokeTodayUsed(conversation),
+      dailyMax: settings.pokeDailyMax,
+    });
+    if (decision.act === 'none') {
+      report('info', `${describeConversation(conversation)} 戳一戳不回应（${decision.reason}）`);
+      return;
+    }
+    // 记账刻意在**发出去之前**：回戳失败、或者那一轮被判成 SKIP，这次机会照样用掉 —
+    // 否则对方一直戳，它就一直在同一个冷却里反复尝试。
+    conversation.pokeAt = now;
+    conversation.pokeToday = pokeTodayUsed(conversation) + 1;
+    if (decision.act === 'poke') {
+      report('info', `${describeConversation(conversation)} 被 ${displayName} 戳了，回戳`);
+      void pokeBack(type, id, notice.userId);
+      return;
+    }
+    report('info', `${describeConversation(conversation)} 被 ${displayName} 戳了，走一轮（${decision.reason}）`);
+    conversation.pendingIntent = 'poke';
+    enqueue(conversation, async () => {
+      try {
+        const agent = await ensureAgent(conversation);
+        const userMessage = createUserMessage({
+          content: [{ type: 'text', text: pokeNudge({ userName: displayName }) }],
+          source: { kind: 'user' },
+        });
+        // 戳一戳不是「主动搭话」：有人真的碰了它一下，出错照常道歉、SKIP 照常静默。
+        submitted.set(userMessage.id, {
+          key: conversation.key,
+          quote: { messageId: '', userId: '', seq: 0 },
+          intent: 'poke',
+        });
+        agent.followup(userMessage);
+      } catch (error) {
+        report('warn', `poke turn for ${conversation.key} could not start: ${errorText(error)}`);
+      }
+    });
+  }
+
   /** 处理一条已解码的 OneBot 事件（由 OneBotClient 的 onEvent 调用）。 */
   function handleEvent(event) {
     const selfId = client.selfId;
-    if (event?.post_type !== 'message') return;
     if (selfId === '') return;
+    // 通知事件（戳一戳）先于消息分流：以前这里第一行就把非 message 全丢了，
+    // 于是「有人戳了它一下」它完全收不到（§8.3）。
+    if (event?.post_type === 'notice') {
+      handlePoke(event, selfId);
+      return;
+    }
+    if (event?.post_type !== 'message') return;
     // 先记「群里又有人说了一句」，`admit` 紧接着快照的序号才算上这条自己 ——
     // 快照与发送时读到的值相等就说明中间没有新消息，`auto` 便不引用。
     noteChatter(event, selfId);
@@ -3161,13 +3470,11 @@ export function apply(ctx, config) {
     maybeRepeat(event, selfId, admitted === undefined);
     // 长期记忆：把这条消息记进这个会话的转录（**所有**别人的消息，包括没 @ 机器人的
     // 群聊）。放在复读/环境上下文之前 —— 那两条路都会提前 return，而转录不该漏掉任何一条。
-    // 「活跃对话里接上的一句」（`continued`）**不算指令**：`/jm` 与 `/reset` 这类旁路要求
-    // 明确叫了它（@ 或前缀）才认 —— 否则窗口里一句闲聊「jm 123」就会绕开模型去下本子。
+    // 「活跃对话里接上的一句」（`continued`）**不算指令**：`/reset` 这类旁路要求
+    // 明确叫了它（@ 或前缀）才认 —— 否则窗口里一句闲聊「reset」就会绕开模型把会话重置了。
     const commanded = admitted !== undefined && admitted.continued !== true;
-    const jmCommandForLog = commanded ? readJmCommand(messageToText(admitted.message, selfId).trim()) : undefined;
     memory.rememberTranscript(event, selfId, {
       admitted,
-      jmCommand: jmCommandForLog,
       reset: commanded && resetCommand.length > 0 && admitted.preview.toLowerCase() === resetCommand,
     });
     if (admitted === undefined) {
@@ -3179,20 +3486,6 @@ export function apply(ctx, config) {
     const who = describeConversation(conversation);
     // 兜底清理归属表，避免「消息入队了但 turn 始终没被 claim」导致无限增长。
     if (submitted.size > 512) submitted.clear();
-    // 禁漫下载指令走**旁路**：它不进会话队列、也不建 Agent 会话。整本要下十几分钟，
-    // 排在队列里会把后面所有消息堵死；而且「/jm 123」是一个明确任务，不需要模型参与。
-    const jmCommand = jmCommandForLog;
-    if (jmCommand !== undefined) {
-      // 攒着的那批比这条指令先到，先放它们走，回复顺序才不颠倒。
-      flushBatch(conversation);
-      report('info', `← ${who} ${sender.nickname ?? ''}: ${jmCommand.ref === undefined ? '（/jm 缺车号）' : `jm ${jmCommand.ref.id}`}`);
-      if (jmCommand.ref === undefined) {
-        void sendToConversation(conversation, `用法：${settings.jmCommand.trim() || '/jm'} <车号 或 18comic 链接>`, { quote });
-      } else {
-        void runJmCommand(conversation, jmCommand.ref, quote);
-      }
-      return;
-    }
     // 会话重置指令：整条消息恰好等于指令才触发，且只对「发指令的这个会话」生效。
     // 它开的是**新一轮**会话（旧会话留在磁盘上当存档），而不是把记录删掉。
     // 攒着的那批是在重置之前收到的，必须先投出去，否则那几句话会被一起忘掉。
@@ -3220,6 +3513,7 @@ export function apply(ctx, config) {
       quote,
       // 「活跃对话里接上的一句」正文里没有前缀可去（见 admit / dropPrefix）。
       continued: admitted.continued === true,
+      intent: admitted.intent ?? 'addressed',
       // 空消息（单纯 @ / 一个空格）的那句说明：媒体落盘后正文还是空的，用它兜底。
       blankBody: admitted.blankBody ?? '',
       userId: String(event.user_id ?? ''),
@@ -3267,11 +3561,15 @@ export function apply(ctx, config) {
     const conversation = conversations.get(owner.key);
     if (conversation === undefined) return;
     const reason = event.data.reason?.kind;
-    // 被打断 / fork 掉 / 中止的 turn 不是有效回复，静默丢弃。
-    if (reason === 'aborted' || reason === 'forked' || reason === 'interrupted') return;
+    // 被打断 / fork 掉 / 中止的 turn 不是有效回复，静默丢弃（意图也要清，别漏到下一轮）。
+    if (reason === 'aborted' || reason === 'forked' || reason === 'interrupted') {
+      conversation.pendingIntent = undefined;
+      return;
+    }
     if (reason === 'error') {
       // 主动搭话是我自己挑起来的话头，没人问过它：出错就安静地算了，
       // 别反过来在群里贴一句「我这边出错了」。
+      conversation.pendingIntent = undefined;
       if (owner.proactive !== true) void sendToConversation(conversation, '（我这边处理时出错了，稍后再试试）');
       return;
     }
@@ -3289,20 +3587,24 @@ export function apply(ctx, config) {
     // 「引用 + SKIP」同时出现的那种消息**一定**是走这一支的。
     if (proactiveSkip(reply)) {
       report('info', `→ ${conversation.key}: （判成 SKIP，不发送）`);
+      conversation.pendingIntent = undefined;
       return;
     }
+    // 这一轮的意图在发送前就取出来（sendToConversation 是异步的，之后 pendingIntent 会变）。
+    const intent = owner.intent ?? conversation.pendingIntent ?? 'addressed';
+    conversation.pendingIntent = undefined;
     if (owner.proactive === true) {
       report('info', `→ ${conversation.key}: ${reply.slice(0, 120)}（主动）`);
       // 同一条「拟人」通道：拆短句 + 打字延迟。主动搭话没有可指向的消息，quote 为空。
-      void sendToConversation(conversation, reply, { human: true, quote: owner.quote });
+      void sendToConversation(conversation, reply, { human: true, quote: owner.quote, intent: owner.intent ?? 'proactive' });
       return;
     }
-    report('info', `→ ${conversation.key}: ${reply.slice(0, 120)}`);
+    report('info', `→ ${conversation.key}: ${reply.slice(0, 120)}（${intent}）`);
     // 自动回复走「拟人」通道：拆短句 + 打字延迟 + 引用/@ 对方。
     // 等这一轮真的发完再挂「过一会儿也许补一句」的定时器（见 scheduleChime）：
     // 补一句必须排在它这次回复**之后**，而且得等打完字才算「对方安静了」。
-    void sendToConversation(conversation, reply, { human: true, quote: owner.quote }).then(() => {
-      scheduleChime(conversation);
+    void sendToConversation(conversation, reply, { human: true, quote: owner.quote, intent }).then(() => {
+      scheduleChime(conversation, owner);
     });
   });
 
@@ -3326,13 +3628,13 @@ export function apply(ctx, config) {
     // 存表情包：不可用时传 undefined，`registerQqTools` 会跳过那个工具
     // （与 memory.tools 同一个规矩：不留「一调就报错」的壳）。
     saveSticker: stickerSaveAllowed() ? saveSticker : undefined,
+    // 戳一戳：与通知事件共用同一个「怎么戳」（动作名在不同实现里不一样，见 pokeBack）。
+    poke: settings.pokeReply === true ? pokeBack : undefined,
     imageSend,
     imageMaxBytes,
     resolveRoute,
     conversations,
     sessionIdFor,
-    downloadJm,
-    sendJmFile,
     // 记忆停用时 memory.tools 是 undefined：`registerQqTools` 会连那两个工具一起跳过，
     // 不留「一调就报错」的壳。
     memory: memory.tools,
@@ -3407,7 +3709,7 @@ export function apply(ctx, config) {
   // 配置 schema 是根 volatile（见 config.js），所以保存走的是 Loader 的「volatile
   // 热更新」路径：它就地换掉引用里的值，**不重跑 apply()**。而这个插件的装配几乎
   // 全在 apply() 里 —— OneBot 连接、主动说话 / 摘要 / 凭据轮换的定时器、工具注册、
-  // 目录越界校验、jm 文件服务，光换值它们一个都不会重建。
+  // 目录越界校验，光换值它们一个都不会重建。
   //
   // 所以这里挂一个监听：收到热更新就重启自己（`ctx.fiber.restart()`，等价于把这一行
   // 停用再启用）。重启**不丢聊天记忆**：会话 id 是确定性的（sessionIdFor），下一条
@@ -3454,9 +3756,6 @@ export function apply(ctx, config) {
       client.dispose();
     };
   }, 'qq-bridge:onebot');
-
-  // 下载链路的托管：关掉那个给 NapCat 取文件的小 HTTP 服务与一次性 token。
-  ctx.effect(() => () => jmService.close(), 'qq-bridge:jm');
 
   // NapCat 那一侧的自检：跑完就没了，不需要托管任何句柄；放进 ctx.effect 只是为了让
   // 「它在生命周期这一节里」这件事一眼可见（异步部分自己把异常收进日志）。
@@ -3604,6 +3903,29 @@ export function apply(ctx, config) {
   } else {
     report('info', 'active conversation — activeFollow is off: group messages still need an explicit @ (or the configured prefix)');
   }
+
+  // 人格与表达：启动时说清「人设从哪来」。排查「改了 PERSONA.md 没反应」时，第一件事
+  // 就是看这行说的是文件还是配置 —— 两套人设叠加是最容易搞混的地方。
+  const personaProfile = personaDoc.read();
+  if (personaProfile !== undefined) {
+    const traits = personaProfile.profile.traits.filter((trait) => trait.enabled).length;
+    report(
+      'info',
+      `人设来自 ${personaDoc.path}（${traits} 条启用的性格${settings.personaSceneOverlays ? '' : '，场景叠加已关'}）` +
+        (settings.persona.trim().length > 0 ? '；配置里的 persona 已被文件取代（不再叠加）' : ''),
+    );
+  } else if (settings.persona.trim().length > 0) {
+    report('info', '人设来自配置 persona（没有找到 PERSONA.md）');
+  } else {
+    report('info', `人设用内置那份（写 ${settings.personaFile || '.qq-persona/PERSONA.md'} 可以换成自己的）`);
+  }
+  const styleProse = styleDoc.read();
+  report(
+    'info',
+    styleProse !== undefined
+      ? `表达规则来自 ${styleDoc.path}；气泡：最多 ${styleParams.bubbleChatMax} 个，第二个 ${Math.round(settings.bubbleContinueChance * 100)}% 起、每个 ×${settings.bubbleContinueDecay}${settings.bubbleGamble ? '' : '（掷骰已关）'}；聊天型门槛 ${chatMaxChars || '不限'} 字`
+      : '表达规则用内置那份（写 .qq-persona/STYLE.md 可以换成自己的）',
+  );
 
   // 表情包目录：启动时确保它存在 —— 「往里丢几张图就能用」比「先读文档建目录」友好。
   // 建不出来（只读挂载、权限不对）只是没有表情包可挑，发图本身照常，所以只记一条 warn。

@@ -27,7 +27,12 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 - **活跃对话**：一对一的免 @ 接话（`activeFollow`，默认关）、群聊热起来后的**多人搭话**
   （`activeGroup*`）与「回完再补一句」（`activeChime*`）；见 §4.F。
 - **长期记忆**：消息落盘成转录，定时由**独立摘要会话**照 `.dsh/skills/` 的 skill 整理；聊天时用
-  `qq_transcript` / `qq_memory` 查，`update-cognition` / `moegirl` 学梗与查二次元梗（见 §4.D）。
+  `qq_transcript` / `qq_memory` 查，`learn-meme` / `learn-sticker` / `moegirl` 学梗与查二次元梗
+  （见 §4.D）。认知（语言）与表情包（图）是两个文件：`COGNITION.md` / `STICKERS.md`。
+- **人格与表达**：`cwd/.qq-persona/PERSONA.md`（是谁）与 `STYLE.md`（怎么说）热读；气泡计划在
+  发送前一次决定发几个（见 §3 发送链路、§6）。
+- **感知与运维**：戳一戳 / 卡片 / 视频封面 / 语音占位（`modalities.js` / `links.js` /
+  `interactions.js`），以及跨平台 `scripts/ops.mjs doctor --json`（见 §11）。
 - **每天轮换模型凭据**（`apiKeyRotate`，默认开）：每天 04:00 从 `cwd/data/api-keys.txt` 挑一个
   **探测通过**的 key 交给 `ctx.credentials.set()`；池子不存在、没有第二个能用的 key、或 key 由
   启动环境提供时什么都不做（见 §4.H）。
@@ -44,36 +49,52 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 ## 2. 文件地图
 
 ```
-index.js      3524 行  插件本体：运行时状态、事件路由、发送/准入/复读/存表情包/主动说话/活跃对话、连接生命周期
+index.js      3950 行  插件本体：运行时状态、事件路由、发送/准入/复读/存表情包/戳一戳/主动说话/活跃对话、连接生命周期
+persona.js      273 行  `PERSONA.md` 的解析与渲染：身份 / 背景 / 性格（底色 + 点缀）/ 场景；坏文件回退上一版
+style.js        278 行  表达层：气泡计划（发送前掷一次骰）、标点清洗、表达契约渲染；`STYLE.md` 的热读
+speech-policy.js 134 行  「这条群消息该不该进 Agent、以什么身份进」：intent（addressed / continued / interject / none）+ C 路四条排除
+cognition.js    345 行  认知库与表情包目录的**纯解析**：`COGNITION.md` / `STICKERS.md` 的条目、热梗段、目录行
+docfile.js       83 行  cwd 内的热读文档（同步 + `size:mtime` 缓存 + 截断 + 越界拒绝），人设与表达共用
+modalities.js   474 行  感知层：消息段 → `Observation` → 占位符（图片/表情/语音/视频/文件/卡片/转发）
+links.js        830 行  卡片解析 + URL 预览（SSRF 防护、重定向逐跳校验、大小/超时/内容类型上限）
+interactions.js 208 行  戳一戳的纯判据：该不该回、回戳还是走一轮、冷却 / 每日上限
+ops.js          913 行  运维的**纯计划**：平台识别、doctor findings、service/install 步骤、退出码
+scripts/ops.mjs 1671 行  运维执行器 + CLI（`doctor` / `status` / `restart` / `logs` / `install` / `napcat` / `migrate` / `cleanup` / `selftest`），`--json` + `--apply`
+scripts/migrate-cognition.mjs 364 行  老 `COGNITION.md` 的路径条目一次性迁到 `STICKERS.md`（画面指纹认图、默认 dry-run、写前备份）
 chatter.js      171 行  群里「谁在说话」的三本账（插话序号 / 回答指向 / 热度窗口）：只暴露语义动作，不暴露 Map
 mention.js      209 行  `[[@昵称]]` → OneBot `at` 段：纯函数解析 + 「昵称 → QQ 号」名单（名单挂在会话记录上）
-speaking-rules.js 292 行  「什么时候该主动开口」的纯判据（闸门 / 免 @ 接话与搭话抽卡 / 补一句）：普通入参 → 布尔
+speaking-rules.js 330 行  「什么时候该主动开口」的纯判据（闸门 / 抽卡 / 补一句 / 私聊补一句）：普通入参 → 布尔
 util.js        269 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 写边界 / key 池解析与打码 / withinActiveHours 等（完整清单见本节末尾）
-filestore.js   108 行  「原子写 / 尽力而为读」的小工具（读不到返回空而不是抛错），记忆、转录与表情包都走它；`writeTextAtomicUtf16` 专给 Windows 那两个产物（WSH / PowerShell 5.1 读无 BOM 脚本按 ANSI 解码，中文会乱码）
-config.js      175 行  配置 schema（**唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段；**根上是 `.volatile()`**（设置页的前提，见 §5.12）
-settings.js    252 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
-client.js      约 800 行  **浏览器半侧**（手写 `window.__ModuleLoader__.load({...})` bundle）：把 schema 投影成设置面板里自己的一页（`settings.section`），字段按 `SECTIONS` 分折叠卡片；保存走 Host 的 settings 写路径（见 §5.12）
-tools.js       640 行  宿主平面工具的**声明**（qq_send_* / qq_save_sticker / qq_list_conversations / qq_transcript / qq_memory 等），依赖由 index.js 显式传入
-memory.js     1143 行  长期记忆子系统：转录落盘、记忆文件读写（两个记忆工具的能力来源）、每日摘要循环；依赖由 index.js 显式传入
-onebot.js      707 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/文本化/@ 名单提取）
+filestore.js   108 行  「原子写 / 尽力而为读」（读不到返回空而不是抛错），记忆、转录、表情包都走它；`writeTextAtomicUtf16` 专给 Windows 那两个产物
+config.js      181 行  配置 schema（**唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段；**根上是 `.volatile()`**（设置页的前提，见 §5.12）
+settings.js    303 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
+client.js      1844 行  **浏览器半侧**（手写 bundle）：把 schema 投影成设置页自己的一页（`settings.section`），6 个 `TABS` / 14 个 `SECTIONS`；保存走 Host 的 settings 写路径（见 §5.12）
+tools.js       635 行  宿主平面工具的**声明**（qq_send_* / qq_poke / qq_save_sticker / qq_list_conversations / qq_transcript / qq_memory），依赖由 index.js 显式传入
+memory.js     1240 行  长期记忆子系统：转录落盘、记忆文件读写（两个记忆工具的能力来源）、STICKERS.md 的追加、每日摘要循环；依赖由 index.js 显式传入
+onebot.js      637 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/@ 名单提取）；文本渲染委托 `modalities.js`
 media.js       327 行  入站媒体：QQ 的图/表情包 → 按内容哈希落盘 → 给模型 read_image 的本地路径
 image.js       135 行  出站图片：本地路径 / URL → 校验（大小、格式、目录越界）→ base64:// 段
-napcat.js      828 行  NapCat 那一侧：**目录探测**（强判据 = config 里有账号配置；弱判据 = 目录里有它自带的启动件 —— 刚解压没登录过也算）、只读探测与**幂等**写入 websocketServers（含备份）、`withAutoLoginAccount`（快速登录）、`withNapcatLogging`（日志改文件）、`webuiTarget`（WebUI 地址与 token）；启动那半边：`startPlan`（提权）、`hiddenWrapperVbs` + `hiddenStartPlan`（`wscript //B` + VBS 隐藏窗口）、`scheduledTaskXml` / `scheduledTask*Plan`（计划任务）；插件启动自检与一键脚本共用
-desktop.js      约 150 行  「装进桌面版 profile」里纯的那一半：`.env` 段落幂等替换 + manifest 依赖/bundles 改写 + `pluginLinkState`（`node_modules` 那条链接**指着谁**）/ `removePluginLink`（删链接：junction 对 `unlink` 是 EPERM，要退到 `rmdir`）
-perceptual.js 约 1080 行  图片指纹：JPEG(DC)/PNG/GIF → 16×16 灰度 → dHash，复读判「同一张画面」用
+napcat.js      828 行  NapCat 那一侧：目录探测（强判据 = 有账号配置；弱判据 = 有它自带的启动件）、只读探测与**幂等**写 websocketServers（含备份）、快速登录 / 日志改文件 / WebUI 地址、`startPlan`（提权）、`hiddenStartPlan`（`wscript //B` + VBS 隐藏窗口）、`scheduledTask*Plan`；插件自检与一键脚本共用
+desktop.js      约 150 行  装进桌面版 profile 的纯函数：`.env` 段落幂等替换、manifest 改写、`pluginLinkState`（链接指着谁）/ `removePluginLink`（junction 对 `unlink` 是 EPERM，退到 `rmdir`）
+perceptual.js 约 1080 行  图片指纹：JPEG(DC)/PNG/GIF → 16×16 灰度 → dHash（复读判同一张画面）
 scripts/napcat-setup.mjs + .cmd  Windows 一键配置（网络配置 + 快速登录 + .env + 装进 desktop profile；`--start` / `--autostart` / `--window`），幂等 + 先备份
 scripts/dev-node-modules.mjs      Windows 上铺 `node_modules`（按依赖闭包拷贝真实文件），只服务开发与测试
-scripts/release.mjs               打发布包（`git archive` 出 tag 源码树 + **干净**的 NapCat → `dist/<名>.zip`）：排除规则在代码里，打完体检暂存树，命中账号配置/登录态就整体失败
+scripts/release.mjs               打发布包（`git archive` 源码树 + 干净的 NapCat → `dist/<名>.zip`），打完体检，命中账号配置/登录态就整体失败
+docs/{refactor-persona-style-perception,settings-ui-redesign,ops}.md  设计 / 重设计（已实现）/ 排查
 .dsh/skills/message-digest/SKILL.md    聊天记录 → 长期记忆的流程（定时摘要与「以前说过什么」用它）
-.dsh/skills/update-cognition/SKILL.md  学梗 / 表情包含义 → COGNITION.md 的流程
+.dsh/skills/learn-meme/SKILL.md        文字梗 / 黑话 / 谐音 → COGNITION.md 的流程
+.dsh/skills/learn-sticker/SKILL.md     表情包 → 先 qq_save_sticker 收藏、再写 STICKERS.md 的流程
+.dsh/skills/update-cognition/SKILL.md  **兼容壳**：只做一句话分诊（旧名字还在用）
 .dsh/skills/moegirl/SKILL.md           二次元梗 → 萌娘百科 MediaWiki 接口查意思的流程（只读，不落盘）
-test/bridge.test.mjs  集成测试：假 OneBot 服务端 + 假 Harness ctx（含假 timer），跑完整往返（`/jm` 那组需要真 spawn，沙箱里跳过）
+test/bridge.test.mjs  集成测试：假 OneBot 服务端 + 假 Harness ctx（含假 timer），跑完整往返
+test/{persona,style,speech-policy,modalities,links,interactions,cognition,migrate-cognition,ops}.test.mjs
+                      0.2.0 新增的纯函数测试：人设 / 气泡 / intent / 消息段 / SSRF / 戳一戳 / 认知 / 迁移 / 运维
 test/settings.test.mjs  配置归一化的契约测试（默认值 / 非法值 / 白名单不 trim 这类刻意的不对称）
 test/chatter.test.mjs   「谁在说话」三本账的**不变量**测试（合并两本账就会红的那种）
 test/speaking-rules.test.mjs 主动说话 / 免 @ 接话 / 搭话抽卡 / 补一句的判据：每个用例从「通过」的基准入参出发只翻一个字段
 test/mention.test.mjs  `[[@昵称]]` → at 段的纯函数测试：标记边界、认不出来就丢、名单按会话隔离
 test/util.test.mjs      纯函数边界：写边界、memorySlug、本地时间、errorText、key 打码、isVolatileRef/liveConfig
-test/client.test.mjs    浏览器半侧的契约测试（假 `__ModuleLoader__` / require / `useState`）：注册位置 / 字段全覆盖 / 分组不漏 / 折叠卡片默认只展开第一组
+test/client.test.mjs    设置页契约测试（假模块系统 + 迷你渲染器）：字段全覆盖 / tab / 控件 / 草稿 / 搜索 / 只看已改 / 量纲
 test/filestore.test.mjs 原子读写与「读不到就返回空/undefined，不抛错」这条失败语义
 test/perceptual.test.mjs  图片指纹的单元测试（同图不同编码 / 异图 / 畸形输入 / 解压炸弹）
 test/image-fixtures.mjs  上面两个测试共用的图片 fixture（真编码的字节，不是 test 文件）
@@ -85,12 +106,12 @@ CHANGELOG.md          更新记录（发 Release 的说明从对应那一节里�
 AGENTS.md             **本文件**：给改代码的智能体的说明书（DSH 会自动注入上下文）
 ```
 
-> **不在本文档范围内**：`jm.js` / `scripts/jm_download.py` / `test/jm.test.mjs` 是既有的、
-> 独立于 QQ 会话链路的旁路。上面这张地图与 §4 **刻意不列它**，改它也不受本文档约束。
-
-**数据目录**（gitignore，运行时生成在 `cwd` 下）：`data/`（会话缓存 + `/reset` 标记 +
-`api-keys.txt` 池子）、`.qq-media/`（入站图 LRU）、`.qq-stickers/`（表情包）、
-`.qq-memory/`（转录 + 摘要 + 认知）。后三个**必须在 `cwd` 内**，否则各自记 warn 并停用。
+**数据目录**（运行时生成在 `cwd` 下）：`data/`（会话缓存 + `/reset` 标记 + `api-keys.txt` 池子，
+gitignore）、`.qq-media/`（入站图 LRU，gitignore）、`.qq-stickers/`（表情包，gitignore）、
+`.qq-memory/`（转录 + 摘要 + 认知 + `STICKERS.md`，gitignore）、
+`.qq-persona/`（**人设与表达规则，是部署者的资产，故意提交进仓库**）。前四个**必须在 `cwd`
+内**，否则各自记 warn 并停用；`.qq-persona/` 同样必须在 `cwd` 内，配到外面只记 warn 并回退
+到配置 / 内置人设。
 
 ### 依赖方向（保持单向，别造环）
 
@@ -98,11 +119,17 @@ AGENTS.md             **本文件**：给改代码的智能体的说明书（DSH
 index.js ──▶ config.js（schema）/ settings.js ──▶ image.js（只借 DEFAULT_IMAGE_MAX_BYTES）
          ──▶ tools.js ──▶ mention.js / onebot.js / image.js
          ──▶ chatter.js（三本账）/ mention.js（`[[@昵称]]` → at 段）/ speaking-rules.js（纯判据）
+         ──▶ speech-policy.js ──▶ speaking-rules.js（intent 判定；C 路四条排除也在这里）
+         ──▶ persona.js ──▶ docfile.js ──▶ util.js（pathInside）/ style.js ──▶ docfile.js
+         ──▶ modalities.js（消息段渲染）/ interactions.js（戳一戳）/ links.js（卡片与 URL 预览）
+         ──▶ cognition.js（认知与表情包目录的纯解析；memory.js 也用它）
+         ──▶ docfile.js（人设 / 表达规则的热读）
          ──▶ memory.js ──▶ util.js / filestore.js（长期记忆子系统）
          ──▶ util.js（纯函数，无 IO）/ filestore.js（原子读写）
          ──▶ onebot.js / media.js / image.js / perceptual.js
          ──▶ napcat.js（配置探测与幂等写入 + 快速登录 / 启动计划）
                       └── index.js 自检与 scripts/napcat-setup.mjs 共用
+         ──▶ ops.js（运维纯计划）──▶ napcat.js / desktop.js；scripts/ops.mjs 执行它
          ──▶ desktop.js（.env 段落、manifest 改写）
                       └── scripts/napcat-setup.mjs 用它，test/desktop.test.mjs 钉它
                       └── media.js 用到 onebot.js 的占位符/嗅探约定（image.js 从 util.js 取 pathInside）
@@ -130,18 +157,19 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 | 配置 schema | **不在这里**：在 `config.js`（第 136 行只是 `export { Config } from './config.js'`） | 唯一真相来源，`.description()` 就是 Web UI 上给用户看的文档 |
 | 配置的取值 | **不在这里**：`settings = createSettings(liveConfig(config), process.cwd())`（第 198 行）之后一律读 `settings.*` | 取默认值/夹紧/去空白都在 `settings.js`；`index.js` 里**没有一处**直接读 `config.xxx`。`liveConfig` 必须调：schema 是根 volatile（§5.12），`apply()` 拿到的是引用 |
 | 运行时状态 | 第 243–534 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / **`chatter`**（三本账，见 `chatter.js`；搬出去前叫 `chatterSeq` / `groupChatter` / `quoteSeq`）/ `repeatStates` / `mediaResolutions`（记忆的账已搬去 `memory.js`）；会话记录里还挂着 `sessionGeneration`（第几轮，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` / `activeInterposeSeq`（插话序号快照）与主动说话、活跃对话的记账（见 `blankConversation`） |
-| Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` | 见 §7 |
-| 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` `conversationMentions` | 串行队列保证同一会话不乱序；`sendOne` 顺带记 `lastBotSpeakAt`（主动说话靠它避免独白）；正文里的 `[[@昵称]]` 在 `sendParts` 里换成 `at` 段（解析在 `mention.js`） |
+| Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` `personaLines` `styleLines` `hardRules` | 见 §7。`channelPrompt` 是**槽位化**的：场景 → 人设 → 表达契约 → 记忆/热梗 → 能力 → 额外要求 → **硬性规则（最后）** |
+| 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` `conversationMentions` | 串行队列保证同一会话不乱序；`sendOne` 顺带记 `lastBotSpeakAt`；`replyPieces` 走「拆标记 → 拆条 → **气泡计划 + 标点清洗**」；`quoteHead` 只给第一个**文字**气泡挂指向（图永不挂；插话轮强制引用锚点）；正文里的 `[[@昵称]]` 在 `sendParts` 里换成 `at` 段 |
 | 会话管理 | `resetConversation` `conversationFor` `sessionIdFor` `resetMarkerDir` `loadConversationResetCounts` `writeConversationResetCount` `refreshSessionGeneration` | `/reset` 开新一轮（**不删旧会话**，代次 +1 并落盘），以及在线会话列表（新一轮时连主动说话的节奏一起清） |
-| 准入与复读 | `admit` `noteChatter` `touchActivity` `rememberAmbient` `registerParticipant` `maybeRepeat` `repeatStep` `sketchOf` `sameCandidate` | 白名单、群触发判定、环境上下文（**顺带登记「谁可以被 @」**，名单挂在 `participants` 上）、复读状态机（图片来源判定 = 字节相同 **或** 画面指纹相近，见 `perceptual.js`）；`admit` 里还有免 @ 的旁路 |
+| 准入与复读 | `admit` `noteChatter` `touchActivity` `rememberAmbient` `registerParticipant` `maybeRepeat` `repeatStep` `sketchOf` `sameCandidate` | 白名单、群触发判定、环境上下文（**顺带登记「谁可以被 @」**）、复读状态机；`admit` 里的 A/C 抽卡与插话准入**收在 `speech-policy.js`**，这里只剩凑入参 + 记账 |
+| 戳一戳 | `handlePoke` `pokeBack` `pokeTodayUsed` | 通知事件（`notice/notify/poke`）；判据在 `interactions.js`，冷却 / 每日上限在会话记录上；回戳只打给戳它的人 |
 | 主动说话 | `proactiveSweep` `proactiveEligible`（适配器）`proactiveSpeak` `proactiveNudge` `busyWithTurn` `proactiveTodayCount` | 见 §4.E；**闸门在 `speaking-rules.js`**（`proactiveEligible` / `proactiveSkip`），这里只是把会话记录凑成入参的适配器；`withinActiveHours`（util.js）是纯函数 |
 | 活跃对话 | `noteActiveMessage` `activeFollowAllows` / `activeTurnsLeft` / `activeTalkChance` / `activeTalkAllows` / `chimeAllows` / `chimeDelay` / `batchScale`（适配器）`groupTalkActive` `scheduleChime` `cancelChime` `runChime` `chimeSpeak` `chimeNudge` `chimeTodayUsed` | 见 §4.F；A（一对一免 @）与 C（多人搭话）在 `admit` 里判，够资格后共用一次抽卡（`talkMisses`）；倾听倍数在 `holdForBatch`，B（补一句）挂在 `turn/end` 之后 |
 | 攒批 | `enqueue` `holdForBatch` `flushBatch` `submitBatch` `renderBatch`；`batchWindow` / `batchCap` / `batchScale` 是 3 行适配器，算法在 `speaking-rules.js` | 前后脚到的消息合成一条再投给 Agent；多人搭话时窗口与上限同倍放大（见 §4.F） |
 | 媒体 | `resolveMessageMedia` `mediaFor` `resolveQuote` `hydrateAmbientMedia` | 环境上下文与复读**共用同一次下载**（`mediaResolutions` 这个 WeakMap 就是干这个的） |
-| 事件轮转 | `handleEvent`（约 77 行）+ 持久化事件路由 | 见 §4.A；`turn/end` 里按 `owner.proactive` 分流 |
+| 事件轮转 | `handleEvent`（约 77 行）+ 持久化事件路由 | 见 §4.A；`notice`（戳一戳）先于 `message` 分流（`handlePoke`）；`turn/end` 里按 `owner.proactive` / `owner.intent` 分流 |
 | 长期记忆 | 只剩一行装配（`const memory = createMemory({ … })`）与三个调用点（`handleEvent` / `channelPrompt` / 生命周期） | 整个子系统在 `memory.js`（见 §4.D）；依赖表就在那一行里 |
 | 模型凭据轮换 | `rotateApiKey` `probeApiKey` | 见 §4.H；每天到点挑下一个探测通过的 key 交给 `ctx.credentials.set()`（**不用重启**）。时段/超时/探测地址在 `settings` 上 |
-| 工具装配 | `registerQqTools(ctx, { … })`（第 3260 行起，24 行） | 一张**依赖表**：把上面那些函数递给 `tools.js`（记忆是 `memory.tools`，存表情包是 `saveSticker`）。工具声明在 `tools.js`，不在这里 |
+| 工具装配 | `registerQqTools(ctx, { … })` | 一张**依赖表**：把上面那些函数递给 `tools.js`（记忆是 `memory.tools`，存表情包是 `saveSticker`，戳一戳是 `poke`）。工具声明在 `tools.js`，不在这里 |
 | 生命周期 | `ctx.effect(...)` + `ctx.on('loader/volatile-update', …)` | 托管 socket、API key 轮换与主动说话的定时器；摘要定时器由 `memory.startDigestTimer()` 挂。volatile-update 监听是**设置页保存之后唯一的生效路径**（延后一拍 `ctx.fiber.restart()`，见 §5.12） |
 
 **往外搬模块的两条纪律**（`tools.js` / `config.js` / `settings.js` / `util.js` / `filestore.js` /
@@ -218,16 +246,14 @@ QQ ─▶ NapCat ─ws─▶ OneBotClient.onEvent ─▶ handleEvent
 
 不能踩的：
 
-- **图片来源判定必须留两层**：字节相同只是快路；QQ 会把同一张表情包按发送者重新编码
-  （实测同一张「寿来」有 94657B/131307B/79284B 三种形态，画面 SSIM ≥ 0.985），只比字节的话
-  这一整块在真实群里永远不触发。第二层是 `sketchOf` 的画面指纹（`perceptual.js`），阈值
-  `repeatImageTolerance`（0 = 关掉那层）。指纹**懒算 + 按路径缓存**：只有真要比较两条字节
-  不同的图时才读盘解一次 —— 别改成在 `repeatCandidate` 里就算，那会让每条表情包都白解一遍。
-- **指纹是对不可信字节做二进制的解析**：`perceptual.js` 里所有尺寸/块数/扫描数/解压长度都有硬
-  上限，任何畸形输入只允许返回 undefined，绝不允许抛异常或大块分配。加格式（如 WebP）之前先把
-  这几条上限补上。
-- **`sketchOf` 只读 `.qq-media` 里刚落盘的那一张**（`outcome.path` 是内容哈希命名的相对路径），
-  别让它去读工作目录里的任意文件 —— 那等于把群消息变成读文件的入口。
+- **图片来源判定必须留两层**：字节相同只是快路；QQ 会把同一张表情包按发送者重新编码（实测同一张
+  图三种字节、画面 SSIM ≥ 0.985）。第二层是 `sketchOf` 的画面指纹，阈值 `repeatImageTolerance`
+  （0 = 关）。指纹**懒算 + 按路径缓存**：只在真要比较两条字节不同的图时读盘，别挪到
+  `repeatCandidate` 里让每条表情包都白解一遍。
+- **指纹是对不可信字节的二进制解析**：`perceptual.js` 的尺寸/块数/解压长度都有硬上限，畸形输入
+  只允许返回 undefined（不抛异常、不大块分配）。加格式（如 WebP）先补这几条上限。
+- **`sketchOf` 只读 `.qq-media` 里刚落盘的那一张**，别让它读工作目录里的任意文件（那等于把群
+  消息变成读文件的入口）。
 
 ### D. 长期记忆（转录 → 定时摘要 → 认知）
 
@@ -254,16 +280,15 @@ ctx.interval（排到下一个 digestAtHour，默认 04:00）─▶ runDigestSwe
 
 几条不能踩的：
 
-- **摘要 Agent 不是记忆的载体**：它只读磁盘上的转录、只写磁盘上的记忆文件，所以被压缩、被销毁、
-  被重启都不影响记忆 —— 别把「记住」实现成会话上下文里的东西。
-- **一天至多一次靠日期判据**（`localDate(lastDigestAt)` vs 今天），不是「距上次 ≥ N 小时」：
-  重启后同一天不能摘要第二遍。改这个判据时要一起改 `lastDigestDate` 的写入。
-- **`digest.json` 只在成功之后才推进**；在排队的消息靠内存里的 `memoryDirty` 计数（重启归零，
-  靠 `lastDigestAt` 重新数），所以「摘要没跑成」不会把消息算丢。
-- **别在启动时直接扫一遍**：`conversations` 是运行时状态，`apply()` 那一刻还是空的。补课挂在
-  「重启后第一条消息到达」这个时刻上（`maybeCatchUpDigest`）。
-- **读转录之前要先等写入**（`writesFor` + `Promise.all`）：转录是后台追加的，而摘要可能紧跟
-  一条消息触发 —— 不等就会读到还没写出来的目录，然后静默跳过。
+- **摘要 Agent 不是记忆的载体**：它只读磁盘上的转录、只写磁盘上的记忆文件，被压缩/销毁/重启都
+  不影响记忆 —— 别把「记住」实现成会话上下文里的东西。
+- **一天至多一次靠日期判据**（`localDate(lastDigestAt)` vs 今天），不是「距上次 ≥ N 小时」。
+- **`digest.json` 只在成功之后才推进**；排队中的消息靠内存 `memoryDirty` 计数（重启归零、靠
+  `lastDigestAt` 重新数），所以摘要没跑成不会把消息算丢。
+- **别在启动时扫一遍**（`conversations` 那刻还是空的）：补课挂在「重启后第一条消息到达」上。
+- **读转录前先等写入**（`writesFor` + `Promise.all`），否则会读到还没写出来的目录然后静默跳过。
+- **认知与表情包是两个文件**：`COGNITION.md` 只有语言（键是文字写法），`STICKERS.md` 是表情包
+  （键是收藏后的文件名）。解析在 `cognition.js`；`qq_save_sticker` 存完图顺手补一行。
 - **摘要 Agent 不在 `sessionIndex` 里**，它的 turn/end 因此不会往 QQ 发东西 —— 这是「后台会话」
   与「QQ 会话」唯一的区别机制，别把 digest session 注册进去。
 - **写边界只有一处**：`memoryRelativePath`（模块级纯函数）。`qq_memory` 的写路径必须过它，
@@ -292,27 +317,18 @@ ctx.interval（每 proactiveCheckMs）─▶ proactiveSweep
 
 - **伪造的 user message 必须说清「这不是谁发来的」并给出 `SKIP` 出口**：不给出路时模型会硬编
   一句，比不说话更像机器人（文案见 `proactiveNudge`）。
-- **`SKIP` 判定对 `所有` 轮次生效，不只主动那一轮**：提醒落在同一个会话的上下文里，模型会在
-  **回别人**的那一轮（尤其还引用了消息时）也照样写 `SKIP`。只在 `owner.proactive` 分支里判的话，
-  群里收到的就是一句字面的 `SKIP` —— 真实事故：它引用了别人的表情包，正文写着「SKIP」。
-  「引用」只出现在回别人那一轮（主动搭话的 `quote` 永远为空）。判据在 `proactiveSkip`。
-- **掷中即消耗**：`SKIP` / 失败也算用掉当天额度与 `proactiveGapMs`，否则每次检查都重新掷骰子；
-  由 `proactiveSpeak` 里「先记账再 followup」的顺序保证。
-- **走的是这个群自己的会话**（与摘要 Agent 相反）：主动搭话必须看得见这段聊天的历史与环境上下文，否则接不上话；所以它**在 `sessionIndex` 里**，回复照常回 QQ。
-- **`lastBotSpeakAt` 由 `sendOne` 记账**：「不做独白」的判据，别绕过 `sendOne` 直接
-  `client.call('send_group_msg')`（那样机器人会以为自己一直没说话）。
-- **`lastActiveAt` 由 `touchActivity` 在 `handleEvent` 里更新**，含**没被 @** 的群消息：群里
-  正聊得热闹时最不该插嘴，那条闲聊必须算活跃。它只更新 `conversations` 里**已有**的会话 ——
-  「只对已经聊过的群生效」就落在这里。
-- **状态全在内存**（`lastProactiveAt` / 当天计数）：重启归零，所以别把 `proactiveIdleMs` 配成 0
-  又反复重启（那时每次重启都可能补一句）。
-- **只群聊**：`proactiveEligible` 第一行就 `type !== 'group'` 返回 false，私聊不打扰（刻意不给开关）。
-- **`withinActiveHours` 是模块级纯函数**（左闭右开 / 两边相等 = 全天 / `from > to` 跨零点）。
-  改时段语义就改它，并跑它的边界用例。
-- **闸门本身是纯函数**（`speaking-rules.js` 的 `proactiveEligible` / `proactiveSkip`）：五道闸门加
-  两个节奏闸收在一个 `(普通入参) → boolean` 里，`test/speaking-rules.test.mjs` 从「能通过」的基准
-  入参出发逐条翻字段。`index.js` 里的同名函数只是**把会话记录凑成入参的适配器**（含两个带跨天
-  归零副作用的计数读数）。
+- **`SKIP` 判定对 `所有` 轮次生效**：提醒落在同一会话的上下文里，模型在**回别人**的那一轮也会
+  学着写 `SKIP`（真实事故：它引用了别人的表情包，正文写着「SKIP」）。判据在 `proactiveSkip`。
+- **掷中即消耗**：`SKIP` / 失败也算用掉当天额度与 `proactiveGapMs`（先记账再 followup）。
+- **走的是这个群自己的会话**（与摘要 Agent 相反），所以它在 `sessionIndex` 里、回复照常回 QQ。
+- **`lastBotSpeakAt` 由 `sendOne` 记账**（不做独白的判据），别绕过它直接 `client.call`。
+- **`lastActiveAt` 由 `touchActivity` 更新**，含**没被 @** 的群消息；只更新**已有**的会话
+  （「只对已经聊过的群生效」就落在这里）。
+- **状态全在内存**：重启归零，别把 `proactiveIdleMs` 配成 0 又反复重启。
+- **只群聊**：第一行就 `type !== 'group'` 返回 false（刻意不给私聊开关）。
+- **`withinActiveHours` 是纯函数**（左闭右开 / 相等 = 全天 / `from > to` 跨零点），改语义就改它。
+- **闸门本身是纯函数**（`proactiveEligible` / `proactiveSkip`）：五道闸门 + 两个节奏闸收在
+  `(普通入参) → boolean` 里；`index.js` 里只是凑入参的适配器（含带跨天归零副作用的计数读数）。
 
 ### F. 活跃对话（`activeWindowMs` / `activeFollow` / `activeGroup*` / `activeChime*`）
 
@@ -350,27 +366,18 @@ turn/end（正常回复发完之后）
 
 不能踩的：
 
-- **窗口只靠别人发来的消息往后滑**（机器人自己的话不滑）：否则它自己就能给窗口续命，「活跃」会
-  变成永远不结束的状态。
-- **三本账别合并，而且这件事已经不由注释维持了**：都搬进了 `chatter.js`，只暴露语义动作 ——
-  `noteOther`（别人的话：插话序号 +1，并记进热度窗口）/ `noteSelf`（我自己的话：只推回答指向）
-  / `others`（比**大小**，判「中间有没有人插过话」）/ `anchor`（**含我自己**，判「我回的那条被
-  挤远了没有」）/ `isHot`（比**时间**，判「最近够不够热」）/ `forgetHeat`（`/reset`）。
-  `chatter.js` 的模块注释写着为什么不能并成一张表，`test/chatter.test.mjs` 把那几条不变量钉成了
-  断言（「我自己说一句不该推进别人的账」「一个人刷屏不算热」「窗口一过就退出」）——**合并了两本
-  账，那些用例会直接红**。判断「算不算我自己说的话」看调的是 `noteOther` 还是 `noteSelf` 就够；
-  我自己那一票是**发出去**那一刻由 `noteOwnMessage` 记的（NapCat 配的是 `reportSelfMessage:
-  false`，自己发的消息不会回灌）：`sendOne` 与两个发送工具那几处。
-- **多人搭话是纯查询（`groupTalkActive`），不存「搭话状态」**：大家一停窗口自己就空了，自动
-  退出；存一个 `activeGroupUntil` 反而要处理「谁负责过期」，也天然支持不了「有人插话就升级」。
-  **不消耗 `activeMaxTurns`**：那是防一个人揪着它刷屏的，而这里的闸门是「够条数、够人数」，
-  再叠一层只会让它在最热闹的时候哑掉。
-- **够资格 ≠ 就接：A 与 C 共用一次抽卡**（`activeTalkChance` / `activeTalkAllows`，计数在
-  会话记录的 `talkMisses` 上）：抽中、被 @ 到、或两个资格都不成立时归零。**A 路没抽中也必须走
-  `noteActiveMessage(..., continued=true)`**（窗口照滑、轮数照扣），否则窗口会在概率攒够之前
-  过期。空消息在抽卡之前就被丢掉。
-- **搭话状态里只放大攒批（`batchScale`），不放大打字延迟**：`holdForBatch` 拿它乘窗口与上限，
-  两处必须同倍——只放大窗口不放大上限时，`batchMaxWaitMs` 会把「多听几句」又卡回去。
+- **窗口只靠别人发来的消息往后滑**（机器人自己的话不滑），否则它自己就能给窗口续命。
+- **三本账别合并**：都在 `chatter.js`，只暴露语义动作 —— `noteOther`（别人：序号 +1、记热度）/
+  `noteSelf`（我自己：只推回答指向）/ `others`（比大小，判有没有人插话）/ `anchor`（含我自己，
+  判我回的那条被挤远没有）/ `isHot`（比时间，判最近够不够热）/ `forgetHeat`（`/reset`）。
+  `test/chatter.test.mjs` 把这些不变量钉成断言 ——**合并两本账会直接红**。
+- **多人搭话是纯查询**（`groupTalkActive`），不存「搭话状态」；也**不消耗 `activeMaxTurns`**
+  （那是防一个人刷屏的，这里的闸门是「够条数、够人数」）。
+- **够资格 ≠ 就接：A 与 C 共用一次抽卡**（计数在 `talkMisses` 上）：抽中、被 @ 到、或两个资格
+  都不成立时归零；**A 路没抽中也必须 `noteActiveMessage(..., continued=true)`**，否则窗口会在
+  概率攒够之前过期。空消息在抽卡之前就被丢掉。
+- **只放大攒批（`batchScale`），不放大打字延迟**：窗口与上限两处必须同倍，否则
+  `batchMaxWaitMs` 会把「多听几句」又卡回去。
 - **`continued` 一路要传到 `submitBatch`**：前缀模式下按前缀长度硬切会切掉正文首字
   （`dropPrefix` 只对**显式带前缀**的那条调用）。
 - **窗口接上的那句不是指令**：`handleEvent` 里 `commanded`（= 被叫到且不是 continued）
@@ -384,12 +391,11 @@ turn/end（正常回复发完之后）
   只剩「凑入参 → 掷骰子 → 叫 chimeSpeak」。
 - **`chimeSeq` 是防漏的保险**：新消息（`noteActiveMessage`）与 `/reset`、插件卸载都会
   `cancelChime`，但正确性只依赖「编号对不对得上」，不依赖取消点记得 `clearTimeout`。
-- **`activeFollow` 默认关**：它放松「群里只在被 @ 时才说话」这条默认约定（A 与 C 一起），
-  属于安全面（§5.5）。默认值、README 配置表与「安全提醒」三处要一起改。
-- **`/reset` 要清热度窗口**（`chatter.forgetHeat`）：不然新一轮第一句就可能被上一轮热度判成多人搭话。两个序号刻意不清（理由写在 `forgetHeat` 上）。
-- **B 需要 `proactive: true`**：`scheduleChime` 第一行就是总开关 —— 「允许它主动发消息」只有
-  这一个开关，别让补一句绕过它；A 与 C 不需要 `proactive`（启动自述因此在
-  `if (proactiveEnabled)` 块外）。
+- **`activeFollow` 默认关**（放松「群里只在被 @ 时才说话」，属于安全面 §5.6），改默认值要同步
+  README 配置表与「安全提醒」。
+- **`/reset` 要清热度窗口**（`chatter.forgetHeat`），两个序号刻意不清（理由写在 `forgetHeat`）。
+- **群聊的 B 需要 `proactive: true`**；**私聊的补一句不需要**（那是刻意的语义例外，见
+  `privateAfterthoughtAllows` 的注释与 README「私聊补一句」）。
 
 ### G. 会话轮次（`/reset` 开新一轮）
 
@@ -411,17 +417,14 @@ QQ 里发 /reset ─▶ handleEvent 的旁路（先 flushBatch）─▶ resetCon
 
 不能踩的：
 
-- **代次必须落盘**（见 §5.4）：只在内存里的话，重启会把第 0 轮的会话 resume 回来。
-- **`/reset` 之后旧会话仍在磁盘上**（那段聊天的存档，刻意不删）：别「清理」它，也别把它重新
-  注册进 `sessionIndex`（旧 Agent 迟到的 turn/end 会当成这个会话的回复发出去）。
-- **长期记忆与轮次无关**：转录 / `MEMORY.md` 都按会话 key（`memorySlug`）落，`/reset` 不动它们 ——
-  「上一轮聊过什么」仍查得到，只是不再占着上下文。
-- **第 0 轮的 id 是历史契约**（见 §5.3）：`sessionIdFor(key, 0)` 必须与改动前逐位相同。
-- **重置要过权限**（`canReset` / `Config.resetUsers`）：这是全项目唯一一个「白名单为空 = 谁都
-  不能」的配置项，与 `allowUsers` / `allowGroups` 的「空 = 不限制」**相反**，别顺手「统一」。
-  判断点在 `handleEvent` 的 `/reset` 分支里、`flushBatch` **之前**：挪到后面会让没权限的人也拿到
-  「攒着的消息立刻投出去」这个副作用。没权限时静默 return（不回「你没有权限」），那条消息已经由
-  `rememberTranscript` 记进转录了，保持这个顺序。
+- **代次必须落盘**（§5.4）：只在内存里的话，重启会把第 0 轮的会话 resume 回来。
+- **`/reset` 之后旧会话仍在磁盘上**（存档，刻意不删）：别清理它，也别重新注册进 `sessionIndex`
+  （旧 Agent 迟到的 turn/end 会被当成这个会话的回复发出去）。
+- **长期记忆与轮次无关**：转录 / `MEMORY.md` 按会话 key（`memorySlug`）落，`/reset` 不动它们。
+- **第 0 轮的 id 是历史契约**（§5.3）：`sessionIdFor(key, 0)` 必须与改动前逐位相同。
+- **重置要过权限**（`canReset` / `Config.resetUsers`）：全项目唯一一个「白名单为空 = 谁都不能」
+  的配置项（与 `allowUsers` 相反），别顺手统一。判断点在 `handleEvent` 的 `/reset` 分支里、
+  `flushBatch` **之前**（否则没权限的人也能让攒着的消息提前投出去），没权限时静默 return。
 
 ### H. 每天轮换模型凭据（`apiKeyRotate`，默认开）
 
@@ -440,25 +443,16 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
 
 不能踩的：
 
-- **必须走 `ctx.credentials`，别自己去改 `$DSH_HOME/.credentials.yaml`**：那里还有浏览器会话等
-  records，手写一份很容易弄丢；凭据层自带文件锁与写后通知，并监听该文件，所以 `set()` 之后
-  **不用重启**，下一个模型请求就用新 key（llm-deepseek 每次请求都 resolve）。
-- **`ctx.get('credentials')` 而不是写进 `inject`**：`ctx.get()` 明确允许「读一个没声明依赖的
-  服务」，拿不到就返回 undefined。写进 `inject` 会让**没有凭据服务的组合整个插件不激活**
-  （§10 第一条那种事故），而轮换只是顺带的事。
-- **探测必须便宜且不消耗 token**：所以是 `GET /models`，不是发一次真对话。两个鉴权头
-  （`Authorization: Bearer` + `x-api-key`）一起带，是为了同时兼容 OpenAI 面与 Anthropic 面；
-  别只留一个。
-- **日志里绝不能出现完整 key**：用模块级 `apiKeyFingerprint`（前 6 字符 + sha256 前 8 位）。
-  新增任何打日志的地方都走它。
-- **「当前是哪个 key」是现算的，不落盘**：靠 `credentials.resolve` + 池子里的位置决定下一个。
-  别加「上次换到第几个」的内存/磁盘状态 —— 重启、手工改 key、调整池子顺序都会让它跑偏。
-- **不通过探测就不写**：池子里混进坏 key 时宁可不做，也不能把 bot 换成不可用的状态 —— 这就是
-  「尝试轮换」里「尝试」二字的含义。
-- **key 来自环境变量时提前退场**：环境变量优先级高于凭据文件，写进去也不生效；
-  `describe()` 返回 `writable: false` 就是这个信号。
-- **池子文件必须在 `cwd` 内**（`insideDirectory` 校验，同 `mediaDir` / `memoryDir`），配到外面
-  记 warn 并整个停用；默认 `data/api-keys.txt` 已被 `.gitignore` 盖住。
+- **必须走 `ctx.credentials`，别手改 `$DSH_HOME/.credentials.yaml`**（那里还有浏览器会话等
+  records；凭据层自带文件锁与写后通知，`set()` 之后不用重启）。
+- **`ctx.get('credentials')` 而不是写进 `inject`**：写进 inject 会让没有凭据服务的组合整个插件
+  不激活（§10 第一条），而轮换只是顺带的事。
+- **探测必须便宜**：`GET /models`，不是发一次真对话；两个鉴权头一起带（OpenAI 面 + Anthropic 面）。
+- **日志绝不出现完整 key**：一律走 `apiKeyFingerprint`。
+- **「当前是哪个 key」现算、不落盘**：靠 `credentials.resolve` + 池子里的位置，别加「上次换到
+  第几个」的状态（重启、手改 key、调顺序都会让它跑偏）。
+- **探测不通过就不写**（宁可不换，也不能把 bot 换成不可用的状态）；**key 来自环境变量时提前
+  退场**（`describe()` 的 `writable: false`）；**池子文件必须在 `cwd` 内**。
 
 ## 5. 必须知道的硬约束
 
@@ -500,33 +494,23 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
    它靠 `logger.exporter` 是否存在来避免污染测试输出。
 9. **同一会话的消息必须串行**（`enqueueSend` / `enqueue`）。QQ 消息到达顺序和异步
    IO 完成顺序不一致，绕过队列会串话/乱序。
-10. **手写 profile 的 `cordis.patch.yml` 时，不许给 `qq-bridge` 只写一段残缺的 `config`：DSH 的
-    patch 是整块替换、不是深合并**（`dsh-app-boot` 的 `applyEntryPatches` 就是
-    `target.config = patch.config`）。只写一个 `resetUsers` 就会把仓库 patch 里那整套配置
-    （`activeFollow` / `proactive` / `batchWindowMs` / `persona` …）**连同 `agentPreset: qq`
-    与 `allowTools` 白名单一起顶掉**：表现是「群里不 @ 就不说话」，实际更严重 —— QQ 会话会挂上
-    部署默认的 `standard` 预设（有 shell / 子代理 / write），而这是不可信输入面。真发生过一次。
-    所以：改仓库的 `cordis.patch.yml`、或用 Web UI 的设置页（它写的是完整 config，见 §5.12）；
-    每台部署各不相同的值走环境变量（`resetUsers` 就是这么接的，见 §11）。
-11. **Windows 桌面版（Electron）不是上面那套容器部署**：它以 `~/.dsh/profiles/desktop`
-    作为 Host 进程的 cwd，插件以 `link:<仓库>` 装进那个 profile 的 `dependencies` **和**
-    `dsh.profile.bundles`（两处都要，缺一个就是「装了不加载」；`scripts/napcat-setup.mjs`
-    负责这两处 + node_modules 链接，可 `--dry-run`）；`peerDependencies` 是解析要求（§2 末尾）。
-    每台机器不同的取值走 profile 目录的 `.env`（`QQBOT_*`，patch 里用 `!!js` 读），
-    改完源码要**重启整个桌面版**。NapCat 那一侧的自检在 `napcat.js`：默认只读，
-    `napcatAutoConfig` 打开才写（先备份、只动 `websocketServers` 里我们那一条）。
-    详见 README「Windows 桌面版」。
-12. **Web UI 的设置页由 schema 生成，`client.js` 里没有字段表。** 链路：`config.js` 的 Config
-    （根 volatile）→ `dsh-settings` 的 `volatileForm` 投影出表单 schema → `client.js` 读
-    `configForms.describe()` 那份 schema（按节点 `type` 选控件、按 `.description()` 取标签）→
-    保存走 `configForms.get('qq-bridge')` 的 `mutate`（写 profile patch 的**完整** config，
-    `!!js` 表达式原样保留）。**页面挂在 `settings.section`**（设置面板左边导航里的一格
-    「QQ Bridge」，与 `dsh-our-free-model` 同一套），不是插件页那张组合包卡片 —— 后者是
-    `plugins.bundle.config`，早先那一版挂在那边，一百多项把插件页撑爆了。三条推论：加配置项
-    **不用动界面**，但要在 `client.js` 的 `SECTIONS` 里给它一段（否则落进「其它」，
-    `test/client.test.mjs` 会红）；根上的 `.volatile()` 删了页面就直接消失
-    （`test/util.test.mjs` 钉着）；volatile 热更新不重跑 `apply()`，所以 `index.js` 收到
-    `loader/volatile-update` 会调 `ctx.fiber.restart()` —— 别删那个监听。
+10. **手写 profile 的 `cordis.patch.yml` 时不许给 `qq-bridge` 只写一段残缺的 `config`：DSH 的
+    patch 是整块替换、不是深合并**。只写一个 `resetUsers` 就会把仓库 patch 里那整套配置（连同
+    `agentPreset: qq` 与 `allowTools`）一起顶掉 —— QQ 会话会挂上带 shell 的默认预设，而这是
+    不可信输入面。真发生过一次。改配置走仓库 patch 或 Web UI 设置页；每台部署不同的是环境变量。
+11. **Windows 桌面版不是容器部署**：Host 的 cwd 是 `~/.dsh/profiles/desktop`，插件以
+    `link:<仓库>` 装进 profile 的 `dependencies` **和** `dsh.profile.bundles`（缺一个就是「装了
+    不加载」）；每台机器不同的值走 profile 的 `.env`（`QQBOT_*`），改完源码要重启整个桌面版。
+    NapCat 自检默认只读、`napcatAutoConfig` 才写（先备份、只动 `websocketServers` 里我们那一条）。
+12. **设置页由 schema 生成，`client.js` 里没有字段表**：`configForms.describe()` → 按 `type` 选
+    控件 / 按 `.description()` 取标签 → `mutate` 写 profile patch 的**完整** config。页面挂在
+    `settings.section`（侧栏「QQ Bridge」）。三条推论：加配置项**不用动界面**，但要在 `SECTIONS`
+    里给它一段（否则 `test/client.test.mjs` 会红）；根上的 `.volatile()` 删了页面就消失
+    （`test/util.test.mjs` 钉着）；volatile 热更新不重跑 `apply()`，`index.js` 收到
+    `loader/volatile-update` 会 `ctx.fiber.restart()` —— 别删那个监听。
+    显式 `fields` 清单的顺序就是组内渲染顺序（前缀组按 schema，见 `orderedRows`）。
+    页面是 6 个下划线 tab（`TABS`）+ 扁平区块 + 官方字段行（控件映射 / 搜索 / `FIELD_HINTS`
+    量纲见 docs/settings-ui-redesign.md）；改设置页只动 `client.js`。
 
 ## 6. 怎么改：任务 → 动哪里
 
@@ -534,8 +518,14 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
 |---|---|
 | 加一个不碰状态的纯函数 | `util.js`（碰磁盘的放 `filestore.js`）；**别 import `index.js`**，也别让它读闭包状态 |
 | 加一个配置项 | `config.js` 的 schema（含中文 `.description()`）+ （需要兜底/夹紧时）`settings.js` 加一行 + README 配置表 + `test/settings.test.mjs` 补边界；界面不用改，但要在 `client.js` 的 `SECTIONS` 里给它一段（见 §5.12） |
-| 改 Web UI 设置页（分组 / 标签 / 控件 / 草稿口径） | 只改 `client.js`：`SECTIONS`（分组）、`LABEL_OVERRIDES`（短标签，或在 schema 上加 `.comment()`）、`specFor`（布尔 / 逗号列表 / 枚举的读写口径） |
-| 改提示词 / 人设 | `DEFAULT_PERSONA`、`channelPrompt`、`Config.persona` / `.instructions` |
+| 改 Web UI 设置页（分组 / 标签 / 控件 / 草稿口径） | 只改 `client.js`：`TABS` / `SECTIONS`（含 `subs` 小标题）、`LABEL_OVERRIDES`、`ENUM_LABELS`、`FIELD_HINTS`、`specFor`；设计见 docs/settings-ui-redesign.md |
+| 改提示词 / 人设 | `DEFAULT_PERSONA`（内置兜底）、`channelPrompt` 的槽位、`Config.persona` / `.instructions`；**「是谁」写 `.qq-persona/PERSONA.md`、「怎么说」写 `STYLE.md`**（`persona.js` / `style.js`） |
+| 改气泡数 / 标点 / 追问概率 / 引用规则 | `style.js`（`planBubbles` / `sanitizeBubble` / `renderStyleContract`）+ `Config` 的 `bubble*` / `stripShortPeriod` / `interjectQuote` + `index.js` 的 `replyPieces` / `sendParts` / `quoteHead` |
+| 改私聊补一句 | `speaking-rules.js` 的 `privateAfterthoughtAllows` + index.js 的 `scheduleChime` / `runChime` / `chimeNudge` + `Config.privateAfterthought*` |
+| 改群聊「谁该开口」 / 插话 | `speech-policy.js`（`decideGroupTurn` / `interjectExclusion` / `interjectLine`）+ `speaking-rules.js` + index.js 的 `admit` / `submitBatch` / `speakerLine` |
+| 改认知 / 表情包目录 | `cognition.js`（纯解析）+ `memory.js` 的 `catalogState` / `appendSticker` + `tools.js` 的 `qq_save_sticker` + 三个 skill + `scripts/migrate-cognition.mjs` |
+| 改消息段的渲染 / 新加一种段 | `modalities.js`（`observationOf` / `renderObservation`）；卡片解析在 `links.js` |
+| 加运维动作 / 改 doctor | `ops.js`（纯计划）+ `scripts/ops.mjs`（执行器）+ `test/ops.test.mjs`；写 cwd 外的步骤必须带 `requires: human|root` |
 | 加一个 Agent 工具 | 在 `tools.js` 里照 `qqSendMessage` 抄结构（`defineTool` + `output.schema` + `render` + 中文报错），再在 `registerQqTools` 里注册、在 `index.js` 的 `deps` 里补上它需要的能力；**别 import `index.js`** |
 | 改分条/打字节奏 | `onebot.js` 的 `splitBurst` / `splitStickerLines` / `typingDelayMs`（**纯函数，优先在这里改**） |
 | 改图片落盘/去重/淘汰 | `media.js` |
@@ -597,12 +587,9 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
 `node scripts/dev-node-modules.mjs --from <DSH checkout>`；DSH 沙箱里 `node --test` 会
 `spawn EPERM`，改用同进程模式 `node --test --experimental-test-isolation=none "test/*.test.mjs"`。
 
-- 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**（基线：`test/` 下 **321** 个用例；
-  普通终端 321 全过、约 40 秒，DSH 沙箱里是 **308 过 + 13 跳过**）。
-- **那 13 条跳过不是「坏了」，是环境做不到**：沙箱禁止带管道的子进程（`spawn EPERM`），而这条
-  链路必须真起一次子进程才验证得到 —— 所以 `jm.test.mjs` 的 6 条与 `bridge.test.mjs` 里 `/jm`
-  的 7 条按 `jm.js` 导出的 `spawnAvailable` **跳过并打印原因**，别改回「让它红」（0.1.1 的验收
-  报告就把它们当成了发布包损坏）。
+- 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**（基线：`test/` 下 **491** 个用例，
+  普通终端约 35 秒全过）。0.2.0 删掉 JM 之后**不再有「跳过」**：原先 13 条探针需要真 spawn
+  外部进程，沙箱里只能跳过，随 JM 一起删掉了。
 - 已知偶发：**全量同进程连跑**时偶尔红一条、且每次红的那条都不同（见过 `proactive` 节奏、
   `allowTools`、群聊图片、`qq_transcript` 四组的用例），单独跑永远绿 —— 是 `until` 轮询与真实
   计时的竞态，重跑确认即可，**别为了「让它稳」去放宽断言**。
@@ -617,7 +604,9 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
   →bridge 里搜 `reset`；`rotateApiKey`/`probeApiKey`/`parseApiKeyPool`→bridge 最后的
   `bootKeyRotation` 那组；`napcat.js`/`desktop.js`→`napcat.test.mjs` / `desktop.test.mjs`；
   `util.js`/`filestore.js`→各自的用例；`client.js`（设置页）→`client.test.mjs`（它同时钉住
-  「每个配置项都有分组」这条）。
+  「每个配置项都有分组」这条）；`persona.js`/`style.js`/`speech-policy.js`/`modalities.js`/
+  `links.js`/`interactions.js`/`cognition.js`/`ops.js`→同名 `test/<模块>.test.mjs`；
+  迁移脚本→`migrate-cognition.test.mjs`。
 - **读 `agent.inbox` 的用例要等 `untilInbox(host, n)`，别只等 `host.list.created[0]`**：假 Host 的
   `create()` 是如实照搬真宿主的 —— Agent 先记进 `created`，消息由插件**之后**才
   `agent.followup(...)` 投进去，而 `until` 是 20ms 轮询，于是会偶发地抢在投递之前断言
@@ -663,6 +652,7 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
 
 ```
 profile   ~/.dsh/profiles/qqbot/   （bundles: dsh-base + dsh-web-app + 本插件，link 安装）
+运维      node scripts/ops.mjs doctor --json   （三套部署共用；`--apply` 默认关，见 README「一键运维」）
 UI/启动   http://127.0.0.1:3081/   或 dsh --profile qqbot --port 3081 --no-open
 重启/日志 systemctl --user restart qqbot ｜ journalctl --user -u qqbot -f
 OneBot    容器 napcat（mlikiowa/napcat-docker），端口 3001 = WebSocket **服务器**

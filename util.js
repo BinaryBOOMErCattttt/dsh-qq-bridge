@@ -252,7 +252,7 @@ export function stickerFileName(raw, extension) {
  * 为什么非要有这一步：NTFS **不区分大小写**，而同一个目录在这台机器上真会以不同写法
  * 出现 —— `process.cwd()` 给 `D:\…`、配置里手写 `d:\…`、`resolve()` 又可能把盘符
  * 归一成另一种大小写。按字节前缀比较的话，「明明在沙箱里」的路径会被判成越界，
- * 表现是记忆 / 表情包 / 禁漫目录被**静默停用**（那几处越界判定失败只记一条 warn）。
+ * 表现是记忆 / 表情包目录被**静默停用**（那几处越界判定失败只记一条 warn）。
  *
  * @param value - 任意路径。
  * @param platform - `process.platform` 的值（测试可注入，用来在任一平台上验 Windows 语义）。
@@ -272,7 +272,7 @@ function pathKey(value, platform) {
  *   - **两侧都先归一化**（调用方传进来的应当已经是 `resolve()` 过的绝对路径）。
  *
  * 从 `image.js` 搬到这里，是因为它不只服务出站图片：`memoryRelativePath`（`qq_memory`
- * 的写边界）、`mediaDir` / `stickerDir` / `jmDir` 的沙箱校验都靠同一条规矩 —— 散成
+ * 的写边界）、`mediaDir` / `stickerDir` 的沙箱校验都靠同一条规矩 —— 散成
  * 三份实现迟早有一份忘了补分隔符或者忘了大小写。
  *
  * @param root - 已解析的绝对目录。
@@ -288,35 +288,6 @@ export function pathInside(root, target, platform = process.platform) {
   // 「在任一平台上验证另一条平台的语义」，用宿主分隔符会当场得出相反的结论。
   const slash = platform === 'win32' ? '\\' : '/';
   return right.startsWith(left.endsWith(slash) ? left : `${left}${slash}`);
-}
-
-/**
- * 禁漫用的 python 解释器默认位置（相对 `cwd`）。
- *
- * 两边的 venv 布局不一样：POSIX 是 `.venv/bin/python`，Windows 是
- * `.venv\Scripts\python.exe`。写死成前者的话，Windows 上会在**每次** `/jm` 时
- * 报「cannot start .venv/bin/python」—— 一个只在这边出现的、看起来像环境没装好的错。
- *
- * @param platform - `process.platform` 的值。
- * @returns 相对工作目录的解释器路径（正斜杠，两边的 path 都能解析）。
- */
-export function defaultJmPython(platform = process.platform) {
-  return platform === 'win32' ? '.venv/Scripts/python.exe' : '.venv/bin/python';
-}
-
-/**
- * 禁漫文件服务默认绑定的地址 —— 「NapCat 从哪里能取到这个 PDF」。
- *
- * Linux 部署里 NapCat 在容器里，插件在宿主机上，所以默认绑 docker 网桥
- * （`172.17.0.1`），只有本机容器网段够得着。Windows 桌面版没有容器：NapCat 是
- * 注入进本机 QQ 的原生进程，容器网桥那个地址**根本不存在**，绑它必然失败并退回
- * 127.0.0.1（还白记一条 warn），所以那边直接就是回环地址。
- *
- * @param platform - `process.platform` 的值。
- * @returns 绑定地址。
- */
-export function defaultJmFileHost(platform = process.platform) {
-  return platform === 'win32' ? '127.0.0.1' : '172.17.0.1';
 }
 
 /**

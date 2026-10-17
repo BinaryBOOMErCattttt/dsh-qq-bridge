@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "QQ Bridge",
-    "description": "Connects a QQ account over OneBot v11: QQ messages drive Harness agents, and agents can send QQ messages, images and stickers. Every setting lives under Settings → QQ Bridge (connection, triggers, repeats, proactive talk, memory…)."
+    "description": "Connects a QQ account over OneBot v11: QQ messages drive Harness agents, and agents can send QQ messages, images and stickers. Every setting lives under Settings → QQ Bridge, grouped into six pages: connection, session, persona, group chat, perception, memory."
   }
 }

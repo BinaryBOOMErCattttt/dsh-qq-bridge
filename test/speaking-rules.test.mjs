@@ -20,6 +20,7 @@ import {
   batchWindow,
   chimeAllows,
   chimeDelay,
+  privateAfterthoughtAllows,
   proactiveEligible,
   proactiveSkip,
 } from '../speaking-rules.js';
@@ -236,4 +237,57 @@ test('攒批窗口与上限：0 = 关闭，两处同倍放大', () => {
   assert.equal(batchCap(0, 1200, 1), 1200, '上限关着时退化成窗口');
   assert.equal(batchCap(5000, 2400, 2), 10_000, '与窗口同倍放大');
   assert.equal(batchCap(500, 2400, 2), 2400, '放大后（1000）仍小于窗口就取窗口');
+});
+
+// ---- 私聊补一句（L2）--------------------------------------------------------
+
+/** 「能通过」的基准入参：每个用例只翻一个字段。 */
+const PRIVATE_OK = {
+  enabled: true,
+  type: 'private',
+  seqMatches: true,
+  hasQueuedBatch: false,
+  busy: false,
+  chimeCount: 0,
+  chimeToday: 0,
+  dailyMax: 10,
+  lastBotSpeakAt: 2000,
+  lastActiveAt: 1000,
+  chance: 0.3,
+  roll: 0.1,
+};
+
+test('私聊补一句：基准入参通过（我回过、对方没接、当天没超量）', () => {
+  assert.equal(privateAfterthoughtAllows(PRIVATE_OK), true);
+});
+
+test('私聊补一句：只私聊，且总开关关掉就不补（不搭群聊 proactive 那趟车）', () => {
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, type: 'group' }), false);
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, enabled: false }), false);
+});
+
+test('私聊补一句：编号对不上 / 有批次 / 有在飞的 turn 都不补', () => {
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, seqMatches: false }), false);
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, hasQueuedBatch: true }), false);
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, busy: true }), false);
+});
+
+test('私聊补一句：这一条用户消息之后已经补过就不再补（不连锁）', () => {
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, chimeCount: 1 }), false);
+});
+
+test('私聊补一句：当天到上限就停，0 表示不限', () => {
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, chimeToday: 10 }), false);
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, chimeToday: 999, dailyMax: 0 }), true);
+});
+
+test('私聊补一句：对方在这期间接了话，就不补（那一句自己会走正常回复）', () => {
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, lastActiveAt: 5000 }), false);
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, lastBotSpeakAt: 0, lastActiveAt: 0 }), false);
+});
+
+test('私聊补一句：概率为 0 / NaN / 没掷中都不补', () => {
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, chance: 0 }), false);
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, chance: Number.NaN }), false);
+  assert.equal(privateAfterthoughtAllows({ ...PRIVATE_OK, roll: 0.9 }), false);
 });
