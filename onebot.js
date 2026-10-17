@@ -126,6 +126,34 @@ export function repeatableText(message) {
 }
 
 /**
+ * 这条**入站**消息段是不是「表情」（而不是普通图片）。
+ *
+ * 只有一个用途：复读把这张图发回去时，要不要带 QQ 的「大表情」标记（`sub_type: 1`，
+ * 见 `image.js` 的 `imageSegment`）。同一张图当表情发和当图片发，QQ 的渲染完全不同
+ * （表情没有图片气泡、按表情尺寸显示；图片按原图像素铺开、还可能带边框）—— 复读要的是
+ * 「原样接上一张」，所以得连「它是个表情」这件事一起接上，否则群里看到的是照片样式的图。
+ *
+ * 判据只看 OneBot 给的**结构字段**，不猜 `summary` 那种给人看的文字：
+ *   - `mface` 段本身就是商城表情；
+ *   - NapCat 把 QQ 的 `picSubType` 原样放进 `image.data.sub_type`，非 0 就是表情
+ *     （OneBot 生态的约定，与出站方向我们带的 `sub_type: 1` 是同一个字段）；
+ *   - NapCat 上报的商城表情会被折成 `image` 段，但会多带 `emoji_id`（普通图片没有）。
+ *
+ * 只回一个布尔值：这些字段来自不可信的群消息，绝不能被原样转发回 QQ。
+ *
+ * @param segment - 一个 OneBot 消息段。
+ * @returns 是表情时为 true。
+ */
+export function isStickerSegment(segment) {
+  if (segment?.type === 'mface') return true;
+  if (segment?.type !== 'image') return false;
+  const data = segment.data ?? {};
+  const subType = Number(data.sub_type);
+  if (Number.isFinite(subType) && subType > 0) return true;
+  return typeof data.emoji_id === 'string' && data.emoji_id.length > 0;
+}
+
+/**
  * 判断消息段数组里是否 @ 了某个确定的 QQ 号。
  * 用于群消息的 mention 触发判定。
  * @param message - OneBot 的 `message` 字段。

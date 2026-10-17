@@ -33,7 +33,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdir, readFile, stat } from 'node:fs/promises';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { OneBotClient, atMentions, blankMessageLabel, chunkText, collectMedia, findReply, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs, userDisplayName } from './onebot.js';
+import { OneBotClient, atMentions, blankMessageLabel, chunkText, collectMedia, findReply, isStickerSegment, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs, userDisplayName } from './onebot.js';
 import { createMediaStore } from './media.js';
 import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
@@ -2437,7 +2437,9 @@ export function apply(ctx, config) {
    * 和话拆开复读、或者把 @ 段再发一遍都不是那回事。它们照样会打断链（调用方的处理）。
    *
    * @param message - OneBot 的 `message` 字段。
-   * @returns `{ kind, key, raw }` / `{ kind, key, path }` / `{ kind, key, id }`；不复读时 undefined。
+   * @returns `{ kind, key, raw }` / `{ kind, key, path, sticker }` / `{ kind, key, id }`；
+   *   不复读时 undefined。`sticker` 表示原消息是表情（见 {@link isStickerSegment}），
+   *   复读时照它决定带不带 QQ 的大表情标记。
    */
   async function repeatCandidate(message) {
     const text = repeatableText(message);
@@ -2470,7 +2472,8 @@ export function apply(ctx, config) {
     if (outcome?.path === undefined) return undefined;
     // 出站上限比这张图还小的话，跟了也发不出去，不如别跟（链照样被它打断）。
     if (outcome.bytes > imageMaxBytes) return undefined;
-    return { kind: 'image', key: `image:${outcome.path}`, path: outcome.path };
+    // 记下「原消息是表情还是普通图片」（只留布尔值）：复读要原样接上，连渲染样式一起。
+    return { kind: 'image', key: `image:${outcome.path}`, path: outcome.path, sticker: isStickerSegment(only) };
   }
 
   /**
@@ -2538,7 +2541,8 @@ export function apply(ctx, config) {
    * 把复读发出去（按候选类型选载体），全都挂在会话的发送队列上。
    *
    * 图片走 `loadOutgoingImage` + `imageSegment`：和 Agent 主动发表情包同一条出站链路
-   * （读本地文件、校验格式与大小、base64 交给 NapCat）。发不出去只记一条 warn ——
+   * （读本地文件、校验格式与大小、base64 交给 NapCat）；带不带「大表情」标记看**原消息**
+   * 是表情还是普通图片（`repeatCandidate` 里的 `sticker`）。发不出去只记一条 warn ——
    * 复读本来就是插话，静默不跟比在群里喊一句「我发不出去」更像真人。
    *
    * @param conversation - 目标会话。
@@ -2561,9 +2565,10 @@ export function apply(ctx, config) {
         report('warn', `could not repeat the sticker ${candidate.path}: ${errorText(error)}`);
         return;
       }
-      // 不带 `sticker`（= 普通图片）：复读的是**别人刚发的原图**，可能是截图或照片，
-      // 标成 QQ 的大表情反而会被当成表情裁小。收藏目录里的表情才走 `replyPieces` 那条。
-      await sendOne(conversation, [imageSegment(bytes)]);
+      // 原消息是什么就按什么发：群里那张是表情（`sub_type` 非 0 的收藏表情 / 商城表情），
+      // 复读也带 QQ 的大表情标记，群里看到的才是同一张表情；原来是照片/截图就照旧按普通
+      // 图片发 —— 把长图标成表情会被 QQ 按表情裁小。判定在 `isStickerSegment`。
+      await sendOne(conversation, [imageSegment(bytes, { sticker: candidate.sticker === true })]);
     });
   }
 

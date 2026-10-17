@@ -19,7 +19,7 @@ import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import yaml from 'js-yaml';
 import { Config, apply, inject, liveConfig, parseApiKeyPool, sessionIdFor, withinActiveHours } from '../index.js';
-import { blankMessageLabel, collectMedia, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
+import { blankMessageLabel, collectMedia, isStickerSegment, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
 import { OTHER_PNG, PIC_JPEG, PIC_PNG } from './image-fixtures.mjs';
@@ -1838,9 +1838,9 @@ test('a repeated line is never parsed as a sticker marker', async () => {
 // 表情包复读：连着两张一样的表情包/图片，就跟着把这张发回去
 // ---------------------------------------------------------------------------
 
-/** 「群里有人只发了一张图」。 */
-function groupSticker(url, { messageId = 7000, userId = 100000003, card = 'kaguya', summary = '[动画表情]', file = 'A.png' } = {}) {
-  return groupMessage([{ type: 'image', data: { summary, file, url } }], { messageId, userId, card });
+/** 「群里有人只发了一张图」。默认是一张收藏表情（NapCat 上报的 `sub_type: 1`）。 */
+function groupSticker(url, { messageId = 7000, userId = 100000003, card = 'kaguya', summary = '[动画表情]', file = 'A.png', subType = 1 } = {}) {
+  return groupMessage([{ type: 'image', data: { summary, file, url, sub_type: subType } }], { messageId, userId, card });
 }
 
 /** 从一条出站消息里取出图片字节（`base64://` 解回来）。 */
@@ -1868,11 +1868,45 @@ test('two identical stickers in a row get echoed', async () => {
     assert.equal(sent.params.group_id, '100000001');
     assert.equal(sent.params.message.length, 1);
     assert.deepEqual(sentImageBytes(sent), TINY_PNG);
+    // 复读要原样接上：原消息是表情，发回去也得带 QQ 的大表情标记（否则群里看到的是
+    // 照片样式的图片，一眼就不是人发的表情）。
+    assert.equal(sent.params.message[0].data.sub_type, 1);
     // 复读是插件直接发的：不建会话、不经过模型。
     assert.equal(host.list.created.length, 0);
     // 判「是不是同一张」要内容哈希，而这份字节就是环境上下文落盘时留下的：
     // 两条消息 = 两次下载（`mediaFor` 按消息对象共用同一次），没有为复读多拉一遍。
     assert.equal(images.hits.length, 2);
+  } finally {
+    await onebot.close();
+    await images.close();
+    await rm(mediaRoot, { recursive: true, force: true });
+  }
+});
+
+// 用例：复读按**原消息的样子**发 —— 原消息是表情就带大表情标记，是普通图片就不带。
+// 群里两种「图」混着出现很正常：截图/照片不能标成表情（会被 QQ 按表情裁小），
+// 而带 `emoji_id` 的商城表情（NapCat 把它折成 image 段，没有 sub_type）要按表情发回去。
+test('a repeated picture keeps its kind: sticker stays a sticker, photo stays a photo', async () => {
+  const images = await startImageServer(TINY_PNG);
+  const mediaRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
+  const { onebot } = await boot({ cwd: mediaRoot, mediaDir: 'media' });
+  const groupSends = () => onebot.calls.filter((call) => call.action === 'send_group_msg' && Array.isArray(call.params.message));
+  try {
+    // 普通图片：NapCat 上报 `sub_type: 0`。复读出去仍是普通图片。
+    onebot.push(groupSticker(images.url(), { messageId: 142, subType: 0 }));
+    onebot.push(groupSticker(images.url(), { messageId: 143, userId: 3333333333, card: 'iroha', subType: 0 }));
+    await until(() => groupSends().length >= 1, 'the repeated picture');
+    assert.equal(groupSends()[0].params.message[0].data.sub_type, undefined);
+
+    // 商城表情：NapCat 折成 `image` + `emoji_id`（没有 sub_type）。复读按表情发。
+    const marketFace = (messageId, userId, card) => groupMessage(
+      [{ type: 'image', data: { summary: '猫猫', file: 'A.gif', url: images.url(), emoji_id: '42' } }],
+      { messageId, userId, card },
+    );
+    onebot.push(marketFace(144, 100000003, 'kaguya'));
+    onebot.push(marketFace(145, 3333333333, 'iroha'));
+    await until(() => groupSends().length >= 2, 'the repeated market face');
+    assert.equal(groupSends()[1].params.message[0].data.sub_type, 1);
   } finally {
     await onebot.close();
     await images.close();
@@ -2602,6 +2636,24 @@ test('repeatableText only accepts messages made of plain text', () => {
   // 不是消息段数组（字段缺失、上报格式不认识）时什么都不复读。
   assert.equal(repeatableText(undefined), undefined);
   assert.equal(repeatableText({ type: 'text', data: { text: '6' } }), undefined);
+});
+
+// 用例十九之三：入站段「是不是表情」只认结构字段 —— 复读要不要按大表情发的判据。
+test('isStickerSegment only trusts structural fields', () => {
+  // 收藏表情 / 大表情：NapCat 把 QQ 的 picSubType 原样放进 sub_type（非 0 就是表情）。
+  assert.equal(isStickerSegment({ type: 'image', data: { sub_type: 1 } }), true);
+  assert.equal(isStickerSegment({ type: 'image', data: { sub_type: 2 } }), true);
+  assert.equal(isStickerSegment({ type: 'image', data: { sub_type: '1' } }), true);
+  // 商城表情：NapCat 上报时折成 image 段 + emoji_id（没有 sub_type）。
+  assert.equal(isStickerSegment({ type: 'image', data: { emoji_id: '42' } }), true);
+  // mface 段本身就是商城表情。
+  assert.equal(isStickerSegment({ type: 'mface', data: { emoji_id: '42' } }), true);
+  // 普通图片（0）与别的段一律不是表情；字段缺失也不能猜成表情。
+  assert.equal(isStickerSegment({ type: 'image', data: { sub_type: 0 } }), false);
+  assert.equal(isStickerSegment({ type: 'image', data: {} }), false);
+  assert.equal(isStickerSegment({ type: 'image' }), false);
+  assert.equal(isStickerSegment({ type: 'face', data: { id: '13' } }), false);
+  assert.equal(isStickerSegment(undefined), false);
 });
 
 // ---------------------------------------------------------------------------
