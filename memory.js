@@ -35,7 +35,7 @@
  *
  * @module @qqbot/dsh-plugin-qq/memory
  */
-import { appendFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, unlink } from 'node:fs/promises';
 import { readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -43,7 +43,7 @@ import { errorText, localDate, localStamp, memoryOneLine, memoryRelativePath, me
 import { readJsonl, readTextOrUndefined, readdirOrEmpty, writeJsonAtomic, writeTextAtomic } from './filestore.js';
 import { collectMedia, messageToText } from './onebot.js';
 import { insideDirectory } from './image.js';
-import { appendStickerRow, hotCognitionLines, parseCognition, parseStickerCatalog, stickerCatalogLines } from './cognition.js';
+import { appendStickerRow, hotCognitionLines, normalizeCognitionDoc, normalizeStickerDoc, parseCognition, parseStickerCatalog, removeCognitionRow, removeStickerRow, stickerCatalogLines, upsertCognitionRow, upsertStickerRow } from './cognition.js';
 
 /** 认知库与表情包目录的文件名（都在 memoryDir 根下，与 INDEX.md 同级）。 */
 const COGNITION_FILE = 'COGNITION.md';
@@ -55,6 +55,9 @@ const HOT_COGNITION_LIMIT = 15;
 const HOT_COGNITION_MAX_CHARS = 1200;
 /** 这两个文件每轮都要读：用 mtime+size 判定缓存，避免每次装配提示词都读两遍盘。 */
 const CATALOG_CACHE_MS = 5000;
+
+/** 每个记忆文件在 `.history/` 里最多留几份旧版本（写坏时人工翻回去用）。 */
+const HISTORY_KEEP = 20;
 
 /** 索引片段（INDEX.md）最多这么大：它每次提示词装配都会被读一遍，不能无节制地长。 */
 const MEMORY_INDEX_MAX_CHARS = 4096;
@@ -667,8 +670,25 @@ export function createMemory(deps) {
       lines_total: lines.length,
       returned: lines.length,
       truncated,
+      note: readWarningNote(relative, text),
       text: truncated ? `${numbered.slice(0, MEMORY_FILE_RETURN_CHARS)}\n…（已截断）` : numbered,
     };
+  }
+
+  /**
+   * 读这两个文件时，把「解析不了、因此永远不会进提示词」的行直接点出来。
+   *
+   * 这些行是静默失效的：写在文件里、search 找得到、模型每轮却看不到（真实事故：
+   * 31 条里 3 条只有一段，从来没进过提示词）。不点出来，谁都不会去修它。
+   */
+  function readWarningNote(relative, text) {
+    const parsed = relative === COGNITION_FILE
+      ? parseCognition(text)
+      : relative === STICKERS_FILE
+        ? parseStickerCatalog(text)
+        : undefined;
+    if (parsed === undefined || parsed.warnings.length === 0) return undefined;
+    return `⚠ ${parsed.warnings.length} 行不会被注入/选中（字段不全，补齐或删掉）：\n${parsed.warnings.slice(0, 3).map((line) => `  - ${line}`).join('\n')}`;
   }
 
   /**
@@ -713,25 +733,46 @@ export function createMemory(deps) {
    * @param append - true = 追加，false = 覆盖。
    * @returns 工具输出。
    */
-  async function writeMemoryFile(relative, text, append) {
+  async function writeMemoryFile(relative, text, append, { force = false } = {}) {
     const absolute = join(memoryBase, relative);
     const maxBytes = Math.max(256, Math.floor(Number(settings.memoryFileMaxBytes) || 0));
-    const body = append ? `\n${text.replace(/\s+$/, '')}\n` : `${text.replace(/\s+$/, '')}\n`;
     const previousRaw = (await readTextOrUndefined(absolute)) ?? '';
     const previousBytes = Buffer.byteLength(previousRaw, 'utf8');
-    const bodyBytes = Buffer.byteLength(body, 'utf8');
-    if (!append && bodyBytes > maxBytes) {
-      throw new Error(`qq_memory: ${bodyBytes} bytes exceeds memoryFileMaxBytes (${maxBytes}); write less, or split it across files`);
+    const isCognition = relative === COGNITION_FILE;
+    const isStickers = relative === STICKERS_FILE;
+    // 1) 落盘前归一化：重复二级标题只留一个、同键条目只留最后一条。
+    //    写在**写入路径**而不是读路径：读要如实反映磁盘上到底有什么，否则人看不出问题。
+    let next = append
+      ? `${previousRaw.replace(/\s*$/, '')}\n${text.replace(/\s+$/, '')}\n`
+      : `${text.replace(/\s+$/, '')}\n`;
+    if (isCognition) next = normalizeCognitionDoc(next);
+    else if (isStickers) next = normalizeStickerDoc(next);
+    // 2) 护栏：整份重写把条目数砍掉一大截就拒绝。模型漏抄几行是这类文件最常见的破坏方式，
+    //    而它自己完全不会察觉（文件「写成功了」）。确实要精简时用 force。
+    if (!append && (isCognition || isStickers)) {
+      const countOf = (value) => (isCognition
+        ? parseCognition(value).entries.length
+        : parseStickerCatalog(value).collected.length + parseStickerCatalog(value).pending.length);
+      const before = countOf(previousRaw);
+      const after = countOf(next);
+      if (!force && before > 0 && after < Math.ceil(before * 0.9)) {
+        throw new Error(
+          `qq_memory: this write would keep only ${after} of ${before} entries in ${memoryLabel}/${relative} — ` +
+            'rewrite it keeping every row (or pass force: true if the reduction is intentional). ' +
+            'Add or update single rows with action "upsert" instead of rewriting the whole file.',
+        );
+      }
     }
-    if (append && previousBytes + bodyBytes > maxBytes) {
-      const room = maxBytes - previousBytes;
+    const bodyBytes = Buffer.byteLength(next, 'utf8');
+    if (bodyBytes > maxBytes) {
       throw new Error(
-        `qq_memory: appending ${bodyBytes} bytes would exceed memoryFileMaxBytes (${maxBytes}) — ` +
-          `\`${memoryLabel}/${relative}\` is already ${previousBytes} bytes (room for ${Math.max(0, room)} more). ` +
+        `qq_memory: ${bodyBytes} bytes exceeds memoryFileMaxBytes (${maxBytes}) — ` +
+          `\`${memoryLabel}/${relative}\` is already ${previousBytes} bytes. ` +
           'Rewrite it shorter with action "write" (keep only what still matters), or put the new fact in a different file.',
       );
     }
-    const next = append ? `${previousRaw.replace(/\s*$/, '')}\n${text.replace(/\s+$/, '')}\n` : body;
+    // 3) 写前留一份历史：模型整份重写时写坏，至少还能翻回上一版（只留最近 20 份）。
+    if (previousBytes > 0 && relative.endsWith('.md')) await backupMemoryFile(relative, previousRaw);
     const queueKey = absolute;
     const previous = memoryWrites.get(queueKey) ?? Promise.resolve();
     const done = previous
@@ -745,12 +786,101 @@ export function createMemory(deps) {
     return {
       action: append ? 'append' : 'write',
       path: `${memoryLabel}/${relative}`,
-      bytes: Buffer.byteLength(next, 'utf8'),
+      bytes: bodyBytes,
       lines_total: next.split('\n').length,
       returned: 1,
       truncated: false,
       note: append ? `appended ${bodyBytes} bytes` : `replaced ${previousBytes} bytes with ${bodyBytes} bytes`,
     };
+  }
+
+  /**
+   * 写入前把旧内容复制进 `<memory>/.history/`，同一个文件只留最近 `HISTORY_KEEP` 份。
+   *
+   * 为什么要它：`qq_memory write` 是整份覆盖，模型漏抄几行这种事故**没有任何提示**；
+   * 有历史至少能人工翻回去。备份失败绝不挡正常写入 —— 记忆写成功比备份重要。
+   */
+  async function backupMemoryFile(relative, text) {
+    const dir = join(memoryBase, '.history');
+    const flat = relative.replace(/[\\/]/g, '_');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    try {
+      await mkdir(dir, { recursive: true });
+      await writeTextAtomic(join(dir, `${flat}.${stamp}.md`), text);
+      const kept = (await readdirOrEmpty(dir)).filter((name) => name.startsWith(`${flat}.`)).sort();
+      for (const old of kept.slice(0, Math.max(0, kept.length - HISTORY_KEEP))) await unlink(join(dir, old)).catch(() => {});
+    } catch (error) {
+      report('warn', `could not back up ${memoryLabel}/${relative}: ${errorText(error)}`);
+    }
+  }
+
+  /**
+   * 写入或更新单条记忆（`qq_memory` 的 upsert）。
+   *
+   * 这是「不要让模型整份重写 markdown」的正解：它只给字段，格式、分节、去重都由
+   * `cognition.js` 的纯函数负责（见 `upsertCognitionRow` / `upsertStickerRow`）。
+   * @param relative - 只能是 `COGNITION.md` 或 `STICKERS.md`。
+   * @param entry - 字段集合。
+   * @returns 工具输出。
+   */
+  async function upsertMemoryEntry(relative, entry) {
+    const current = (await readTextOrUndefined(join(memoryBase, relative))) ?? '';
+    let result;
+    if (relative === STICKERS_FILE) {
+      result = upsertStickerRow(current, {
+        name: entry?.name,
+        look: entry?.look,
+        meaning: entry?.meaning,
+        scene: entry?.scene,
+        path: entry?.image,
+        date: entry?.date,
+        confidence: entry?.confidence,
+      });
+    } else if (relative === COGNITION_FILE) {
+      result = upsertCognitionRow(current, {
+        writeup: entry?.name,
+        meaning: entry?.meaning,
+        usage: entry?.usage,
+        source: entry?.source,
+        date: entry?.date,
+        confidence: entry?.confidence,
+        variants: String(entry?.variants ?? '').split(/[\/／、,，]/).map((item) => item.trim()).filter((item) => item.length > 0),
+        type: entry?.type,
+      });
+    } else {
+      throw new Error('qq_memory: action "upsert" only works on COGNITION.md and STICKERS.md (use "append" for other files)');
+    }
+    const written = await writeMemoryFile(relative, result.text, false, { force: true });
+    // 目录/热梗是每轮提示词的一部分：立刻失效缓存，别等 TTL。
+    catalogCache = { at: 0, key: '', text: catalogCache.text };
+    return {
+      ...written,
+      action: 'upsert',
+      path: `${memoryLabel}/${relative}`,
+      note: `${result.replaced ? 'replaced' : 'added'} in «${result.section}»`,
+      text: result.text.split(/\r?\n/).find((line) => line.includes(String(entry?.name ?? ''))) ?? '',
+    };
+  }
+
+  /**
+   * 删掉单条记忆（`qq_memory` 的 remove）。
+   * @param relative - 只能是 `COGNITION.md` 或 `STICKERS.md`。
+   * @param name - 认知条目的写法 / 表情包的名字。
+   * @returns 工具输出。
+   */
+  async function removeMemoryEntry(relative, name) {
+    const current = (await readTextOrUndefined(join(memoryBase, relative))) ?? '';
+    const result = relative === STICKERS_FILE
+      ? removeStickerRow(current, name)
+      : relative === COGNITION_FILE
+        ? removeCognitionRow(current, name)
+        : (() => { throw new Error('qq_memory: action "remove" only works on COGNITION.md and STICKERS.md'); })();
+    if (!result.removed) {
+      return { action: 'remove', path: `${memoryLabel}/${relative}`, bytes: Buffer.byteLength(current, 'utf8'), lines_total: current.split('\n').length, returned: 0, truncated: false, note: `no entry named «${String(name ?? '').trim()}»` };
+    }
+    const written = await writeMemoryFile(relative, result.text, false, { force: true });
+    catalogCache = { at: 0, key: '', text: catalogCache.text };
+    return { ...written, action: 'remove', path: `${memoryLabel}/${relative}`, note: `removed «${String(name ?? '').trim()}»` };
   }
 
   /** 一条转录记录在工具结果里的一行文本。 */
@@ -1214,6 +1344,8 @@ export function createMemory(deps) {
         readFile: readMemoryFile,
         searchFile: searchMemoryFile,
         writeFile: writeMemoryFile,
+        upsertEntry: upsertMemoryEntry,
+        removeEntry: removeMemoryEntry,
       }
     : undefined;
 

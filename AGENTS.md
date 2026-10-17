@@ -295,6 +295,21 @@ ctx.interval（排到下一个 digestAtHour，默认 04:00）─▶ runDigestSwe
   `../` 与绝对路径都要被拒。要放开范围之前先想清楚 QQ 消息是不可信输入。
 - **`memoryDir` 校验与 `mediaDir` / `stickerDir` 同一套路**：配到 `cwd` 外记 warn 并整个停用。
 
+**结构化文件只走字段级写入**（0.2.0 之后的修订，对应三次真实事故）：
+
+| 事 | 落点 | 为什么 |
+|---|---|---|
+| `qq_memory` 的 `upsert` / `remove` | `cognition.js` 的 `upsertCognitionRow` / `upsertStickerRow` / `remove*`；`memory.js` 的 `upsertMemoryEntry` / `removeMemoryEntry` | 模型只给字段，格式与分节由纯函数生成：它写不坏格式、不会重复标题、不会因为整份重写丢行 |
+| 写入归一化 | `normalizeCognitionDoc` / `normalizeStickerDoc`，在 `writeMemoryFile` 里对这两个文件强制跑 | `append` 一段带 `## 黑话与缩写` 的 markdown 是最常见的写法，落盘时就合并掉，别指望模型自觉 |
+| 整份重写的护栏 | `writeMemoryFile` 里「条目数掉到 90% 以下就拒绝」（`force: true` 放行） | 模型漏抄几行时文件照样「写成功」，护栏是唯一能拦住它的地方 |
+| `.history/` 备份 | `backupMemoryFile`，每次写入前留一份，每个文件最近 20 份 | 写坏了至少能人工翻回去 |
+
+- **`type` → 二级标题的路由在 `sectionForType`**：`缩写`/`谐音`/`专名`/`其它`。认知条目
+  **按首见日期**注入（`hotCognitionLines`），不按文件里的位置 —— 否则整理一次文件就等于
+  换掉它每轮记得什么。
+- **认不出来的行不删**：`parseCognition` / `parseStickerCatalog` 只记 warn；`qq_memory read`
+  会把它们点出来（`readWarningNote`），`ops doctor` 也会（`COGNITION_UNPARSED` 等五条）。
+
 ### E. 主动说话（`proactive`，默认关）
 
 ```
@@ -544,6 +559,8 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
 | 改「谁能重置会话」 | `Config.resetUsers` + `canReset` + `handleEvent` 里的 `/reset` 分支（**空白名单 = 谁都不能**，别改成 `allowUsers` 那种语义）+ README「新开一轮会话」 |
 | 改 QQ 会话能用哪些工具 | `cordis.patch.yml` 的 `preset-qq` + `Config.allowTools`（见 §7） |
 | 改长期记忆的行为 | `Config` 的 `memory*` / `digest*` + `memory.js`（整个子系统）+ README「长期记忆」（见 §4.D） |
+| 改记忆文件的写入方式（逐条 / 归一化 / 护栏 / 历史） | `cognition.js` 的 `upsert*` / `remove*` / `normalize*` / `sectionForType` + `memory.js` 的 `writeMemoryFile` / `backupMemoryFile` + `tools.js` 的 `qq_memory` 参数 + `test/cognition.test.mjs` 与 bridge 里搜索 `upsert` 的那组 |
+| 改「发表情只能从收藏目录发」 | `index.js` 的 `stickerSendSource` + `channelPrompt` 里的标记文案与 `stickerFailure` 回灌 + bridge 里「只认收藏目录」那组；`qq_send_image` 是显式动作，**没有**这条限制 |
 | 改摘要的触发时刻 | `digestAtHour` + `msUntilDailyHour`（模块级纯函数）+ `memory.js` 里 `runDigestSweep` 的日期判据 |
 | 改 API key 轮换（池子格式 / 探测 / 什么时候换） | `Config` 的 `apiKeyRotate*` + index.js 的凭据轮换区块（`rotateApiKey` / `probeApiKey`）+ 模块级 `parseApiKeyPool` / `apiKeyFingerprint` + README「每天轮换 API key」（见 §4.H） |
 | 改 Windows 一键配置 / 启动 NapCat（提权、窗口、隐藏、自启、快速登录） | `scripts/napcat-setup.mjs`（编排；开关 `--start` / `--window normal\|min\|hidden` / `--autostart install\|remove\|status` / `--no-log-to-file` / `--force`）+ `napcat.js` 的 `findNapcatDir` / `withAutoLoginAccount` / `withNapcatLogging` / `webuiTarget` / `startPlan` / `hiddenWrapperVbs` / `hiddenStartPlan` / `scheduledTaskXml` / `scheduledTask*Plan`（纯函数判据）+ `test/napcat.test.mjs` + README「Windows 桌面版」。四条实测禁令：**别改回 `launcher-user.bat`**（不提权时 QQ 注入后崩在 `QQNT.dll`）、**`wscript` 必须带 `//B`**（否则出错弹模态框卡死）、**隐藏启动走 `cmd.exe /s /c`，别把 `.bat` 直接交给 `WshShell.Run`**（文件关联 + MotW 会弹看不见的警告框）、**包装脚本与任务 XML 按 UTF-16LE + BOM 落盘** |
@@ -628,6 +645,9 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
 - [ ] 动过 `sessionIdFor` / 会话代次 → 确认「第 0 轮的 id 逐位没变」，且代次仍然落盘
 - [ ] 动过权限判断（`resetUsers` 之类）→ 确认「不配 = 全关」，而不是「不配 = 人人可用」
 - [ ] 涉及安全面（审批策略、白名单、`cwd` 越界校验）的改动单独复核过
+- [ ] 动过记忆写入（`qq_memory` / `cognition.js` 的 upsert / normalize）→ 跑
+      `test/cognition.test.mjs` + `test/bridge.test.mjs` 里搜索 `upsert` 的那组，并确认
+      「整份重写丢行会被拒」「重复标题会被合并」两条仍然成立
 - [ ] 加/改了配置项 → 跑 `test/client.test.mjs`（分组别漏、标签别退化成字段名）
 
 ## 10. 常见坑速查
@@ -641,6 +661,8 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
 | journal 里没有任何插件日志 | 用了 `ctx.logger` 而不是 `report()`（§5.8） |
 | 群里回复乱序 / 串话 | 绕过了 `enqueueSend` / `enqueue` 串行队列 |
 | 表情包/图片功能静默失效 | `mediaDir`/`stickerDir` 被配到 `cwd` 外，代码只记 warn 并停用 |
+| 群里收到「（那张表情我这儿没有，发不出去）」 | 模型把 `.qq-media/<哈希>` 或别的路径写进了 `[[图片: …]]`：发表情**只认 `.qq-stickers/`**（`stickerSendSource`）。下一轮提示词里会带上这次失败的原因 |
+| 记忆文件里的条目「写了却不生效」 | 那一行字段不全（少于两段），`parseCognition` 只 warn 跳过；`qq_memory read` 的 note 与 `ops doctor` 的 `COGNITION_UNPARSED` 会点出来。用 `upsert` 重写那一行，别手写 markdown |
 | bot 回「存好了」但 `.qq-stickers/` 里没有那张图 | 工具没注册：旧进程没重启（§5.1）/ 目录停用 / `imageSend: false` / `allowTools` 里没有它。它会退回往 `COGNITION.md` 记一个会过期的 `.qq-media/<哈希>` 路径 |
 | subagent 出现在 QQ 会话里 | 预设用了 `standard`，`tools.restrict()` 收不到作用域内注册的工具（§7） |
 | agent 会话突然没能力了 | `agentPreset` 没 join 到预设，或 `allowTools` 挡掉了 |

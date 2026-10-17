@@ -70,6 +70,7 @@ import {
   renderPlan,
   servicePlan,
 } from '../ops.js';
+import { cognitionPathViolations, duplicateSectionNames, parseCognition, parseStickerCatalog } from '../cognition.js';
 import {
   HIDDEN_WRAPPER_NAME,
   TASK_NAME,
@@ -648,10 +649,44 @@ function logFacts(platform, facts) {
   return {};
 }
 
+/**
+ * 长期记忆的体检事实：认知库与表情包目录里那些「文件在、但不生效」的问题。
+ *
+ * 只按默认的 `.qq-memory` 找：脚本不解析插件配置（零依赖、不读 YAML），读错了也只影响
+ * 报告，不影响插件真正的读写路径。
+ * @param root - 部署的 cwd。
+ * @returns 可直接合并进 doctor facts 的字段。
+ */
+async function collectMemoryFacts(root) {
+  const dir = join(root, '.qq-memory');
+  const facts = {};
+  const cognition = await readTextOrUndefined(join(dir, 'COGNITION.md'));
+  if (cognition !== undefined) {
+    const parsed = parseCognition(cognition);
+    facts.cognitionWarnings = parsed.warnings;
+    facts.cognitionDuplicateSections = duplicateSectionNames(cognition);
+    facts.cognitionPathViolations = cognitionPathViolations(parsed.entries).map((item) => item.path);
+  }
+  const stickers = await readTextOrUndefined(join(dir, 'STICKERS.md'));
+  if (stickers !== undefined) {
+    const parsed = parseStickerCatalog(stickers);
+    const missing = [];
+    const mediaPaths = [];
+    for (const entry of parsed.collected) {
+      if (String(entry.path ?? '').startsWith('.qq-media/')) mediaPaths.push(entry.name);
+      else if (!existsSync(join(root, String(entry.path ?? '')))) missing.push(entry.path);
+    }
+    facts.stickerMissing = missing;
+    facts.stickerMediaPaths = mediaPaths;
+  }
+  return facts;
+}
+
 async function collectFacts(platform) {
   const facts = { ...platform, unit: unitName(), endpoint };
   facts.endpointReachable = await probeEndpoint(endpoint);
   Object.assign(facts, await collectNapcat(platform));
+  Object.assign(facts, await collectMemoryFacts(cwd));
   if (platform.systemd === true) {
     facts.systemdUnitPresent = existsSync(systemdUnitPath());
     // unit 不在时不再探 is-active：`systemctl` 对不存在的 unit 也回 inactive，

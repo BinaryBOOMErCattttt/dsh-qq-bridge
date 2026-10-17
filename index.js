@@ -137,6 +137,15 @@ const QUOTE_FETCH_TIMEOUT_MS = 5000;
 const STICKER_PROMPT_MAX = 40;
 
 /**
+ * 「上一轮那张表情没发出去」这条提醒在提示词里保留多久（毫秒）。
+ *
+ * 失败的原因（路径不存在 / 不在收藏目录）模型必须知道，否则它会照着自己编的路径
+ * 再试一次 —— 真实事故：它写了一个 `.qq-media/<哈希>`，被拒之后下一轮又编了另一个。
+ * 但这条提醒是短时效的：十轮之后还在说「上一轮」，模型会以为那是一句没做完的指令。
+ */
+const STICKER_FAILURE_TTL_MS = 10 * 60 * 1000;
+
+/**
  * 一个会话最多记住多少个「可以被 @ 的人」。
  *
  * 名单只用来把 `[[@昵称]]` 解析成 QQ 号，超过几十个人之后更早的发言者本来也早就
@@ -992,6 +1001,40 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 发表情时**只认收藏目录里的文件**（`[[图片: …]]` 这一条路）。
+   *
+   * 三条理由，都对应真实事故或明确的设计边界：
+   *   1. `.qq-media/<内容哈希>` 是入站图的 LRU 缓存（默认 200 张），迟早被淘汰。模型把
+   *      它写进正文时，**当时看着像真的**、发的时候早没了，用户收到的是一句「没发出去」
+   *      —— 它还会接着编下一个哈希（真发生过）。
+   *   2. 任意 cwd 路径（`README.md`、别人的截图、`/etc/...`）不该借「发表情」发出去：
+   *      QQ 消息是不可信输入，模型可能被群里的人指使去发本地文件。
+   *   3. 想发「别人刚发的那张」有正当入口：先 `qq_save_sticker` 收藏（带名字与含义），
+   *      它才进得了这个目录 —— 这同时也让那张图以后还能再被选中。
+   *
+   * 裸文件名先按 `resolveStickerSource` 补全（模型常写 `笑死` 而不是全路径）。
+   * @param source - 标记里给的来源。
+   * @returns 收藏目录内的绝对路径。
+   * @throws 目录不可用 / 不在收藏目录 / 文件不存在时抛错（message 是给人看的一句话）。
+   */
+  function stickerSendSource(source) {
+    const raw = resolveStickerSource(source);
+    if (stickerRoot === undefined || !stickerInside || stickerLabel === undefined) {
+      throw new Error(`stickerDir is not usable (${settings.stickerDir.trim() || '(empty)'}): it must be a directory inside ${cwd}`);
+    }
+    const target = resolve(cwd, raw);
+    if (!insideDirectory(stickerRoot, target)) {
+      throw new Error(`${stickerLabel}/ 里没有「${raw}」：表情包只能从收藏目录里发（别人刚发的图要先 qq_save_sticker 存下来）`);
+    }
+    return target;
+  }
+
+  /** 记下「这一轮想发的图没发出去」，给下一轮提示词用（见 `channelPrompt`）。 */
+  function noteStickerFailure(conversation, source, reason) {
+    conversation.stickerFailure = { path: String(source ?? '').slice(0, 120), reason: String(reason ?? '').slice(0, 160), at: Date.now() };
+  }
+
+  /**
    * 把「一张图」固化进表情包目录：`qq_save_sticker` 的全部实现。
    *
    * 为什么需要它（实测缺口）：QQ 会话按设计没有 write / edit / bash —— 那三样在不可信
@@ -1095,6 +1138,15 @@ export function apply(ctx, config) {
     const lines = ['## QQ 渠道', '', who, ''];
     // ---- 槽 1：场景 ----
     if (isGroup) lines.push(speakerLine(conversation), '', ...ambientPrompt(conversation));
+    // 上一轮那张图为什么没发出去：不给原因的话，模型下一轮会照着自己编的路径再试一次
+    // （真实事故：`.qq-media/<哈希>` 连编两轮，用户连收两遍「没发出去」）。
+    const failedSticker = conversation.stickerFailure;
+    if (failedSticker !== undefined && Date.now() - failedSticker.at < STICKER_FAILURE_TTL_MS) {
+      lines.push(
+        `- 上一轮你想发的表情 \`${failedSticker.path}\` 没发出去（${failedSticker.reason}）。表情包只能从 ${stickerLabel ?? '收藏目录'}/ 里挑现成的；别人的图先用 qq_save_sticker 存下来，**别自己拼 \`.qq-media\` 的哈希**。`,
+        '',
+      );
+    }
     // ---- 槽 2：人设（是谁）----
     lines.push(...personaLines(conversation), '');
     // ---- 槽 3：表达契约（怎么说）----
@@ -1152,8 +1204,15 @@ export function apply(ctx, config) {
     // 标记不是工具，但**跟着同一个开关走**：`allowTools` 把 qq_send_image 挡在外面时，
     // 回复里也不该还能发图 —— 否则白名单就漏了一层（operator 明确说了「只给 read」）。
     if (imageAllowed()) {
+      // 标记只认**收藏目录**里的现成表情：以前这里举的是 `.qq-media/ab12….jpg`，模型有样
+      // 学样去拼哈希，而那是 LRU 缓存，发的时候大概率已经没了（真实事故，见
+      // `stickerSendSource`）。目录不可用时整条标记建议都不给 —— 那条路本来就走不通。
+      if (stickerLabel !== undefined) {
+        lines.push(
+          `- 想发表情包时，在回复正文里写 \`[[图片: 路径]]\`，路径**只能**是收藏目录里的现成表情（例如 \`[[图片: ${stickerLabel}/笑死.gif]]\`）。\`.qq-media/…\` 这类临时缓存路径会被直接拒绝 —— 别自己拼哈希，目录里没有就是没有。这个标记会作为**一张图**发出去，位置就在它出现的地方；**想只发一张表情、一个字都不说，整条回复就只写这一行** —— 别配「给你发张表情包」这种话。`,
+        );
+      }
       lines.push(
-        '- 想发表情包 / 甩张图时，在回复正文里写 `[[图片: 路径]]`（路径的写法就是正文里那些 `[图片: …]` 里的样子，例如 `[[图片: .qq-media/ab12….jpg]]`）：这个标记会作为**一张图**发出去，位置就在它出现的地方。**想只发一张表情、一个字都不说，整条回复就只写这一行** —— 别配「给你发张表情包」这种话。别人刚发的那张图也能这样发回去，把正文里给它的路径写进标记就行。',
         '- 要给**别的**群 / 好友发图、或者就是「把这张图发过去」这种明确动作，用 qq_send_image 工具（它也接受 http(s) 图片链接；它是立刻发出去的，不跟在正文的行序里）。',
       );
       // 目录优先用 STICKERS.md 的「名字（含义）」：模型看含义就能判断该不该发，看裸文件名
@@ -1169,7 +1228,7 @@ export function apply(ctx, config) {
           lines.push(
             names.length > 0
               ? `- 你自己的表情包在 ${stickerLabel}/ 里：${names.join('、')}。文件名通常就是它的意思${canReadImages ? '，拿不准的先 read_image 看一眼' : ''}；想发哪张就把它的路径写进标记里。表情包别滥用 —— 一次最多一张，也别每句都配一张。`
-              : `- 你自己的表情包目录 ${stickerLabel}/ 目前是空的，没有现成的表情包可挑（别人刚发的那张图仍然可以发回去）。`,
+              : `- 你自己的表情包目录 ${stickerLabel}/ 目前是空的，没有现成的表情包可挑（别人刚发的图要先 qq_save_sticker 存下来才能发）。`,
           );
         }
         // 「把这张存下来」是群里最常见的一句话，而模型自己没有写文件的能力（QQ 会话没有
@@ -1529,17 +1588,22 @@ export function apply(ctx, config) {
       }
       let bytes;
       try {
-        bytes = (await loadOutgoingImage({ source: resolveStickerSource(piece.source), cwd, maxBytes: imageMaxBytes })).bytes;
+        bytes = (await loadOutgoingImage({ source: stickerSendSource(piece.source), cwd, maxBytes: imageMaxBytes })).bytes;
       } catch (error) {
         // 表情包发不出去**不能静默**：整条回复只有这一行时，静默就等于「机器人没理人」。
+        // 同时把失败记进会话（`stickerFailure`）：模型下一轮看得到「那张没发出去、为什么」，
+        // 否则它会照着自己编的路径再编一个（真实事故：`.qq-media/<哈希>` 连编两轮）。
         report('warn', `sticker ${piece.source} could not be sent: ${errorText(error)}`);
-        const notice = '（表情包没发出去）';
+        noteStickerFailure(conversation, piece.source, errorText(error));
+        const notice = '（那张表情我这儿没有，发不出去）';
         if (!(await sendOne(conversation, notice))) return;
         continue;
       }
       // 图不挂引用、也没有可算的打字时间（延迟只留 index 0 的那个「读消息」）。
       // `imageSegment` 返回的是**一个段**，`message` 要的是段数组（旧写法就是 [segment]）。
       if (!(await sendOne(conversation, [imageSegment(bytes)]))) return;
+      // 发出去了就把上一条失败记录清掉：再留着会变成一句没做完的指令。
+      conversation.stickerFailure = undefined;
     }
   }
 
@@ -1693,6 +1757,8 @@ export function apply(ctx, config) {
     conversation.activeInterposeSeq = 0;
     conversation.activeTurns = 0;
     conversation.pendingIntent = undefined;
+    // 上一轮「那张表情没发出去」也一起忘：新一轮不该还惦记着上一轮想发的东西。
+    conversation.stickerFailure = undefined;
     // 抽卡的累计也一起忘：新开一轮的第一句不该继承上一轮攒下的「保底」。
     conversation.talkMisses = 0;
     conversation.chimeCount = 0;
@@ -1753,6 +1819,14 @@ export function apply(ctx, config) {
        * `turn/end` 清掉 —— 漏清的话下一轮会披着上一轮的意图说话。
        */
       pendingIntent: undefined,
+      /**
+       * 上一次「想发一张图但没发成」的记录：`{ path, reason, at }`。
+       *
+       * 只给提示词用（见 `channelPrompt`）：失败必须让模型知道，否则它会照着那个
+       * 不存在的路径再编一个（真实事故：`.qq-media/<哈希>` 连编两轮）。
+       * 发图成功、`/reset`、超过 `STICKER_FAILURE_TTL_MS` 都会把它清掉。
+       */
+      stickerFailure: undefined,
       /**
        * 「群里最后一条**别人的**消息」是什么时候到的（含没 @ 机器人的闲聊）。
        *

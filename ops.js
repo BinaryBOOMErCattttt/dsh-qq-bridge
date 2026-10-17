@@ -371,6 +371,35 @@ export function doctorFindings(facts = {}) {
       '给它写权限（chmod / chown），或把 QQBOT_CWD 指到写得进去的目录');
   }
 
+  // ---- 长期记忆的卫生 ----------------------------------------------------
+  // 这几条对应的都是「文件在、但不生效」的静默故障：解析不了的行永远不会进提示词，
+  // 指向已删除图片的目录条目选了就发不出去 —— 靠人翻文件才发现太晚。
+  if (Array.isArray(f.cognitionWarnings) && f.cognitionWarnings.length > 0) {
+    add('warn', 'COGNITION_UNPARSED', 'workspace',
+      `COGNITION.md 有 ${f.cognitionWarnings.length} 行字段不全，永远不会进提示词（首条：${f.cognitionWarnings[0]}）`,
+      '补齐那一行的「｜」分隔（写法｜意思｜怎么用），或删掉它；迁移脚本只搬路径条目，不替你补格式');
+  }
+  if (Array.isArray(f.cognitionDuplicateSections) && f.cognitionDuplicateSections.length > 0) {
+    add('warn', 'COGNITION_DUPLICATE_SECTION', 'workspace',
+      `COGNITION.md 有重复的二级标题：${f.cognitionDuplicateSections.join(' / ')}`,
+      '合并成一个；之后再用 append 写认知也会在落盘时自动合并，但历史内容要人看一眼');
+  }
+  if (Array.isArray(f.cognitionPathViolations) && f.cognitionPathViolations.length > 0) {
+    add('warn', 'COGNITION_PATH', 'workspace',
+      `COGNITION.md 里有 ${f.cognitionPathViolations.length} 条以文件路径为键的条目（.qq-media 是缓存，会过期）`,
+      'node scripts/ops.mjs migrate --apply 把它们迁进 STICKERS.md');
+  }
+  if (Array.isArray(f.stickerMissing) && f.stickerMissing.length > 0) {
+    add('warn', 'STICKER_PATH_MISSING', 'workspace',
+      `STICKERS.md 的已收藏条目指向不存在的文件：${f.stickerMissing.slice(0, 3).join(' / ')}${f.stickerMissing.length > 3 ? ' …' : ''}`,
+      '把图放回 .qq-stickers/，或者删掉那一条（删之前确认不是只改了文件名）');
+  }
+  if (Array.isArray(f.stickerMediaPaths) && f.stickerMediaPaths.length > 0) {
+    add('warn', 'STICKER_MEDIA_PATH', 'workspace',
+      `STICKERS.md 的「已收藏」区里出现了 .qq-media 路径：${f.stickerMediaPaths.slice(0, 3).join(' / ')}`,
+      '先用 qq_save_sticker 收藏，再把那一行改成 .qq-stickers/… —— 缓存路径迟早被淘汰');
+  }
+
   // ---- 日志里的现场 ------------------------------------------------------
   if (typeof f.journalProblem === 'string' && f.journalProblem.length > 0) {
     add('warn', 'JOURNAL_PROBLEM', 'workspace',

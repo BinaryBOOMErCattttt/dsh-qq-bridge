@@ -132,6 +132,37 @@ test('doctorFindings：完全未知的事实不产生任何 finding', () => {
   assert.deepEqual(doctorFindings(), [], '不传参数也不能当成「什么都坏了」');
 });
 
+test('doctorFindings：长期记忆里「文件在、但不生效」的五种情况都要点名', () => {
+  const findings = doctorFindings({
+    cognitionWarnings: ['COGNITION.md 第 15 行少于两段，跳过：- popipa…'],
+    cognitionDuplicateSections: ['黑话与缩写'],
+    cognitionPathViolations: ['.qq-media/d792c9e4.gif'],
+    stickerMissing: ['.qq-stickers/蔫了.gif'],
+    stickerMediaPaths: ['无语'],
+  });
+  assert.deepEqual(findings.map((item) => item.code).sort(), [
+    'COGNITION_DUPLICATE_SECTION',
+    'COGNITION_PATH',
+    'COGNITION_UNPARSED',
+    'STICKER_MEDIA_PATH',
+    'STICKER_PATH_MISSING',
+  ]);
+  assert.ok(findings.every((item) => item.level === 'warn'), '这些是「能用但会静默失效」，不是错误');
+  assert.match(findings.find((item) => item.code === 'COGNITION_PATH').fix, /ops\.mjs migrate/);
+  assert.match(findings.find((item) => item.code === 'STICKER_MEDIA_PATH').fix, /qq_save_sticker/);
+});
+
+test('doctorFindings：记忆正常时一条都不报', () => {
+  const findings = doctorFindings({
+    cognitionWarnings: [],
+    cognitionDuplicateSections: [],
+    cognitionPathViolations: [],
+    stickerMissing: [],
+    stickerMediaPaths: [],
+  });
+  assert.deepEqual(findings, []);
+});
+
 test('doctorFindings：ONEBOT_UNREACHABLE 是 error，fix 里要说清怎么查', () => {
   const findings = doctorFindings({ endpoint: 'ws://127.0.0.1:3001', endpointReachable: false });
   const one = findings.find((item) => item.code === 'ONEBOT_UNREACHABLE');

@@ -14,12 +14,19 @@ import assert from 'node:assert/strict';
 import {
   appendStickerRow,
   cognitionPathViolations,
+  duplicateSectionNames,
   hotCognitionLines,
+  normalizeCognitionDoc,
+  normalizeStickerDoc,
   parseCognition,
   parseStickerCatalog,
+  removeCognitionRow,
+  removeStickerRow,
   splitFields,
   stickerCatalogLines,
   stickerRow,
+  upsertCognitionRow,
+  upsertStickerRow,
 } from '../cognition.js';
 
 const COGNITION = `# 公共认知（语言梗 / 黑话 / 缩写 / 谐音）
@@ -172,6 +179,93 @@ function describeStickers() {
   });
 }
 
-// 两个分组放在最后调用：它们用到的样例常量在文件中间定义（TDZ）。
+/** 逐条写入、写入归一化、注入顺序 —— 这三组对应「模型别再整份重写 markdown」。 */
+function describeStructuredWrites() {
+  test('hotCognitionLines：注入「最近」按首见日期算，不按文件里的位置', () => {
+    const a = parseCognition(['## 黑话与缩写', '- 旧梗｜很早学的｜2026-09-01', '- 新梗｜刚学的｜2026-10-17'].join('\n')).entries;
+    const b = parseCognition(['## 黑话与缩写', '- 新梗｜刚学的｜2026-10-17', '- 旧梗｜很早学的｜2026-09-01'].join('\n')).entries;
+    assert.deepEqual(hotCognitionLines(a, { limit: 1 }), ['新梗 —— 刚学的']);
+    assert.deepEqual(hotCognitionLines(b, { limit: 1 }), ['新梗 —— 刚学的'], '换个排列不该换成另一条');
+  });
+
+  test('upsertCognitionRow：同写法原地替换，别的条目一字不动', () => {
+    const before = '## 黑话与缩写\n- 典｜旧意思\n- 急了｜破防\n';
+    const { text, replaced, section } = upsertCognitionRow(before, { writeup: '典', meaning: '讽刺「经典操作」', usage: '有人发离谱东西时' });
+    assert.equal(replaced, true);
+    assert.equal(section, '黑话与缩写');
+    assert.match(text, /- 典｜讽刺「经典操作」｜有人发离谱东西时｜置信：确认/);
+    assert.match(text, /- 急了｜破防/, '其它条目必须原样保留');
+    // 名字包了反引号也认得住（模型常这么写）。
+    assert.equal(upsertCognitionRow(before, { writeup: '`典`', meaning: 'x' }).replaced, true);
+  });
+
+  test('upsertCognitionRow：新条目按 type 归节，没有那个节就补一个', () => {
+    const { text, section } = upsertCognitionRow('## 黑话与缩写\n- 典｜经典操作\n', { writeup: '蚌埠住了', meaning: '绷不住了', type: '谐音', variants: '绷不住/绷' });
+    assert.equal(section, '谐音与变体');
+    assert.match(text, /## 谐音与变体\n- 蚌埠住了（变体：绷不住 \/ 绷）｜绷不住了｜置信：确认/);
+    // 没有含义直接拒绝：解析器会把这种行整个丢掉，不能「写成功」。
+    assert.throws(() => upsertCognitionRow('', { writeup: '空' }), /meaning/);
+  });
+
+  test('removeCognitionRow / removeStickerRow：只删那一条', () => {
+    const cog = removeCognitionRow('## 黑话与缩写\n- 典｜a\n- 急｜b\n', '典');
+    assert.equal(cog.removed, true);
+    assert.doesNotMatch(cog.text, /典/);
+    assert.match(cog.text, /急｜b/);
+    assert.equal(removeCognitionRow(cog.text, '不存在').removed, false);
+
+    const st = upsertStickerRow('# 表情包目录\n\n## 已收藏\n', { name: '疑惑', meaning: '没听懂', path: '.qq-stickers/疑惑.jpg' });
+    const gone = removeStickerRow(st.text, '疑惑');
+    assert.equal(gone.removed, true);
+    assert.doesNotMatch(gone.text, /疑惑/);
+  });
+
+  test('upsertStickerRow：同名替换而不是再追加一条（未收藏补了含义会升进已收藏）', () => {
+    const pending = '# 表情包目录\n\n## 已收藏\n\n## 未收藏\n- 疑惑｜.qq-stickers/疑惑.jpg｜待补含义\n';
+    const { text, replaced, section } = upsertStickerRow(pending, { name: '疑惑', meaning: '没听懂、满脸问号', path: '.qq-stickers/疑惑.jpg' });
+    assert.equal(replaced, true);
+    assert.equal(section, '已收藏');
+    assert.equal(parseStickerCatalog(text).collected.length, 1);
+    assert.equal(parseStickerCatalog(text).pending.length, 0, '旧的待办行必须被替换掉，不能两份并存');
+    const again = upsertStickerRow(text, { name: '疑惑', meaning: '没听懂', path: '.qq-stickers/疑惑.jpg' });
+    assert.equal(parseStickerCatalog(again.text).collected.length, 1);
+  });
+
+  test('normalizeCognitionDoc：合并重复标题、去掉完全相同的行，但不吃同写法不同义的条目', () => {
+    const dup = [
+      '# 公共认知',
+      '',
+      '## 黑话与缩写',
+      '- 典｜a',
+      '',
+      '## 黑话与缩写',
+      '- 典｜a',
+      '- 南梁｜群 A 里指男娘',
+      '- 南梁｜群 B 里指别的东西',
+      '',
+    ].join('\n');
+    const text = normalizeCognitionDoc(dup);
+    assert.equal(duplicateSectionNames(text).length, 0, '重复标题必须合掉');
+    assert.equal(parseCognition(text).entries.length, 3, '完全相同的行只留一条，不同义的两条都要在');
+    assert.equal(normalizeCognitionDoc(text), text, '幂等');
+  });
+
+  test('normalizeStickerDoc：同名条目只留最后一条，不同名的不动', () => {
+    const same = normalizeStickerDoc('# X\n\n## 已收藏\n- 无语｜画面｜旧｜.qq-stickers/a.gif\n- 无语｜画面｜新｜.qq-stickers/b.gif\n');
+    const parsedSame = parseStickerCatalog(same);
+    assert.equal(parsedSame.collected.length, 1);
+    assert.match(same, /b\.gif/, '保留最后写的那条');
+    const different = normalizeStickerDoc('# X\n\n## 已收藏\n- 无语｜画面｜a｜.qq-stickers/a.gif\n- 疑惑｜画面｜b｜.qq-stickers/c.gif\n');
+    assert.equal(parseStickerCatalog(different).collected.length, 2);
+  });
+
+  test('duplicateSectionNames：重复标题点名，正常文件为空', () => {
+    assert.deepEqual(duplicateSectionNames('## A\n- x\n## A\n'), ['A']);
+    assert.deepEqual(duplicateSectionNames('## A\n- x\n## B\n- y\n'), []);
+  });
+}
+
+// 三个分组放在最后调用：它们用到的样例常量在文件中间定义（TDZ）。
 describeCognition();
 describeStickers();
+describeStructuredWrites();

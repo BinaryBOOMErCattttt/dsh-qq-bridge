@@ -3308,13 +3308,38 @@ test('a sticker that cannot be sent says so instead of going silent', async () =
 
   completeTurn(host, agent, '[[图片: .qq-stickers/nope.png]]');
   const sent = await until(
-    () => sentTexts(onebot, 'send_private_msg').find((text) => text.includes('表情包没发出去')),
+    () => sentTexts(onebot, 'send_private_msg').find((text) => text.includes('发不出去')),
     'the notice to reach QQ',
   );
-  assert.match(sent, /表情包没发出去/);
+  assert.match(sent, /发不出去/);
   // 一张图都没发出去。
   assert.equal(onebot.calls.some((call) => Array.isArray(call.params.message)), false);
   assert.ok(host.list.warnings.some((line) => line.includes('nope.png')), host.list.warnings.join('|'));
+  // 失败必须回灌进提示词：下一轮模型才看得到「那张没发出去、为什么」，
+  // 否则它会照着自己编的路径再编一个（真实事故：连编两轮 `.qq-media` 哈希）。
+  const prompt = promptText(host, 'qq-bridge:channel');
+  assert.match(prompt, /nope\.png/);
+  assert.match(prompt, /没发出去/);
+});
+
+test('发表情只认收藏目录：`.qq-media` 里真实存在的图也不能借标记发出去', async () => {
+  const { onebot, host, cwd } = await bootImages();
+  // 造一张**真实存在**的缓存图：旧事故里模型编的路径根本不存在，这里要证明的是
+  // 「就算存在也不许发」—— 否则它迟早会挑到一张已经被人删掉的。
+  await mkdir(join(cwd, '.qq-media'), { recursive: true });
+  await writeFile(join(cwd, '.qq-media', 'abc123.png'), TINY_PNG);
+  onebot.push(privateMessage('在吗'));
+  const agent = await untilInbox(host, 1, 'the Agent');
+
+  completeTurn(host, agent, '[[图片: .qq-media/abc123.png]]');
+  const sent = await until(
+    () => sentTexts(onebot, 'send_private_msg').find((text) => text.includes('发不出去')),
+    'the refusal notice',
+  );
+  assert.match(sent, /发不出去/);
+  assert.equal(onebot.calls.some((call) => Array.isArray(call.params.message)), false, '一张图都不该发出去');
+  const prompt = promptText(host, 'qq-bridge:channel');
+  assert.match(prompt, /只能从收藏目录/);
 });
 
 test('the marker stays literal text when image sending is off or whitelisted away', async () => {
@@ -3486,6 +3511,59 @@ test('qq_memory appends, reads back and overwrites, and refuses paths outside th
   await assert.rejects(() => tool.execute({ action: 'write', path: '../evil.md', text: 'x' }, {}), /not inside the memory directory/);
   await assert.rejects(() => tool.execute({ action: 'write', path: '/tmp/evil.md', text: 'x' }, {}), /not inside the memory directory/);
   assert.equal(existsSync(join(cwd, 'evil.md')), false);
+});
+
+/** 定时器每天醒一次（默认 04:00），醒来帮会话摘要一次并记下进度。 */
+test('qq_memory upsert / remove：逐条写认知与表情包，整份重写丢行会被挡住', async () => {
+  const { host, cwd } = await bootMemory();
+  const tool = host.tools.get('qq_memory');
+
+  // 认知：新增 → 按 type 归节；同一条再写一次是「替换」，不是多加一行。
+  const added = await tool.execute({ action: 'upsert', path: 'COGNITION.md', name: '蚌埠住了', meaning: '绷不住了', type: '谐音', variants: '绷不住/绷' }, {});
+  assert.equal(added.action, 'upsert');
+  assert.match(added.note, /added/);
+  let cognition = await readMemory(cwd, 'COGNITION.md');
+  assert.match(cognition, /## 谐音与变体\n- 蚌埠住了（变体：绷不住 \/ 绷）｜绷不住了/);
+
+  const replaced = await tool.execute({ action: 'upsert', path: 'COGNITION.md', name: '蚌埠住了', meaning: '忍不住笑了', confidence: '存疑' }, {});
+  assert.match(replaced.note, /replaced/);
+  cognition = await readMemory(cwd, 'COGNITION.md');
+  assert.equal((cognition.match(/蚌埠住了/g) ?? []).length, 1, '同一条不能变成两行');
+  assert.match(cognition, /置信：存疑/);
+
+  // 追加时又贴了一遍同一个标题：落盘时合并，文件里只留一个。
+  await tool.execute({ action: 'append', path: 'COGNITION.md', text: '## 黑话与缩写\n- 典｜讽刺「经典操作」' }, {});
+  await tool.execute({ action: 'append', path: 'COGNITION.md', text: '## 黑话与缩写\n- 急了｜破防了' }, {});
+  cognition = await readMemory(cwd, 'COGNITION.md');
+  assert.equal((cognition.match(/^## 黑话与缩写$/gm) ?? []).length, 1, '重复标题必须被合并');
+  assert.match(cognition, /典｜/);
+  assert.match(cognition, /急了｜/);
+
+  const removed = await tool.execute({ action: 'remove', path: 'COGNITION.md', name: '蚌埠住了' }, {});
+  assert.match(removed.note, /removed/);
+  assert.doesNotMatch(await readMemory(cwd, 'COGNITION.md'), /蚌埠住了/);
+
+  // 表情包：upsert 一条进「已收藏」，名字与路径由工具保证格式。
+  await tool.execute({ action: 'upsert', path: 'STICKERS.md', name: '无语', meaning: '无语、懒得吐槽', image: '.qq-stickers/无语.gif' }, {});
+  assert.match(await readMemory(cwd, 'STICKERS.md'), /## 已收藏\n- 无语/);
+
+  // 护栏：整份重写把条目砍掉一大截 → 拒绝；`force: true` 才放行。
+  await assert.rejects(
+    () => tool.execute({ action: 'write', path: 'STICKERS.md', text: '# 表情包目录\n\n## 已收藏\n' }, {}),
+    /keep only 0 of 1 entries/,
+  );
+  const forced = await tool.execute({ action: 'write', path: 'STICKERS.md', text: '# 表情包目录\n\n## 已收藏\n', force: true }, {});
+  assert.equal(forced.action, 'write');
+
+  // 解析不了的行：read 直接点出来（否则它永远不进提示词，谁都不会去修）。
+  await tool.execute({ action: 'write', path: 'COGNITION.md', text: '# 公共认知\n\n## 黑话与缩写\n- 只有一段没有竖线\n', force: true }, {});
+  const read = await tool.execute({ action: 'read', path: 'COGNITION.md' }, {});
+  assert.match(read.note ?? '', /不会.*注入|不会被注入/);
+
+  // 每次写入都把旧版本留在 `.history/` 里：整份重写写坏了还能人工翻回去。
+  const history = await readdir(join(cwd, '.qq-memory', '.history')).catch(() => []);
+  assert.ok(history.length > 0, '写前必须留历史版本');
+  assert.ok(history.some((name) => name.startsWith('COGNITION.md.')), history.join('|'));
 });
 
 /** 定时器每天醒一次（默认 04:00），醒来帮会话摘要一次并记下进度。 */

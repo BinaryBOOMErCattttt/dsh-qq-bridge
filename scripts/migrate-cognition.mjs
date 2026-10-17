@@ -44,12 +44,25 @@ function pathFieldOf(entry) {
   return fieldsOf(entry).find((field) => /^\.qq-(?:media|stickers)\//.test(field));
 }
 
-/** 条目去掉 `- ` 之后的字段数组（去空白）。 */
+/**
+ * 去掉字段外侧成对的 markdown 包裹（反引号 / 直引号）。
+ *
+ * 为什么必须有这一步：摘要 Agent 与旧提示词写路径时习惯包一层反引号
+ * （``- `.qq-media/d792c9e4….gif`｜画面｜含义``）。不剥掉的话路径字段认不出来，
+ * 整条会被当成「普通文字条目」留在认知库里 —— 那不但是一条死链，还让迁移报告显示
+ * 「搬走 0」，看起来像没事发生（本机真实事故：STICKERS.md 一直没被生成）。
+ */
+function unwrapField(field) {
+  const match = /^([`"'])([\s\S]*)\1$/.exec(field);
+  return match === null ? field : match[2].trim();
+}
+
+/** 条目去掉 `- ` 之后的字段数组（去空白、剥掉 markdown 包裹）。 */
 function fieldsOf(entry) {
   return String(entry.line ?? '')
     .replace(/^[-*]\s+/, '')
     .split(/[｜|]/)
-    .map((field) => field.trim());
+    .map((field) => unwrapField(field.trim()));
 }
 
 /**
@@ -72,8 +85,11 @@ function splitEntry(entry, path, resolvedPath) {
   const rest = fields.filter((field) => field !== path);
   // 文件名是内容哈希（`.qq-media/8f3c1a….gif`）时，拿它当名字对谁都没用：
   // 退一步用画面描述当前几个字，至少让「未收藏」区里那一条读得懂。
+  // 只取到第一个标点：`Q 版蓝毛女仆脸：蓝发盘发＋…` 当名字会得到半句被截断的废话，
+  // 而这条名字是给人决定「还要不要收藏」看的。
   const fileBase = basename(resolvedPath, extname(resolvedPath));
-  const base = /^[0-9a-f]{8,}$/i.test(fileBase) ? String(rest[0] ?? '表情包').slice(0, 12) : fileBase;
+  const described = String(rest[0] ?? '').split(/[：:，,；;。]/)[0].trim();
+  const base = /^[0-9a-f]{8,}$/i.test(fileBase) ? (described.length > 0 ? described.slice(0, 12) : '表情包') : fileBase;
   if (pathFirst) {
     return {
       // 路径作键的老写法：段序是「路径｜画面｜含义｜场景｜日期」。`rest` 已经去掉了路径。
@@ -188,14 +204,18 @@ export async function planCognitionMigration({ cwd, memoryDir = '.qq-memory', st
 
   const files = await stickerFiles(stickerRoot);
   let stickers = stickersText;
-  const keptLines = [];
+  // 与 `parsed.entries` **逐位对齐**的「这条留下什么」：`undefined` = 整条迁走、原文那行删掉。
+  // 不能只用「保留下来的行」这个数组 —— 文件里有 `parseCognition` 跳过的碎条目（少一段的
+  // 手写行），拿保留下来的行去逐行回填会整体错位，把后面的条目挤丢（本机真实事故：
+  // 「森美奈美」「洛天依」两条差点被一次迁移吃掉）。
+  const keptByEntry = new Array(parsed.entries.length);
   // 逐条重写 COGNITION.md：留着的行原样写回，带路径的行去掉路径字段（写回时若已没有
   // 有效含义就整条丢掉 —— 空壳条目只会让提示词里多一行废话）。
   for (const [index, entry] of parsed.entries.entries()) {
     const report = plan.entries[index];
     const path = pathFieldOf(entry);
     if (path === undefined) {
-      keptLines.push(entry.line);
+      keptByEntry[index] = entry.line;
       plan.stats.kept += 1;
       continue;
     }
@@ -236,7 +256,7 @@ export async function planCognitionMigration({ cwd, memoryDir = '.qq-memory', st
     }
     // 只有「写法在前」的那种条目在认知库里还有内容；路径作键的老条目整条迁走。
     if (keepLine.length > 0) {
-      keptLines.push(keepLine);
+      keptByEntry[index] = keepLine;
       plan.stats.kept += 1;
     } else if (!collected) {
       plan.stats.dropped += 1;
@@ -247,8 +267,8 @@ export async function planCognitionMigration({ cwd, memoryDir = '.qq-memory', st
   // 原文件有二级标题时就按原结构保留，否则给一个最小骨架。
   const hasSections = /^##\s/m.test(cognitionText);
   plan.next.cognition = hasSections
-    ? normalizeCognition(cognitionText, keptLines)
-    : `# 公共认知（语言梗 / 黑话 / 缩写 / 谐音）\n\n${keptLines.join('\n')}\n`;
+    ? normalizeCognition(cognitionText, parsed.entries, keptByEntry)
+    : `# 公共认知（语言梗 / 黑话 / 缩写 / 谐音）\n\n${keptByEntry.filter((line) => line !== undefined).join('\n')}\n`;
   plan.next.stickers = stickers;
   return plan;
 }
@@ -258,27 +278,35 @@ export async function planCognitionMigration({ cwd, memoryDir = '.qq-memory', st
  *
  * 为什么不是直接拼一个新文件：`COGNITION.md` 里有摘要 Agent 手写的分节标题与说明，
  * 迁移只该动条目，不该顺手把结构冲平。
+ *
+ * 逐行替换的依据是**原文那一行本身**（`entry.line`），不是「第几个 `- ` 行」：
+ * `parseCognition` 会跳过字段不够的碎条目，按序号回填会让它们与后面的条目错位 ——
+ * 被跳过的行必须原样留在原处，它旁边那几条才不会被挪走或吃掉。
+ *
+ * @param text - 原文件内容。
+ * @param entries - {@link parseCognition} 的 `entries`（与原文同序）。
+ * @param keptByEntry - 与 `entries` 逐位对齐的替换行；`undefined` 表示整条删除。
  */
-function normalizeCognition(text, keptLines) {
+function normalizeCognition(text, entries, keptByEntry) {
   const lines = String(text).split(/\r?\n/);
   const out = [];
-  let keptAt = 0;
+  let at = 0;
   for (const line of lines) {
-    if (/^[-*]\s+/.test(line.trim())) {
-      // 条目行：用「保留下来且还是条目」的那批按顺序替换；多出来的原条目被吃掉了。
-      const replacement = keptLines[keptAt];
-      if (replacement !== undefined) {
-        out.push(replacement);
-        keptAt += 1;
-      }
+    const trimmed = line.trim();
+    if (/^[-*]\s+/.test(trimmed) && at < entries.length && trimmed === entries[at].line) {
+      // 认出了这是「解析到的那一条」：按计划替换，或整条删掉（它已经迁进 STICKERS.md）。
+      const replacement = keptByEntry[at];
+      if (replacement !== undefined) out.push(replacement);
+      at += 1;
       continue;
     }
+    // 其余行（标题、说明、以及解析器跳过的碎条目）原样留着。
     out.push(line);
   }
-  // 原文件里没有条目行（或保留的比原条目多）时，把剩下的补在末尾。
-  while (keptAt < keptLines.length) {
-    out.push(keptLines[keptAt]);
-    keptAt += 1;
+  // 理论上走不到这里；真剩了说明解析结果与原文对不上，宁可补到末尾，也不静默丢条目。
+  for (let index = at; index < entries.length; index += 1) {
+    const replacement = keptByEntry[index];
+    if (replacement !== undefined) out.push(replacement);
   }
   return `${out.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
 }

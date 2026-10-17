@@ -21,8 +21,8 @@
  * @module @qqbot/dsh-plugin-qq/cognition
  */
 
-/** `COGNITION.md` 里认得的两个二级标题；其余节的条目照样解析，只是不区分。 */
-const COGNITION_SECTIONS = ['黑话与缩写', '谐音与变体', '其它'];
+/** `COGNITION.md` 里认得的二级标题；其余节的条目照样解析，只是不区分。 */
+const COGNITION_SECTIONS = ['黑话与缩写', '谐音与变体', '专名与作品', '其它'];
 
 /** `STICKERS.md` 里认得的两个二级标题：只有「已收藏」会进提示词。 */
 const STICKER_COLLECTED = '已收藏';
@@ -152,9 +152,12 @@ export function parseCognition(markdown) {
 /**
  * 每轮注入的「热梗段」：最近 `limit` 条**确认过**的条目。
  *
- * 为什么只取文件末尾：写入是追加式的，最新学到的梗在最后；而聊天里「刚学到的」
- * 恰恰最可能马上又用到。这也是为什么它不能替代 `qq_memory search` —— 更早的条目
- * 仍然在文件里，要查的时候查得到。
+ * 「最近」按**首见日期**算，不按它在文件里排第几：条目顺序会被人整理、被合并分节
+ * 动过，拿文件位置当时间轴的话，一次排版就等于悄悄换了它每轮记得什么（真实事故：
+ * 合并两个同名标题时，谁在最后谁就还在「最近 15 条」里）。没有日期的条目算最旧 ——
+ * 手写条目常常不写日期，不能让它挤掉有日期的；同日期按文件顺序、靠后的算更新。
+ *
+ * 这也是为什么它不能替代 `qq_memory search` —— 更早的条目仍然在文件里，要查的时候查得到。
  *
  * 「置信：存疑」刻意不进：存疑的条目正是那些「大概是这个意思」的猜测，每轮摆在
  * 提示词里会让模型把猜测当事实用。
@@ -164,10 +167,21 @@ export function parseCognition(markdown) {
  * @returns {string[]} 形如 `典 —— 讽刺「经典操作」` 的行；没有条目时为空数组。
  */
 export function hotCognitionLines(entries, { limit = 15, maxChars = 1200 } = {}) {
-  const confirmed = (entries ?? []).filter((entry) => entry.confidence !== DOUBTFUL && entry.meaning.length > 0);
+  const confirmed = (entries ?? [])
+    .filter((entry) => entry.confidence !== DOUBTFUL && entry.meaning.length > 0)
+    .map((entry, index) => ({ entry, index }));
   const cap = Math.max(0, Math.floor(Number(limit) || 0));
-  // `cap === 0` 时直接空：`slice(-0)` 是「整个数组」，那是这里最容易踩的坑。
-  const picked = cap === 0 ? [] : confirmed.slice(-cap);
+  const byRecency = confirmed.slice().sort((a, b) => {
+    const da = a.entry.date ?? '';
+    const db = b.entry.date ?? '';
+    if (da !== db) return da < db ? 1 : -1;
+    return a.index - b.index;
+  });
+  // `cap === 0` 时要显式给空数组：`slice(0, -0)` 与 `slice(-0)` 都容易在这里出错。
+  // 选完之后按文件顺序渲染：提示词里读起来仍是「先学的在前」，顺序稳定也好核对。
+  const picked = (cap === 0 ? [] : byRecency.slice(0, cap))
+    .sort((a, b) => a.index - b.index)
+    .map((item) => item.entry);
   const lines = [];
   let used = 0;
   for (const entry of picked) {
@@ -342,4 +356,241 @@ export function cognitionPathViolations(entries) {
     if (match !== null) violations.push({ line: entry.line, writeup: entry.writeup, path: match[1] });
   }
   return violations;
+}
+
+/** `type`（分诊时说的类型）→ 二级标题。认不出来的走「黑话与缩写」，不新造节。 */
+const SECTION_BY_TYPE = {
+  缩写: '黑话与缩写',
+  简称: '黑话与缩写',
+  黑话: '黑话与缩写',
+  谐音: '谐音与变体',
+  变体: '谐音与变体',
+  专名: '专名与作品',
+  作品: '专名与作品',
+  角色: '专名与作品',
+  选手: '专名与作品',
+  主播: '专名与作品',
+  其它: '其它',
+  其他: '其它',
+};
+
+/**
+ * 把一个「类型」映射成 `COGNITION.md` 的二级标题。
+ *
+ * 为什么要这一步：分类不该由模型在 append 时自己决定（它只会照抄上一个标题），
+ * 也不该在写完之后靠人整理 —— 让工具在落盘时按类型归位，才有稳定的分节。
+ * @param type - 例如 `谐音` / `专名` / `缩写`。
+ * @returns 二级标题名（不含 `## `）。
+ */
+export function sectionForType(type) {
+  const key = String(type ?? '').trim();
+  if (key.length === 0) return COGNITION_SECTIONS[0];
+  return SECTION_BY_TYPE[key] ?? SECTION_BY_TYPE[key.replace(/[与和]/g, '').slice(0, 2)] ?? COGNITION_SECTIONS[0];
+}
+
+/** 比较用的键：反引号与空白都不算区别（模型常把名字包一层反引号）。 */
+function compareKey(value) {
+  return String(value ?? '').replace(/[`\s]/g, '').trim();
+}
+
+/** 一条认知条目渲染成文件里的那一行。 */
+export function cognitionRow(entry) {
+  // 变体既接受数组，也接受「A / B」这样的字符串：工具层拆过一次，直接调用的人可能没拆。
+  const variants = Array.isArray(entry?.variants)
+    ? entry.variants
+    : String(entry?.variants ?? '').split(/[\/／、,，]/);
+  const picked = variants.map((item) => String(item ?? '').trim()).filter((item) => item.length > 0);
+  const writeup = `${String(entry?.writeup ?? '').trim()}${picked.length > 0 ? `（变体：${picked.join(' / ')}）` : ''}`;
+  const meaning = String(entry?.meaning ?? '').trim();
+  if (writeup.length === 0) throw new Error('cognition row needs a writeup (the word itself)');
+  // 没有含义的认知条目解析器会整个丢掉（`rest.length < 2`），所以这里就拒绝，
+  // 别让工具「成功」写进一条永远不会被读到的行。
+  if (meaning.length === 0) throw new Error('cognition row needs a meaning (one sentence)');
+  const tail = [entry.usage, entry.source, entry.date]
+    .map((field) => String(field ?? '').trim())
+    .filter((field) => field.length > 0);
+  const confidence = entry.confidence === DOUBTFUL ? DOUBTFUL : CONFIRMED;
+  return `- ${[writeup, meaning, ...tail, `置信：${confidence}`].join('｜')}`;
+}
+
+/** 删掉文件里满足条件的行（保留其余内容与顺序）。 */
+function dropLines(markdown, test) {
+  return String(markdown ?? '')
+    .split(/\r?\n/)
+    .filter((line) => !test(line))
+    .join('\n');
+}
+
+/** 在一节末尾插入一行；节不存在就补一个节（不覆盖原内容）。 */
+function insertIntoSection(markdown, section, row) {
+  const body = String(markdown ?? '');
+  const lines = body.split(/\r?\n/);
+  const start = lines.findIndex((line) => sectionName(line) === section);
+  if (start < 0) {
+    const suffix = body.length === 0 ? '' : body.endsWith('\n') ? '' : '\n';
+    return `${body}${suffix}${body.length === 0 ? '' : '\n'}## ${section}\n${row}\n`;
+  }
+  let insertAt = start + 1;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (line.startsWith('#')) break;
+    if (/^[-*]\s+/.test(line)) insertAt = index + 1;
+  }
+  lines.splice(insertAt, 0, row);
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * 写入或更新一条认知条目（按写法匹配，不再让模型整份重写 markdown）。
+ *
+ * 三条规则：
+ *   1. 同「写法」已经存在 → **原地替换**那一行（位置不变，其它条目一字不动）；
+ *   2. 不存在 → 按 `type` 归到对应的二级标题下，没有那个节就补一个；
+ *   3. 什么都不猜：没有含义直接报错，不写一条解析器会丢掉的空条目。
+ *
+ * @param markdown - 现有文件内容（不存在时传空串）。
+ * @param entry - `{ writeup, meaning, usage?, source?, date?, confidence?, variants?, type? }`。
+ * @param options.section - 显式指定二级标题（优先于 `type`）。
+ * @returns `{ text, section, replaced }`。
+ */
+export function upsertCognitionRow(markdown, entry, { section } = {}) {
+  const row = cognitionRow(entry);
+  const key = compareKey(entry?.writeup);
+  const body = String(markdown ?? '');
+  const { entries } = parseCognition(body);
+  const existing = entries.find((item) => compareKey(item.writeup) === key);
+  if (existing !== undefined) {
+    const lines = body.split(/\r?\n/);
+    const at = lines.findIndex((line) => line.trim() === existing.line);
+    if (at >= 0) {
+      lines[at] = row;
+      return { text: `${lines.join('\n')}\n`, section: existing.section, replaced: true };
+    }
+  }
+  const target = section ?? sectionForType(entry?.type);
+  return { text: insertIntoSection(body, target, row), section: target, replaced: false };
+}
+
+/**
+ * 删掉一条认知条目（按写法匹配）。只删这一行，其余原样保留。
+ * @returns `{ text, removed }`。
+ */
+export function removeCognitionRow(markdown, writeup) {
+  const key = compareKey(writeup);
+  const { entries } = parseCognition(markdown);
+  const hit = entries.find((item) => compareKey(item.writeup) === key);
+  if (hit === undefined) return { text: String(markdown ?? ''), removed: false };
+  return { text: dropLines(markdown, (line) => line.trim() === hit.line), removed: true };
+}
+
+/**
+ * 写入或更新一条表情包目录条目（按名字匹配）。
+ *
+ * 与 `appendStickerRow` 的区别：同名条目会被**替换**而不是再追加一条（否则目录里
+ * 会出现两张同名、含义不同的记录，模型只能随机挑一个）。替换时先删旧的再插到目标区，
+ * 所以「未收藏 → 补了含义」会自然升进「已收藏」。
+ *
+ * @param markdown - 现有内容。
+ * @param entry - 见 {@link stickerRow}。
+ * @param options.collected - 是否进「已收藏」区（默认按有没有含义判断）。
+ * @returns `{ text, section, replaced }`。
+ */
+export function upsertStickerRow(markdown, entry, { collected } = {}) {
+  const nameKey = compareKey(entry?.name);
+  if (nameKey.length === 0) throw new Error('sticker row needs a name');
+  const hasMeaning = String(entry?.meaning ?? '').trim().length > 0;
+  const target = collected ?? hasMeaning;
+  const parsed = parseStickerCatalog(markdown);
+  const existing = [...parsed.collected, ...parsed.pending].find((row) => compareKey(row.name) === nameKey);
+  let body = String(markdown ?? '');
+  if (existing !== undefined) body = dropLines(body, (line) => line.trim() === existing.line);
+  const { text } = appendStickerRow(body, entry, { collected: target });
+  return { text, section: target ? STICKER_COLLECTED : STICKER_PENDING, replaced: existing !== undefined };
+}
+
+/**
+ * 删掉一条表情包目录条目（按名字匹配，两个区都找）。
+ * @returns `{ text, removed }`。
+ */
+export function removeStickerRow(markdown, name) {
+  const key = compareKey(name);
+  const parsed = parseStickerCatalog(markdown);
+  const hit = [...parsed.collected, ...parsed.pending].find((row) => compareKey(row.name) === key);
+  if (hit === undefined) return { text: String(markdown ?? ''), removed: false };
+  return { text: dropLines(markdown, (line) => line.trim() === hit.line), removed: true };
+}
+
+/**
+ * 归一化一份记忆文档：重复的二级标题只留第一个，同一个键的条目只留最后一条。
+ *
+ * 为什么在**写入时**做：这文件是模型用自由文本 append 出来的，重复标题、同名条目
+ * 都是「写的时候顺手」造成的（真实事故：`## 黑话与缩写` 出现两次，中间夹着一个
+ * 已经没有图的 `## 表情包`）。读路径不动它 —— 读要如实反映磁盘上的内容。
+ *
+ * 它**不重排**条目（顺序对人是可读性，对注入没有语义，见 `hotCognitionLines`），
+ * 也**不删除**解析不了的行：那些是用户写下的字，只由 `qq_memory read` 标出来。
+ * @param markdown - 文件内容。
+ * @param keyOf - 一行 → 去重键（不是条目行时返回 undefined）。
+ */
+function normalizeDoc(markdown, keyOf) {
+  const lines = String(markdown ?? '').split(/\r?\n/);
+  const lastAt = new Map();
+  for (const [index, line] of lines.entries()) {
+    const key = keyOf(line);
+    if (key !== undefined) lastAt.set(key, index);
+  }
+  const seenHeadings = new Set();
+  const out = [];
+  for (const [index, line] of lines.entries()) {
+    const heading = sectionName(line);
+    if (heading.length > 0) {
+      if (seenHeadings.has(heading)) continue;
+      seenHeadings.add(heading);
+      out.push(line);
+      continue;
+    }
+    const key = keyOf(line);
+    if (key !== undefined && lastAt.get(key) !== index) continue;
+    out.push(line);
+  }
+  // 标题下面紧跟空行是删重复标题时留下的痕迹：收掉，别让文件越整理越松。
+  return `${out.join('\n').replace(/(^#{2,3}[^\n]*\n)\n+/gm, '$1').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
+}
+
+/** `COGNITION.md` 的写入归一化（见 {@link normalizeDoc}）。 */
+export function normalizeCognitionDoc(markdown) {
+  return normalizeDoc(markdown, (line) => {
+    if (!/^[-*]\s/.test(line.trim())) return undefined;
+    // 认知库只合并**完全相同的行**：同一个写法在不同群里意思不同时，本来就是两条
+    // （skill 明确允许），按写法去重会把其中一条吃掉。
+    const entry = parseCognition(`${line.trim()}\n`).entries[0];
+    return entry === undefined ? undefined : compareKey(line);
+  });
+}
+
+/**
+ * 文件里出现不止一次的二级标题（体检用）。
+ *
+ * 这不是「分类」，是同一个标题被 append 了两遍 —— 条目会散在两处，人翻的时候以为
+ * 自己看漏了（真实事故：`## 黑话与缩写` 出现两次，中间夹着一个空掉的 `## 表情包`）。
+ * @param markdown - 文件内容。
+ * @returns 重复的标题名数组（顺序按首次出现）。
+ */
+export function duplicateSectionNames(markdown) {
+  const counts = new Map();
+  for (const line of String(markdown ?? '').split(/\r?\n/)) {
+    const name = sectionName(line);
+    if (name.length === 0) continue;
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return [...counts.entries()].filter(([, count]) => count > 1).map(([name]) => name);
+}
+
+/** `STICKERS.md` 的写入归一化（见 {@link normalizeDoc}）。 */
+export function normalizeStickerDoc(markdown) {
+  return normalizeDoc(markdown, (line) => {
+    if (!/^[-*]\s/.test(line.trim())) return undefined;
+    const name = splitFields(line.trim().replace(/^[-*]\s+/, ''))[0];
+    return compareKey(name);
+  });
 }

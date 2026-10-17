@@ -47,6 +47,19 @@ test('路径作键的老条目：认出收藏图就迁过去，认知库里整�
   assert.match(plan.next.stickers, /## 已收藏\n- 摇头｜一张猫摇头｜表示「不不不」｜拒绝时｜\.qq-stickers\/摇头\.jpg/);
 });
 
+test('路径被反引号包着也要认出来（本机真实事故：包了反引号 → 搬走 0 → STICKERS.md 一直没生成）', async () => {
+  const cwd = await workspace({
+    // 摘要 Agent / 旧提示词习惯把路径包一层反引号，这一行就是这么写进 COGNITION.md 的。
+    cognition: '# 公共认知\n\n## 表情包\n- `.qq-media/aaaabbbb.jpg`｜一张猫摇头｜表示「不不不」｜拒绝时｜2026-10-12\n',
+    stickers: { '摇头.jpg': PIC_JPEG },
+    media: { 'aaaabbbb.jpg': PIC_JPEG },
+  });
+  const plan = await planCognitionMigration({ cwd });
+  assert.equal(plan.stats.moved, 1);
+  assert.doesNotMatch(plan.next.cognition, /qq-media/);
+  assert.match(plan.next.stickers, /- 摇头｜一张猫摇头｜表示「不不不」｜拒绝时｜\.qq-stickers\/摇头\.jpg/);
+});
+
 test('识别靠画面指纹：QQ 重新编码过的同一张图也能认出来', async () => {
   const cwd = await workspace({
     cognition: '## 表情包\n- .qq-media/ccccdddd.jpg｜熊猫头大笑｜笑到不行｜有人发离谱东西时\n',
@@ -83,6 +96,36 @@ test('写法在前、路径混在中间：图迁走，那个词仍留在认知�
   assert.equal(plan.stats.moved, 1);
   assert.match(plan.next.cognition, /- 摇头猫｜一张猫摇头｜表示不不不｜2026-10-12/);
   assert.doesNotMatch(plan.next.cognition, /\.qq-stickers/);
+});
+
+test('解析器跳过的碎条目不能被挤掉：只替换「认出来的那几行」，其余原样留在原处', async () => {
+  // 真实文件里就有这种手写碎条目（少于两段 → parseCognition 只记 warn、不当条目）。
+  // 老实现按「第几个 - 行」回填，它后面的条目会整体错位，末尾几条被吃掉。
+  const cognition = [
+    '# 公共认知',
+    '',
+    '## 黑话与缩写',
+    '- 魔了｜魔怔了',
+    '- 只写了一段没有竖线的碎条目',
+    '- 中杯｜给角色评强度的说法',
+    '',
+    '## 表情包',
+    '- 菲比｜鸣潮角色',
+    '- .qq-media/aaaabbbb.jpg｜猫摇头｜不不不',
+    '- jtb｜群友外号',
+    '',
+  ].join('\n');
+  const cwd = await workspace({ cognition });
+  const plan = await planCognitionMigration({ cwd });
+  const text = plan.next.cognition;
+  assert.match(text, /只写了一段没有竖线的碎条目/, '解析器跳过的行必须原样保留');
+  // 四条正常条目一条都不能少，顺序也不能变。
+  const order = ['魔了', '只写了一段没有竖线的碎条目', '中杯', '菲比', 'jtb'].map((word) => text.indexOf(word));
+  assert.ok(order.every((at) => at >= 0), `条目被吃掉了：${text}`);
+  for (let index = 1; index < order.length; index += 1) assert.ok(order[index - 1] < order[index], '顺序被打乱了');
+  // 迁走的那条（路径作键）才允许从认知库消失。
+  assert.doesNotMatch(text, /qq-media/);
+  assert.match(plan.next.stickers, /猫摇头/);
 });
 
 test('没有 COGNITION.md 时什么都不做，只给一句说明', async () => {
