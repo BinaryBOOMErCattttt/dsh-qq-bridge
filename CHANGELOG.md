@@ -16,7 +16,7 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
 | 字段 | 旧默认 | 新默认 | 影响 |
 |---|---|---|---|
 | `agentPreset` | `''`（部署默认预设） | `qq` | 新装默认挂本 bundle 的最小预设，而不是可能带 shell 的 `standard` |
-| `allowTools` | `[]`（不限制） | 14 个工具名 | 默认收窄到「只读文件 + 检索 + 联网 + 七个 `qq_*`」；`qq` 预设里的 `write` / `edit` 默认拿不到 |
+| `allowTools` | `[]`（不限制） | 17 个工具名 | 默认收窄到「只读文件 + 检索 + 联网 + 十个 `qq_*`」；`qq` 预设里的 `write` / `edit` 默认拿不到 |
 | `activeFollow` | `false` | `true` | 被叫到之后，窗口内同一个人接着说话也算数（还要过抽卡）；群里聊热了会进入多人搭话 |
 | `proactive` | `false` | `true` | 冷场后会自己开口（仍有 7 道闸，安静阈值 45 分钟） |
 | `burstSingleMaxChars` | `0`（用 80） | `100` | ≤100 字按聊天型走气泡计划，超过的按信息型完整发送 |
@@ -26,6 +26,28 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
 想回到「最保守」的那一套，在部署的 patch 里显式写回去即可：
 `agentPreset: ''`（或 `none`）、`allowTools: []`、`activeFollow: false`、`proactive: false`、
 `recallAddressed: answer`、`recallPrivate: false`。
+
+### 新增：定时提醒
+
+- **`qq_remind_create` / `qq_remind_list` / `qq_remind_cancel`**：让 Agent 把「明早 8 点提醒我
+  交作业」变成一条持久化任务；到点由插件直接发 `@目标 + 文本`，**不经过模型**，重启不丢。
+- **三种模式**：`text` 原样发固定文案（最可靠、不花 token）；`agent` 让模型用自己的语气说，
+  失败 / 超时 / SKIP 都退回固定文案；`prompt` 到点按指令做事（可调工具，默认关闭，只给受信者）。
+  `reminderModes` 是上限，默认 `agent`。
+- **时间**：一次性或每天 / 工作日 / 每周 / 每月；`at` 用本地 `YYYY-MM-DDTHH:MM`，也接受
+  `in_minutes`；周期任务的第一次已过去时自动滚到下一个未来时刻，`monthly` 在小月夹到月末。
+- **安全默认值**：只能提醒创建者自己；`@` 别人与 `@全体` 默认关（`reminderMentionOthers` /
+  `reminderAllowAll`）；每人每天 5 条、每会话 20 条待发；`reminderUsers` 是受信名单。
+  提醒正文原样发送、**不解析** `[[图片]]` / `[[@]]` 标记，@ 只来自创建时解析好的 QQ 号。
+- **重启 / 断线**：任务文件 `data/reminders.json`；错过时刻在 `reminderGraceMs`（默认 10 分钟）
+  内补发，超过标 `missed`；周期任务不补历史；agent 轮跑到一半进程被杀时补一条固定文案。
+- **发送是 at-most-once**：先记账再发，宁可重启后补一条文本，也不重复 @ 全体。
+- **`/reset` 不影响提醒**：任务属于会话而不是某一轮 Session。
+- **设置页能看见记着的任务**：新增独立的「提醒」tab（提醒同样服务私聊，不再塞在「群聊」
+  里），列表放在这一页最上面，按状态列出待发与最近历史（时间 / 模式 / 目标 / @ 名单 /
+  创建者 / 已发次数 / 上次错误），每 15 秒自动重读，也可以手动刷新；数据走 Connection
+  认证栅栏内的一条只读路由。
+- 详见[定时提醒](docs/reminders.md)；设置页在「提醒」tab。
 
 ### 行为变化
 

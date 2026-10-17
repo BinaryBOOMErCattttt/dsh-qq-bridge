@@ -22,7 +22,7 @@
 
 侧栏底部的 **设置** → 左边导航里的 **QQ Bridge**：本插件的全部配置都在这单独的一页里
 （这个入口是刻意保留的顶级入口，不挂到「设置 → 插件」的 tab 下 —— 一百多项埋在插件页里
-会被彻底忽略）。页面按用途分成 **6 个下划线 tab**：
+会被彻底忽略）。页面按用途分成 **7 个下划线 tab**：
 
 | tab | 全称 | 装什么 |
 |---|---|---|
@@ -30,6 +30,7 @@
 | 会话 | 会话与节奏 | QQ 会话与 Agent / 攒批与群聊上下文 / 说话方式与节奏 |
 | 人格 | 人格与表达 | 人格与提示词（PERSONA.md 优先）/ 表达（STYLE.md / 气泡 / 标点 / 补一句） |
 | 群聊 | 群聊互动 | 自动复读 / 主动说话 / 活跃对话 |
+| 提醒 | 定时提醒 | 定时提醒的配置；这一页最上面是**已记录的定时任务**（只读，每 15 秒刷新） |
 | 感知 | 感知与媒体 | 图片与表情包 / 感知与互动（链接 / 视频 / 戳一戳 / 撤回） |
 | 记忆 | 记忆与运维 | 长期记忆 / 模型凭据轮换 |
 
@@ -93,7 +94,7 @@
 | `agentPreset` | `qq` | QQ 会话 Agent 挂载的 Agent 预设 id：默认 `qq`（本 bundle 自带：只读文件 + 检索 + 联网，没有 shell / 子代理）。空 = 用**部署的默认预设**（可能是带 shell 的 `standard`，QQ 消息是不可信输入，别轻易这么配），`none` = 不挂预设（只剩宿主平面的 `qq_*`） |
 | `provider` / `model` | `''` | QQ 会话使用的模型；空 = 用默认 |
 | `approvalPolicy` | `never` | `never` = 无人值守时一律拒绝需要审批的操作 |
-| `allowTools` | 14 个工具名 | QQ 会话可用的工具白名单：默认 `read` / `read_image` / `glob` / `grep` / `web_search` / `web_fetch` / `skill` + 七个 `qq_*` —— **没有 write / edit / bash**。空 = 不限制（全给它继承到的工具）；写错的名字会被丢掉并记 warn，见[限制 QQ 会话的工具](tools.md#限制-qq-会话的工具allowtools) |
+| `allowTools` | 17 个工具名 | QQ 会话可用的工具白名单：默认 `read` / `read_image` / `glob` / `grep` / `web_search` / `web_fetch` / `skill` + 十个 `qq_*` —— **没有 write / edit / bash**。空 = 不限制（全给它继承到的工具）；写错的名字会被丢掉并记 warn，见[限制 QQ 会话的工具](tools.md#限制-qq-会话的工具allowtools) |
 | `resetCommand` | `/reset` | 新开一轮会话（旧会话留在磁盘上当存档）的指令；空 = 禁用 |
 | `resetUsers` | `[]` | 允许用 `resetCommand` 的 QQ 号；**留空 = 谁都不能重置**（与 `allowUsers` 反过来，见[新开一轮会话](sessions.md#新开一轮会话reset)）。本仓库的 `cordis.patch.yml` 把这一项接在 `QQBOT_RESET_USERS` 环境变量上（写进 `<启动 cwd>/.env`，逗号分隔）—— 免得把自己的号提交进仓库 |
 | `maxReplyChars` | `1500` | 单条 QQ 消息最大字符数（协议上限），超出自动分段 |
@@ -140,6 +141,17 @@
 | `activeChimeIdleMs` | `20000` | 它回完话、对方安静这么久之后可能自己再补一句（毫秒，按 `delayJitter` 抖动）；`0` = 不补；需要 `proactive: true` |
 | `activeChimeMax` | `1` | 对方每说一句之后最多自己补几句；`0` = 不补 |
 | `activeChimeDailyMax` | `12` | 同一个会话一天最多自己补几句（与 `proactiveDailyMax` 分开算）；`0` = 不限 |
+| `reminder` | `true` | 是否启用定时提醒（`qq_remind_create` / `qq_remind_list` / `qq_remind_cancel`）：到点由插件发消息，不依赖模型醒着；关掉后三个工具不注册、已有任务留在文件里不丢，见[定时提醒](reminders.md) |
+| `reminderFile` | `data/reminders.json` | 提醒任务文件，相对 `cwd`；必须落在 `cwd` 内，否则整个功能记 warn 并停用 |
+| `reminderUsers` | `[]` | 允许创建提醒的 QQ 号白名单；留空 = 不限制（与 `allowUsers` 同语义）。名单里的人额外视为**受信者**：可以 @ 别人、指定别的会话、建 prompt 模式 |
+| `reminderMentionOthers` | `false` | 是否允许普通群友的提醒 @ 创建者以外的人；默认关（定时 @ 人比即时 @ 更敏感）。受信者不受这一项限制 |
+| `reminderAllowAll` | `false` | 是否允许 `@全体成员`；默认关，且只有受信者（`reminderUsers` 里的人或 Web 操作员）能用 |
+| `reminderDailyMax` | `5` | 同一个人一天最多新建几条提醒（本地日界线，按任务文件里今天的记录算，重启不清零）；`0` = 不限；Web 操作员不受限 |
+| `reminderMaxActive` | `20` | 同一个会话最多同时有多少条待发提醒；满了就拒绝新建，直到发掉或取消 |
+| `reminderGraceMs` | `600000` | 补发窗口：进程重启 / 断线错过时刻后，超过这么久就不再补发，只把任务标成 `missed` |
+| `reminderModes` | `agent` | 允许的最高模式：`text` 只发固定文案（最可靠、不花 token）/ `agent` 让模型用自己的语气说（失败、超时、SKIP 都退回固定文案）/ `prompt` 到点按指令做事（可调工具，默认关闭，只给受信者） |
+| `reminderAgentTimeoutMs` | `120000` | agent/prompt 模式的硬超时：超过这么久模型还没给出可发送的正文，就发固定文案（prompt 模式没有兜底文案且允许跳过时丢弃），迟到的回复不再发送 |
+| `reminderAgentDailyMax` | `20` | 同一个会话一天最多跑几次 Agent 提醒；超过之后新的 agent/prompt 提醒自动退回固定文案；`0` = 不限；`text` 不计入 |
 | `humanize` | `true` | 自动回复是否拆成几条短消息 + 加打字延迟；`false` = 一条整段发出 |
 | `burstMaxChars` | `60` | 把一行长句拆开时的单条目标长度；`0` = 不按长度拆（换行仍然分条） |
 | `burstMaxParts` | `3` | 单行长句最多拆成几条；超出部分并进该行最后一条 |

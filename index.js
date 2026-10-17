@@ -41,7 +41,7 @@ import { endpointTarget, findNapcatDir, repairNapcat } from './napcat.js';
 import { registerQqTools } from './tools.js';
 import { createSettings, MAX_TIMER_MS } from './settings.js';
 import { createChatter } from './chatter.js';
-import { buildMentionResolver, hasMentionMarker, mentionSegments } from './mention.js';
+import { buildMentionResolver, hasMentionMarker, isAllMention, mentionSegments } from './mention.js';
 import {
   activeFollowAllows as activeFollowAllowsRule,
   activeTurnsLeft as activeTurnsLeftRule,
@@ -55,6 +55,7 @@ import {
   proactiveSkip,
 } from './speaking-rules.js';
 import { createMemory } from './memory.js';
+import { createReminders, describeTask, REMINDER_ROUTE_PATH } from './reminders.js';
 import { builtinStyle, classifyReply, createStyle, planBubbles, renderStyleContract, sanitizeBubble } from './style.js';
 import { createPersona, renderPersona } from './persona.js';
 import { observationOf, renderObservation } from './modalities.js';
@@ -68,12 +69,14 @@ import {
   hourLabel,
   liveConfig,
   localDate,
+  localMinute,
   memorySlug,
   msUntilDailyHour,
   parseApiKeyPool,
   sessionIdFor,
   stickerFileName,
   visibleText,
+  weekdayLabel,
   withinActiveHours,
 } from './util.js';
 import { readTextOrUndefined, writeBytesAtomic, writeJsonAtomic } from './filestore.js';
@@ -484,6 +487,90 @@ export function apply(ctx, config) {
     mountAgentPreset,
     restrictAgentTools,
     channelSectionOrder: CHANNEL_SECTION_ORDER,
+  });
+
+  // ---- 定时提醒（见 reminders.js 与 docs/reminders.md）--------------------------
+  //
+  // 任务文件放在 cwd 内（与 mediaDir / memoryDir 同一套越界校验）：它是唯一一份
+  // 「机器人未来要说什么」的数据，写到 cwd 外既不好备份，也绕过了部署的边界约定。
+  //
+  // `pendingReminderTurns` 是 agent/prompt 那一轮的账：task id → { resolve, guard }。
+  // 守卫按**任务**存而不是按会话存 —— `/reset` 会清掉这个会话的 turnOwners，那一轮的
+  // turn/end 永远不会来，只有守卫能把兜底文案发出去。
+  const pendingReminderTurns = new Map();
+  const reminderRoot = settings.reminder && settings.reminderFile.length > 0 ? resolve(cwd, settings.reminderFile) : undefined;
+  const reminderInside = reminderRoot !== undefined && insideDirectory(resolve(cwd), reminderRoot);
+  if (settings.reminder && reminderRoot === undefined) {
+    report('warn', 'reminderFile is empty; scheduled reminders are disabled');
+  } else if (settings.reminder && !reminderInside) {
+    report('warn', `reminderFile "${settings.reminderFile}" resolves outside cwd (${cwd}); scheduled reminders are disabled`);
+  }
+  const reminders = reminderInside
+    ? createReminders({
+        file: reminderRoot,
+        now: () => Date.now(),
+        schedule: scheduleTimer,
+        report,
+        deliverText: deliverReminderText,
+        deliverModel: deliverReminderModel,
+        runTurn: runReminderTurn,
+        isBusy: (task) => busyWithTurn(targetConversation(task.type, task.targetId)),
+        limits: {
+          maxActive: settings.reminderMaxActive,
+          dailyMax: settings.reminderDailyMax,
+          graceMs: settings.reminderGraceMs,
+          modeMax: settings.reminderModes,
+          agentDailyMax: settings.reminderAgentDailyMax,
+        },
+      })
+    : undefined;
+  const remindersEnabled = reminders !== undefined;
+  if (reminders !== undefined) {
+    ctx.effect(() => {
+      void mkdir(dirname(reminderRoot), { recursive: true })
+        .then(() => reminders.start())
+        .catch((error) => report('warn', `could not start scheduled reminders: ${errorText(error)}`));
+      return () => {
+        reminders.dispose();
+        for (const entry of pendingReminderTurns.values()) entry.guard?.();
+        pendingReminderTurns.clear();
+      };
+    }, 'qq-bridge:reminders');
+  }
+
+  // 设置页那一块「已记录的定时任务」要读的是**运行中的任务文件**，它不是配置项，
+  // schema 里没有、也不能为了它加一个假的配置字段。于是这里挂一条只读的 Host 路由：
+  // Connection 的 `/api` 自带 Host/Origin 栅栏与浏览器认证，页面（同源 fetch）拿到的
+  // 就是操作员视角；数据本身走 `reminders.overview()`，只含展示字段。
+  //
+  // 没有 Connection 服务（headless / 没开 Web）时静默不挂 —— 那边也没有设置页。
+  //
+  // 必须用 `ctx.inject`（可选依赖）、**不能**在这里 `ctx.get('connection')` 一次：
+  // 本插件的 `apply()` 跑在 `dsh-client-connection` 之前（实测启动日志：插件在
+  // T+0s 打完整套配置，`dsh web: http://…` 在 T+2s 才出现），那一刻
+  // `ctx.get('connection')` 是 undefined —— 于是路由**永远**挂不上，设置页那一块
+  // 只会拿到 404（真实事故：任务确实建好了，页面上却什么都没有）。
+  // `ctx.inject(['connection'], …)` 等的是「服务出现」这个事件：有了才跑回调，
+  // 全程没有 Web 半侧的组合（headless）里回调压根不跑，也不影响插件激活。
+  // 路由的注销由 `registerFetchRoute` 自己挂的 effect 负责（它绑在回调拿到的那个
+  // 子上下文上），插件卸载时一起收掉。
+  ctx.inject(['connection'], (connectionCtx) => {
+    const connection = connectionCtx.get('connection');
+    if (connection === undefined || typeof connection.fetch?.register !== 'function') return;
+    connection.fetch.register({
+      path: REMINDER_ROUTE_PATH,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => {
+        const at = Date.now();
+        const body = reminders === undefined
+          ? { ok: true, enabled: false, now: at, pending: 0, total: 0, tasks: [] }
+          : { ok: true, enabled: true, ...(await reminders.overview(at)) };
+        return new Response(JSON.stringify(body), {
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        });
+      },
+    });
   });
 
   // ---- 模型凭据：每天尝试轮换（见 docs/ops.md「每天轮换 API key」）------------------
@@ -959,6 +1046,11 @@ export function apply(ctx, config) {
    * @returns 一行提示词。
    */
   function speakerLine(conversation) {
+    // 到点提醒那一轮没有「刚跟你说话的人」：用普通那句会写成上一位发言人，
+    // 模型很容易回一句「怎么了」，而不是把该提醒的事说出来。
+    if (conversation.pendingIntent === 'reminder') {
+      return '这条不是谁发给你的，是你自己到点要提醒的事。';
+    }
     const speakers = conversation.speakers ?? [];
     if (conversation.pendingIntent === 'interject') {
       // 插话轮：这句不是冲它来的。元信息已经写在 user message 里了，这里只说清场景，
@@ -1252,6 +1344,20 @@ export function apply(ctx, config) {
     if (recommended.length > 0) {
       lines.push(`- 需要主动给其他人或群发消息、或查询联系人时，使用 ${recommended.join(' / ')} 工具。`);
     }
+    // 定时提醒：模型必须知道「现在几点」，否则「明天下午 3 点」只能靠猜；还要告诉它
+    // 答应下来的事必须真的落成任务，而不是只在回复里说「好的我记住了」—— 它只在这一轮
+    // 醒着，到点叫醒它的是插件，不是它自己的记忆。
+    if (remindersEnabled && (allowTools.length === 0 || allowTools.includes('qq_remind_create'))) {
+      const nowAt = Date.now();
+      lines.push(
+        `- 现在是 ${localMinute(nowAt)}（${weekdayLabel(nowAt)}，本地时间）。要提醒谁在某个时刻做什么，必须调用 qq_remind_create；不要只在回复里答应 —— 到点叫醒你的是插件，不是你自己的记忆。`,
+        '- 建完在回复里说清「几点提醒谁」；没建成要把原因说出来，别假装建好了。提醒的正文会原样发出，不会把图片或 @ 标记解析成真的图 / at 段，把要做什么写清楚。',
+      );
+      const summary = reminders.summaryFor(conversation.key);
+      if (summary.count > 0) {
+        lines.push(`- 这个会话还有 ${summary.count} 条待发的提醒，最近一条：${describeTask(summary.next)}。`);
+      }
+    }
     if (memory.toolsAllowed()) {
       const canSkill = allowTools.length === 0 || allowTools.includes('skill');
       lines.push(
@@ -1519,11 +1625,13 @@ export function apply(ctx, config) {
    * @param options - `human`：拆短句 + 打字延迟（自动回复用）；`quote`：本轮的回复指向
    *   `{ messageId, userId, seq }`，仅群聊生效，且只挂在第一个**文字**气泡上；
    *   `intent`：这一轮为什么轮到它（`addressed` / `continued` / `interject` / `proactive` /
-   *   `chime`）。插话轮靠它强制引用锚点（见 `quoteHead`）。
-   * @returns 本次发送（含延迟）完成时兑现的 Promise，绝不 reject。
+   *   `chime` / `reminder`）。插话轮靠它强制引用锚点（见 `quoteHead`）；`at`：要挂到
+   *   第一个文字气泡前的 `{ id, name }[]`（定时提醒用，模型自己不写 @）。
+   * @returns 本次发送（含延迟）完成时兑现的 Promise：至少发出一条为 true，否则 false。
+   *   绝不 reject。
    */
-  function sendToConversation(conversation, text, { human = false, quote, intent } = {}) {
-    return enqueueSend(conversation, () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 }, intent));
+  function sendToConversation(conversation, text, { human = false, quote, intent, at } = {}) {
+    return enqueueSend(conversation, () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 }, intent, at));
   }
 
   /**
@@ -1609,21 +1717,33 @@ export function apply(ctx, config) {
   }
 
   /** `sendToConversation` 的实际发送步骤（调用方已保证同一会话串行）。 */
-  async function sendParts(conversation, text, human, quote, intent) {
+  async function sendParts(conversation, text, human, quote, intent, at) {
     const pieces = replyPieces(text, human);
     // 「昵称 → QQ 号」的名单在一次发送里只造一遍：几个分段共用同一份，也保证同一次回复里
     // 同名的解析结果一致。
     const mentionsFor = conversationMentions(conversation);
+    // 定时提醒的 @ 名单由任务提供（创建时就解析成了 QQ 号），只挂到**第一个文字气泡**：
+    // 模型自己不写 `[[@…]]`，重试/重启之后也不依赖会话上那份会过期的 participants。
+    const atSegments = Array.isArray(at)
+      ? at
+          .filter((entry) => entry !== undefined && String(entry.id ?? '').trim().length > 0)
+          .map((entry) => ({ type: 'at', data: { qq: String(entry.id).trim() } }))
+      : [];
     const mode = human ? classifyReply(text, { chatMaxChars }) : 'informational';
     // 「发送中被打断就停」的快照：聊天型的后续气泡在真正发出前比一比，这期间对方又说话了
     // 就不再发剩下的（已经发的第一条留着）。真人也是这么停的；信息型该讲完还得讲完。
     const activitySnapshot = conversation.lastActiveAt;
     let firstTextSeen = false;
+    // 至少发出一条就是 true：定时提醒靠它判断「要不要走兜底」。
+    let sentAny = false;
+    // @ 只挂到**第一条真正发出去的文字**上：第一条文字如果被标记解析吃空，
+    // 它不该把 @ 也一起带走。
+    let atPending = atSegments.length > 0;
     for (const [index, piece] of pieces.entries()) {
       // 聊天型：对方已经接话了，就别接着说。
       if (human && mode === 'chat' && index > 0 && piece.kind === 'text' && conversation.lastActiveAt !== activitySnapshot) {
         report('info', `${describeConversation(conversation)}: 对方已经接话，剩下的 ${pieces.length - index} 个气泡不发了`);
-        return;
+        return sentAny;
       }
       if (human) {
         // 第一条前多等一个「读消息」的时间；后续每条只算打字时间。
@@ -1641,11 +1761,14 @@ export function apply(ctx, config) {
       const head = piece.kind === 'text' && !firstTextSeen
         ? quoteHead(conversation, { quote, intent })
         : undefined;
+      const atHere = piece.kind === 'text' && atPending ? atSegments : [];
       if (piece.kind === 'text') firstTextSeen = true;
       if (piece.kind === 'text') {
-        // 没有 @ 标记、也没有指向时仍然发纯字符串：与旧版发送格式完全一致，也少一个出错点。
-        if (piece.mention !== true && head === undefined) {
-          if (!(await sendOne(conversation, piece.text))) return;
+        // 没有 @ 标记、没有指向、也没有任务给的 @ 时仍然发纯字符串：与旧版发送格式完全一致。
+        if (piece.mention !== true && head === undefined && atHere.length === 0) {
+          if (!(await sendOne(conversation, piece.text))) return sentAny;
+          sentAny = true;
+          atPending = false;
           continue;
         }
         const segments = piece.mention === true
@@ -1653,20 +1776,32 @@ export function apply(ctx, config) {
           : [{ type: 'text', data: { text: piece.text } }];
         // 标记解析完什么都不剩（只写了一个认不出来的名字）时，这一条就没有内容可发了。
         if (segments.length === 0) continue;
-        const message = head === undefined ? segments : [head, ...segments];
-        if (await sendOne(conversation, message)) continue;
+        const message = [...(head === undefined ? [] : [head]), ...atHere, ...segments];
+        if (await sendOne(conversation, message)) {
+          sentAny = true;
+          atPending = false;
+          continue;
+        }
         // 插话轮的锚点是**必须**的（§7.1）：引用发不出去就退化成 @ 说话人，再不行才裸文本。
         // 宁可有指向地弱一点，也不要一句没有来由的话 —— 但只对插话轮这么做，别的轮次失败就算了。
         if (head?.type === 'reply' && intent === 'interject' && quote.userId.length > 0) {
           report('warn', `${describeConversation(conversation)}: 插话的引用发不出去，退化成 @ 说话人`);
-          const fallback = [{ type: 'at', data: { qq: quote.userId } }, ...segments];
-          if (await sendOne(conversation, fallback)) continue;
+          const fallback = [{ type: 'at', data: { qq: quote.userId } }, ...atHere, ...segments];
+          if (await sendOne(conversation, fallback)) {
+            sentAny = true;
+            atPending = false;
+            continue;
+          }
         }
         if (head !== undefined && intent === 'interject') {
           report('warn', `${describeConversation(conversation)}: 插话的引用与 @ 都发不出去，改为裸文本`);
-          if (await sendOne(conversation, segments)) continue;
+          if (await sendOne(conversation, [...atHere, ...segments])) {
+            sentAny = true;
+            atPending = false;
+            continue;
+          }
         }
-        return;
+        return sentAny;
       }
       let bytes;
       try {
@@ -1678,16 +1813,281 @@ export function apply(ctx, config) {
         report('warn', `sticker ${piece.source} could not be sent: ${errorText(error)}`);
         noteStickerFailure(conversation, piece.source, errorText(error));
         const notice = '（那张表情我这儿没有，发不出去）';
-        if (!(await sendOne(conversation, notice))) return;
+        if (!(await sendOne(conversation, notice))) return sentAny;
+        sentAny = true;
         continue;
       }
       // 图不挂引用、也没有可算的打字时间（延迟只留 index 0 的那个「读消息」）。
       // `imageSegment` 返回的是**一个段**，`message` 要的是段数组（旧写法就是 [segment]）。
       // `sticker: true` 带上 QQ 的「大表情」标记 —— 这条路只发收藏目录里的表情包。
-      if (!(await sendOne(conversation, [imageSegment(bytes, { sticker: true })]))) return;
+      if (!(await sendOne(conversation, [imageSegment(bytes, { sticker: true })]))) return sentAny;
+      sentAny = true;
       // 发出去了就把上一条失败记录清掉：再留着会变成一句没做完的指令。
       conversation.stickerFailure = undefined;
     }
+    return sentAny;
+  }
+
+  // ---- 定时提醒：发送、Agent 轮与守卫 -----------------------------------------
+  //
+  // 这一块只做「怎么把提醒发出去」与「agent 那一轮怎么等」；任务的生命周期
+  // （到点没到点、失败怎么退、重启怎么补）在 reminders.js 里。
+
+  /** 排一个一次性定时器；有 timer 服务就用它（插件卸载自动清），否则退回裸 setTimeout。 */
+  function scheduleTimer(callback, ms) {
+    if (typeof ctx.timeout === 'function') {
+      const dispose = ctx.timeout(callback, ms);
+      return typeof dispose === 'function' ? dispose : () => {};
+    }
+    const handle = setTimeout(callback, ms);
+    handle.unref?.();
+    return () => clearTimeout(handle);
+  }
+
+  /** 任务里的 @ 名单 → OneBot at 段；私聊不发 @（没有意义，也容易显示成怪东西）。 */
+  function reminderAtSegments(task) {
+    if (task?.type !== 'group') return [];
+    return (Array.isArray(task.mentions) ? task.mentions : [])
+      .filter((entry) => String(entry?.id ?? '').trim().length > 0)
+      .map((entry) => ({ type: 'at', data: { qq: String(entry.id).trim() } }));
+  }
+
+  /**
+   * 发提醒的固定文案：原样、不分气泡、不清标点、不加打字延迟。
+   *
+   * 为什么不复用 `sendToConversation(..., { human: true })`：提醒是「到点必须说出口」的
+   * 承诺，气泡掷骰与标点清洗都可能改变它，拟人延迟还会让它晚几秒。文本走
+   * `chunkText` 只按协议上限分段；@ 只挂在第一段。
+   *
+   * @returns `{ ok, retryable, reason }`：断线可重试，其余按失败处理。
+   */
+  async function deliverReminderText(task, text) {
+    if (!client.connected) return { ok: false, retryable: true, reason: 'QQ bridge is not connected' };
+    const conversation = targetConversation(task.type, task.targetId);
+    const head = reminderAtSegments(task);
+    const parts = chunkText(String(text ?? ''), settings.maxReplyChars);
+    if (parts.length === 0) return { ok: true };
+    let sent = false;
+    await enqueueSend(conversation, async () => {
+      for (const [index, part] of parts.entries()) {
+        const message = index === 0 && head.length > 0 ? [...head, { type: 'text', data: { text: part } }] : part;
+        if (!(await sendOne(conversation, message))) return;
+        sent = true;
+      }
+    });
+    return sent ? { ok: true } : { ok: false, retryable: true, reason: 'send failed' };
+  }
+
+  /**
+   * 发 agent 写出来的正文：走正常拟人通道（拆句/打字延迟），但 @ 由任务注入。
+   *
+   * 不把 @ 交给模型自己写：重启后 participants 名单是空的、模型也可能忘；
+   * `sendParts` 的 `at` 选项会把 at 段挂到第一个文字气泡前，且只挂一次。
+   */
+  async function deliverReminderModel(task, text) {
+    if (!client.connected) return { ok: false, retryable: true, reason: 'QQ bridge is not connected' };
+    const conversation = targetConversation(task.type, task.targetId);
+    const ok = await sendToConversation(conversation, text, {
+      human: true,
+      intent: 'reminder',
+      at: task.mentions,
+    });
+    return ok === false ? { ok: false, retryable: true, reason: 'send failed' } : { ok: true };
+  }
+
+  /**
+   * 到点提醒那一轮「伪造的 user message」。
+   *
+   * 与 `proactiveNudge` 的三条纪律相同：说清这不是谁发来的、给出 SKIP 出口（仅 prompt
+   * 模式允许跳过）、别暴露机制。agent 模式**不给** SKIP 出口 —— 提醒不能因为模型
+   * 「不想说」就消失，真不想说也得把事说出来。
+   */
+  function reminderNudge(task) {
+    const at = localMinute(Number(task.scheduledAt) || Number(task.dueAt) || Date.now());
+    const who = (Array.isArray(task.mentions) ? task.mentions : []).map((entry) => entry.name).join('、');
+    const subject = who.length > 0 ? `提醒 ${who}` : '提醒这个会话';
+    const lines = [
+      `（这条不是谁发给你的消息，是插件在提醒你：你之前答应过在 ${at} ${subject}「${task.text}」，现在到点了。）`,
+      '',
+    ];
+    if (task.mode === 'prompt') {
+      lines.push(`要做的事：${task.prompt}`);
+    } else {
+      lines.push(`用你平时的语气把这件事说出来：${task.text}`);
+    }
+    lines.push(
+      '',
+      '注意：',
+      '- 别提前面这条提醒，也别说「这是定时任务」；就当自己到点想起来了。',
+      '- @ 由插件加，你不用自己写 @；一条就够，别刷屏。',
+    );
+    if (task.mode === 'prompt' && task.allowSkip === true) {
+      lines.push('- 如果确实没事可报、或者做不成，就整条回复只写 `SKIP` —— 那样一个字都不会发出去。');
+    } else {
+      lines.push('- 这条不能跳过：至少要把这件事说出来。');
+    }
+    return lines.join('\n');
+  }
+
+  /** 结束（或丢弃）一条等待中的 agent 提醒；返回是否真的结算了。 */
+  function settleReminderTurn(taskId, outcome) {
+    const entry = pendingReminderTurns.get(taskId);
+    if (entry === undefined) return false;
+    pendingReminderTurns.delete(taskId);
+    if (entry.guard !== undefined) {
+      entry.guard();
+      entry.guard = undefined;
+    }
+    entry.resolve(outcome);
+    return true;
+  }
+
+  /**
+   * 跑一轮 agent/prompt 提醒，兑现 `{ kind: 'reply'|'skip'|'failure'|'timeout', ... }`。
+   *
+   * 守卫按**任务**存而不是按会话存：`/reset` 会清掉这个会话的 turnOwners，那一轮的
+   * `turn/end` 永远不会来 —— 只有这个守卫能把兜底文案发出去。超时之后迟到的
+   * `turn/end` 会找不到 entry，按「已结算」静默丢弃。
+   */
+  function runReminderTurn(task) {
+    return new Promise((resolve) => {
+      const entry = { resolve, guard: undefined };
+      pendingReminderTurns.set(task.id, entry);
+      entry.guard = scheduleTimer(() => {
+        pendingReminderTurns.delete(task.id);
+        report('warn', `reminder ${task.id}: agent turn timed out after ${settings.reminderAgentTimeoutMs}ms; falling back`);
+        resolve({ kind: 'timeout' });
+      }, settings.reminderAgentTimeoutMs);
+
+      const conversation = targetConversation(task.type, task.targetId);
+      enqueue(conversation, async () => {
+        try {
+          if (!client.connected) {
+            settleReminderTurn(task.id, { kind: 'failure', reason: 'QQ bridge is not connected' });
+            return;
+          }
+          conversation.pendingIntent = 'reminder';
+          const agent = await ensureAgent(conversation);
+          const message = createUserMessage({
+            content: [{ type: 'text', text: reminderNudge(task) }],
+            source: { kind: 'user' },
+          });
+          // 与主动搭话同一套归属记账，但**不标 proactive**：proactive 在 turn/end 里
+          // 出错会被静默吞掉，而提醒必须要能走到兜底。
+          submitted.set(message.id, {
+            key: conversation.key,
+            quote: { messageId: '', userId: '', seq: 0 },
+            intent: 'reminder',
+            reminderId: task.id,
+          });
+          agent.followup(message);
+        } catch (error) {
+          settleReminderTurn(task.id, { kind: 'failure', reason: errorText(error) });
+        }
+      });
+    });
+  }
+
+  /** 「谁在调这个工具」：当前这一轮最后一位发言人；Web 主会话没有会话记录。 */
+  function conversationSpeaker(conversation) {
+    const speakers = conversation?.speakers ?? [];
+    if (speakers.length > 0) return speakers[speakers.length - 1];
+    return { id: conversation?.senderId ?? '', name: conversation?.senderName ?? '' };
+  }
+
+  /** `qq_remind_list` / `qq_remind_cancel` 看到的调用者。 */
+  function reminderViewer(exec) {
+    const conversation = exec?.agent?.id !== undefined ? conversations.get(sessionIndex.get(exec.agent.id)) : undefined;
+    if (conversation === undefined) return { key: '', callerId: '', operator: true };
+    const speaker = conversationSpeaker(conversation);
+    return { key: conversation.key, callerId: String(speaker.id ?? ''), operator: false };
+  }
+
+  /** 把工具里的 @ 名字解析成 QQ 号；认不出来就报错并列出可用的昵称。 */
+  function resolveReminderMentions(raw, conversation, { callerId, callerName, operator, type }) {
+    if (type === 'private') return [];
+    const names = (Array.isArray(raw) ? raw : [])
+      .map((value) => String(value ?? '').trim())
+      .filter((value) => value.length > 0);
+    if (names.length === 0) {
+      if (callerId.length === 0 || operator) return [];
+      return [{ id: callerId, name: callerName }];
+    }
+    const resolve = conversationMentions(conversation);
+    const out = [];
+    const unknown = [];
+    for (const name of names) {
+      const lower = name.toLowerCase();
+      if (lower === 'me' || name === '我') {
+        if (callerId.length > 0 && !operator) out.push({ id: callerId, name: callerName });
+        continue;
+      }
+      if (isAllMention(name)) {
+        out.push({ id: 'all', name: '全体成员' });
+        continue;
+      }
+      const id = resolve(name);
+      if (id === undefined) {
+        unknown.push(name);
+        continue;
+      }
+      out.push({ id, name });
+    }
+    if (unknown.length > 0) {
+      const known = (conversation?.participants ?? []).map((entry) => entry.name).slice(0, 20);
+      throw new Error(
+        `unknown mention name(s): ${unknown.join(', ')}; names seen in this conversation: ${known.join('、') || '(none yet)'}`,
+      );
+    }
+    return out;
+  }
+
+  /**
+   * `qq_remind_create` 的上下文：目标会话、创建者、受信程度、@ 名单。
+   *
+   * 三条纪律：
+   *   - 创建者取**当前这一轮最后一位发言人**（`conversation.speakers`）而不是
+   *     `senderId`：后者会被随后到达的消息改掉，一批多人同时说话时更是没法归属；
+   *   - 「受信」= `reminderUsers` 里的人或 Web 操作员：只有他们能指定别的会话、
+   *     建 prompt 模式、@全体；`reminderMentionOthers` 是给普通群友的一层额外开关；
+   *   - @ 名字只从**这个会话**的 participants 里解析，不接受裸 QQ 号 —— 否则群友能让
+   *     机器人 @ 一个根本不在群里的人。
+   */
+  function reminderPrepare(args, exec, toolName) {
+    const fromAgent = exec?.agent?.id !== undefined ? conversations.get(sessionIndex.get(exec.agent.id)) : undefined;
+    const operator = fromAgent === undefined;
+    const speaker = fromAgent === undefined ? undefined : conversationSpeaker(fromAgent);
+    const callerId = operator ? 'operator' : String(speaker?.id ?? fromAgent.senderId ?? '');
+    const callerName = operator ? '操作员' : String(speaker?.name ?? fromAgent.senderName ?? '');
+    const trusted = operator || (settings.reminderUsers.length > 0 && settings.reminderUsers.includes(callerId));
+    // `reminderUsers` 非空时是**创建白名单**（空 = 不限制，与 allowUsers 同语义）；
+    // 受信者额外能 @ 别人 / 指定别的会话 / 建 prompt，但那不是「只有他们能建」的替代。
+    if (!operator && settings.reminderUsers.length > 0 && !trusted) {
+      throw new Error(`${toolName}: scheduled reminders are limited to reminderUsers`);
+    }
+    const explicit = args.target_type !== undefined || args.target_id !== undefined;
+    if (explicit && !operator && !trusted) {
+      throw new Error(`${toolName}: only trusted users can target another conversation`);
+    }
+    const target = resolveTarget(args, exec, toolName);
+    const mentions = resolveReminderMentions(args.mention, target.conversation, {
+      callerId,
+      callerName,
+      operator,
+      type: target.type,
+    });
+    return {
+      key: target.conversation.key,
+      type: target.type,
+      targetId: target.id,
+      callerId,
+      callerName,
+      operator,
+      trusted,
+      canMentionOthers: operator || trusted || settings.reminderMentionOthers,
+      canAll: (operator || trusted) && settings.reminderAllowAll,
+      mentions,
+    };
   }
 
   /**
@@ -4130,6 +4530,28 @@ export function apply(ctx, config) {
     const conversation = conversations.get(owner.key);
     if (conversation === undefined) return;
     const reason = event.data.reason?.kind;
+    // 只发该 turn 里最后一条有文本的 assistant 消息；中间步骤的工具调用等不发给 QQ。
+    const reply = list?.[list.length - 1]?.trim() ?? '';
+
+    // 定时提醒的 agent/prompt 轮：必须在 error / SKIP / aborted 之前收账。
+    // 这几个分支在普通轮次里是「静默丢弃」，但提醒不能静默 —— 要让 reminders.js 拿到
+    // 结果去走兜底文案。`settleReminderTurn` 返回 false 说明守卫已经超时并结算过，
+    // 这一条迟到的回复必须丢弃，否则同一件事会发两遍。
+    if (owner.reminderId !== undefined) {
+      conversation.pendingIntent = undefined;
+      const failed = reason === 'aborted' || reason === 'forked' || reason === 'interrupted' || reason === 'error';
+      const hasText = reply.length > 0 && replyPieces(reply, true).some((piece) => piece.kind === 'text');
+      const outcome = failed
+        ? { kind: 'failure', reason }
+        : hasText
+          ? (proactiveSkip(reply) ? { kind: 'skip' } : { kind: 'reply', text: reply })
+          : { kind: 'empty' };
+      if (!settleReminderTurn(owner.reminderId, outcome)) {
+        report('info', `reminder ${owner.reminderId}: 迟到的回复已丢弃（超时兜底已经发过）`);
+      }
+      return;
+    }
+
     // 被打断 / fork 掉 / 中止的 turn 不是有效回复，静默丢弃（意图也要清，别漏到下一轮）。
     if (reason === 'aborted' || reason === 'forked' || reason === 'interrupted') {
       conversation.pendingIntent = undefined;
@@ -4142,8 +4564,6 @@ export function apply(ctx, config) {
       if (owner.proactive !== true) void sendToConversation(conversation, '（我这边处理时出错了，稍后再试试）');
       return;
     }
-    // 只发该 turn 里最后一条有文本的 assistant 消息；中间步骤的工具调用等不发给 QQ。
-    const reply = list?.[list.length - 1]?.trim() ?? '';
     if (reply.length === 0) return;
     // `SKIP` 是**这一条会话本身**的「不说了」信号，不是「主动搭话」才有的信号：提醒
     // （`proactiveNudge` / `chimeNudge`）虽然只在那两种轮次里发，但它落在同一个会话的
@@ -4213,6 +4633,10 @@ export function apply(ctx, config) {
     // 记忆停用时 memory.tools 是 undefined：`registerQqTools` 会连那两个工具一起跳过，
     // 不留「一调就报错」的壳。
     memory: memory.tools,
+    // 定时提醒：停用（reminder: false / 文件在 cwd 外）时是 undefined，三个工具一起跳过。
+    reminders,
+    reminderPrepare,
+    reminderViewer,
   });
   // ---- NapCat 那一侧的自检 ----------------------------------------------------
   //
@@ -4477,6 +4901,20 @@ export function apply(ctx, config) {
     );
   } else {
     report('info', 'active conversation — activeFollow is off: group messages still need an explicit @ (or the configured prefix)');
+  }
+
+  // 定时提醒：启动自述把「文件在哪、最高模式、额度、补发窗口」一次说清 ——
+  // 排查「它怎么不提醒」时，先看这行有没有出现、模式是不是被 reminderModes 挡住了。
+  if (remindersEnabled) {
+    report(
+      'info',
+      `reminders on — ${settings.reminderFile}, modes up to ${settings.reminderModes}` +
+        `${settings.reminderModes === 'text' ? ' (fixed text only)' : ''}, ` +
+        `${settings.reminderMaxActive}/conversation, ${settings.reminderDailyMax || '不限'}/person/day, ` +
+        `grace ${Math.round(settings.reminderGraceMs / 60000)} min, agent timeout ${Math.round(settings.reminderAgentTimeoutMs / 1000)}s`,
+    );
+  } else if (!settings.reminder) {
+    report('info', 'reminders are off (reminder is false)');
   }
 
   // 人格与表达：启动时说清「人设从哪来」。排查「改了 PERSONA.md 没反应」时，第一件事

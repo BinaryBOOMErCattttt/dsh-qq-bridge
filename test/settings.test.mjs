@@ -215,3 +215,30 @@ test('未再加工的字段原样透传（schema 已经保证类型与默认值�
   assert.equal(settings({ memory: false }).memoryOn, false);
   assert.equal(settings({ memory: true }).memoryOn, true);
 });
+
+test('定时提醒：默认值、0 = 不限、非法值退回默认', () => {
+  const s = settings();
+  assert.equal(s.reminder, true);
+  assert.equal(s.reminderFile, 'data/reminders.json');
+  assert.deepEqual(s.reminderUsers, []);
+  assert.equal(s.reminderMentionOthers, false);
+  assert.equal(s.reminderAllowAll, false);
+  assert.equal(s.reminderDailyMax, 5);
+  assert.equal(s.reminderMaxActive, 20);
+  assert.equal(s.reminderGraceMs, 10 * 60 * 1000);
+  assert.equal(s.reminderModes, 'agent');
+  assert.equal(s.reminderAgentTimeoutMs, 120000);
+  assert.equal(s.reminderAgentDailyMax, 20);
+
+  assert.equal(settings({ reminderDailyMax: 0 }).reminderDailyMax, 0, '0 是明确的不限');
+  assert.equal(settings({ reminderDailyMax: -1 }).reminderDailyMax, 5, '负数不能变成不限');
+  assert.equal(settings({ reminderDailyMax: NaN }).reminderDailyMax, 5);
+  assert.equal(settings({ reminderMaxActive: 0 }).reminderMaxActive, 20);
+  assert.equal(settings({ reminderMaxActive: 3 }).reminderMaxActive, 3);
+  assert.equal(settings({ reminderModes: 'bogus' }).reminderModes, 'agent');
+  assert.equal(settings({ reminderModes: 'prompt' }).reminderModes, 'prompt');
+  assert.equal(settings({ reminderGraceMs: 'nonsense' }).reminderGraceMs, 600000);
+  assert.equal(settings({ reminderGraceMs: -5 }).reminderGraceMs, 0);
+  assert.equal(settings({ reminderAgentTimeoutMs: 100 }).reminderAgentTimeoutMs, 5000);
+  assert.equal(settings({ reminderAgentDailyMax: -1 }).reminderAgentDailyMax, 20);
+});

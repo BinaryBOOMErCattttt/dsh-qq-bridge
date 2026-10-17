@@ -195,6 +195,25 @@ export function createSettings(config, defaultCwd) {
     return Number.isFinite(value) && value > 1 ? value : 1;
   })();
 
+  // —— 定时提醒（见 reminders.js）——
+  // 额度三项的 0 都是「明确的不限」，但非法值要退回默认 —— 不能把一次手滑变成无上限。
+  const reminder = config.reminder !== false;
+  const reminderFile = trimmed(config.reminderFile);
+  const reminderUsers = deduped(config.reminderUsers);
+  const reminderMentionOthers = config.reminderMentionOthers === true;
+  const reminderAllowAll = config.reminderAllowAll === true;
+  const reminderDailyMaxRaw = Math.floor(Number(config.reminderDailyMax));
+  const reminderDailyMax = Number.isFinite(reminderDailyMaxRaw) && reminderDailyMaxRaw >= 0 ? reminderDailyMaxRaw : 5;
+  const reminderMaxActiveRaw = Math.floor(Number(config.reminderMaxActive));
+  const reminderMaxActive = Number.isFinite(reminderMaxActiveRaw) && reminderMaxActiveRaw >= 1 ? reminderMaxActiveRaw : 20;
+  const reminderGraceMs = msOf(config.reminderGraceMs, 10 * 60 * 1000);
+  // 模式是枚举：非法值退回默认的 agent（而不是 text）—— text 会把用户已经习惯的
+  // agent 提醒静默降级；而 prompt 不该因为一次手滑就被打开。
+  const reminderModes = ['text', 'agent', 'prompt'].includes(config.reminderModes) ? config.reminderModes : 'agent';
+  const reminderAgentTimeoutMs = Math.max(5000, Math.floor(Number(config.reminderAgentTimeoutMs) || 0) || 120000);
+  const reminderAgentDailyMaxRaw = Math.floor(Number(config.reminderAgentDailyMax));
+  const reminderAgentDailyMax = Number.isFinite(reminderAgentDailyMaxRaw) && reminderAgentDailyMaxRaw >= 0 ? reminderAgentDailyMaxRaw : 20;
+
   // —— 长期记忆 ——
   const memoryOn = config.memory !== false;
   const memorySearchHits = Math.max(1, Math.floor(Number(config.memorySearchHits) || 40));
@@ -297,6 +316,17 @@ export function createSettings(config, defaultCwd) {
     activeChimeMax,
     activeChimeDailyMax,
     activeGroupBatchScale,
+    reminder,
+    reminderFile,
+    reminderUsers,
+    reminderMentionOthers,
+    reminderAllowAll,
+    reminderDailyMax,
+    reminderMaxActive,
+    reminderGraceMs,
+    reminderModes,
+    reminderAgentTimeoutMs,
+    reminderAgentDailyMax,
     memoryOn,
     memorySearchHits,
     memoryFileMaxBytes,

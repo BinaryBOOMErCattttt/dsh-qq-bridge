@@ -41,12 +41,23 @@
 - **撤回的调侃默认只冲它来的**（`recallScope: to-me`）：`all` 会让它为群里任何人的撤回开一次口，
   那等于当着全群承认它每条都看。另外 `recallMode: tease` 会真的多发一条消息，所以它带冷却、
   当天上限与时效三道闸；`ignore`（默认）除了「清引用 + 记忆留标记」之外什么都不做。
-- **唯一一个能让 QQ 会话写磁盘的工具是 `qq_save_sticker`**（`allowTools` 里可以去掉它）：
-  它只往 `stickerDir` 里写一个文件名被洗成单层的图片，字节还要先过魔数与大小校验，
-  张数受 `stickerMaxFiles` 限制，同名不覆盖。除此之外 QQ 会话没有 write / edit / bash ——
+- **定时提醒（`reminder`，默认开）会把「机器人未来要说什么」落盘**：`qq_remind_create` 让
+  插件往 `reminderFile`（默认 `data/reminders.json`）写一条任务，到点由插件直接发消息，
+  **不经过模型**。它新增的风险不是「能发消息」（`qq_send_message` 现在就能），而是
+  **时间上的突袭**（凌晨 @ 人）和**目标本人没同意**，所以默认：只能提醒创建者自己、
+  @ 别人与 @全体都关、每人每天 5 条、每会话 20 条待发。`reminderUsers` 是受信名单
+  （可 @ 别人、指定别的会话、建 prompt 模式），`reminderModes` 是模式上限（默认 `agent`，
+  设 `text` 就只剩固定文案）。提醒正文**原样发送**，不解析 `[[图片]]` / `[[@]]` 标记；
+  @ 只来自创建时解析好的 QQ 号。`prompt` 模式是「无人在场的指令执行」，默认关闭且只给
+  受信者。详见[定时提醒](reminders.md)。
+- **`qq_save_sticker` 是唯一一个让 QQ 会话直接按自己给的字节写磁盘的工具**（`allowTools`
+  里可以去掉它）：它只往 `stickerDir` 里写一个文件名被洗成单层的图片，字节还要先过魔数与
+  大小校验，张数受 `stickerMaxFiles` 限制，同名不覆盖。`qq_remind_create` 也会让插件写盘，
+  但写的是 `reminderFile` 里**由纯函数校验过字段**的任务（不是模型给的任意路径/字节），
+  两者不是同一类能力。除此之外 QQ 会话没有 write / edit / bash ——
   这是「群里谁都能让它存一张图」与「工作区不能被群里的人写坏」之间的那条线，别随手挪。
 
 ## 相关分册
 
-[主动开口](proactive.md) · [被撤回的消息](recall.md) · [图片、表情包与感知](media.md) ·
+[主动开口](proactive.md) · [定时提醒](reminders.md) · [被撤回的消息](recall.md) · [图片、表情包与感知](media.md) ·
 [长期记忆](memory.md) · [运维（key 轮换）](ops.md) · [配置项](configuration.md)

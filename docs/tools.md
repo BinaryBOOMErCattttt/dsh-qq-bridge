@@ -13,11 +13,15 @@
 | `qq_list_conversations` | 列出在线群/好友列表，以及本 Harness 已处理过的 QQ 会话、当前 Session id 与轮次（`session_round`） |
 | `qq_transcript` | 读某个 QQ 会话的聊天记录：`list` / `read` / `search`（长期记忆的原料，见[长期记忆](memory.md#长期记忆聊天记录--摘要--认知)） |
 | `qq_memory` | 读 / 追加 / 覆盖 / 搜索 / **逐条 upsert / remove** 长期记忆文件：`conversations/<slug>/MEMORY.md`、`COGNITION.md`、`STICKERS.md`、`INDEX.md`；整份 `write` 有「条目数不能掉 10%」护栏，写前留 `.history/` 备份；写被限制在 `memoryDir` 之内 |
+| `qq_remind_create` | 建一条到点的提醒：到点由插件直接发消息（`text` 原样 / `agent` 让模型换语气 / `prompt` 到点做事），可 `@` 创建者或名单里的人；时间用本地 `YYYY-MM-DDTHH:MM` 或 `in_minutes`，周期支持每天 / 工作日 / 每周 / 每月，见[定时提醒](reminders.md) |
+| `qq_remind_list` | 列出提醒：默认这个会话的，`scope: "mine"` 只看自己建的，`scope: "all"` 只在 Web 操作员那里可用；带状态、下一次时间与失败原因 |
+| `qq_remind_cancel` | 按 id 取消一条还没发的提醒；只有创建者本人（或 Web 操作员）能取消 |
 
-这六个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
+这九个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
 `qq_send_image` / `qq_save_sticker` 见[它也能发表情包](media.md#它也能发表情包)；
 `qq_transcript` / `qq_memory` 见[长期记忆](memory.md#长期记忆聊天记录--摘要--认知)，
-关掉 `memory` 后它们**根本不会注册**。
+关掉 `memory` 后它们**根本不会注册**；关掉 `reminder`（或任务文件配到 `cwd` 外）后
+`qq_remind_*` 三个**根本不会注册**。
 
 ## QQ 会话的工具从哪来（`agentPreset`）
 
@@ -101,10 +105,10 @@ allowTools:
 
 - **只影响 QQ 会话**：收窄施加在「由 QQ 消息创建出来的那个 Agent」自己的作用域上
   （DSH 的 `tools.restrict()`），Web UI 主会话等其它 Agent 完全不受影响。
-- **默认就是收窄过的**（14 个：只读文件 + 检索 + 联网 + 七个 `qq_*`）—— 这样即使
+- **默认就是收窄过的**（17 个：只读文件 + 检索 + 联网 + 十个 `qq_*`）—— 这样即使
   `agentPreset: qq` 的预设里带了 `write` / `edit`，QQ 会话也拿不到它们。
 - **显式写空数组 = 不限制**（与 `allowUsers` / `allowGroups` 同一套语义）：把这个 Agent
-  继承到的工具全给它。想放开某一项，就把默认那 14 个抄下来再加减，别直接清空。
+  继承到的工具全给它。想放开某一项，就把默认那 17 个抄下来再加减，别直接清空。
 - 过滤的是**继承来的**工具（宿主平面的全局工具 + 这个 Agent join 的预设里的工具）。
   ⚠️ Agent **自己作用域里注册**的工具不受影响 —— 这是设计使然（它回头作答所依赖的
   机制不能被收走），但也意味着某个预设行可能绕过白名单，典型例子就是 `standard`

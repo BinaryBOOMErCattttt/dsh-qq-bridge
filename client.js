@@ -18,7 +18,7 @@
  *      把整份配置投影成表单 schema），标签与说明也来自 schema 上的 `.description()`。
  *      于是「加一个配置项」只需要改 `config.js` 一处 —— 设置页自动多出一行。
  *
- * 版式（定稿）：**6 个下划线 tab + 单列扁平区块 +
+ * 版式（定稿）：**7 个下划线 tab + 单列扁平区块 +
  * 官方两种字段行**，不再有折叠卡片墙。`TABS` 负责分组（字段 → 分组见 `SECTIONS`），
  * `FIELD_HINTS` 给数字补只读量纲（`= 45 分钟`），`ENUM_LABELS` 给枚举取值配人话。
  * 布尔是 `Switch`（官方开关行），枚举是原生 `<select>`（Input 外观），其余是输入框 /
@@ -43,6 +43,7 @@ window.__ModuleLoader__.load({
     const P = require('@deepseek-ai/dsh-client-ui-primitives');
 
     const useState = React.useState;
+    const useEffect = React.useEffect;
 
     /** 本页文案的字典命名空间（`ctx.locale.register` 的那把钥匙）。 */
     const NS = 'settings.qq';
@@ -58,6 +59,16 @@ window.__ModuleLoader__.load({
     /** tab 与 tabpanel 的 id：roving tabindex 的 `aria-controls` 要指得准。 */
     const TAB_ID_PREFIX = 'qq-tab-';
     const TAB_PANEL_ID_PREFIX = 'qq-tabpanel-';
+    /**
+     * 「已记录的定时任务」的只读接口。
+     *
+     * 路径必须与 `reminders.js` 的 `REMINDER_ROUTE_PATH` 一致：这份文件是浏览器
+     * bundle，不能 import 主机模块，所以只能各写一份 —— `test/client.test.mjs`
+     * 断言两处相等（漏改一边会红）。它是 Connection 认证栅栏内的 exact Fetch route。
+     */
+    const REMINDER_TASKS_PATH = '/api/qq-bridge/reminders';
+    /** 页面开着时多久重读一次任务（建/取消任务发生在 QQ 那一侧，不会推事件过来）。 */
+    const REMINDER_REFRESH_MS = 15000;
 
     // ---- 样式 ------------------------------------------------------------------
     //
@@ -130,6 +141,16 @@ window.__ModuleLoader__.load({
 .qq-disclosure[open] > .qq-summary .qq-chevron{transform:rotate(45deg)}
 .qq-disclosureBody{display:flex;flex-direction:column;padding-top:2px}
 .qq-empty{margin:0;font-size:13px;line-height:20px;color:var(--dsw-alias-label-tertiary)}
+.qq-tasksToolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px}
+.qq-tasksCount{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
+.qq-taskList{display:flex;flex-direction:column;margin:8px 0 0;padding:0;list-style:none}
+.qq-task{display:flex;flex-direction:column;gap:4px;padding:10px 0;border-top:.5px solid var(--dsw-alias-border-l2);min-width:0}
+.qq-task:first-child{border-top:0}
+.qq-taskHead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.qq-taskTime{font-size:13px;font-weight:500;line-height:20px;color:var(--dsw-alias-label-primary)}
+.qq-taskTags{display:inline-flex;align-items:center;gap:6px;margin-left:auto;flex:none}
+.qq-taskText{margin:0;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.qq-taskMeta{margin:0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
 @media (prefers-reduced-motion: reduce){.qq-chevron{transition:none}}
 `;
 
@@ -146,7 +167,7 @@ window.__ModuleLoader__.load({
     const zh = {
       navTitle: 'QQ Bridge',
       title: 'QQ Bridge',
-      intro: 'QQ 桥接的全部配置，按用途分成六页；改完在底部一次保存。',
+      intro: 'QQ 桥接的全部配置，按用途分页；改完在底部一次保存。',
       notice: '保存会写进当前 profile 的 cordis.patch.yml，随后插件重启一次；环境变量（QQBOT_*）的取值会以表达式保留。',
       searchPlaceholder: '搜索配置项…',
       searchEmpty: '没有匹配的配置项。可以搜字段名（如 proactiveChance）或描述里的词。',
@@ -177,11 +198,37 @@ window.__ModuleLoader__.load({
       saveFailed: '本部署没有接受这些值，已保留供你修改。',
       save: '保存',
       saving: '保存中…',
+      remindersTitle: '已记录的定时任务',
+      remindersNote:
+        '来自提醒任务文件，每 {seconds} 秒自动刷新一次；这一块只读，建任务 / 取消任务都在 QQ 里说一声。',
+      remindersRefresh: '刷新',
+      remindersLoading: '正在读取任务…',
+      remindersEmpty: '还没有记录任何定时任务。在 QQ 里说「明早 8 点提醒我」就会出现在这里。',
+      remindersDisabled: '定时提醒已关闭（reminder），或提醒任务文件不可用。',
+      remindersFailed: '读取任务失败：{message}',
+      remindersCount: '待发 {pending} 条 · 共 {total} 条',
+      remindersTargetGroup: '群 {id}',
+      remindersTargetPrivate: '私聊 {id}',
+      remindersMentions: '提醒 {names}',
+      remindersCreatedBy: '{name} 建的',
+      remindersFired: '已发 {count} 次',
+      remindersPromptPrefix: '指令：',
+      remindersErrorLabel: '上次错误：{message}',
+      remindersStatusActive: '待发送',
+      remindersStatusFiring: '发送中',
+      remindersStatusDone: '已发送',
+      remindersStatusMissed: '已错过',
+      remindersStatusFailed: '失败',
+      remindersStatusCancelled: '已取消',
+      remindersStatusUnknown: '未知状态',
+      remindersModeText: '固定文案',
+      remindersModeAgent: 'Agent 组织',
+      remindersModePrompt: 'Agent 执行',
     };
     const en = {
       navTitle: 'QQ Bridge',
       title: 'QQ Bridge',
-      intro: 'Every QQ bridge setting, grouped into six pages; save once at the bottom.',
+      intro: 'Every QQ bridge setting, grouped by purpose; save once at the bottom.',
       notice: 'Saving writes this profile’s cordis.patch.yml and restarts the plugin once; values that come from QQBOT_* stay as expressions.',
       searchPlaceholder: 'Search settings…',
       searchEmpty: 'No matching settings. Try a field name (e.g. proactiveChance) or a word from its description.',
@@ -212,6 +259,32 @@ window.__ModuleLoader__.load({
       saveFailed: 'The deployment did not accept these values; they were left for you to correct.',
       save: 'Save',
       saving: 'Saving…',
+      remindersTitle: 'Scheduled reminders',
+      remindersNote:
+        'Read from the reminder task file and refreshed every {seconds} seconds. This block is read-only; create or cancel tasks by talking to the bot in QQ.',
+      remindersRefresh: 'Refresh',
+      remindersLoading: 'Loading tasks…',
+      remindersEmpty: 'No reminders yet. Ask the bot in QQ (“remind me at 8 tomorrow”) and it will show up here.',
+      remindersDisabled: 'Scheduled reminders are disabled (reminder), or the task file is unavailable.',
+      remindersFailed: 'Could not load tasks: {message}',
+      remindersCount: '{pending} pending · {total} total',
+      remindersTargetGroup: 'Group {id}',
+      remindersTargetPrivate: 'DM {id}',
+      remindersMentions: 'reminds {names}',
+      remindersCreatedBy: 'by {name}',
+      remindersFired: 'sent {count}×',
+      remindersPromptPrefix: 'Prompt: ',
+      remindersErrorLabel: 'Last error: {message}',
+      remindersStatusActive: 'Pending',
+      remindersStatusFiring: 'Sending',
+      remindersStatusDone: 'Sent',
+      remindersStatusMissed: 'Missed',
+      remindersStatusFailed: 'Failed',
+      remindersStatusCancelled: 'Cancelled',
+      remindersStatusUnknown: 'Unknown',
+      remindersModeText: 'Verbatim',
+      remindersModeAgent: 'Agent phrasing',
+      remindersModePrompt: 'Agent task',
     };
 
     // ---- 分组、tab 与标签 -------------------------------------------------------
@@ -325,6 +398,7 @@ window.__ModuleLoader__.load({
       { id: 'repeat', title: '自动复读', prefix: ['repeat'] },
       { id: 'proactive', title: '主动说话（冷场时自己冒个泡）', prefix: ['proactive'] },
       { id: 'active', title: '活跃对话（聊起来之后保持搭话）', prefix: ['active'] },
+      { id: 'reminder', title: '定时提醒（到点自己开口）', prefix: ['reminder'] },
       {
         id: 'perception',
         title: '感知与互动（链接 / 视频 / 戳一戳 / 撤回）',
@@ -395,16 +469,20 @@ window.__ModuleLoader__.load({
     const OTHER_SECTION = { id: 'other', title: '其它' };
 
     /**
-     * 6 个 tab：`sections` 是 SECTIONS 的 id，顺序即页面顺序。
+     * 7 个 tab：`sections` 是 SECTIONS 的 id，顺序即页面顺序。
      *
      * 为什么映射写死在这里而不是从 schema 推：schema 只说「有哪些配置」，不知道
      * 「这一堆该按什么顺序读」；tab 是阅读顺序，是界面的事。
+     *
+     * 「提醒」单独一页：它同时服务群聊与私聊，塞进「群聊」既分类错误、又会被压在
+     * 一长串群聊配置后面。任务列表放在这一页的最上面（见下面的 panelSections）。
      */
     const TABS = [
       { id: 'connect', label: '连接', title: '连接与准入', sections: ['connection', 'admission'] },
       { id: 'session', label: '会话', title: '会话与节奏', sections: ['agent', 'batch', 'style'] },
       { id: 'persona', label: '人格', title: '人格与表达', sections: ['persona', 'expression'] },
       { id: 'group', label: '群聊', title: '群聊互动', sections: ['repeat', 'proactive', 'active'] },
+      { id: 'reminder', label: '提醒', title: '定时提醒', sections: ['reminder'] },
       { id: 'perception', label: '感知', title: '感知与媒体', sections: ['media', 'perception'] },
       { id: 'memory', label: '记忆', title: '记忆与运维', sections: ['memory', 'apikey'] },
     ];
@@ -471,6 +549,17 @@ window.__ModuleLoader__.load({
       activeChimeIdleMs: '群里补一句前的安静时间',
       activeChimeMax: '群里每轮最多补几句',
       activeChimeDailyMax: '群里每天最多补几句',
+      reminder: '启用定时提醒',
+      reminderFile: '提醒任务文件',
+      reminderUsers: '谁能建提醒',
+      reminderMentionOthers: '允许提醒 @ 别人',
+      reminderAllowAll: '允许提醒 @全体',
+      reminderDailyMax: '每人每天最多建几条',
+      reminderMaxActive: '每个会话最多待发几条',
+      reminderGraceMs: '补发窗口（毫秒）',
+      reminderModes: '允许的最高模式',
+      reminderAgentTimeoutMs: 'Agent 提醒的超时',
+      reminderAgentDailyMax: '每个会话每天最多跑几次 Agent',
       memoryFileMaxBytes: '记忆文件的字节上限',
       memorySearchHits: '搜索最多返回几条',
     };
@@ -486,6 +575,7 @@ window.__ModuleLoader__.load({
       recallMode: { off: '不处理（只修引用）', ignore: '假装没看到', tease: '调侃一下' },
       recallAddressed: { answer: '照常回答（不引用）', drop: '真不回' },
       recallScope: { 'to-me': '只调侃冲它来的', all: '群里谁撤回都调侃' },
+      reminderModes: { text: '只发固定文案（最可靠）', agent: 'Agent 组织语言', prompt: 'Agent 执行指令（受信者）' },
       replyStyle: { auto: '自动（默认）', plain: '直接发', quote: '引用', at: '@ 对方' },
     };
 
@@ -637,6 +727,8 @@ window.__ModuleLoader__.load({
       privateAfterthoughtIdleMs: formatMs,
       digestTimeoutMs: formatMs,
       apiKeyProbeTimeoutMs: formatMs,
+      reminderGraceMs: formatMs,
+      reminderAgentTimeoutMs: formatMs,
       // 字节
       mediaMaxBytes: formatBytes,
       imageMaxBytes: formatBytes,
@@ -1542,9 +1634,212 @@ window.__ModuleLoader__.load({
       );
     });
 
+    // ---- 已记录的定时任务（只读） ------------------------------------------------
+    //
+    // 数据不在 schema 里：任务文件是运行状态，不是配置。Host 那条 `REMINDER_TASKS_PATH`
+    // 挂在 Connection 的认证栅栏后面，这里只负责画。页面开着时每 15 秒重读一次 ——
+    // 任务是在 QQ 那一侧建的，没有事件能推到浏览器。
+
+    /** 状态 → 字典 key（`unknown` 兜底，读到坏数据也不会把 key 露到页面上）。 */
+    const REMINDER_STATUS_KEY = {
+      active: 'remindersStatusActive',
+      firing: 'remindersStatusFiring',
+      done: 'remindersStatusDone',
+      missed: 'remindersStatusMissed',
+      failed: 'remindersStatusFailed',
+      cancelled: 'remindersStatusCancelled',
+      unknown: 'remindersStatusUnknown',
+    };
+
+    /** 状态 → Tag 色调：待发是信息、发送中要留意、失败是错误、历史静音。 */
+    const REMINDER_STATUS_TONE = {
+      active: 'info',
+      firing: 'warning',
+      done: 'success',
+      missed: 'danger',
+      failed: 'danger',
+      cancelled: 'quiet',
+      unknown: 'outline',
+    };
+
+    /** 模式 → 字典 key：这里用页面自己的短文案，不复用配置页那串长说明。 */
+    const REMINDER_MODE_KEY = {
+      text: 'remindersModeText',
+      agent: 'remindersModeAgent',
+      prompt: 'remindersModePrompt',
+    };
+
+    /** 一行任务的展示标签（时间 / 重复 / 目标 / @ / 创建者 / 发送次数 / 上次错误）。 */
+    const ReminderTaskRow = component(function ReminderTaskRow(props) {
+      const { t, task } = props;
+      const mentions = (Array.isArray(task.mentions) ? task.mentions : []).map(String);
+      const createdBy = typeof task.createdBy === 'string' ? task.createdBy : '';
+      const error = typeof task.error === 'string' ? task.error : '';
+      const text = typeof task.text === 'string' ? task.text : '';
+      const meta = [
+        task.type === 'group'
+          ? t('remindersTargetGroup', { id: task.targetId })
+          : t('remindersTargetPrivate', { id: task.targetId }),
+      ];
+      if (mentions.length > 0) meta.push(t('remindersMentions', { names: mentions.map((name) => `@${name}`).join(' ') }));
+      if (createdBy.length > 0) meta.push(t('remindersCreatedBy', { name: createdBy }));
+      if (task.fireCount > 0) meta.push(t('remindersFired', { count: task.fireCount }));
+      if (error.length > 0) meta.push(t('remindersErrorLabel', { message: error }));
+      const due = typeof task.dueLabel === 'string' && task.dueLabel.length > 0 ? task.dueLabel : String(task.id ?? '');
+      const repeat = typeof task.repeat === 'string' ? task.repeat : '';
+      return jsxs(
+        'li',
+        {
+          className: 'qq-task',
+          'data-status': task.status,
+          children: [
+            jsxs(
+              'div',
+              {
+                className: 'qq-taskHead',
+                children: [
+                  jsx('span', {
+                    className: 'qq-taskTime',
+                    children: task.repeating ? `${due} · ${repeat}` : due,
+                  }, 'time'),
+                  jsxs(
+                    'span',
+                    {
+                      className: 'qq-taskTags',
+                      children: [
+                        jsx(P.Tag, {
+                          tone: REMINDER_STATUS_TONE[task.status] ?? 'outline',
+                          children: t(REMINDER_STATUS_KEY[task.status] ?? REMINDER_STATUS_KEY.unknown),
+                        }, 'status'),
+                        jsx(P.Tag, { tone: 'outline', children: t(REMINDER_MODE_KEY[task.mode] ?? REMINDER_MODE_KEY.text) }, 'mode'),
+                      ],
+                    },
+                    'tags',
+                  ),
+                ],
+              },
+              'head',
+            ),
+            jsx('p', {
+              className: 'qq-taskText',
+              children: task.mode === 'prompt' ? `${t('remindersPromptPrefix')}${text}` : text,
+            }, 'text'),
+            jsx('p', { className: 'qq-taskMeta', children: meta.join(' · ') }, 'meta'),
+          ],
+        },
+        'task',
+      );
+    });
+
+    /** 任务列表（纯展示）：空列表给一句「还没有」，否则逐条画。 */
+    const ReminderTaskList = component(function ReminderTaskList(props) {
+      const { t, data } = props;
+      const tasks = Array.isArray(data?.tasks) ? data.tasks : [];
+      if (tasks.length === 0) return jsx('p', { className: 'qq-empty', children: t('remindersEmpty') }, 'empty');
+      return jsx(
+        'ul',
+        {
+          className: 'qq-taskList',
+          children: tasks.map((task) => jsx(ReminderTaskRow, { t, task }, task.id)),
+        },
+        'list',
+      );
+    });
+
+    /** 定时任务区块：取数（含定时刷新）+ 加载 / 失败 / 关闭 / 空 / 列表五种状态。 */
+    const ReminderTasks = component(function ReminderTasks(props) {
+      const { t } = props;
+      const [reload, setReload] = useState(0);
+      const [state, setState] = useState({ status: 'loading' });
+
+      useEffect(() => {
+        if (typeof fetch !== 'function') {
+          setState({ status: 'error', message: 'fetch is unavailable' });
+          return undefined;
+        }
+        let alive = true;
+        const load = async () => {
+          try {
+            const response = await fetch(REMINDER_TASKS_PATH, {
+              headers: { accept: 'application/json' },
+              credentials: 'same-origin',
+              cache: 'no-store',
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            if (alive) setState({ status: 'ready', data });
+          } catch (error) {
+            if (alive) setState({ status: 'error', message: String(error?.message ?? error) });
+          }
+        };
+        void load();
+        const timer = setInterval(load, REMINDER_REFRESH_MS);
+        return () => {
+          alive = false;
+          clearInterval(timer);
+        };
+      }, [reload]);
+
+      // state 只可能是这三种形状；读到别的（旧版本残留、被意外替换）一律按「还在读」
+      // 处理，宁可多转一圈也不要让整个设置页炸在渲染期。
+      const view = state !== null && typeof state === 'object' && typeof state.status === 'string' ? state : { status: 'loading' };
+      const data = view.status === 'ready' ? view.data : undefined;
+      const toolbar = [
+        data === undefined
+          ? null
+          : jsx('p', {
+              className: 'qq-tasksCount',
+              children: t('remindersCount', {
+                pending: Number(data.pending) || 0,
+                total: Number(data.total) || 0,
+              }),
+            }, 'count'),
+        jsx(P.Pill, {
+          onClick: () => setReload((value) => value + 1),
+          children: t('remindersRefresh'),
+        }, 'refresh'),
+      ];
+
+      let body;
+      if (view.status === 'loading') {
+        body = jsx('p', { className: 'qq-empty', role: 'status', children: t('remindersLoading') }, 'loading');
+      } else if (view.status === 'error') {
+        body = jsx('p', {
+          className: 'qq-invalid',
+          role: 'alert',
+          children: t('remindersFailed', { message: view.message }),
+        }, 'error');
+      } else if (view.data?.enabled === false) {
+        body = jsx('p', { className: 'qq-empty', children: t('remindersDisabled') }, 'disabled');
+      } else {
+        body = jsx(ReminderTaskList, { t, data: view.data }, 'tasks');
+      }
+
+      return jsxs(
+        'section',
+        {
+          className: 'qq-section qq-tasksSection',
+          'aria-labelledby': 'qq-reminders-title',
+          children: [
+            jsx('h3', {
+              id: 'qq-reminders-title',
+              className: 'qq-sectionTitle',
+              children: t('remindersTitle'),
+            }, 'title'),
+            jsx('p', {
+              className: 'qq-sectionNote',
+              children: t('remindersNote', { seconds: Math.round(REMINDER_REFRESH_MS / 1000) }),
+            }, 'note'),
+            jsx('div', { className: 'qq-tasksToolbar', children: toolbar }, 'toolbar'),
+            body,
+          ],
+        },
+        'reminders',
+      );
+    });
+
     /** 工具条：搜索框 + 已改计数 + 只看已改 + 待修正计数。 */
-    const Toolbar = component(function Toolbar(props) {
-      const { t, query, onlyChanged, changedCount, invalidCount, writable } = props;
+    const Toolbar = component(function Toolbar(props) {      const { t, query, onlyChanged, changedCount, invalidCount, writable } = props;
       const items = [
         jsx(
           P.Input,
@@ -1746,6 +2041,14 @@ window.__ModuleLoader__.load({
             rows: changedOnly ? section.rows.filter((row) => row.state.overridden === true) : section.rows,
           }))
           .filter((section) => section.rows.length > 0);
+        // 「提醒」页最上面先给「现在记着哪些」：任务不是配置（schema 里没有），
+        // 但用户打开这一页通常就是想看它们，所以排在配置字段前面。
+        const panelSections = active.id === 'reminder' ? [jsx(ReminderTasks, { t }, 'reminders')] : [];
+        panelSections.push(
+          ...sections.map((section) =>
+            jsx(SectionBlock, { section, t, edit: props.edit, resetField: props.resetField, writable }, section.id),
+          ),
+        );
         pageChildren.push(
           jsx(
             'div',
@@ -1754,9 +2057,7 @@ window.__ModuleLoader__.load({
               className: 'qq-panel',
               role: 'tabpanel',
               'aria-labelledby': `${TAB_ID_PREFIX}${active.id}`,
-              children: sections.map((section) =>
-                jsx(SectionBlock, { section, t, edit: props.edit, resetField: props.resetField, writable }, section.id),
-              ),
+              children: panelSections,
             },
             'panel',
           ),
@@ -1885,6 +2186,11 @@ window.__ModuleLoader__.load({
     exports.ListField = ListField;
     exports.LongTextField = LongTextField;
     exports.QQ_BRIDGE = QQ_BRIDGE;
+    exports.REMINDER_TASKS_PATH = REMINDER_TASKS_PATH;
+    exports.REMINDER_REFRESH_MS = REMINDER_REFRESH_MS;
+    exports.ReminderTaskRow = ReminderTaskRow;
+    exports.ReminderTaskList = ReminderTaskList;
+    exports.ReminderTasks = ReminderTasks;
     return module.exports;
   },
 });

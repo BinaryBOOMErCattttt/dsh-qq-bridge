@@ -11,7 +11,7 @@
  * 把页面展开成节点树，断言设置页的那批契约（清单见 `client.js` 顶部注释）：
  *
  *   1. 注册位置与注入面；
- *   2. 130 个字段在 6 个 tab 的合集里恰好各出现一次、不落「其它」；
+ *   2. 141 个字段在 7 个 tab 的合集里恰好各出现一次、不落「其它」；
  *   3. 每个分组恰属一个 tab（`tabOf` 对未知分组返回 undefined）；
  *   4. 控件映射：布尔 → `Switch`、枚举 → `<select>`、数字 / 文本 → `<input>`（官方字段行
  *      几何）、长文本 → `textarea`；工具条里的搜索框才是 primitives 的 `Input`；
@@ -28,6 +28,7 @@ import { readFileSync } from 'node:fs';
 
 import z from '@deepseek-ai/schemastery';
 import { Config } from '../config.js';
+import { REMINDER_ROUTE_PATH } from '../reminders.js';
 
 // ---- 假的浏览器模块系统 ------------------------------------------------------------
 
@@ -69,6 +70,11 @@ const reactStub = {
       },
     ];
   },
+  /**
+   * 迷你渲染器是同步的，不跑 effect：定时任务区块在测试里停在「正在读取」这一帧，
+   * 断言的是区块外壳与加载态；真正的取数 / 刷新是浏览器行为，不在这里验。
+   */
+  useEffect: () => {},
 };
 
 const jsxRuntimeStub = {
@@ -380,7 +386,7 @@ function fieldsIn(tree) {
   return map;
 }
 
-/** 依次点过全部 tab，收集每个字段那一行（用来做「130 个字段各自的控件」这类断言）。 */
+/** 依次点过全部 tab，收集每个字段那一行（用来做「141 个字段各自的控件」这类断言）。 */
 function allFields(session) {
   const found = new Map();
   mountTree(session);
@@ -491,15 +497,15 @@ test('字段覆盖：schema 里每一项都上了页面、都有标签、都不�
   }
 });
 
-test('tab 映射：6 个 tab、14 个分组各属一个 tab、字段数加起来是 130', () => {
+test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来是 141', () => {
   const { mod } = mount();
   const fields = mod.describeFields(new z(SCHEMA_JSON()));
 
   assert.deepEqual(
     mod.TABS.map((tab) => tab.id),
-    ['connect', 'session', 'persona', 'group', 'perception', 'memory'],
+    ['connect', 'session', 'persona', 'group', 'reminder', 'perception', 'memory'],
   );
-  assert.equal(mod.TABS.length, 6);
+  assert.equal(mod.TABS.length, 7);
   for (const tab of mod.TABS) {
     assert.ok(tab.label.length > 0 && tab.title.length > 0, `${tab.id} 的短标签与全称都要有`);
     assert.ok(tab.sections.length > 0, `${tab.id} 至少要有一个区块`);
@@ -512,6 +518,7 @@ test('tab 映射：6 个 tab、14 个分组各属一个 tab、字段数加起来
   const mapped = mod.TABS.flatMap((tab) => tab.sections);
   assert.deepEqual([...mapped].sort(), mod.SECTIONS.map((section) => section.id).sort(), '没有分组被漏掉');
   assert.equal(mod.tabOf('repeat').id, 'group');
+  assert.equal(mod.tabOf('reminder').id, 'reminder', '定时提醒单独一页，不塞在群聊里');
   assert.equal(mod.tabOf('apikey').id, 'memory');
   assert.equal(mod.tabOf('other'), undefined, 'tabOf 对未知分组返回 undefined（别静默丢字段）');
 
@@ -521,21 +528,125 @@ test('tab 映射：6 个 tab、14 个分组各属一个 tab、字段数加起来
       .length;
   assert.deepEqual(
     Object.fromEntries(mod.TABS.map((tab) => [tab.id, countOf(tab)])),
-    { connect: 12, session: 23, persona: 19, group: 29, perception: 32, memory: 15 },
+    { connect: 12, session: 23, persona: 19, group: 29, reminder: 11, perception: 32, memory: 15 },
     '字段数按设计 §3.1 分布',
   );
-  assert.equal(fields.length, 130, '合计 130 项');
+  assert.equal(fields.length, 141, '合计 141 项');
 });
 
-test('表单投影：6 个 tab 覆盖全部字段，每行带草稿状态与来源上下文', () => {
+test('定时任务：提醒页最上面有一块只读列表，取数路径与 Host 路由一致', () => {
+  const session = mount();
+  const { mod } = session;
+  assert.equal(mod.REMINDER_TASKS_PATH, REMINDER_ROUTE_PATH, '浏览器 bundle 与 reminders.js 的路由必须一致');
+  assert.ok(mod.REMINDER_REFRESH_MS >= 1000, '刷新间隔要是个正经的秒数');
+
+  mountTree(session);
+  const tree = openTab(session, '提醒');
+  const panel = nodes(tree, (node) => node.props?.role === 'tabpanel')[0];
+  assert.ok(panel, '提醒页要有 tabpanel');
+  const section = nodes(
+    panel,
+    (node) => node.type === 'section' && String(node.props?.className ?? '').includes('qq-tasksSection'),
+  )[0];
+  assert.ok(section, '提醒页必须有「已记录的定时任务」区块');
+  assert.equal(textOf(panel.props.children[0]).slice(0, 8), '已记录的定时任务', '任务列表排在这一页最上面');
+  assert.match(textOf(section), /已记录的定时任务/);
+  assert.match(textOf(section), /每 15 秒自动刷新/);
+  assert.match(textOf(section), /正在读取任务/, '迷你渲染器不跑 effect，停在加载态');
+  const refresh = nodes(
+    section,
+    (node) => node.type === primitivesStub.Pill && node.props?.children === '刷新',
+  )[0];
+  assert.ok(refresh, '要有刷新按钮');
+  assert.equal(typeof refresh.props.onClick, 'function');
+});
+
+test('定时任务列表：状态 / 模式 / 时间 / 目标 / @ / 错误都在一行里，空列表给提示', () => {
+  const session = mount();
+  const t = translator(session.host, 'zh');
+  const base = {
+    repeat: '一次',
+    repeating: false,
+    fallbackText: '',
+    createdAt: 1,
+    createdLabel: '2026-08-20 14:00',
+    fireCount: 0,
+    lastFiredAt: 0,
+    lastFiredLabel: '',
+    error: '',
+  };
+  const data = {
+    now: 0,
+    pending: 1,
+    total: 2,
+    tasks: [
+      {
+        ...base,
+        id: 'r-1',
+        status: 'active',
+        mode: 'prompt',
+        repeat: '每天',
+        repeating: true,
+        dueAt: 1,
+        dueLabel: '2026-08-21 16:00',
+        type: 'group',
+        targetId: '100000001',
+        key: 'group:100000001',
+        text: '查一下天气',
+        mentions: ['张三'],
+        createdBy: '李四',
+        fireCount: 2,
+      },
+      {
+        ...base,
+        id: 'r-2',
+        status: 'failed',
+        mode: 'text',
+        dueAt: 2,
+        dueLabel: '2026-08-21 08:00',
+        type: 'private',
+        targetId: '100000002',
+        key: 'private:100000002',
+        text: '交作业',
+        mentions: [],
+        createdBy: '100000002',
+        error: 'bot 没连上',
+      },
+    ],
+  };
+  const tree = renderNode({ type: session.mod.ReminderTaskList, props: { t, data } });
+  const rows = nodes(tree, (node) => node.type === 'li');
+  assert.equal(rows.length, 2);
+
+  assert.match(textOf(rows[0]), /2026-08-21 16:00 · 每天/);
+  assert.match(textOf(rows[0]), /指令：查一下天气/);
+  assert.match(textOf(rows[0]), /群 100000001/);
+  assert.match(textOf(rows[0]), /提醒 @张三/);
+  assert.match(textOf(rows[0]), /李四 建的/);
+  assert.match(textOf(rows[0]), /已发 2 次/);
+  const tags = nodes(rows[0], (node) => node.type === primitivesStub.Tag);
+  assert.equal(tags.length, 2, '状态与模式各一个 Tag');
+  assert.equal(textOf(tags[0]), '待发送');
+  assert.equal(tags[0].props.tone, 'info');
+  assert.equal(textOf(tags[1]), 'Agent 执行');
+
+  assert.match(textOf(rows[1]), /私聊 100000002/);
+  assert.match(textOf(rows[1]), /上次错误：bot 没连上/);
+  assert.equal(textOf(nodes(rows[1], (node) => node.type === primitivesStub.Tag)[0]), '失败');
+
+  const empty = renderNode({ type: session.mod.ReminderTaskList, props: { t, data: { tasks: [] } } });
+  assert.match(textOf(empty), /还没有记录任何定时任务/);
+});
+
+test('表单投影：7 个 tab 覆盖全部字段，每行带草稿状态与来源上下文', () => {
   const session = mount();
   mountTree(session);
   const state = session.page.options.inject().hooks.qqSettings.getSnapshot();
 
-  assert.equal(state.tabs.length, 6);
+  assert.equal(state.tabs.length, 7);
   assert.equal(state.shell.writable, true);
   const rows = state.tabs.flatMap((tab) => tab.sections.flatMap((section) => section.rows));
-  assert.equal(rows.length, 130, '投影必须覆盖全部字段');
+  assert.equal(rows.length, 141, '投影必须覆盖全部字段');
   for (const tab of state.tabs) {
     for (const section of tab.sections) {
       assert.ok(section.title.length > 0, `${section.id} 的区块标题不能空`);
@@ -551,10 +662,10 @@ test('表单投影：6 个 tab 覆盖全部字段，每行带草稿状态与来�
   }
 });
 
-test('控件映射：29 个布尔是 Switch、7 个枚举是 select、长文本是 textarea', () => {
+test('控件映射：32 个布尔是 Switch、8 个枚举是 select、长文本是 textarea', () => {
   const session = mount();
   const fields = allFields(session);
-  assert.equal(fields.size, 130, '六个 tab 加起来必须刚好是 130 行（每行只渲染一次）');
+  assert.equal(fields.size, 141, '七个 tab 加起来必须刚好是 141 行（每行只渲染一次）');
 
   const kinds = new Map();
   for (const [key, field] of fields) {
@@ -576,7 +687,7 @@ test('控件映射：29 个布尔是 Switch、7 个枚举是 select、长文本�
 
   const tally = {};
   for (const kind of kinds.values()) tally[kind] = (tally[kind] ?? 0) + 1;
-  assert.deepEqual(tally, { boolean: 29, choice: 7, long: 2, input: 92 }, '按 schema 的类型分布');
+  assert.deepEqual(tally, { boolean: 32, choice: 8, long: 2, input: 99 }, '按 schema 的类型分布');
 
   // 数字框带 `inputMode="numeric"`；列表行在输入框下面给 Pill 预览。
   assert.equal(controlIn(fields.get('proactiveChance'), isInput).props.inputMode, 'numeric');
@@ -584,9 +695,9 @@ test('控件映射：29 个布尔是 Switch、7 个枚举是 select、长文本�
   assert.ok(controlIn(listField, isInput), '列表行仍然是输入框');
   const pills = nodes(listField, (node) => node.type === primitivesStub.Pill);
   assert.equal(pills.length, 0, '默认值空列表时不渲染 Pill 预览');
-  // `allowTools` 的默认值不再为空（14 个工具名）：每个都渲染成一个可点的 Pill。
+  // `allowTools` 的默认值不再为空（17 个工具名）：每个都渲染成一个可点的 Pill。
   const allowToolsPills = nodes(fields.get('allowTools'), (node) => node.type === primitivesStub.Pill);
-  assert.equal(allowToolsPills.length, 14, '工具白名单的默认值应当逐个渲染成 Pill');
+  assert.equal(allowToolsPills.length, 17, '工具白名单的默认值应当逐个渲染成 Pill');
 });
 
 test('草稿口径：布尔收 true / 是 / 1，空串是「恢复默认」，胡说是非法', () => {
@@ -750,19 +861,19 @@ test('重构新增的字段在设置页上有像样的短标签（不截成半�
   }
 });
 
-test('页面骨架：标题 / 简介 / 通知 / 工具条 / 6 个 tab / 只渲染当前 tab 的区块', () => {
+test('页面骨架：标题 / 简介 / 通知 / 工具条 / 7 个 tab / 只渲染当前 tab 的区块', () => {
   const session = mount();
   const tree = mountTree(session);
 
   assert.equal(tree.type, 'SettingsForm', '根节点必须是 primitives 的 SettingsForm（它带保存按钮与只读提示）');
   assert.equal(textOf(nodes(tree, (node) => node.props?.className === 'qq-title')[0]), 'QQ Bridge');
-  assert.match(textOf(nodes(tree, (node) => node.props?.className === 'qq-intro')[0]), /分成六页/);
+  assert.match(textOf(nodes(tree, (node) => node.props?.className === 'qq-intro')[0]), /按用途分页/);
   assert.match(textOf(nodes(tree, (node) => node.props?.className === 'qq-notice')[0]), /cordis\.patch\.yml/);
 
   const tabs = nodes(tree, (node) => node.props?.role === 'tab');
   assert.deepEqual(
     tabs.map((node) => textOf(node)),
-    ['连接', '会话', '人格', '群聊', '感知', '记忆'],
+    ['连接', '会话', '人格', '群聊', '提醒', '感知', '记忆'],
   );
   assert.equal(tabs[0].props['aria-selected'], true, '默认打开「连接」');
   assert.equal(tabs[0].props.tabIndex, 0, '只有当前 tab 是 tab stop（roving tabindex）');
@@ -786,11 +897,11 @@ test('页面骨架：标题 / 简介 / 通知 / 工具条 / 6 个 tab / 只渲�
   tabs[0].props.onKeyDown(key('ArrowRight'));
   assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[1].props['aria-selected'], true);
   nodes(rerender(session), (node) => node.props?.role === 'tab')[1].props.onKeyDown(key('End'));
-  assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[5].props['aria-selected'], true);
-  nodes(rerender(session), (node) => node.props?.role === 'tab')[5].props.onKeyDown(key('Home'));
+  assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[6].props['aria-selected'], true);
+  nodes(rerender(session), (node) => node.props?.role === 'tab')[6].props.onKeyDown(key('Home'));
   assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[0].props['aria-selected'], true);
   nodes(rerender(session), (node) => node.props?.role === 'tab')[0].props.onKeyDown(key('ArrowLeft'));
-  assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[5].props['aria-selected'], true, '← 从第一个绕回最后一个');
+  assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[6].props['aria-selected'], true, '← 从第一个绕回最后一个');
 });
 
 test('人格页：文件参数在上、旧 persona 折进「兼容」、额外要求在正文', () => {
@@ -1097,7 +1208,7 @@ test('非法值：输入框 aria-invalid、提示走错误色，文案来自字�
 test('summary 视图：导航项问它时只回一行简介', () => {
   const session = mount();
   resetHooks();
-  assert.equal(render(session, { view: 'summary' }), 'QQ 桥接的全部配置，按用途分成六页；改完在底部一次保存。');
+  assert.equal(render(session, { view: 'summary' }), 'QQ 桥接的全部配置，按用途分页；改完在底部一次保存。');
 });
 
 test('旧版的卡片 chrome 与折叠状态都删干净了（源码里搜不到它们的名字）', () => {

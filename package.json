@@ -45,6 +45,7 @@
     "links.js",
     "interactions.js",
     "recall.js",
+    "reminders.js",
     "cognition.js",
     "docfile.js",
     "ops.js",

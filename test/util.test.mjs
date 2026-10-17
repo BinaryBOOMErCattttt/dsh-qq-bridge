@@ -31,13 +31,16 @@ import {
   isVolatileRef,
   liveConfig,
   localDate,
+  localMinute,
   localStamp,
   memoryOneLine,
   memoryRelativePath,
   memorySlug,
   msUntilDailyHour,
+  parseLocalMinute,
   pathInside,
   stickerFileName,
+  weekdayLabel,
   visibleText,
 } from '../util.js';
 
@@ -233,4 +236,17 @@ test('liveConfig：真 schema 解析出来的配置是引用，摊平后才读�
   assert.equal(isVolatileRef(parsed), true, '配置根必须是 volatile 引用（Web UI 设置页的前提）');
   assert.equal(liveConfig(parsed).proactiveChance, 0.5);
   assert.equal(typeof liveConfig(parsed).endpoint, 'string');
+});
+
+test('parseLocalMinute / localMinute / weekdayLabel：本地时间，拒绝不存在的日期', () => {
+  const at = new Date(2026, 7, 20, 14, 32, 0, 0).getTime();
+  assert.equal(localMinute(at), '2026-08-20 14:32');
+  assert.equal(weekdayLabel(at), '周四');
+  assert.deepEqual(parseLocalMinute('2026-08-21T08:00'), { at: new Date(2026, 7, 21, 8, 0).getTime(), text: '2026-08-21 08:00' });
+  assert.deepEqual(parseLocalMinute('2026-08-21 08:00'), parseLocalMinute('2026-08-21T08:00'));
+  assert.equal(parseLocalMinute('2026-02-30T08:00'), undefined, '2 月没有 30 号，不能滚成 3 月');
+  assert.equal(parseLocalMinute('2026-13-01T08:00'), undefined);
+  assert.equal(parseLocalMinute('2026-08-21T24:00'), undefined);
+  assert.equal(parseLocalMinute('2026-08-21T08:60'), undefined);
+  assert.equal(parseLocalMinute('明天早上八点'), undefined);
 });

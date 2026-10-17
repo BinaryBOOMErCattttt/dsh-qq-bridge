@@ -18,6 +18,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { chunkText } from './onebot.js';
 import { imageSegment, loadOutgoingImage } from './image.js';
 import { hasMentionMarker, mentionSegments } from './mention.js';
+import { repeatLabel } from './reminders.js';
+import { localMinute } from './util.js';
 
 /**
  * 工具一：qq_send_message —— 主动向某个 QQ 号或群号发文本（超长自动分段）。
@@ -661,6 +663,231 @@ function qqMemory(deps) {
 }
 
 /**
+ * 工具七：qq_remind_create —— 建一条到点的提醒。
+ *
+ * 时间由模型换算成**本地绝对时间**（渠道提示里每轮都会给出「现在是几点、周几」），
+ * 插件只做严格校验。这样自然语言理解交给模型，日期算术交给 `Date`。
+ *
+ * `mode` 是精度/语气的取舍：`text` 一字不差、`agent` 让模型用自己的语气说、
+ * `prompt` 到点做事。后两种都受 `reminderModes` 与受信者名单限制。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqRemindCreate(deps) {
+  return defineTool({
+    name: 'qq_remind_create',
+    description:
+      'Create a scheduled reminder: at the given local time the QQ bridge itself sends a message to this (or another) conversation, optionally @-mentioning people. Use this whenever someone asks to be reminded later or asks for a message at a future time — do not just say "ok, I will remember" in the reply. Modes: "text" sends the text verbatim; "agent" lets the model phrase the same thing in its own voice (falls back to the text on model failure); "prompt" lets the model perform the instruction with tools (trusted callers only).',
+    parameters: {
+      text: {
+        type: 'string',
+        description: 'The reminder body for mode text/agent, or a short label for mode prompt. Plain text; [[image: ...]] and [[@name]] markers are NOT interpreted — the message is sent exactly as written.',
+      },
+      prompt: {
+        type: 'string',
+        description: 'Mode "prompt" only: the instruction the model should carry out at that time (e.g. "summarize today in this group").',
+      },
+      mode: {
+        type: 'string',
+        enum: ['text', 'agent', 'prompt'],
+        description: 'How to deliver: text = verbatim (default); agent = let the model phrase it in its own voice; prompt = let the model perform the instruction. agent/prompt may be disabled by the deployment.',
+      },
+      at: {
+        type: 'string',
+        description: 'Absolute local time, formatted YYYY-MM-DDTHH:MM (e.g. 2026-08-21T08:00). Required for repeating reminders. Use the current local time shown in the channel prompt to compute it.',
+      },
+      in_minutes: {
+        type: 'integer',
+        description: 'Relative delay in minutes (>= 1), for short reminders. Exactly one of at / in_minutes is required.',
+      },
+      repeat: {
+        type: 'string',
+        enum: ['none', 'daily', 'weekdays', 'weekly', 'monthly'],
+        description: 'Repeat pattern (default none). daily = every day at the HH:MM of "at"; weekdays = Monday-Friday; weekly = same weekday; monthly = same day of month (clamped to month end). Repeating requires "at".',
+      },
+      mention: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Who to @ when it fires: a display name from this conversation, "me" for the creator, or "all" for @everyone (group only, deployment-gated). Omit to @ the creator in groups; private reminders never @ anyone.',
+      },
+      allow_skip: {
+        type: 'boolean',
+        description: 'Mode "prompt" only: allow the model to send nothing when it judges there is nothing to report (default true). Set false together with fallback_text to guarantee a message.',
+      },
+      fallback_text: {
+        type: 'string',
+        description: 'Text to send if the agent turn fails, times out, or (when allow_skip is false) returns SKIP. Defaults to "text" for agent mode; required for prompt mode when allow_skip is false.',
+      },
+      target_type: {
+        type: 'string',
+        enum: ['private', 'group'],
+        description: 'Where to send. Defaults to the QQ conversation this tool was called from; an explicit target is only allowed for trusted callers.',
+      },
+      target_id: {
+        type: 'string',
+        description: 'QQ number (private) or group number (group). Defaults to the current QQ conversation.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string', required: true },
+          mode: { type: 'string', required: true },
+          at: { type: 'string', required: true },
+          repeat: { type: 'string', required: true },
+          mentions: { type: 'array', items: { type: 'string' }, required: true },
+          text: { type: 'string', required: true },
+          duplicate: { type: 'boolean', required: true },
+        },
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text:
+            `${value.duplicate ? 'Already scheduled' : 'Scheduled'} ${value.id}: ${value.mode} reminder at ${value.at} (${value.repeat})` +
+            `${value.mentions.length > 0 ? ` mentioning ${value.mentions.join(', ')}` : ''}: ${value.text}`,
+        },
+      ],
+    },
+    async execute(args, exec) {
+      if (deps.reminders === undefined) throw new Error('scheduled reminders are disabled (reminder is false or the reminder file is outside cwd)');
+      const prepared = deps.reminderPrepare(args, exec, 'qq_remind_create');
+      const { task, duplicate } = await deps.reminders.create({
+        key: prepared.key,
+        type: prepared.type,
+        targetId: prepared.targetId,
+        callerId: prepared.callerId,
+        callerName: prepared.callerName,
+        operator: prepared.operator,
+        trusted: prepared.trusted,
+        canMentionOthers: prepared.canMentionOthers,
+        canAll: prepared.canAll,
+        mentions: prepared.mentions,
+        mode: args.mode ?? 'text',
+        text: args.text,
+        prompt: args.prompt,
+        fallbackText: args.fallback_text,
+        allowSkip: args.allow_skip,
+        at: args.at,
+        inMinutes: args.in_minutes,
+        repeat: args.repeat ?? 'none',
+      });
+      return {
+        id: task.id,
+        mode: task.mode,
+        at: localMinute(task.dueAt),
+        repeat: repeatLabel(task.repeat),
+        mentions: task.mentions.map((entry) => entry.name),
+        text: task.mode === 'prompt' ? task.prompt : task.text,
+        duplicate,
+      };
+    },
+  });
+}
+
+/**
+ * 工具八：qq_remind_list —— 看这个会话 / 自己 / 全部待发与最近的提醒。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqRemindList(deps) {
+  return defineTool({
+    name: 'qq_remind_list',
+    description:
+      'List scheduled reminders. scope "conversation" (default) lists this QQ conversation, "mine" lists the reminders created by the caller, "all" lists every conversation (operator only). Returns pending and recently finished tasks.',
+    parameters: {
+      scope: {
+        type: 'string',
+        enum: ['conversation', 'mine', 'all'],
+        description: 'Which reminders to list. Defaults to the current conversation.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          tasks: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true },
+                mode: { type: 'string', required: true },
+                at: { type: 'string', required: true },
+                repeat: { type: 'string', required: true },
+                mentions: { type: 'array', items: { type: 'string' }, required: true },
+                text: { type: 'string', required: true },
+                status: { type: 'string', required: true },
+                created_by: { type: 'string', required: true },
+                fire_count: { type: 'integer', required: true },
+                error: { type: 'string' },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text:
+            value.tasks.length === 0
+              ? 'No scheduled reminders.'
+              : value.tasks
+                  .map((task) => `${task.id} [${task.status}] ${task.at} (${task.repeat}) ${task.mode}: ${task.text}${task.error ? ` — ${task.error}` : ''}`)
+                  .join('\n'),
+        },
+      ],
+    },
+    async execute(args, exec) {
+      if (deps.reminders === undefined) throw new Error('scheduled reminders are disabled (reminder is false or the reminder file is outside cwd)');
+      const viewer = deps.reminderViewer(exec);
+      return {
+        tasks: deps.reminders.list({
+          key: viewer.key,
+          creatorId: viewer.callerId,
+          scope: args.scope ?? 'conversation',
+          operator: viewer.operator,
+        }),
+      };
+    },
+  });
+}
+
+/**
+ * 工具九：qq_remind_cancel —— 取消一条还没发的提醒（创建者本人或操作员）。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqRemindCancel(deps) {
+  return defineTool({
+    name: 'qq_remind_cancel',
+    description: 'Cancel one scheduled reminder by its id. Only the person who created it (or the operator) can cancel it.',
+    parameters: {
+      id: { type: 'string', required: true, description: 'The reminder id, as returned by qq_remind_create / qq_remind_list.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string', required: true },
+          status: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: `Reminder ${value.id} is now ${value.status}.` }],
+    },
+    async execute(args, exec) {
+      if (deps.reminders === undefined) throw new Error('scheduled reminders are disabled (reminder is false or the reminder file is outside cwd)');
+      const viewer = deps.reminderViewer(exec);
+      const task = await deps.reminders.cancel(args.id, { id: viewer.callerId, operator: viewer.operator });
+      return { id: task.id, status: task.status };
+    },
+  });
+}
+
+/**
  * 注册全部适用的 QQ 工具。两个可选的工具族只在对应能力可用时注册：记忆工具要
  * `deps.memory`（长期记忆停用时是 undefined），`qq_save_sticker` 要 `deps.saveSticker`
  * （表情包目录不可用、或白名单没放开时是 undefined）—— 停用的功能不该留下一个
@@ -690,6 +917,11 @@ function qqMemory(deps) {
  * @param {Map<string, object>} deps.conversations - 已处理过的会话表。
  * @param {(key: string, generation: number) => string} deps.sessionIdFor - 会话 key + 轮次 → Session id。
  * @param {object} [deps.memory] - 长期记忆的读写接口；缺失 = 不注册那两个工具。
+ * @param {object} [deps.reminders] - 定时提醒子系统（`createReminders` 的返回值）；
+ *   缺失 = 不注册那三个工具。
+ * @param {(args: object, exec: object, toolName: string) => object} [deps.reminderPrepare] -
+ *   解析提醒的目标、创建者与 @ 名单（会话状态在 index.js 里）。
+ * @param {(exec: object) => object} [deps.reminderViewer] - 解析「谁在调这个工具」。
  */
 export function registerQqTools(ctx, deps) {
   ctx.tools.register(qqSendMessage(deps));
@@ -702,5 +934,10 @@ export function registerQqTools(ctx, deps) {
   if (deps.memory !== undefined) {
     ctx.tools.register(qqTranscript(deps));
     ctx.tools.register(qqMemory(deps));
+  }
+  if (deps.reminders !== undefined) {
+    ctx.tools.register(qqRemindCreate(deps));
+    ctx.tools.register(qqRemindList(deps));
+    ctx.tools.register(qqRemindCancel(deps));
   }
 }

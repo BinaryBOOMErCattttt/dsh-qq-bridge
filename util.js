@@ -117,6 +117,59 @@ export function localStamp(at) {
 }
 
 /**
+ * 本地日期时间（`YYYY-MM-DD HH:MM`，到分钟）：定时提醒的展示与解析都用它。
+ *
+ * 刻意只到分钟：提醒的精度就是分钟级，秒既没有意义，也会让「输入 09:00、回显 09:00:00」
+ * 这种对照多一处不一致。与 {@link localStamp} 一样用**本地时间**。
+ * @param at - 毫秒时间戳。
+ * @returns 本地 `YYYY-MM-DD HH:MM`。
+ */
+export function localMinute(at = Date.now()) {
+  const date = new Date(Number(at) || Date.now());
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/**
+ * 本地星期（`周一` … `周日`）：提示词里要告诉模型「今天是周几」，
+ * 否则「下周一」这种说法它只能靠猜。
+ * @param at - 毫秒时间戳。
+ * @returns 中文星期。
+ */
+export function weekdayLabel(at = Date.now()) {
+  const labels = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+  return labels[new Date(Number(at) || Date.now()).getDay()];
+}
+
+/**
+ * 解析模型给的本地时间（`YYYY-MM-DDTHH:MM` 或空格分隔），返回毫秒时间戳。
+ *
+ * **不用 `Date.parse`**：它对「带不带时区、空格还是 T」的解释在不同实现/不同时区下
+ * 并不一致，而提醒最不能出的错就是「静默差一小时」。这里逐段解析、用本地 `Date`
+ * 构造，再回读年月日校验 —— `2026-02-30` 会被 `Date` 滚成 3 月 2 日，回读就能拦住。
+ *
+ * @param text - 时间字符串。
+ * @returns `{ at, text }`（`text` 是归一化后的 `YYYY-MM-DD HH:MM`）；非法时 undefined。
+ */
+export function parseLocalMinute(text) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})$/.exec(String(text ?? '').trim());
+  if (match === null) return undefined;
+  const [year, month, day, hour, minute] = match.slice(1).map((part) => Number(part));
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) return undefined;
+  const date = new Date(year, month - 1, day, hour, minute, 0, 0);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day ||
+    date.getHours() !== hour ||
+    date.getMinutes() !== minute
+  ) {
+    return undefined;
+  }
+  return { at: date.getTime(), text: localMinute(date.getTime()) };
+}
+
+/**
  * 计算「下一个每天 `hour` 点」距今多少毫秒。
  *
  * 定时摘要只在每天固定的一个时刻醒来，所以间隔不是常数：醒来一次之后必须重新算到

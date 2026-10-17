@@ -38,7 +38,7 @@ node --test test\
 > 在 DSH 自己的沙箱里跑测试时，`node --test` 会派生子进程并捕获输出，而沙箱不允许管道
 > （`spawn EPERM`）。同一个套件用同进程模式跑即可：`node --test --experimental-test-isolation=none "test/*.test.mjs"`。
 >
-> 基线是 **491 条全过、0 跳过**（0.2.0 删掉 JM 之后，原先那 13 条「沙箱里跳过」的探针也随
+> 基线是 **580 条全过、0 跳过**（0.2.0 删掉 JM 之后，原先那 13 条「沙箱里跳过」的探针也随
 > 之消失 —— 现在没有一条用例需要真的 `spawn` 外部进程）。原有的偶发规律仍在：全量同进程
 > 连跑时偶尔红一条、且每次不同（`until` 轮询与真实计时的竞态），单独跑永远绿，重跑确认即可，
 > 别为了「让它稳」放宽断言。
@@ -46,8 +46,9 @@ node --test test\
 > 新增的纯函数测试文件：`test/persona.test.mjs`、`test/style.test.mjs`、
 > `test/speech-policy.test.mjs`、`test/modalities.test.mjs`、`test/links.test.mjs`、
 > `test/interactions.test.mjs`、`test/cognition.test.mjs`、`test/migrate-cognition.test.mjs`、
-> `test/ops.test.mjs`。行为层的新用例在 `test/bridge.test.mjs`：气泡计划、标点清洗、
-> 插话强制锚点、C 路四条排除、私聊补一句、戳一戳、链接预览、视频封面、语音占位。
+> `test/ops.test.mjs`、`test/reminders.test.mjs`。行为层的新用例在 `test/bridge.test.mjs`：
+> 气泡计划、标点清洗、插话强制锚点、C 路四条排除、私聊补一句、戳一戳、链接预览、
+> 视频封面、语音占位、定时提醒（text / agent / SKIP / 超时 / 重启 / 权限）。
 
 ### 改完源码必须重启 Harness
 
@@ -223,12 +224,15 @@ key 由启动环境提供（`describe().writable === false`）时提前退场（
 
 设置页那半侧（`client.js`）另有一套 `test/client.test.mjs`：它不需要浏览器 —— 假的
 `window.__ModuleLoader__` 收下注册、假的 `require` 给出 react / primitives、假的
-`useState` 让 tab / 搜索 / 只看已改的状态能被驱动，然后用一个十几行的迷你渲染器把页面
-展开成节点树，钉住「页面注册在 `settings.section` + 条目 id `qq-bridge`」「130 个字段在
-6 个 tab 的合集里恰好各出现一次、都不落进『其它』」「每个分组恰属一个 tab」、「控件映射
-（29 个布尔是 `Switch`、7 个枚举是 `<select>`、长文本是 `textarea`）」「草稿的读写口径
+`useState` 让 tab / 搜索 / 只看已改的状态能被驱动（`useEffect` 是空实现：迷你渲染器不跑
+effect，取数那一步不在 node 里验），然后用一个十几行的迷你渲染器把页面
+展开成节点树，钉住「页面注册在 `settings.section` + 条目 id `qq-bridge`」「141 个字段在
+7 个 tab 的合集里恰好各出现一次、都不落进『其它』」「每个分组恰属一个 tab」、「控件映射
+（32 个布尔是 `Switch`、8 个枚举是 `<select>`、长文本是 `textarea`）」「草稿的读写口径
 （`true`/`是`/`1` 都算真，空串 = 恢复默认，胡说会被挡住）」「切 tab 不丢草稿」「搜索按
 标签 / 字段名 / 描述 / 区块标题命中、结果行可编辑、`Esc` 清空」「只看已改与计数」
 「量纲白名单覆盖所有 `Ms`/`Bytes`/`Chars`/`Hour`/`Chance` 字段」「只读部署里全部控件
-`disabled`」，以及整棵树真的能渲染成 `SettingsForm` + 6 个 tab + 官方两种字段行。
+`disabled`」「群聊页那块只读的定时任务列表（外壳与加载态、行里的状态 / 模式 / 时间 /
+目标 / @ / 错误、空列表，以及与 Host 路由同一条路径）」，以及整棵树真的能渲染成
+`SettingsForm` + 7 个 tab + 官方两种字段行。
 **加了新配置项忘了分组、或加了枚举取值忘了写人话，这里都会红。**

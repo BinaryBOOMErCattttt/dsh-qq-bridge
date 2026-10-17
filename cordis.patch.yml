@@ -150,6 +150,11 @@
           - qq_list_conversations
           # 戳一戳：表达「我叫你一下」，没有正文。群里要显式指定戳谁（不给推断）。
           - qq_poke
+          # 定时提醒：建 / 列 / 取消到点的任务。任务由插件自己到点发送，不依赖模型醒着；
+          # 默认只能提醒创建者自己，@ 别人 / @全体 / agent·prompt 模式另有开关与白名单。
+          - qq_remind_create
+          - qq_remind_list
+          - qq_remind_cancel
         # ---- 长期记忆：聊天记录落盘 + 定时摘要 + 认知库（见 docs/memory.md「长期记忆」）----
         # 每条别人的消息（含没 @ 机器人的群聊）都会按会话追加到 .qq-memory 里的
         # 当天转录；插件每天 digestAtHour 点唤起一个**独立的摘要会话**，让它照着

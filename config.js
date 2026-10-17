@@ -70,9 +70,12 @@ export const Config = z.object({
       'qq_save_sticker',
       'qq_list_conversations',
       'qq_poke',
+      'qq_remind_create',
+      'qq_remind_list',
+      'qq_remind_cancel',
     ])
     .description(
-      'QQ 会话 Agent 可用的工具白名单（工具名）：默认只放开「只读文件 + 检索 + 联网 + 七个 qq_*」，没有 write / edit / bash —— QQ 消息是不可信输入。留空表示**不限制**（把这个 Agent 继承到的工具全给它，含预设里的一切）；写错的名字会被丢掉并记 warn（白名单只能收窄，不能凭空给出能力）',
+      'QQ 会话 Agent 可用的工具白名单（工具名）：默认只放开「只读文件 + 检索 + 联网 + 十个 qq_*」，没有 write / edit / bash —— QQ 消息是不可信输入。留空表示**不限制**（把这个 Agent 继承到的工具全给它，含预设里的一切）；写错的名字会被丢掉并记 warn（白名单只能收窄，不能凭空给出能力）',
     ),
   resetCommand: z.string().default('/reset').description('新开一轮会话的指令：在 QQ 里单独发送该指令即生效（旧的会话留在磁盘上当存档，新的一轮从零开始）；留空表示禁用'),
   resetUsers: z.array(z.string()).default([]).description('允许使用 resetCommand 的 QQ 号白名单；留空表示**谁都不能**重置（群里任何一个人都能把会话记忆重置掉显然不合适，所以这一项默认就是关的）'),
@@ -159,6 +162,20 @@ export const Config = z.object({
   activeChimeIdleMs: z.number().default(20 * 1000).description('它回完话、对方安静这么久之后，它可能自己再补一句（毫秒，实际会按 delayJitter 抖动）；0 = 不补。需要 proactive: true 才会补'),
   activeChimeMax: z.number().default(1).description('对方每说一句之后，它最多自己补几句：1 = 顶多追一句「啊对了…」，想让它更黏就调大；0 = 不补'),
   activeChimeDailyMax: z.number().default(12).description('同一个会话一天最多自己补几句（本地日界线，与 proactiveDailyMax 分开算；重启后计数清零）；0 = 不限'),
+  // ---- 定时提醒：到点由插件发一条消息，并可 @ 指定的人（见 docs/reminders.md）----
+  // 这是唯一一个「机器人会在未来某个时刻主动开口」的功能，所以默认值按两条收：
+  // 默认只能提醒创建者自己、@全体默认关、每人每天有额度；agent/prompt 模式再叠一层开关。
+  reminder: z.boolean().default(true).description('是否启用定时提醒：Agent 可以用 qq_remind_create 建一条到点发送的任务（一次性或每天/工作日/每周/每月），到点由插件直接发消息，不依赖模型醒着；关掉后工具不注册、已有任务留在文件里不丢'),
+  reminderFile: z.string().default('data/reminders.json').description('定时提醒的任务文件，相对 cwd（必须落在 cwd 内，否则整个功能记 warn 并停用）；任务在这里持久化，重启不丢'),
+  reminderUsers: z.array(z.string()).default([]).description('允许创建提醒的 QQ 号白名单；留空表示不限制（与 allowUsers 同语义）。名单里的人额外视为受信者：可以 @ 别人、可以指定别的会话、可以建 prompt 模式'),
+  reminderMentionOthers: z.boolean().default(false).description('是否允许提醒 @ 创建者以外的人：默认关（群里任何人都能让机器人在未来某个时刻点名别人，这比即时 @ 更敏感）；reminderUsers 里的受信者不受这一项限制'),
+  reminderAllowAll: z.boolean().default(false).description('是否允许提醒 @全体成员：默认关，且只有受信者（reminderUsers 里的人或 Web 操作员）能用；群里的定时 @全体 是最容易被滥用的组合'),
+  reminderDailyMax: z.number().default(5).description('同一个人一天最多新建几条提醒（本地日界线；按任务文件里今天的记录算，重启不会清零）；0 = 不限。Web 操作员不受这一项限制'),
+  reminderMaxActive: z.number().default(20).description('同一个会话最多同时有多少条待发的提醒：满了就拒绝新建，直到发掉或取消；至少 1'),
+  reminderGraceMs: z.number().default(600000).description('补发窗口（毫秒）：进程重启 / 断线导致错过时刻时，超过这么久就不再补发，只把任务标成 missed；默认 10 分钟'),
+  reminderModes: z.union(['text', 'agent', 'prompt']).default('agent').description('允许的最高模式：text = 只发固定文案（最可靠、不花 token）；agent = 到点跑一轮模型，把文案用它的语气说出来，失败/超时/SKIP 时退回固定文案；prompt = 到点按指令做事（可调工具，默认关闭，只给受信者）。默认 agent：text 永远是兜底，agent 只是让语气自然一点'),
+  reminderAgentTimeoutMs: z.number().default(120000).description('agent/prompt 模式的硬超时（毫秒）：超过这么久模型还没给出可发送的正文，就发固定文案（prompt 模式没有兜底文案时按任务设置丢弃），迟到的回复不再发送'),
+  reminderAgentDailyMax: z.number().default(20).description('同一个会话一天最多跑几次 Agent 提醒（本地日界线）：超过之后新的 agent/prompt 提醒自动退回固定文案；0 = 不限。text 模式不计入'),
   humanize: z.boolean().default(true).description('自动回复是否像真人：按换行/短句拆成几条独立消息并加入打字延迟（换行 = 分条）；false = 一条整段直接发出（旧行为）'),
   burstMaxChars: z.number().default(60).description('把一行长句拆开时的单条目标长度；0 = 不按长度拆（换行仍然分条）'),
   burstMaxParts: z.number().default(3).description('单行长句最多拆成几条；超出部分并进该行最后一条，避免刷屏'),
