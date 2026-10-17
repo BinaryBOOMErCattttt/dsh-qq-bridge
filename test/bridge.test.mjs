@@ -3108,14 +3108,15 @@ test('qq_save_sticker keeps a picture the conversation posted and it shows up in
     const source = /\[图片\(动画表情\): ([^\]]+)\]/.exec(body)?.[1];
     assert.ok(source, body);
 
-    const value = await host.tools.get('qq_save_sticker').execute({ source, name: '委屈' }, { agent });
+    const value = await host.tools.get('qq_save_sticker').execute({ source, name: '委屈', meaning: '委屈、求安慰' }, { agent });
     assert.equal(value.path, '.qq-stickers/委屈.png');
     assert.equal(value.format, 'png');
     assert.equal(value.bytes, TINY_PNG.length);
     // 落盘的必须是原字节：这张图以后要原样发回去，转码过就不是同一张表情了。
     assert.deepEqual(await readFile(join(cwd, '.qq-stickers', '委屈.png')), TINY_PNG);
-    // 提示词每次装配都重新 readdir，所以不用重启就该列出来（名字就是它的意思）。
-    assert.match(promptText(host, 'qq-bridge:channel'), /\.qq-stickers\/委屈\.png/);
+    // 提示词每次装配都重新读目录，所以不用重启就该列出来。条目必须带上**完整路径**：
+    // 只给名字的话模型会自己猜扩展名（真实事故：敲盆.gif 被写成敲盆.jpg，发送侧找不到）。
+    assert.match(promptText(host, 'qq-bridge:channel'), /委屈（委屈、求安慰） → \.qq-stickers\/委屈\.png/);
     // 存下来的唯一用途就是发出去：裸文件名（不带扩展名）也该认得出来。
     const sent = await host.tools.get('qq_send_image').execute({ image: '委屈' }, { agent });
     assert.equal(sent.source, '.qq-stickers/委屈.png');
@@ -3265,10 +3266,11 @@ test('a reply that is only a sticker marker sends one image and no text at all',
   }
 });
 
-test('a sticker written as a bare file name is found in the sticker directory', async () => {
-  // 提示词里给的是 `.qq-stickers/笑死.png`，但模型很可能只写 `笑死` 或 `笑死.png`。
-  // 落空的话群里只会看到一句「表情包没发出去」，所以裸文件名先在表情包目录里找。
-  for (const source of ['笑死', '笑死.png', '.qq-stickers/笑死.png']) {
+test('a sticker written as a bare file name or with the wrong extension is still found', async () => {
+  // 提示词里给的是 `.qq-stickers/笑死.png`，但模型很可能只写 `笑死` / `笑死.png`，
+  // 或者把扩展名猜错（目录里 .jpg 比 .gif 多，真实事故：敲盆.gif 被写成敲盆.jpg）。
+  // 落空的话群里只会看到一句「表情包没发出去」，所以这些写法都先在表情包目录里找回来。
+  for (const source of ['笑死', '笑死.png', '.qq-stickers/笑死.png', '笑死.gif', '.qq-stickers/笑死.gif']) {
     const { onebot, host } = await bootImages();
     onebot.push(privateMessage('在吗'));
     const agent = await untilInbox(host, 1, 'the Agent');

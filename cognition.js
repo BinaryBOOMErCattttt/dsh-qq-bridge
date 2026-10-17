@@ -261,20 +261,29 @@ export function parseStickerCatalog(markdown) {
 }
 
 /**
- * 提示词里的表情包目录：**名字（含义）**，不是裸文件名。
+ * 提示词里的表情包目录：**名字（含义）→ 完整路径**。
  *
  * 这就是「表情包优先」能不能落地的那一步：模型看 `委屈猫（委屈、求安慰）` 时可以直接
  * 判断该不该发；看 `.qq-stickers/8f3c1a.gif` 时只能猜或者先 `read_image` —— 而猜错的
  * 代价是群里收到一张莫名其妙的表情。
  *
+ * 路径必须**原样**给出来（而不只是名字 + 「自己补扩展名」）：表情包目录里 .jpg / .gif
+ * 混着放，模型只看到名字时只能猜一个扩展名，猜错就是「not a local file」—— 群里收到
+ * 一句「那张表情我这儿没有」，而那些图其实好好躺在目录里（真实事故：敲盆.gif 被写成
+ * 敲盆.jpg）。给了完整路径，模型抄过去就行，不用赌。
+ *
  * @param {object[]} collected - {@link parseStickerCatalog} 的 `collected`。
  * @param {object} [options] - `max`（默认 40 条，与旧 `STICKER_PROMPT_MAX` 一致）。
- * @returns {string[]} 形如 `委屈猫（委屈、求安慰）`；没有条目时为空数组。
+ * @returns {string[]} 形如 `委屈猫（委屈、求安慰）→ .qq-stickers/委屈猫.gif`；没有条目时为空数组。
  */
 export function stickerCatalogLines(collected, { max = 40 } = {}) {
   return (collected ?? [])
     .slice(0, Math.max(0, Math.floor(Number(max) || 0)))
-    .map((entry) => (entry.meaning.length > 0 ? `${entry.name}（${entry.meaning}）` : entry.name));
+    .map((entry) => {
+      const label = entry.meaning.length > 0 ? `${entry.name}（${entry.meaning}）` : entry.name;
+      // 老条目可能没有路径（解析层会挡掉，这里只是不拼出 `→ undefined`）。
+      return entry.path.length > 0 ? `${label} → ${entry.path}` : label;
+    });
 }
 
 /**

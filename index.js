@@ -978,14 +978,15 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 把「一个表情包文件名」补成真路径。
+   * 把「一个表情包文件名」补成真路径（裸名字、以及写错扩展名的目录路径）。
    *
-   * 模型很可能不写全 `.qq-stickers/笑死.gif` 而只写 `笑死` / `笑死.gif`（提示词里两种
-   * 写法都在眼前），`loadOutgoingImage` 按 cwd 相对路径去找就会落空、只能回一句
-   * 「表情包没发出去」。所以裸文件名先在表情包目录里找：先精确匹配，再忽略扩展名匹配。
+   * 模型很可能不写全 `.qq-stickers/笑死.png` 而只写 `笑死` / `笑死.png`，也可能把扩展名
+   * 猜错（目录里 .jpg 比 .gif 多，真实事故：`敲盆.gif` 被写成 `敲盆.jpg`）。这两种都会让
+   * `loadOutgoingImage` 按 cwd 相对路径去找时落空、只能回一句「表情包没发出去」。所以：
+   * 裸文件名先在表情包目录里找（精确 → 忽略扩展名）；带 `stickerLabel/` 前缀的路径如果是
+   * 已知文件名写错了扩展名，也换回真实的那一个。
    *
-   * 只兜**裸文件名**：带路径分隔符或协议的写法原样交出去，绝不改写
-   * （`.qq-media/xxx.jpg`、`https://…` 都不该被这层碰）。
+   * 只碰**收藏目录里的文件名**：`.qq-media/xxx.jpg`、URL 之类的写法原样交出去，绝不改写。
    *
    * @param source - 标记或工具参数里给的来源。
    * @returns 能认出来就是相对 cwd 的路径，否则原样返回。
@@ -993,11 +994,34 @@ export function apply(ctx, config) {
   function resolveStickerSource(source) {
     const raw = String(source ?? '').trim();
     if (raw.length === 0 || stickerLabel === undefined) return raw;
-    if (/[/\\]/.test(raw) || /^[a-z][a-z0-9+.-]*:/i.test(raw)) return raw;
-    const files = stickerFiles().sort(); // 排序只是为了「同名不同扩展名」时挑哪个是确定的
-    const exact = files.find((name) => name === raw);
-    const byBase = exact ?? files.find((name) => name.replace(/\.[^.]+$/, '') === raw);
-    return byBase === undefined ? raw : `${stickerLabel}/${byBase}`;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return raw;
+    if (raw.startsWith(`${stickerLabel}/`)) {
+      const name = raw.slice(stickerLabel.length + 1);
+      // 收藏目录只有一层：带子目录的写法不猜，交给发送侧照常报错。
+      if (name.length === 0 || /[/\\]/.test(name)) return raw;
+      const repaired = findStickerByName(name);
+      return repaired === undefined ? raw : `${stickerLabel}/${repaired}`;
+    }
+    if (/[/\\]/.test(raw)) return raw;
+    const repaired = findStickerByName(raw);
+    return repaired === undefined ? raw : `${stickerLabel}/${repaired}`;
+  }
+
+  /**
+   * 在表情包目录里按名字找文件：先精确匹配，再忽略扩展名匹配。
+   *
+   * 同名不同扩展名的文件可能同时存在（`.gif` 和 `.jpg`），排序后取第一个，保证同样的输入
+   * 永远得到同一个结果 —— 别让「发哪张」随 readdir 的顺序漂移。
+   *
+   * @param name - 文件名（可带扩展名，也可只有名字）。
+   * @returns 目录里真实存在的文件名；认不出来时 undefined。
+   */
+  function findStickerByName(name) {
+    const files = stickerFiles().sort();
+    const exact = files.find((file) => file === name);
+    if (exact !== undefined) return exact;
+    const stem = name.replace(/\.[^.]+$/, '');
+    return files.find((file) => file.replace(/\.[^.]+$/, '') === stem);
   }
 
   /**
@@ -1225,25 +1249,28 @@ export function apply(ctx, config) {
     // 标记不是工具，但**跟着同一个开关走**：`allowTools` 把 qq_send_image 挡在外面时，
     // 回复里也不该还能发图 —— 否则白名单就漏了一层（operator 明确说了「只给 read」）。
     if (imageAllowed()) {
+      // 目录优先用 STICKERS.md 的「名字（含义）→ 路径」：模型看含义就能判断该不该发，
+      // 看裸文件名只能猜或者先 read_image。没有目录（旧部署 / 记忆关掉）时退回文件名，行为不变。
+      const catalog = memory.enabled ? memory.catalog() : { stickers: [], hot: [], catalog: false };
+      const names = stickerNames();
       // 标记只认**收藏目录**里的现成表情：以前这里举的是 `.qq-media/ab12….jpg`，模型有样
       // 学样去拼哈希，而那是 LRU 缓存，发的时候大概率已经没了（真实事故，见
       // `stickerSendSource`）。目录不可用时整条标记建议都不给 —— 那条路本来就走不通。
       if (stickerLabel !== undefined) {
+        // 例子用目录里真实存在的第一张：写死 `笑死.gif` 会在改名 / 删图之后变成一句
+        // 「教模型去发一张不存在的图」，而它真的会照着抄。
+        const example = names[0] ?? `${stickerLabel}/笑死.gif`;
         lines.push(
-          `- 想发表情包时，在回复正文里写 \`[[图片: 路径]]\`，路径**只能**是收藏目录里的现成表情（例如 \`[[图片: ${stickerLabel}/笑死.gif]]\`）。\`.qq-media/…\` 这类临时缓存路径会被直接拒绝 —— 别自己拼哈希，目录里没有就是没有。这个标记会作为**一张图**发出去，位置就在它出现的地方；**想只发一张表情、一个字都不说，整条回复就只写这一行** —— 别配「给你发张表情包」这种话。`,
+          `- 想发表情包时，在回复正文里写 \`[[图片: 路径]]\`，路径**只能**是收藏目录里的现成表情（例如 \`[[图片: ${example}]]\`；扩展名照抄目录里那个，别自己改）。\`.qq-media/…\` 这类临时缓存路径会被直接拒绝 —— 别自己拼哈希，目录里没有就是没有。这个标记会作为**一张图**发出去，位置就在它出现的地方；**想只发一张表情、一个字都不说，整条回复就只写这一行** —— 别配「给你发张表情包」这种话。`,
         );
       }
       lines.push(
         '- 要给**别的**群 / 好友发图、或者就是「把这张图发过去」这种明确动作，用 qq_send_image 工具（它也接受 http(s) 图片链接；它是立刻发出去的，不跟在正文的行序里）。',
       );
-      // 目录优先用 STICKERS.md 的「名字（含义）」：模型看含义就能判断该不该发，看裸文件名
-      // 只能猜或者先 read_image。没有目录（旧部署 / 记忆关掉）时退回文件名，行为不变。
-      const catalog = memory.enabled ? memory.catalog() : { stickers: [], hot: [], catalog: false };
-      const names = stickerNames();
       if (stickerLabel !== undefined) {
         if (catalog.stickers.length > 0) {
           lines.push(
-            `- 你自己的表情包（名字（含义）；路径都在 ${stickerLabel}/ 里，想发哪张就把 \`${stickerLabel}/名字.扩展名\` 写进标记里）${canReadImages ? '，目录里没有的再 read_image 看一眼' : ''}：${catalog.stickers.join('、')}。表情包别滥用 —— 一次最多一张，也别每句都配一张。纯情绪（笑、无语、委屈、拒绝、赞成、撒娇、接梗）可以只发一张不说话；**有信息要说、是/否题、承诺、道歉、需要解释的时候不许拿表情代替回答**。`,
+            `- 你自己的表情包（名字（含义）→ 完整路径；想发哪张就把箭头后面的路径**原样**抄进标记里，别自己拼或改扩展名）${canReadImages ? '，目录里没有的再 read_image 看一眼' : ''}：${catalog.stickers.join('、')}。表情包别滥用 —— 一次最多一张，也别每句都配一张。纯情绪（笑、无语、委屈、拒绝、赞成、撒娇、接梗）可以只发一张不说话；**有信息要说、是/否题、承诺、道歉、需要解释的时候不许拿表情代替回答**。`,
           );
         } else {
           lines.push(

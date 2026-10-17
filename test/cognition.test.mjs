@@ -131,11 +131,16 @@ function describeStickers() {
     assert.equal(pending[0].path, '.qq-media/ab12cd.gif');
   });
 
-  test('stickerCatalogLines：提示词里给「名字（含义）」，不是裸文件名', () => {
+  test('stickerCatalogLines：提示词里给「名字（含义）→ 完整路径」，扩展名不用模型猜', () => {
     const { collected } = parseStickerCatalog(STICKERS);
-    assert.deepEqual(stickerCatalogLines(collected), ['委屈猫（委屈、求安慰）', '笑死（笑到不行、没眼看）']);
-    assert.deepEqual(stickerCatalogLines(collected, { max: 1 }), ['委屈猫（委屈、求安慰）']);
+    assert.deepEqual(stickerCatalogLines(collected), [
+      '委屈猫（委屈、求安慰） → .qq-stickers/委屈猫.gif',
+      '笑死（笑到不行、没眼看） → .qq-stickers/笑死.gif',
+    ]);
+    assert.deepEqual(stickerCatalogLines(collected, { max: 1 }), ['委屈猫（委屈、求安慰） → .qq-stickers/委屈猫.gif']);
     assert.deepEqual(stickerCatalogLines([]), []);
+    // 没有路径的老条目不会拼出 `→ undefined`。
+    assert.deepEqual(stickerCatalogLines([{ name: '旧条目', meaning: '含义', path: '' }]), ['旧条目（含义）']);
   });
 
   test('parseStickerCatalog：收藏区缺路径或缺含义的条目退回警告，不参与选择', () => {
