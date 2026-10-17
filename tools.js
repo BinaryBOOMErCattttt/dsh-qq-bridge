@@ -149,7 +149,10 @@ function qqSendImage(deps) {
       const image = await loadOutgoingImage({ source: deps.resolveStickerSource(args.image), cwd: deps.cwd, maxBytes: deps.imageMaxBytes });
       const action = type === 'group' ? 'send_group_msg' : 'send_private_msg';
       const idKey = type === 'group' ? 'group_id' : 'user_id';
-      await deps.client.call(action, { [idKey]: id, message: [imageSegment(image.bytes)] });
+      // 收藏目录里的表情按「大表情」发（`sub_type: 1`），其它来源（`.qq-media` 截图、
+      // 任意 URL、工作目录里的照片）照旧是普通图片 —— 见 `imageSegment` 的注释。
+      const sticker = deps.isStickerFile?.(args.image) === true;
+      await deps.client.call(action, { [idKey]: id, message: [imageSegment(image.bytes, { sticker })] });
       // 同 `qq_send_message`：我发进群的图也要算进回复指向的进度。
       deps.noteOwnMessage(type, id);
       deps.report('info', `→ ${type === 'group' ? '群' : '私聊'} ${id}: ${image.format} 图 ${image.bytes.length} bytes（来源 ${image.label}）`);
@@ -675,6 +678,9 @@ function qqMemory(deps) {
  * @param {(conversation: object) => (name: string) => string | undefined} deps.mentionResolver -
  *   把 `[[@昵称]]` 里的昵称解析成 QQ 号（名单挂在会话记录上）。
  * @param {(source: string) => string} deps.resolveStickerSource - 把表情包文件名解析成路径。
+ * @param {(source: string) => boolean} [deps.isStickerFile] -
+ *   判断来源是不是收藏目录里的表情包：是的话出站 image 段带 `sub_type: 1`（QQ 的大表情），
+ *   否则按普通图片发。缺失时一律当普通图片（测试桩里可以不传）。
  * @param {(options: object) => Promise<object>} [deps.saveSticker] -
  *   把一张图存进表情包目录（校验 + 清洗文件名 + 张数上限 + 往 STICKERS.md 补一行）；
  *   缺失 = 不注册 qq_save_sticker。

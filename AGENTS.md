@@ -73,7 +73,7 @@ tools.js       635 行  宿主平面工具的**声明**（qq_send_* / qq_poke / 
 memory.js     1240 行  长期记忆子系统：转录落盘、记忆文件读写（两个记忆工具的能力来源）、STICKERS.md 的追加、每日摘要循环；依赖由 index.js 显式传入
 onebot.js      637 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/@ 名单提取）；文本渲染委托 `modalities.js`
 media.js       327 行  入站媒体：QQ 的图/表情包 → 按内容哈希落盘 → 给模型 read_image 的本地路径
-image.js       135 行  出站图片：本地路径 / URL → 校验（大小、格式、目录越界）→ base64:// 段
+image.js       149 行  出站图片：本地路径 / URL → 校验（大小、格式、目录越界）→ base64:// 段；收藏目录里的表情额外带 `sub_type: 1`（QQ 的「大表情」）
 napcat.js      828 行  NapCat 那一侧：目录探测（强判据 = 有账号配置；弱判据 = 有它自带的启动件）、只读探测与**幂等**写 websocketServers（含备份）、快速登录 / 日志改文件 / WebUI 地址、`startPlan`（提权）、`hiddenStartPlan`（`wscript //B` + VBS 隐藏窗口）、`scheduledTask*Plan`；插件自检与一键脚本共用
 desktop.js      约 150 行  装进桌面版 profile 的纯函数：`.env` 段落幂等替换、manifest 改写、`pluginLinkState`（链接指着谁）/ `removePluginLink`（junction 对 `unlink` 是 EPERM，退到 `rmdir`）
 perceptual.js 约 1080 行  图片指纹：JPEG(DC)/PNG/GIF → 16×16 灰度 → dHash（复读判同一张画面）
@@ -544,7 +544,7 @@ ctx.interval（排到下一个 apiKeyRotateHour，默认 04:00）─▶ rotateAp
 | 加一个 Agent 工具 | 在 `tools.js` 里照 `qqSendMessage` 抄结构（`defineTool` + `output.schema` + `render` + 中文报错），再在 `registerQqTools` 里注册、在 `index.js` 的 `deps` 里补上它需要的能力；**别 import `index.js`** |
 | 改分条/打字节奏 | `onebot.js` 的 `splitBurst` / `splitStickerLines` / `typingDelayMs`（**纯函数，优先在这里改**） |
 | 改图片落盘/去重/淘汰 | `media.js` |
-| 改出站图片校验或传输 | `image.js` |
+| 改出站图片校验或传输（含表情的 `sub_type` 大表情标记） | `image.js` 的 `imageSegment` + index.js 的 `isStickerFile`（判定哪些来源算表情）+ `replyPieces` / `sendRepeat` 两处调用 |
 | 改「存表情包」（写边界 / 名字清洗 / 张数上限 / 什么时候能存） | `util.js` 的 `stickerFileName`（纯函数写边界）+ index.js 的 `saveSticker` / `stickerSaveAllowed` + `tools.js` 的 `qq_save_sticker` + `Config.stickerMaxFiles` + `filestore.js` 的 `writeBytesAtomic` + `allowTools` |
 | 改群触发/白名单/复读 | index.js 的 `admit` / `maybeRepeat` 区块 |
 | 改回复的指向（引用 / @） | index.js 的 `quoteHead` + `admit` 里快照的 `chatter.anchor()` + `Config.replyStyle`；这个读数**含机器人自己发的话**（`noteSelf`），别换成只算别人的 `others()`，也别把 `noteOwnMessage` 那几处删了（NapCat 的 `reportSelfMessage: false`，自己发的话等不到回灌） |

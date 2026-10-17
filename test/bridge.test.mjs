@@ -2996,6 +2996,13 @@ test('loadOutgoingImage reads paths inside cwd and URLs, and refuses everything 
     assert.equal(segment.type, 'image');
     assert.match(segment.data.file, /^base64:\/\//);
     assert.deepEqual(Buffer.from(segment.data.file.slice('base64://'.length), 'base64'), TINY_PNG);
+    // 普通图片不带 sub_type；收藏目录里的表情带 1（QQ 的大表情 / 原创表情），
+    // 不带的话群里看到的是一张照片样式的图片，一眼不像人发的表情。
+    assert.equal(segment.data.sub_type, undefined);
+    const sticker = imageSegment(TINY_PNG, { sticker: true });
+    assert.equal(sticker.type, 'image');
+    assert.equal(sticker.data.sub_type, 1);
+    assert.match(sticker.data.file, /^base64:\/\//);
   } finally {
     await images.close();
     await rm(cwd, { recursive: true, force: true });
@@ -3020,6 +3027,8 @@ test('qq_send_image sends a sticker to the QQ conversation the calling Agent bel
   assert.equal(sent.params.user_id, '100000002');
   assert.equal(sent.params.message.length, 1);
   assert.equal(sent.params.message[0].type, 'image');
+  // 收藏目录里的表情走「大表情」标记；`qq_send_image` 发别的图时不能带（见下一条用例）。
+  assert.equal(sent.params.message[0].data.sub_type, 1);
   assert.deepEqual(Buffer.from(sent.params.message[0].data.file.replace('base64://', ''), 'base64'), TINY_PNG);
 });
 
@@ -3040,6 +3049,8 @@ test('qq_send_image can send back a picture the conversation already downloaded'
     assert.equal(value.bytes, TINY_PNG.length);
     const sent = onebot.calls.find((call) => call.action === 'send_private_msg' && Array.isArray(call.params.message));
     assert.equal(sent.params.message[0].type, 'image');
+    // `.qq-media` 里的图可能是截图或照片，绝不能标成 QQ 的大表情（会被裁成小图）。
+    assert.equal(sent.params.message[0].data.sub_type, undefined);
   } finally {
     await onebot.close();
     await images.close();
@@ -3057,6 +3068,7 @@ test('qq_send_image needs a target outside a QQ conversation and can post to a g
   const sent = onebot.calls.find((call) => call.action === 'send_group_msg');
   assert.equal(sent.params.group_id, '100000001');
   assert.equal(sent.params.message[0].type, 'image');
+  assert.equal(sent.params.message[0].data.sub_type, 1);
 });
 
 test('qq_send_image refuses non-images, oversized files, and paths outside cwd', async () => {
@@ -3243,6 +3255,8 @@ test('a reply that is only a sticker marker sends one image and no text at all',
     assert.equal(sent.params.user_id, '100000002');
     assert.equal(sent.params.message.length, 1);
     assert.equal(sent.params.message[0].type, 'image');
+    // 收藏目录里的表情按 QQ 的「大表情」发（真人从表情面板发出来的那些也是这样）。
+    assert.equal(sent.params.message[0].data.sub_type, 1);
     assert.deepEqual(Buffer.from(sent.params.message[0].data.file.replace('base64://', ''), 'base64'), TINY_PNG);
     // 一条文字都没有：整轮只发了这一条。
     await new Promise((resolve) => setTimeout(resolve, 150));

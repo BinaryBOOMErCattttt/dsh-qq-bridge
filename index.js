@@ -1029,6 +1029,27 @@ export function apply(ctx, config) {
     return target;
   }
 
+  /**
+   * 这个来源是不是收藏目录里的表情包 —— 决定出站 image 段带不带 `sub_type: 1`
+   * （见 `imageSegment` 的注释）。
+   *
+   * 只认「能确定落在 stickerRoot 里的本地路径」，宁可不标也不乱标：
+   *   - URL / `file://` 一律按普通图片发（远端是什么无从判断）；
+   *   - `.qq-media/<哈希>` 这类缓存图照旧发成普通图片（它可能是截图或照片）；
+   *   - 裸文件名先按 `resolveStickerSource` 补成 `.qq-stickers/笑死.gif` 再判。
+   *
+   * @param source - 标记或工具参数里的来源。
+   * @returns 确认是收藏目录里的文件时 true。
+   */
+  function isStickerFile(source) {
+    if (stickerRoot === undefined || !stickerInside) return false;
+    const raw = resolveStickerSource(source);
+    // 只挡「带协议的来源」。别写成 `/^[a-z][a-z0-9+.-]*:/`：那会把 Windows 的 `C:\…`
+    // 当成协议名（收藏目录就在 C 盘时，绝对路径的表情会被误判成普通图片）。
+    if (raw.length === 0 || /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) || /^file:/i.test(raw)) return false;
+    return insideDirectory(stickerRoot, resolve(cwd, raw));
+  }
+
   /** 记下「这一轮想发的图没发出去」，给下一轮提示词用（见 `channelPrompt`）。 */
   function noteStickerFailure(conversation, source, reason) {
     conversation.stickerFailure = { path: String(source ?? '').slice(0, 120), reason: String(reason ?? '').slice(0, 160), at: Date.now() };
@@ -1606,7 +1627,8 @@ export function apply(ctx, config) {
       }
       // 图不挂引用、也没有可算的打字时间（延迟只留 index 0 的那个「读消息」）。
       // `imageSegment` 返回的是**一个段**，`message` 要的是段数组（旧写法就是 [segment]）。
-      if (!(await sendOne(conversation, [imageSegment(bytes)]))) return;
+      // `sticker: true` 带上 QQ 的「大表情」标记 —— 这条路只发收藏目录里的表情包。
+      if (!(await sendOne(conversation, [imageSegment(bytes, { sticker: true })]))) return;
       // 发出去了就把上一条失败记录清掉：再留着会变成一句没做完的指令。
       conversation.stickerFailure = undefined;
     }
@@ -2512,6 +2534,8 @@ export function apply(ctx, config) {
         report('warn', `could not repeat the sticker ${candidate.path}: ${errorText(error)}`);
         return;
       }
+      // 不带 `sticker`（= 普通图片）：复读的是**别人刚发的原图**，可能是截图或照片，
+      // 标成 QQ 的大表情反而会被当成表情裁小。收藏目录里的表情才走 `replyPieces` 那条。
       await sendOne(conversation, [imageSegment(bytes)]);
     });
   }
@@ -3704,6 +3728,8 @@ export function apply(ctx, config) {
     // 工具里的 `[[@昵称]]` 标记也要解析成 at 段：名单挂在会话记录上（见 `conversationMentions`）。
     mentionResolver: conversationMentions,
     resolveStickerSource,
+    // `qq_send_image` 也要区分「收藏的表情」与「普通图片」：前者带 QQ 的大表情标记发出去。
+    isStickerFile,
     // 存表情包：不可用时传 undefined，`registerQqTools` 会跳过那个工具
     // （与 memory.tools 同一个规矩：不留「一调就报错」的壳）。
     saveSticker: stickerSaveAllowed() ? saveSticker : undefined,

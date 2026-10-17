@@ -1000,8 +1000,9 @@ journalctl --user -u qqbot -f | grep 'qq-bridge: media:'   # 每张图的落盘/
 模型想接个梗 / 想回一张图
       ↓  回复正文里写一行「表情包标记」：[[图片: .qq-stickers/笑死.gif]]
 插件读字节 → 认格式 → 校验大小（只认 PNG/JPEG/WebP/GIF，默认 ≤ 8MB）
-      ↓  send_group_msg / send_private_msg 的 image 段：{"type":"image","data":{"file":"base64://…"}}
-NapCat 解码 → 上传 → 图出现在 QQ 里
+      ↓  send_group_msg / send_private_msg 的 image 段：
+         {"type":"image","data":{"file":"base64://…","sub_type":1}}
+NapCat 解码 → 上传 → 图出现在 QQ 里（`sub_type: 1` = 按「大表情」渲染，见下）
 ```
 
 ### 只发表情、一个字都不说
@@ -1043,6 +1044,11 @@ NapCat 解码 → 上传 → 图出现在 QQ 里
 
 要点：
 
+- **按「大表情」发，而不是普通图片**：从 `.qq-stickers/` 发出去的表情，`image` 段带
+  `sub_type: 1`（NapCat 会原样写进 QQ 的 `picSubType`；真人从表情面板发收藏表情时那里
+  就是非 0 的）。不带这个标记，QQ 只当它是一张照片：带边框、按原图像素铺开，群里一眼
+  就看得出不是人发的。反过来，`.qq-media/<哈希>` 里的截图、URL、工作目录里的照片，以及
+  复读别人刚发的图，都**不**带这个标记 —— 被 QQ 当成表情裁成小图更糟。
 - **表情包放哪儿**：`stickerDir`（默认 `.qq-stickers/`，插件启动时会自动建好）。
   往里丢几张图就能用 —— 文件名会列进「QQ 渠道」提示，所以**名字起得有意义**最划算
   （`笑死.gif`、`摸摸头.png`）；名字看不出来的，模型可以先 `read_image` 看一眼再挑。
@@ -1050,7 +1056,8 @@ NapCat 解码 → 上传 → 图出现在 QQ 里
 - **别人发的图想发回去，先存一次**：入站那张在 `.qq-media/…`（LRU 缓存，迟早被淘汰），
   标记不能直接用它。用 `qq_save_sticker` 存进 `.qq-stickers/`（顺手起个名字、写一句含义），
   下一轮就能挑它 —— 这也是「这张图以后还能再用」的唯一可靠办法。
-  `qq_send_image` 工具仍然可以发 `.qq-media` 里的图（那是显式动作，不是「发表情」）。
+  `qq_send_image` 工具仍然可以发 `.qq-media` 里的图（那是显式动作，不是「发表情」，
+  所以按普通图片发；只有落在收藏目录里的路径才带「大表情」标记）。
 - **权限边界没变**：本地路径只允许 `cwd` 里的文件，而且必须真的是 PNG/JPEG/WebP/GIF
   （按魔数判断，`.txt` 改名成 `.png` 也蒙不过去）—— QQ 那头是不可信输入，没理由为了
   发张图把工作区捅开。标记还**跟着 `allowTools` 走**：白名单里没有 `qq_send_image`

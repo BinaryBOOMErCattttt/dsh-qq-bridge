@@ -131,9 +131,19 @@ export async function loadOutgoingImage({
  *
  * 只给 `file`，不给 `url` —— NapCat 的发送侧按 `[url, file, path]` 取第一个有值的
  * 字段，把 base64 放在 `file` 里最不容易被别的实现误读成链接。
+ *
+ * `sticker: true` 会带上 `sub_type: 1`，也就是 QQ 的「大表情 / 原创表情」。不带这个标记时
+ * QQ 只当它是一张**普通图片**（照片样式、按原图像素铺开），群里一眼就能看出不是人从表情
+ * 面板发出来的；NapCat 的 `createValidSendPicElement` 会把这个值原样写进 `picSubType`，
+ * 而真人发收藏表情时那里就是非 0 的。所以只给**收藏目录里的表情包**用它：`.qq-media`
+ * 里的截图、别人发来的照片仍旧按普通图片发，免得被 QQ 当成表情裁成小图。
+ *
  * @param bytes - 图片字节。
- * @returns `{ type: 'image', data: { file: 'base64://…' } }`。
+ * @param options.sticker - 这是一张表情包（而不是普通图片）。
+ * @returns `{ type: 'image', data: { file: 'base64://…', sub_type?: 1 } }`。
  */
-export function imageSegment(bytes) {
-  return { type: 'image', data: { file: `base64://${Buffer.from(bytes).toString('base64')}` } };
+export function imageSegment(bytes, { sticker = false } = {}) {
+  const data = { file: `base64://${Buffer.from(bytes).toString('base64')}` };
+  if (sticker) data.sub_type = 1;
+  return { type: 'image', data };
 }
