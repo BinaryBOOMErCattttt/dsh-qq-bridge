@@ -3,7 +3,7 @@
 版本号按[语义化版本](https://semver.org/lang/zh-CN/)走。0.x 阶段配置项与行为都可能变，
 每次改动以 `Config` 的 schema 与 README 为准。
 
-## 未发布（0.2.0，BREAKING）
+## 0.2.0 — 2026-10-17
 
 按 `docs/refactor-persona-style-perception.md` 做的四层拆分：**人格 / 表达 / 感知 / 运维**。
 一句话概括：把「你是谁」「怎么说」「看到了什么」「出事了怎么查」从 `index.js` 那一坨提示词与

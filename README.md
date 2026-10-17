@@ -1636,7 +1636,7 @@ systemd」完全不同：没有 docker 网桥、没有 `systemctl`、Host 进程
 
 ### 照着走一遍（第一次装就按这个顺序）
 
-1. 解压发布包到**你想长期放着的位置**（比如 `D:\dsh-qq-bridge-0.1.1`），以后别再挪：
+1. 解压发布包到**你想长期放着的位置**（比如 `D:\dsh-qq-bridge-0.2.0`），以后别再挪：
    profile 里存的是指向这个目录的链接，挪了要重跑一次脚本（脚本会自己发现并重建链接）。
 2. 双击 `scripts\napcat-setup.cmd`（或跑 `node scripts\napcat-setup.mjs`）—— 它配好 NapCat
    的网络配置、profile 的 `.env`，并把插件装进 `desktop` profile。想先看它要做什么就加
