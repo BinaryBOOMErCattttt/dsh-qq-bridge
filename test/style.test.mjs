@@ -118,6 +118,39 @@ test('lintStyleDoc：客服腔 / 空洞 / 反向禁令 / 结构 / 覆盖 / 自�
   assert.equal(hits.find((hit) => hit.code === 'CUSTOMER_SERVICE').sectionLabel, '总体');
 });
 
+test('lintStyleDoc：把逗号写成「配额」的规则会被点出来（每句一个逗号的根因）', () => {
+  // 真实投诉：「几乎每句话都有一个逗号」。根因是这两句许可式写法 —— 模型把它们当成
+  // 「每句可以配一个」的额度，于是句句都配。逗号不能机械删（见 sanitizeBubble），
+  // 所以这一侧只能靠契约措辞 + 体检把它顶回去。
+  for (const line of ['一句里逗号最多一个', '逗号、顿号也正常', '逗号随便用，没关系']) {
+    const hits = lintStyleDoc({ punctuation: [line] });
+    assert.equal(hits.length > 0, true, `应当报出：${line}`);
+    assert.equal(hits[0].code, 'COMMA_QUOTA');
+    assert.ok(hits[0].why.includes('配额'));
+    assert.ok(hits[0].fix.length > 0);
+  }
+  // 讲频率 + 给替代做法的写法是对的，不能被报成噪声。
+  assert.deepEqual(
+    lintStyleDoc({
+      punctuation: [
+        '多数句子不带逗号：逗号只留给不带就会读错的地方',
+        '想说两件事就分成两条发，别用逗号把两个分句缝成一句',
+        '顿号只在并列的东西真的需要时用，能不用就不用',
+      ],
+    }),
+    [],
+  );
+});
+
+test('builtinStyle：标点那条讲频率、不讲「一句最多一个」的配额', () => {
+  // 这条不变量是给未来的自己看的：把措辞改回「最多一个」就等于把「每句一个逗号」写回契约。
+  const punctuation = builtinStyle().punctuation.join('；');
+  assert.ok(punctuation.includes('多数句子不带逗号'));
+  assert.ok(!/最多一个/.test(punctuation), '不能写成按句配给的额度');
+  assert.ok(/反例/.test(punctuation), '要有 few-shot：反例 → 正例才落地');
+});
+
+
 test('lintStyleDoc：「不要写您好」是在禁止客服腔，不能反过来被报成客服腔', () => {
   assert.deepEqual(lintStyleDoc({ general: ['不要写「您好」这类开场'] }), []);
   // 但「不要用语气词」确实是反向禁令，该报。

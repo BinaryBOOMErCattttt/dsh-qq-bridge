@@ -30,6 +30,12 @@
 - **`ops doctor` 新增五条长期记忆检查**：`COGNITION_UNPARSED`、`COGNITION_DUPLICATE_SECTION`、
   `COGNITION_PATH`、`STICKER_PATH_MISSING`、`STICKER_MEDIA_PATH`。
 - **`qq_memory read` 会点出解析不了的行**（它们永远不会进提示词）。
+- **标点契约改讲频率，不再讲配额**：以前的「一句里逗号最多一个」被模型当成额度，结果
+  「几乎每句话都有一个逗号」（真实观感投诉）。内置契约与 `.qq-persona/STYLE.md` 改成「多数
+  句子不带逗号；想说两件事就分成两条发」，并补了三句反例 → 正例的 few-shot。逗号仍然
+  不做字符串替换（会改动断句与语义）。
+- **`lintStyleDoc` 新增第七类 `COMMA_QUOTA`**：`STYLE.md` 里再出现「逗号、顿号也正常」
+  「一句里逗号最多一个」这类许可式写法，启动日志会点出来（含改法），不阻断。
 
 ### 修复
 
