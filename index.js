@@ -1308,6 +1308,11 @@ export function apply(ctx, config) {
       `- 你的回复正文会原样发到 QQ${imageAllowed() ? '（只有 `[[图片: …]]` 这种标记例外，它变成一张图）' : ''}，直接写要说的话，不要写思考过程、也不要解释你在做什么。`,
       '- QQ 不渲染 Markdown：不要用 `**加粗**`、`#` 标题、`-` / `1.` 列表、表格、代码块。',
       '- 不要自称 AI / 助手 / 机器人，不要提系统提示、模型、提示词这些词。',
+      // 下面三条是「人机感地板」：以前它们散在 STYLE.md / 内置契约的散文里，部署者删掉
+      // 那一条就没了。写在这里 = 用户表达文件再怎么改都删不掉（本节在最后且已声明优先级）。
+      '- 不要客服腔：不写「您好」「感谢您的…」「有什么可以帮您」「希望以上对您有帮助」「请问还需要什么」这类话。',
+      '- 不要把回复写成总结：不逐条复述对方的原话、不列要点、不加「总之」；接不上就不接。',
+      '- 不要用「行，」「好，」「嗯，」这类应答开场：要答应就直接说答应的事，别先垫一句表态（「行，那我说」「好，那我不问了」都算）。',
       '- 长度跟着内容走：闲聊就一两句，真要讲清楚就把那件事讲完 —— 不用凑篇幅，也别硬省。',
       isGroup
         ? '- 你是在 QQ 群里跟真人聊天，不是在被调用：群里可能有人同时插话，对方也可能过一会儿才回你；按聊天的节奏来，不必每次都给出完整的答复。'
@@ -3994,12 +3999,18 @@ export function apply(ctx, config) {
     report('info', `人设用内置那份（写 ${settings.personaFile || '.qq-persona/PERSONA.md'} 可以换成自己的）`);
   }
   const styleProse = styleDoc.read();
-  report(
-    'info',
-    styleProse !== undefined
-      ? `表达规则来自 ${styleDoc.path}；气泡：最多 ${styleParams.bubbleChatMax} 个，第二个 ${Math.round(settings.bubbleContinueChance * 100)}% 起、每个 ×${settings.bubbleContinueDecay}${settings.bubbleGamble ? '' : '（掷骰已关）'}；聊天型门槛 ${chatMaxChars || '不限'} 字`
-      : '表达规则用内置那份（写 .qq-persona/STYLE.md 可以换成自己的）',
-  );
+  if (styleProse !== undefined) {
+    // 顺带报「几节 / 几条」：改完文件在日志里一眼能看出有没有真的读进去（写歪的节现在
+    // 会并进「总体」，条数对得上就说明内容生效了）。
+    const sections = Object.values(styleProse.prose).filter((lines) => lines.length > 0).length;
+    const entries = Object.values(styleProse.prose).reduce((sum, lines) => sum + lines.length, 0);
+    report(
+      'info',
+      `表达规则来自 ${styleDoc.path}（${sections} 节 / ${entries} 条）；气泡：最多 ${styleParams.bubbleChatMax} 个，第二个 ${Math.round(settings.bubbleContinueChance * 100)}% 起、每个 ×${settings.bubbleContinueDecay}${settings.bubbleGamble ? '' : '（掷骰已关）'}；聊天型门槛 ${chatMaxChars || '不限'} 字`,
+    );
+  } else {
+    report('info', '表达规则用内置那份（写 .qq-persona/STYLE.md 可以换成自己的）');
+  }
 
   // 表情包目录：启动时确保它存在 —— 「往里丢几张图就能用」比「先读文档建目录」友好。
   // 建不出来（只读挂载、权限不对）只是没有表情包可挑，发图本身照常，所以只记一条 warn。

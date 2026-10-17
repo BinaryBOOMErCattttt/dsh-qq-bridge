@@ -5277,6 +5277,9 @@ async function bootWithPersona(config = {}, hostOptions = {}, onebotOptions = {}
   await writeFile(join(cwd, '.qq-persona', 'STYLE.md'), [
     '## 总体',
     '- 表达文件标记：一条回复一两个气泡',
+    // 故意用不认识的节名：内容必须并进「总体」照样生效（写歪了不能静默丢）。
+    '## 语气',
+    '- 语气节标记',
     '## 群聊',
     '- 群聊表达标记',
   ].join('\n'), 'utf8');
@@ -5296,9 +5299,17 @@ test('PERSONA.md 优先于配置 persona，且按场景选段', async () => {
     assert.doesNotMatch(prompt, /私聊场景标记/, '群聊轮不该带私聊的场景段');
     assert.doesNotMatch(prompt, /配置里那段人设/, '文件存在时配置 persona 被忽略（不叠加）');
     assert.equal(agent.inbox.length, 1);
-    // 表达契约来自 STYLE.md。
+    // 表达契约来自 STYLE.md；不认识的节（`## 语气`）内容也要并进「总体」生效。
     assert.match(prompt, /表达文件标记/);
+    assert.match(prompt, /语气节标记/);
     assert.match(prompt, /群聊表达标记/);
+    // 「行，」这类应答开场在硬性规则里：STYLE.md 没写它，也删不掉它。
+    const hardRulesAt = prompt.indexOf('硬性要求（最高优先级');
+    assert.ok(hardRulesAt >= 0);
+    assert.ok(
+      prompt.indexOf('这类应答开场') > hardRulesAt,
+      '应答开场禁令属于硬性规则，STYLE.md 删不掉',
+    );
   } finally {
     await group.onebot.close();
   }

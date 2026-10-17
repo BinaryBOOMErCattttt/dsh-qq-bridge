@@ -67,7 +67,11 @@ const STYLE_SECTIONS = {
  * 解析 `STYLE.md`：只有 `##` 分节与 `-` 列表，没有 DSL、没有 YAML。
  *
  * 为什么是这种「简单到能正则切」的格式：零依赖是硬约束（不能引 Markdown 库），而且
- * 写它的是部署者 —— 结构越少，写歪了也还能用。不认得的节名忽略并记一条 warn。
+ * 写它的是部署者 —— 结构越少，写歪了也还能用。
+ *
+ * **写歪的内容不丢**：不认得的节名、以及第一个 `##` 之前的段落，一律并进「总体」并记
+ * 一条 warn。以前这里是「忽略」——结果是部署者写了十条规则、节名写错一个字，十条全部
+ * 静默不进提示词，部署者只会觉得「改了没用」。宁可位置不对、内容也要生效。
  *
  * @param {string} markdown - 文件内容。
  * @returns `{ prose, warnings }`：`prose` 的键是 general / punctuation / sticker /
@@ -76,7 +80,10 @@ const STYLE_SECTIONS = {
 export function parseStyleDoc(markdown) {
   const prose = { general: [], punctuation: [], sticker: [], privateChat: [], group: [] };
   const warnings = [];
-  let current;
+  // 默认落在「总体」：第一个 `##` 之前的内容（以及不认识的节）都收在这里。
+  let current = 'general';
+  let sawHeading = false;
+  let preambleWarned = false;
   for (const raw of String(markdown ?? '').split(/\r?\n/)) {
     const line = raw.trim();
     if (line.length === 0) continue;
@@ -86,24 +93,117 @@ export function parseStyleDoc(markdown) {
     if (/^#[^#]/.test(line)) continue;
     const heading = /^##\s*(.+?)\s*$/.exec(line);
     if (heading !== null) {
+      sawHeading = true;
       const key = STYLE_SECTIONS[heading[1]];
       if (key === undefined) {
-        warnings.push(`STYLE.md 里不认识的节「${heading[1]}」，已忽略`);
-        current = undefined;
+        warnings.push(`STYLE.md 里不认识的节「${heading[1]}」，内容已并入「总体」`);
+        current = 'general';
       } else {
         current = key;
       }
       continue;
     }
     const item = /^[-*]\s+(.+)$/.exec(line);
-    if (item === null) {
-      // 段落说明（没有 `-` 的行）也收进去：部署者常先写一句「总体要求」再列条。
-      if (current !== undefined) prose[current].push(line);
-      continue;
+    // 段落说明（没有 `-` 的行）也收进去：部署者常先写一句「总体要求」再列条。
+    const text = item === null ? line : item[1].trim();
+    if (!sawHeading && !preambleWarned) {
+      warnings.push('STYLE.md 顶部（第一个 `##` 之前）的内容没有节名，已并入「总体」');
+      preambleWarned = true;
     }
-    if (current !== undefined) prose[current].push(item[1].trim());
+    prose[current].push(text);
   }
   return { prose, warnings };
+}
+
+/** 节名 → 日志里的中文叫法（lint 报错时用）。 */
+const SECTION_LABELS = {
+  general: '总体',
+  punctuation: '标点',
+  sticker: '表情包',
+  privateChat: '私聊',
+  group: '群聊',
+};
+
+/**
+ * 用户最容易写出的六类「语法上没问题、语义上把人往客服腔推」的规则。
+ *
+ * 判据刻意收得窄：只抓**已知会诱发人机感**的措辞，不判断文笔好坏。宽词表会把
+ * 「不要用序号、列表」这种正确的禁令也报出来，警告一多就没人看了。
+ */
+const STYLE_LINT_RULES = [
+  {
+    code: 'CUSTOMER_SERVICE',
+    pattern: /(您好|感谢您的|感谢您对|有什么可以帮|希望(?:以上|这些)?对您有(?:所)?帮助|请问还需要|为您服务|请稍等)/,
+    why: '客服腔是中文模型最熟的语气，写进契约会把回复拉回模板',
+    fix: '删掉这类措辞；真要禁止就点名「不要写『您好』『感谢您的…』」，别反过来要求礼貌专业',
+  },
+  {
+    code: 'VAGUE',
+    pattern: /(自然一点|自然一些|生动|有个性|有温度|像真人|不要太机械|别太机械|有感情|有灵魂)/,
+    why: '没有可执行判据，模型只能退回默认的助手腔',
+    fix: '改成能验证的一条：句子多长、能不能用语气词、什么情况只回一句',
+  },
+  {
+    code: 'FORBID_SPOKEN',
+    pattern: /(?:不要|别|避免|禁止|勿)[^。；\n]{0,8}(?:语气词|网络用语|网络语言|口语|缩写|颜文字|波浪号|省略号)/,
+    why: '整类禁掉会直接掐掉 QQ 语感',
+    fix: '只禁具体的坏习惯（比如「一句话里别叠两个语气词」），别整类禁',
+  },
+  {
+    code: 'STRUCTURE',
+    pattern: /(分点|列点|列成几点|条理|总结一下|要总结|概括|完整的答复|完整答复|先说[^。；\n]{0,6}再)/,
+    why: '和气泡计划、「不写列表」的硬规则对打，模型会平均成一段书面语',
+    fix: '改成「先给结论、要展开就接着说」，别要求分点或总结',
+  },
+  {
+    code: 'OVERRIDE',
+    pattern: /(忽略以上|忽略上面|以此为准|优先级最高|覆盖以上|覆盖之前|不受以上限制)/,
+    why: '表达契约压不过硬性规则，写这句只会让模型在两边平均',
+    fix: '删掉覆盖声明；要改行为就改具体那一条规则',
+  },
+  {
+    code: 'SELF_AI',
+    pattern: /(?:(?:你|我)是(?:一个)?|作为(?:一个)?)\s*(?:AI|人工智能|助手|机器人)/i,
+    why: '自称 AI / 助手是最典型的人机感来源，硬性规则里也已经禁了',
+    fix: '删掉；要写身份就写名字、自称、跟群的关系',
+  },
+];
+
+/**
+ * 给解析出来的散文做一次「人机感体检」。
+ *
+ * 位置在**解析之后、渲染之前**：不改内容、不改文件、不阻断 —— 只把「这句会把人往
+ * 客服腔推」的地方连原因和改法一起报出来。写坏了最多是日志里多一条 warn，机器人
+ * 照常说话（这条底线与 docfile.js 的失败语义一致）。
+ *
+ * @param {object} prose - {@link parseStyleDoc} 的 `prose`。
+ * @returns {{section: string, sectionLabel: string, line: string, code: string,
+ *   why: string, fix: string}[]} 命中的条目，按节与行序排列。
+ */
+export function lintStyleDoc(prose) {
+  const hits = [];
+  for (const [section, lines] of Object.entries(prose ?? {})) {
+    for (const raw of lines ?? []) {
+      const text = String(raw ?? '').trim();
+      if (text.length === 0) continue;
+      // 「不要写『您好』」是在禁止客服腔，不是在用客服腔：开头的否定词先挡掉两条
+      // 正向词表（FORBID_SPOKEN 恰恰相反，它就是靠「不要…」触发的）。
+      const negated = /^(?:不要|别|禁止|避免|不得|绝不能|不准)/.test(text);
+      for (const rule of STYLE_LINT_RULES) {
+        if (negated && (rule.code === 'CUSTOMER_SERVICE' || rule.code === 'SELF_AI')) continue;
+        if (!rule.pattern.test(text)) continue;
+        hits.push({
+          section,
+          sectionLabel: SECTION_LABELS[section] ?? section,
+          line: text,
+          code: rule.code,
+          why: rule.why,
+          fix: rule.fix,
+        });
+      }
+    }
+  }
+  return hits;
 }
 
 /** 内置契约的副本（每次给新对象，调用方随便改不会污染模块级常量）。 */
@@ -253,24 +353,45 @@ export function sanitizeBubble(text, { stripShortPeriod = true, shortPeriodMaxCh
  * 同步求值的）、按 `size:mtime` 缓存、超出 `styleMaxChars` 截断并 warn、文件必须在 cwd 内。
  * 文件不存在时返回 undefined —— 调用方据此退回内置契约。
  *
+ * 解析警告与 {@link lintStyleDoc} 的体检**只在文件内容变化时跑一次**：写坏了不会阻断，
+ * 但下一次热读一定会把它说清楚（见 `read()` 里的 `lastLinted`）。
+ *
  * @param {object} options - `{ cwd, file, maxChars, report }`。
  * @returns `{ read(): { prose, warnings } | undefined, path }`。
  */
 export function createStyle({ cwd, file, maxChars = 2000, report }) {
   const reader = createDocReader({ cwd, file, maxChars, report, label: '表达规则' });
   let lastGood;
+  // 上一次做过体检的原文。提示词每轮装配都会调 `read()`，而解析与 warn 只跟内容有关：
+  // 不在版本变化时收口，日志会被同一批警告刷满，真正的「这次改出了新问题」反而看不见。
+  // 字符串比较是**按值**的，所以只是 touch 一下（内容没变）不会重报。
+  let lastLinted;
   return {
     path: reader.path,
     read() {
       const { text } = reader.read();
       if (text === undefined) return undefined;
       const parsed = parseStyleDoc(text);
-      for (const warning of parsed.warnings) report('warn', warning);
       const empty = Object.values(parsed.prose).every((lines) => lines.length === 0);
-      if (empty) {
-        report('warn', `表达规则文件 ${reader.path} 里没有可用的内容，继续用上一版/内置契约`);
-        return lastGood === undefined ? undefined : { prose: lastGood, warnings: [] };
+      if (text !== lastLinted) {
+        lastLinted = text;
+        for (const warning of parsed.warnings) report('warn', warning);
+        const hits = lintStyleDoc(parsed.prose);
+        for (const hit of hits) {
+          report(
+            'warn',
+            `表达规则 ${reader.path} 的「${hit.sectionLabel}」有一条可能让人机感变强：「${hit.line}」`
+              + ` —— ${hit.why}；${hit.fix}`,
+          );
+        }
+        if (hits.length > 0) {
+          report('warn', `表达规则体检：${hits.length} 处写法可能让人机感变强（逐条见上）；改文件不用重启，写歪了也只是 warn`);
+        }
+        if (empty) {
+          report('warn', `表达规则文件 ${reader.path} 里没有可用的内容，继续用上一版/内置契约`);
+        }
       }
+      if (empty) return lastGood === undefined ? undefined : { prose: lastGood, warnings: [] };
       lastGood = parsed.prose;
       return parsed;
     },

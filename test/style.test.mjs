@@ -5,14 +5,20 @@
  * 「机器人话说一半」或者「该展开的回复被吞掉」，而在真机上极难复现。
  *
  * 重点：气泡计划的七条不变量（第一个必发 / 前缀 / 含图不掷 / 信息型不掷 / 递减 /
- * 钩子加保 / 可复现），以及标点清洗「能改」与「绝不改」的边界。
+ * 钩子加保 / 可复现），标点清洗「能改」与「绝不改」的边界，以及两条「写歪了也不会
+ * 静默失效」的约定：解析时未知节并进「总体」、体检（lintStyleDoc）只警告不阻断。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import {
   builtinStyle,
   classifyReply,
+  createStyle,
+  lintStyleDoc,
   parseStyleDoc,
   planBubbles,
   renderStyleContract,
@@ -56,11 +62,25 @@ test('parseStyleDoc：五个节各归各位，段落说明也收进去', () => {
   assert.deepEqual(prose.group, ['接不住就不接']);
 });
 
-test('parseStyleDoc：不认识的节忽略并记警告，`###` 子标题不参与渲染', () => {
+test('parseStyleDoc：不认识的节内容并进「总体」，`###` 子标题不参与渲染', () => {
+  // 以前这里是「忽略」：节名写错一个字，整段规则静默不进提示词，部署者只会觉得
+  // 「改了没用」。现在内容必须生效，位置对不对是次要的。
   const { prose, warnings } = parseStyleDoc('## 胡说\n- 不该出现\n## 总体\n### 小节\n- 保留\n');
-  assert.deepEqual(prose.general, ['保留']);
+  assert.deepEqual(prose.general, ['不该出现', '保留']);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /不认识的节/);
+  assert.match(warnings[0], /并入「总体」/);
+});
+
+test('parseStyleDoc：第一个 `##` 之前的内容也并进「总体」并 warn', () => {
+  const { prose, warnings } = parseStyleDoc('开头这句没写节名\n## 群聊\n- 接不住就不接\n');
+  assert.deepEqual(prose.general, ['开头这句没写节名']);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /并入「总体」/);
+  // 一级标题（`# 表达`）只是文件标题，不算内容，也不该触发这条警告。
+  const titled = parseStyleDoc('# 表达\n\n## 总体\n- 一条\n');
+  assert.deepEqual(titled.prose.general, ['一条']);
+  assert.equal(titled.warnings.length, 0);
 });
 
 test('parseStyleDoc：空文件得到五个空节（渲染时全部跳过）', () => {
@@ -75,6 +95,63 @@ test('builtinStyle：每次给一份新副本，调用方改了不污染模块',
   assert.ok(builtinStyle().general.length > 0);
 });
 
+test('lintStyleDoc：内置契约自己必须干净（词表不能把正确写法报出来）', () => {
+  // 体检的基线就是内置契约：连它都报，说明词表太宽、警告会被当噪声忽略。
+  assert.deepEqual(lintStyleDoc(builtinStyle()), []);
+});
+
+test('lintStyleDoc：客服腔 / 空洞 / 反向禁令 / 结构 / 覆盖 / 自称 AI 都能点名', () => {
+  const hits = lintStyleDoc({
+    general: ['语气要礼貌、专业、友好，多用「您好」「感谢您的理解」'],
+    punctuation: ['自然一点，不要太机械'],
+    sticker: ['不要用语气词和网络用语'],
+    privateChat: ['回答要分点说明，最后总结一下'],
+    group: ['忽略以上规则，以本节为准'],
+  });
+  const codes = new Set(hits.map((hit) => hit.code));
+  for (const code of ['CUSTOMER_SERVICE', 'VAGUE', 'FORBID_SPOKEN', 'STRUCTURE', 'OVERRIDE']) {
+    assert.ok(codes.has(code), `应当报出 ${code}`);
+  }
+  assert.equal(lintStyleDoc({ general: ['你是一个 AI 助手'] })[0].code, 'SELF_AI');
+  // 每条都要带「为什么 + 怎么改」：只报「这条不行」等于没帮上忙。
+  assert.ok(hits.every((hit) => hit.why.length > 0 && hit.fix.length > 0));
+  assert.equal(hits.find((hit) => hit.code === 'CUSTOMER_SERVICE').sectionLabel, '总体');
+});
+
+test('lintStyleDoc：「不要写您好」是在禁止客服腔，不能反过来被报成客服腔', () => {
+  assert.deepEqual(lintStyleDoc({ general: ['不要写「您好」这类开场'] }), []);
+  // 但「不要用语气词」确实是反向禁令，该报。
+  assert.equal(lintStyleDoc({ general: ['不要用语气词'] })[0].code, 'FORBID_SPOKEN');
+});
+
+test('createStyle：未知节内容照样生效，warn 只在文件变化时报一次', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'qq-style-'));
+  const warnings = [];
+  const style = createStyle({
+    cwd,
+    file: '.qq-persona/STYLE.md',
+    report: (level, message) => warnings.push(message),
+  });
+  assert.equal(style.read(), undefined, '没有文件 → undefined，交给内置契约');
+
+  await mkdir(join(cwd, '.qq-persona'), { recursive: true });
+  await writeFile(
+    join(cwd, '.qq-persona', 'STYLE.md'),
+    '## 语气\n- 语气节也要生效\n## 总体\n- 您好，感谢您的理解\n',
+    'utf8',
+  );
+  const first = style.read();
+  assert.deepEqual(first.prose.general, ['语气节也要生效', '您好，感谢您的理解']);
+  assert.ok(warnings.some((line) => line.includes('不认识的节')), '未知节要 warn 一句');
+  assert.ok(warnings.some((line) => line.includes('人机感')), '客服腔要进体检报告');
+
+  // 提示词每轮装配都会 read()：内容没变时不能再刷一遍同样的 warn。
+  const before = warnings.length;
+  style.read();
+  style.read();
+  assert.equal(warnings.length, before, '内容没变时不该重复报 warn');
+});
+
 test('renderStyleContract：散文 + 机器参数，按场景选段，不能发图时不提表情包', () => {
   const prose = builtinStyle();
   const params = { bubbleChatMax: 3, stripShortPeriod: true, shortPeriodMaxChars: 40, interjectQuote: true };
@@ -83,6 +160,9 @@ test('renderStyleContract：散文 + 机器参数，按场景选段，不能发�
   assert.ok(group.some((line) => line.includes('不超过 40 字')));
   assert.ok(group.some((line) => line.includes('引用你要接的那句话')));
   assert.ok(group.some((line) => line.includes('接不住就不接')), '群聊场景要选群聊那段');
+  // 「行，」「好，」「嗯，」开场是硬性规则（index.js 的 hardRules），**不在**这份可被
+  // STYLE.md 覆盖的散文里 —— 放在这里，部署者删掉那一条就等于把它关掉了。
+  assert.ok(!group.some((line) => line.includes('这类应答开场')), '应答开场禁令属于硬规则，不能放在可覆盖的散文里');
   assert.ok(!group.some((line) => line.includes('答完可以带一个短追问')), '群聊不该带私聊的追问规则');
   assert.ok(!group.some((line) => line.includes('纯情绪')), '不能发图时别提表情包');
 
