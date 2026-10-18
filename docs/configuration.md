@@ -94,7 +94,7 @@
 | `agentPreset` | `qq` | QQ 会话 Agent 挂载的 Agent 预设 id：默认 `qq`（本 bundle 自带：只读文件 + 检索 + 联网，没有 shell / 子代理）。空 = 用**部署的默认预设**（可能是带 shell 的 `standard`，QQ 消息是不可信输入，别轻易这么配），`none` = 不挂预设（只剩宿主平面的 `qq_*`） |
 | `provider` / `model` | `''` | QQ 会话使用的模型；空 = 用默认 |
 | `approvalPolicy` | `never` | `never` = 无人值守时一律拒绝需要审批的操作 |
-| `allowTools` | 17 个工具名 | QQ 会话可用的工具白名单：默认 `read` / `read_image` / `glob` / `grep` / `web_search` / `web_fetch` / `skill` + 十个 `qq_*` —— **没有 write / edit / bash**。空 = 不限制（全给它继承到的工具）；写错的名字会被丢掉并记 warn，见[限制 QQ 会话的工具](tools.md#限制-qq-会话的工具allowtools) |
+| `allowTools` | 18 个工具名 | QQ 会话可用的工具白名单：默认 `read` / `read_image` / `glob` / `grep` / `web_search` / `web_fetch` / `skill` + 十一个 `qq_*` —— **没有 write / edit / bash**。空 = 不限制（全给它继承到的工具）；写错的名字会被丢掉并记 warn，见[限制 QQ 会话的工具](tools.md#限制-qq-会话的工具allowtools) |
 | `resetCommand` | `/reset` | 新开一轮会话（旧会话留在磁盘上当存档）的指令；空 = 禁用 |
 | `resetUsers` | `[]` | 允许用 `resetCommand` 的 QQ 号；**留空 = 谁都不能重置**（与 `allowUsers` 反过来，见[新开一轮会话](sessions.md#新开一轮会话reset)）。本仓库的 `cordis.patch.yml` 把这一项接在 `QQBOT_RESET_USERS` 环境变量上（写进 `<启动 cwd>/.env`，逗号分隔）—— 免得把自己的号提交进仓库 |
 | `maxReplyChars` | `1500` | 单条 QQ 消息最大字符数（协议上限），超出自动分段 |

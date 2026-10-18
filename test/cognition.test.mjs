@@ -22,6 +22,7 @@ import {
   parseStickerCatalog,
   removeCognitionRow,
   removeStickerRow,
+  renameStickerRow,
   splitFields,
   stickerCatalogLines,
   stickerRow,
@@ -234,6 +235,55 @@ function describeStructuredWrites() {
     assert.equal(parseStickerCatalog(text).pending.length, 0, '旧的待办行必须被替换掉，不能两份并存');
     const again = upsertStickerRow(text, { name: '疑惑', meaning: '没听懂', path: '.qq-stickers/疑惑.jpg' });
     assert.equal(parseStickerCatalog(again.text).collected.length, 1);
+  });
+
+  test('renameStickerRow：按旧名字搬整行，旧名不留下、字段不丢', () => {
+    const { text, renamed, section } = renameStickerRow(STICKERS, '委屈猫', {
+      name: '委屈',
+      path: '.qq-stickers/委屈.gif',
+    });
+    assert.equal(renamed, true);
+    assert.equal(section, '已收藏');
+    const parsed = parseStickerCatalog(text);
+    assert.deepEqual(parsed.collected.map((entry) => entry.name), ['委屈', '笑死']);
+    assert.equal(parsed.collected[0].meaning, '委屈、求安慰', '改名字不能把含义丢了');
+    assert.equal(parsed.collected[0].scene, '对方凶我 / 我装可怜时');
+    assert.equal(parsed.collected[0].look, '白猫缩成一团、眼泪汪汪');
+    assert.equal(parsed.collected[0].path, '.qq-stickers/委屈.gif');
+    assert.equal(parsed.collected[0].date, '2026-10-12', '首见日期跟着走，不要重置成今天');
+    assert.doesNotMatch(text, /委屈猫/, '旧名字那条必须消失，否则以后两张都会被挑中');
+    assert.match(text, /- 蓝色女仆捂脸/, '未收藏区原样保留');
+  });
+
+  test('renameStickerRow：顺手给新含义 / 场景 / 画面时以新值为准（pending 会升进已收藏）', () => {
+    const { text, section } = renameStickerRow(STICKERS, '蓝女仆', {
+      name: '女仆捂脸',
+      path: '.qq-stickers/女仆捂脸.gif',
+      look: '蓝发女仆捂着嘴',
+      meaning: '害羞、没眼看',
+      scene: '被人夸的时候',
+    });
+    // 旧名字不在（内容里只有更长的「蓝色女仆捂脸」）→ renamed: false 只追加一条新的。
+    assert.equal(section, '已收藏');
+    assert.equal(parseStickerCatalog(text).collected.length, 3);
+
+    const pending = '# 表情包目录\n\n## 已收藏\n\n## 未收藏\n- 疑惑｜.qq-stickers/疑惑.jpg｜待补含义\n';
+    const up = renameStickerRow(pending, '疑惑', { name: '满脸问号', path: '.qq-stickers/满脸问号.jpg', meaning: '没听懂' });
+    assert.equal(up.renamed, true);
+    assert.equal(up.section, '已收藏', '改名时补了含义，就该升进已收藏');
+    const parsed = parseStickerCatalog(up.text);
+    assert.deepEqual(parsed.collected.map((entry) => entry.name), ['满脸问号']);
+    assert.equal(parsed.pending.length, 0);
+    assert.equal(parsed.collected[0].meaning, '没听懂');
+    assert.doesNotMatch(up.text, /疑惑/);
+  });
+
+  test('renameStickerRow：旧名字认不出来时只追加一条新的（renamed=false），名字照样要求非空', () => {
+    const { text, renamed } = renameStickerRow(STICKERS, '不存在', { name: '新表情', meaning: '随便', path: '.qq-stickers/新表情.gif' });
+    assert.equal(renamed, false);
+    assert.equal(parseStickerCatalog(text).collected.length, 3);
+    assert.throws(() => renameStickerRow(STICKERS, '委屈猫', { name: '  ', path: '.qq-stickers/x.gif' }), /new sticker name/);
+    assert.throws(() => renameStickerRow(STICKERS, '', { name: 'x', path: '.qq-stickers/x.gif' }), /current sticker name/);
   });
 
   test('normalizeCognitionDoc：合并重复标题、去掉完全相同的行，但不吃同写法不同义的条目', () => {

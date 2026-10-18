@@ -20,7 +20,7 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 
 - **入站**：QQ 私聊/群 @ 消息 → 持久的 DSH Session → Agent → 结果发回 QQ。
 - **出站**：任何 DSH Agent 都能调 `qq_send_*` 主动发消息/图片；`[[图片: 路径]]` 按正文位置发；
-  `qq_save_sticker` 把别人发的存进 `.qq-stickers/`（见 §6 表）。
+  `qq_save_sticker` 把别人发的存进 `.qq-stickers/`、`qq_rename_sticker` 给已收藏的改名（文件与目录一起搬，见 §6 表）。
 - **不走模型的旁路**：群里的**自动复读**（见 §4.C）。
 - **主动说话**（`proactive`，默认开；闸门很多，见 §4.E）：群里安静下来后，插件往**该群自己的会话**里伪造一条提醒，
   让它带着环境上下文与长期记忆自己冒个泡（见 §4.E）。
@@ -76,7 +76,7 @@ filestore.js   108 行  「原子写 / 尽力而为读」（读不到返回空�
 config.js      227 行  配置 schema（**唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段；**根上是 `.volatile()`**（设置页的前提，见 §5.12）
 settings.js    331 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
 client.js     2181 行  **浏览器半侧**（手写 bundle）：把 schema 投影成设置页自己的一页（`settings.section`），7 个 `TABS` / 15 个 `SECTIONS`；保存走 Host 的 settings 写路径（见 §5.12）
-tools.js       943 行  宿主平面工具的**声明**（qq_send_* / qq_poke / qq_save_sticker / qq_list_conversations / qq_transcript / qq_memory / qq_remind_*），依赖由 index.js 显式传入
+tools.js       约 1090 行  宿主平面工具的**声明**（qq_send_* / qq_poke / qq_save_sticker / qq_rename_sticker / qq_list_conversations / qq_transcript / qq_memory / qq_remind_*），依赖由 index.js 显式传入
 memory.js     1414 行  长期记忆子系统：转录落盘、记忆文件读写（两个记忆工具的能力来源）、STICKERS.md 的追加、每日摘要循环；依赖由 index.js 显式传入
 onebot.js      637 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/@ 名单提取）；文本渲染委托 `modalities.js`
 media.js       327 行  入站媒体：QQ 的图/表情包 → 按内容哈希落盘 → 给模型 read_image 的本地路径
@@ -249,7 +249,7 @@ QQ ─▶ NapCat ─ws─▶ OneBotClient.onEvent ─▶ handleEvent
 ### B. 出站：Agent 主动发
 
 `qq_send_message` / `qq_send_image` 直接调 `client.call('send_*', …)`；`qq_list_conversations`
-只查询；`qq_save_sticker` 只写表情包目录（**不发消息**，见 §6 表与 docs/media.md）；`qq_transcript` /
+只查询；`qq_save_sticker` 只写表情包目录、`qq_rename_sticker` 只在那个目录里改名（都**不发消息**，见 §6 表与 docs/media.md）；`qq_transcript` /
 `qq_memory` 只读写记忆目录。注意区别：**工具**（显式动作）只按协议上限 `chunkText` 分段，
 **不加**打字延迟；拟人节奏只加在 A 链路的自动回复上。
 
@@ -303,7 +303,8 @@ ctx.interval（排到下一个 digestAtHour，默认 04:00）─▶ runDigestSwe
 - **别在启动时扫一遍**（`conversations` 那刻还是空的）：补课挂在「重启后第一条消息到达」上。
 - **读转录前先等写入**（`writesFor` + `Promise.all`），否则会读到还没写出来的目录然后静默跳过。
 - **认知与表情包是两个文件**：`COGNITION.md` 只有语言（键是文字写法），`STICKERS.md` 是表情包
-  （键是收藏后的文件名）。解析在 `cognition.js`；`qq_save_sticker` 存完图顺手补一行。
+  （键是收藏后的文件名）。解析在 `cognition.js`；`qq_save_sticker` 存完图顺手补一行，
+  `qq_rename_sticker` 改名时把那一行一起搬（`cognition.js` 的 `renameStickerRow`）。
 - **摘要 Agent 不在 `sessionIndex` 里**，它的 turn/end 因此不会往 QQ 发东西 —— 这是「后台会话」
   与「QQ 会话」唯一的区别机制，别把 digest session 注册进去。
 - **写边界只有一处**：`memoryRelativePath`（模块级纯函数）。`qq_memory` 的写路径必须过它，
@@ -588,7 +589,8 @@ agent 轮在 `index.js`**。
    `/reset` 默认**谁都不能用**（`resetUsers` 空 = 全关，见 §4.G）。
    任何扩大 QQ 侧能力的改动都要重新想一遍这一点。唯一能让 QQ 会话**按自己给的字节**写盘的
    是 `qq_save_sticker`（只写 `stickerDir` 内、文件名洗成单层、张数受 `stickerMaxFiles` 限制，
-   见 docs/media.md 的同名小节）；`qq_remind_create` 也会让插件写提醒任务文件，但写的是
+   见 docs/media.md 的同名小节）；`qq_rename_sticker` 也只能给那个目录里**已有**的文件改名
+   （不引入新字节、目标名占用就拒绝、目录写失败会回滚），是同一类窄通道而不是新能力；`qq_remind_create` 也会让插件写提醒任务文件，但写的是
    `reminderFile` 里字段级校验过的任务（见 §4.J）。
 7. **`Config` schema 是配置的唯一真相（在 `config.js`）。** 加配置项 = 在 schema 里加字段
    （带**中文** `.description()`）+ 需要再加工的话在 `settings.js` 里加一行 + docs/configuration.md 的表格里
@@ -634,7 +636,7 @@ agent 轮在 `index.js`**。
 | 改气泡数 / 标点 / 引用规则 | 气泡条数由模型按 `STYLE.md` 自己写，插件**不设上限**；标点与中断在 `style.js`（`sanitizeBubble` / `classifyReply` / `renderStyleContract`）+ `Config` 的 `burstSingleMaxChars` / `stripShortPeriod` / `replyStyle` + `index.js` 的 `burstParts` / `replyPieces` / `sendParts` / `quoteHead`（被回复的那条只有表情时不引用：`onebot.js` 的 `isEmojiOnlyMessage`） |
 | 改私聊补一句 | `speaking-rules.js` 的 `privateAfterthoughtAllows` + index.js 的 `scheduleChime` / `runChime` / `chimeNudge` + `Config.privateAfterthought*` |
 | 改群聊「谁该开口」 / 插话 | `speech-policy.js`（`decideGroupTurn` / `interjectExclusion` / `interjectLine`）+ `speaking-rules.js` + index.js 的 `admit` / `submitBatch` / `speakerLine` |
-| 改认知 / 表情包目录 | `cognition.js`（纯解析）+ `memory.js` 的 `catalogState` / `appendSticker` + `tools.js` 的 `qq_save_sticker` + 三个 skill + `scripts/migrate-cognition.mjs` |
+| 改认知 / 表情包目录 | `cognition.js`（纯解析与 `upsertStickerRow` / `renameStickerRow` / `removeStickerRow`）+ `memory.js` 的 `catalogState` / `appendSticker` / `renameStickerEntry` + `tools.js` 的 `qq_save_sticker` / `qq_rename_sticker` + 三个 skill + `scripts/migrate-cognition.mjs` |
 | 改消息段的渲染 / 新加一种段 | `modalities.js`（`observationOf` / `renderObservation`）；卡片解析在 `links.js` |
 | 加运维动作 / 改 doctor | `ops.js`（纯计划）+ `scripts/ops.mjs`（执行器）+ `test/ops.test.mjs`；写 cwd 外的步骤必须带 `requires: human|root` |
 | 加一个 Agent 工具 | 在 `tools.js` 里照 `qqSendMessage` 抄结构（`defineTool` + `output.schema` + `render` + 中文报错），再在 `registerQqTools` 里注册、在 `index.js` 的 `deps` 里补上它需要的能力；**别 import `index.js`** |
@@ -642,6 +644,7 @@ agent 轮在 `index.js`**。
 | 改图片落盘/去重/淘汰 | `media.js` |
 | 改出站图片校验或传输（含表情的 `sub_type` 大表情标记） | `image.js` 的 `imageSegment` + index.js 的 `isStickerFile`（收藏目录来源算表情）+ `onebot.js` 的 `isStickerSegment`（复读时原消息算不算表情）+ `replyPieces` / `sendRepeat` 两处调用 |
 | 改「存表情包」（写边界 / 名字清洗 / 张数上限 / 什么时候能存） | `util.js` 的 `stickerFileName`（纯函数写边界）+ index.js 的 `saveSticker` / `stickerSaveAllowed` + `tools.js` 的 `qq_save_sticker` + `Config.stickerMaxFiles` + `filestore.js` 的 `writeBytesAtomic` + `allowTools` |
+| 改「给表情改名」 | `cognition.js` 的 `renameStickerRow`（纯函数：按旧名字搬整行、同区原地替换）+ `memory.js` 的 `renameStickerEntry` + index.js 的 `renameSticker` / `stickerRenameAllowed`（文件 `rename` + 目录写失败回滚）+ `tools.js` 的 `qq_rename_sticker` + `docs/media.md` 同名小节 |
 | 改群触发/白名单/复读 | index.js 的 `admit` / `maybeRepeat` 区块 |
 | 改回复的指向（引用 / @） | index.js 的 `quoteHead` + `admit` 里快照的 `chatter.anchor()` + `Config.replyStyle`；这个读数**含机器人自己发的话**（`noteSelf`），别换成只算别人的 `others()`，也别把 `noteOwnMessage` 那几处删了（NapCat 的 `reportSelfMessage: false`，自己发的话等不到回灌） |
 | 改「@ 人」的行为（标记语法 / 名单来源 / 认不出来怎么办） | `mention.js`（纯函数解析与名单查询）+ `Config` 里**没有**配置项 + index.js 的 `registerParticipant` / `conversationMentions` / `sendParts` 与 `admit` 里登记的 `sender.mentions` + `tools.js` 的 `qq_send_message` + 提示词里那两条 `[[@昵称]]` 硬要求；名字的显示口径（群名片优先）在 `onebot.js` 的 `userDisplayName`，**正文与名单必须来自同一个值** |
@@ -685,7 +688,7 @@ workflow**。理由写在 patch 的注释里，其中一个是硬 bug 规避：`
 `.dsh/skills`。`allowTools` 里也要留着 `skill`，否则模型拿到目录却打不开。
 
 `allowTools` 白名单在 `restrictAgentTools` 里生效。**默认值不是空的**：17 个名字（只读文件 +
-检索 + 联网 + 十个 `qq_*`），所以 `qq` 预设里带的 `write` / `edit` 默认拿不到；显式写空数组才是
+检索 + 联网 + 十一个 `qq_*`），所以 `qq` 预设里带的 `write` / `edit` 默认拿不到；显式写空数组才是
 「不限制」。名字写错会被丢掉并记 warn（白名单只能收窄）。
 
 ## 8. 测试与验证
@@ -715,7 +718,7 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
   `speaking-rules.js` 或 `admit` 里凑入参那几行→`speaking-rules.test.mjs`；
   `mention.js`/`registerParticipant`/`sendParts`→`mention.test.mjs` + bridge 里那组端到端；
   `perceptual.js` 或复读的图片判定→`perceptual.test.mjs`；`stickerFileName`/`saveSticker`→
-  `util.test.mjs` + bridge 里搜 `qq_save_sticker`；记忆相关→bridge 末尾那组；
+  `util.test.mjs` + bridge 里搜 `qq_save_sticker` / `qq_rename_sticker`（改名还要看 `test/cognition.test.mjs` 的 `renameStickerRow`）；记忆相关→bridge 末尾那组；
   主动说话→bridge 末尾 `bootProactive` 那组（靠 `digestMinLines: 9999` 隔离摘要循环，
   假 `fireInterval()` 会唤醒**所有**周期定时器）；`sessionIdFor`/`resetConversation`/`canReset`
   →bridge 里搜 `reset`；`rotateApiKey`/`probeApiKey`/`parseApiKeyPool`→bridge 最后的

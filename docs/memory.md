@@ -32,7 +32,7 @@ QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写�
 | `conversations/<slug>/log/YYYY-MM-DD.jsonl` | 插件 | 原始转录：每条**别人的**消息一行（含没 @ 机器人的群聊） |
 | `conversations/<slug>/MEMORY.md` | 摘要 Agent | 这个会话的长期记忆（人、约定、偏好、在追的东西） |
 | `COGNITION.md` | 摘要 Agent / 聊天中的模型 | 跨会话的公共认知：**只有语言**（梗、黑话、缩写、谐音；键是文字写法含变体） |
-| `STICKERS.md` | `qq_save_sticker` / 摘要 Agent | 表情包目录：名字、画面、含义、场景、**收藏后的文件路径** |
+| `STICKERS.md` | `qq_save_sticker` / `qq_rename_sticker` / 摘要 Agent | 表情包目录：名字、画面、含义、场景、**收藏后的文件路径**（改名时那一条跟着文件一起搬） |
 | `INDEX.md` | 摘要 Agent | 「去哪里找什么」的短索引，每次提示词都注入 |
 | `digest.json` | 插件 | 摘要进度（上次摘要时间 + **本地日期**），重启后据此补课、并保证一天至多摘要一次 |
 

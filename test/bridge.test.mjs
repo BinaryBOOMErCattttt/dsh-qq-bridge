@@ -39,6 +39,7 @@ const DEFAULT_ALLOW_TOOLS = [
   'qq_send_message',
   'qq_send_image',
   'qq_save_sticker',
+  'qq_rename_sticker',
   'qq_list_conversations',
   'qq_poke',
 ];
@@ -1340,6 +1341,7 @@ test('the bundled patch declares the narrowed preset the plugin mounts', async (
     'qq_send_message',
     'qq_send_image',
     'qq_save_sticker',
+    'qq_rename_sticker',
     'qq_list_conversations',
     'qq_poke',
     'qq_remind_create',
@@ -3362,6 +3364,94 @@ test('qq_save_sticker is not registered when the sticker directory or its whitel
     await until(() => restricted.host.list.created[0], 'the restricted Agent');
     assert.equal(restricted.host.tools.get('qq_save_sticker'), undefined);
     assert.doesNotMatch(promptText(restricted.host, 'qq-bridge:channel'), /qq_save_sticker/);
+  } finally {
+    await restricted.onebot.close();
+  }
+});
+
+// ---- 给表情包改名：qq_rename_sticker -------------------------------------------
+// 这个工具的来历就是一条真实事故：模型想改一张表情的名字 / 含义时，手上只有
+// `qq_save_sticker` 这一条写盘通道，于是它把同一张图**换个名字再存一遍** ——
+// `.qq-stickers/` 里多出一张同画面、不同名的重复表情，`STICKERS.md` 里旧名字那条
+// 还留着，两张以后都会被挑中，而它自己没有删文件的通道。改名必须是「同一个文件换
+// 个名字、目录那一条跟着搬」，这一组钉住的就是：文件真的搬了、目录没有旧条目、
+// 含义 / 场景 / 日期不丢、目标名占用时拒绝、失败时不留半套。
+
+test('qq_rename_sticker moves the file and its catalogue row together', async () => {
+  const { onebot, host, cwd } = await bootImages();
+  onebot.push(privateMessage('在吗'));
+  const agent = await untilInbox(host, 1, 'the Agent');
+  try {
+    const save = host.tools.get('qq_save_sticker');
+    await save.execute({ source: '.qq-stickers/笑死.png', name: '委屈', meaning: '委屈、求安慰', scene: '对方凶我时' }, { agent });
+
+    const renamed = await host.tools.get('qq_rename_sticker').execute({ from: '委屈', to: '难过' }, { agent });
+    assert.equal(renamed.previous, '.qq-stickers/委屈.png');
+    assert.equal(renamed.path, '.qq-stickers/难过.png');
+    assert.equal(renamed.renamed, true);
+    assert.equal(renamed.bytes, TINY_PNG.length);
+    // 文件是**搬过去**的：旧名字不在了，也不该多出一张同画面的副本。
+    assert.deepEqual((await readdir(join(cwd, '.qq-stickers'))).sort(), ['笑死.png', '难过.png']);
+    assert.deepEqual(await readFile(join(cwd, '.qq-stickers', '难过.png')), TINY_PNG, '改的是名字，不是字节');
+    // 目录那一条跟着搬：含义 / 场景 / 路径都在新名字下，旧名字一条不剩。
+    const prompt = promptText(host, 'qq-bridge:channel');
+    assert.match(prompt, /难过（委屈、求安慰） → \.qq-stickers\/难过\.png/);
+    assert.doesNotMatch(prompt, /委屈（/);
+    // 发图那条路认得新名字（旧名字的裸名字解析已经不指向任何文件）。
+    const sent = await host.tools.get('qq_send_image').execute({ image: '难过' }, { agent });
+    assert.equal(sent.source, '.qq-stickers/难过.png');
+    // 旧名字再改一次就该明确报错（而不是悄悄追加一条新的）。
+    await assert.rejects(() => host.tools.get('qq_rename_sticker').execute({ from: '委屈', to: '更难过' }, { agent }), /没有「委屈」/);
+  } finally {
+    await onebot.close();
+  }
+});
+
+test('qq_rename_sticker refuses taken names and unusable names', async () => {
+  const { onebot, host, cwd } = await bootImages();
+  onebot.push(privateMessage('在吗'));
+  const agent = await untilInbox(host, 1, 'the Agent');
+  try {
+    const rename = () => host.tools.get('qq_rename_sticker');
+    // 改成同一个名字是空操作（不报错，也不该搬文件）。
+    const same = await rename().execute({ from: '笑死', to: '笑死' }, { agent });
+    assert.equal(same.renamed, false);
+    await host.tools.get('qq_save_sticker').execute({ source: '.qq-stickers/笑死.png', name: '委屈', meaning: '委屈、求安慰' }, { agent });
+    // 目标名已被占用（目录里本来就有 笑死.png）：与「同名不覆盖」同一条理由。
+    await assert.rejects(() => rename().execute({ from: '委屈', to: '笑死' }, { agent }), /already exists/);
+    // 名字清洗完什么都不剩：必须报错，而不是搬成 `.png`。
+    await assert.rejects(() => rename().execute({ from: '委屈', to: '..' }, { agent }), /not a usable sticker name/);
+    // 找不到来源：说清目录里有哪些，别让模型去猜。
+    await assert.rejects(() => rename().execute({ from: '不存在的表情', to: '新名字' }, { agent }), /没有「不存在的表情」/);
+    // 一次都没动过目录。
+    assert.deepEqual((await readdir(join(cwd, '.qq-stickers'))).sort(), ['委屈.png', '笑死.png']);
+    assert.match(promptText(host, 'qq-bridge:channel'), /委屈（委屈、求安慰） → \.qq-stickers\/委屈\.png/);
+  } finally {
+    await onebot.close();
+  }
+});
+
+test('qq_rename_sticker is not registered without the sticker directory or its whitelist slot', async () => {
+  const outside = await bootImages({ stickerDir: '../stickers' });
+  try {
+    outside.onebot.push(privateMessage('在吗'));
+    await until(() => outside.host.list.created[0], 'the outside Agent');
+    assert.equal(outside.host.tools.get('qq_rename_sticker'), undefined);
+    assert.doesNotMatch(promptText(outside.host, 'qq-bridge:channel'), /qq_rename_sticker/);
+  } finally {
+    await outside.onebot.close();
+  }
+
+  // 只整理不新增：存图关掉、改名单独放开 —— 白名单是逐名字的，不应该被别的工具连坐。
+  const restricted = await bootImages(
+    { allowTools: ['read', 'qq_send_image', 'qq_rename_sticker'] },
+    { knownTools: ['read', 'qq_send_image', 'qq_save_sticker', 'qq_rename_sticker'] },
+  );
+  try {
+    restricted.onebot.push(privateMessage('在吗'));
+    await until(() => restricted.host.list.created[0], 'the rename-only Agent');
+    assert.equal(restricted.host.tools.get('qq_save_sticker'), undefined);
+    assert.ok(restricted.host.tools.get('qq_rename_sticker'), '改名不该被存图的白名单连坐');
   } finally {
     await restricted.onebot.close();
   }

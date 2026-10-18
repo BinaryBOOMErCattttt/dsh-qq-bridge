@@ -31,7 +31,7 @@ import { readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdir, readFile, stat } from 'node:fs/promises';
+import { mkdir, readFile, rename, stat } from 'node:fs/promises';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { OneBotClient, atMentions, blankMessageLabel, chunkText, collectMedia, findReply, isEmojiOnlyMessage, isStickerSegment, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs, userDisplayName } from './onebot.js';
 import { createMediaStore } from './media.js';
@@ -1274,6 +1274,90 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 给一张已收藏的表情**改名**：`qq_rename_sticker` 的全部实现。
+   *
+   * 为什么需要它（真实事故，就是它促成了这个工具）：模型想改一张表情的名字 / 含义时，
+   * 手上只有「用新名字再存一遍」这一条路 —— 于是 `.qq-stickers/` 里多出一张**同画面、
+   * 不同名**的图，`STICKERS.md` 里旧名字那条还留着，以后两张都会被挑中，删除又做不到。
+   * 改名必须是「同一个文件换个名字，目录里那一条跟着搬」，不是「再存一张」。
+   *
+   * 边界（与 `saveSticker` 同一套路，只是方向反过来）：
+   *   - 只认 `stickerRoot` 里**已经存在**的那张（`findStickerByName` 的解析规则与发表情一致：
+   *     裸名字、写错扩展名都找得回来）；
+   *   - 新名字走同一个纯函数 `stickerFileName` 清洗，扩展名**沿用旧文件的真格式**（不重新嗅：
+   *     这里没有新字节，换扩展名只会让「名字写着 .png、里面是 GIF」）；
+   *   - 目标名已被占用就拒绝 —— 与「同名不覆盖」同一条理由，别让群里任何一个人一句
+   *     「改个名」把别人的表情挤掉；
+   *   - 目录那一步失败时**把文件改回去**：改名的价值就在于「文件与目录一致」，只改一半
+   *     比不改更糟（目录指着一个不存在的路径，发出去就是「表情包没发出去」）。
+   *
+   * @param options.from - 现在的名字（文件名，可带扩展名）。
+   * @param options.to - 想改成的新名字（扩展名由旧文件决定）。
+   * @param options.meaning - 可选：顺手改含义（不给就沿用目录里原来的）。
+   * @param options.scene - 可选：顺手改适用场景。
+   * @param options.look - 可选：顺手改画面描述。
+   * @returns `{ path, previous, bytes, renamed, catalog? }`：`catalog` 是目录那一步的结果说明。
+   */
+  async function renameSticker({ from, to, meaning, scene, look } = {}) {
+    if (stickerRoot === undefined || !stickerInside || stickerLabel === undefined) {
+      throw new Error(`the sticker directory is not usable (${settings.stickerDir.trim() || '(empty)'}): it must be a directory inside ${cwd}`);
+    }
+    const wanted = String(from ?? '').trim();
+    const found = findStickerByName(wanted);
+    if (found === undefined) {
+      const names = stickerFiles().sort().slice(0, 20);
+      throw new Error(
+        `${stickerLabel}/ 里没有「${wanted}」：只能给已经收藏的表情改名${names.length > 0 ? `（现有：${names.join('、')}）` : '（目录是空的，先 qq_save_sticker 收藏）'}`,
+      );
+    }
+    const extension = found.replace(/^.*\./, '').toLowerCase();
+    const target = stickerFileName(to, extension);
+    if (target === undefined) {
+      throw new Error(`"${String(to ?? '').slice(0, 40)}" is not a usable sticker name: pass a short file name such as "委屈" (the extension stays "${extension}")`);
+    }
+    const previous = `${stickerLabel}/${found}`;
+    const path = `${stickerLabel}/${target}`;
+    if (target === found) {
+      // 名字没变：不算错，也不搬文件（只把现有大小回显出来）。
+      const size = (await stat(join(stickerRoot, found)).catch(() => undefined))?.size;
+      return { path, previous, bytes: size, renamed: false };
+    }
+    // 先查占用再改名：`existing` 只列认得出来的图片，多一次 stat 挡住隐藏文件 / 目录。
+    const targetPath = join(stickerRoot, target);
+    const sourcePath = join(stickerRoot, found);
+    if ((await stat(targetPath).catch(() => undefined)) !== undefined) {
+      throw new Error(`${path} already exists: pick another name`);
+    }
+    const size = (await stat(sourcePath)).size;
+    await rename(sourcePath, targetPath);
+    let catalog;
+    if (memory.enabled) {
+      let written;
+      try {
+        written = await memory.renameSticker({
+          from: found.replace(/\.[^.]+$/, ''),
+          to: target.replace(/\.[^.]+$/, ''),
+          path,
+          meaning: String(meaning ?? '').trim() || undefined,
+          scene: String(scene ?? '').trim() || undefined,
+          look: String(look ?? '').trim() || undefined,
+        });
+      } catch (error) {
+        // 目录写失败就把文件改回去：只改一半的改名，比不改更糟（见函数头）。
+        await rename(targetPath, sourcePath).catch(() => {});
+        throw error instanceof Error ? error : new Error(errorText(error));
+      }
+      if (!written.ok) {
+        await rename(targetPath, sourcePath).catch(() => {});
+        throw new Error(`could not update STICKERS.md: ${written.reason}`);
+      }
+      catalog = `updated ${memory.label}/STICKERS.md (${written.section})`;
+    }
+    report('info', `sticker renamed: ${previous} → ${path} (${size} bytes)`);
+    return { path, previous, bytes: size, renamed: true, catalog };
+  }
+
+  /**
    * 生成「每个会话各不相同」的系统提示补充段落。
    *
    * 注意这个函数是作为 `text` 的 provider 注册的、每次提示词装配都会被调用：
@@ -1424,6 +1508,21 @@ export function apply(ctx, config) {
             '- 有人让你「存一下」某张表情包 / 你自己觉得某张图以后还会用到时，用 qq_save_sticker 存进上面那个目录：source 就写正文里给它的那个路径（例如 `.qq-media/ab12….jpg`，也可以是 http 图片链接），name 起一个**有含义的短名字**（`委屈` / `笑死` / `摸摸头`），**meaning 一句话说清它表达什么情绪**（`委屈、求安慰` / `笑到不行、没眼看`），能说出场景就再给 scene（`对方凶我时`）—— 那个名字和含义以后每轮都会摆在你眼前，写得准才挑得动；扩展名不用管，插件按图片真实格式接。同名已存在时会报错，换个名字。别见一张存一张：存的是你以后真的会想发的。',
           );
         }
+        // 改名字 / 改含义都是**已经收藏过**的那一张的事，别重新存一张：
+        // 目录里多一张同画面不同名的图以后会被反复挑中，而且删不掉（真实事故）。
+        if (stickerRenameAllowed()) {
+          // 两条建议各自有前提：qq_memory / qq_save_sticker 不在白名单里时，提示词推荐一个
+          // 被挡掉的工具只会让模型去撞一次「工具不存在」。
+          const saveHint = stickerSaveAllowed()
+            ? '**别用新名字再 qq_save_sticker 存一遍** —— 那会多出一张同画面、不同名的重复表情。'
+            : '';
+          const meaningHint = memory.toolsAllowed()
+            ? '只是想改含义 / 场景的话，用 qq_memory 的 upsert 按**原来的名字**改，同样不用再存一张。'
+            : '';
+          lines.push(
+            `- 想给表情包**换个名字**、或者名字没起好要改，用 qq_rename_sticker（from = 现在的名字，to = 新名字）：它把文件和 STICKERS.md 那一条一起改。${saveHint}${meaningHint}`,
+          );
+        }
       }
     }
     // 引用前缀是插件加上去的，得告诉模型它是什么，否则会被当成对方原话的一部分。
@@ -1538,6 +1637,19 @@ export function apply(ctx, config) {
     return imageAllowed()
       && stickerRoot !== undefined && stickerInside
       && (allowTools.length === 0 || allowTools.includes('qq_save_sticker'));
+  }
+
+  /**
+   * 这个 Agent 能不能给已收藏的表情改名（`qq_rename_sticker`）。
+   *
+   * 与 `stickerSaveAllowed` 同一套路，只是白名单那一格换成它自己的名字：改名动的是
+   * 目录里**已有的**文件（不引入新字节），所以它能单独放开 —— 只读部署里「模型存不了
+   * 新图、但能整理已有名字」是合理的。
+   */
+  function stickerRenameAllowed() {
+    return imageAllowed()
+      && stickerRoot !== undefined && stickerInside
+      && (allowTools.length === 0 || allowTools.includes('qq_rename_sticker'));
   }
 
   /**
@@ -4580,7 +4692,7 @@ export function apply(ctx, config) {
 
   // ---- 工具注册 --------------------------------------------------------------
   //
-  // 六份 `defineTool` 声明本身没有策略（校验参数 → 调一个函数 → 拼一段 render），却占了
+  // `defineTool` 声明本身没有策略（校验参数 → 调一个函数 → 拼一段 render），却占了
   // 五百多行、最深处缩进到 20 层，所以整块搬去了 `tools.js`。这里只做装配：把闭包里那
   // 几个函数显式递过去 —— 工具能碰到哪些状态，看这份依赖表就够了，不用去翻闭包。
   registerQqTools(ctx, {
@@ -4600,6 +4712,10 @@ export function apply(ctx, config) {
     // 存表情包：不可用时传 undefined，`registerQqTools` 会跳过那个工具
     // （与 memory.tools 同一个规矩：不留「一调就报错」的壳）。
     saveSticker: stickerSaveAllowed() ? saveSticker : undefined,
+    // 给已收藏的表情改名：文件与 STICKERS.md 一起搬，别让模型「用新名字再存一遍」
+    // 造出一张同画面的重复表情（真实事故，见 renameSticker 的注释）。记忆关掉时
+    // 仍可注册：那只是少更新一份目录（与 saveSticker 同一口径）。
+    renameSticker: stickerRenameAllowed() ? renameSticker : undefined,
     // 戳一戳：与通知事件共用同一个「怎么戳」（动作名在不同实现里不一样，见 pokeBack）。
     poke: settings.pokeReply === true ? pokeBack : undefined,
     imageSend,

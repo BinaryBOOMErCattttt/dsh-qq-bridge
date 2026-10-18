@@ -68,6 +68,7 @@ export const Config = z.object({
       'qq_send_message',
       'qq_send_image',
       'qq_save_sticker',
+      'qq_rename_sticker',
       'qq_list_conversations',
       'qq_poke',
       'qq_remind_create',
@@ -75,7 +76,7 @@ export const Config = z.object({
       'qq_remind_cancel',
     ])
     .description(
-      'QQ 会话 Agent 可用的工具白名单（工具名）：默认只放开「只读文件 + 检索 + 联网 + 十个 qq_*」，没有 write / edit / bash —— QQ 消息是不可信输入。留空表示**不限制**（把这个 Agent 继承到的工具全给它，含预设里的一切）；写错的名字会被丢掉并记 warn（白名单只能收窄，不能凭空给出能力）',
+      'QQ 会话 Agent 可用的工具白名单（工具名）：默认只放开「只读文件 + 检索 + 联网 + 十一个 qq_*」，没有 write / edit / bash —— QQ 消息是不可信输入。留空表示**不限制**（把这个 Agent 继承到的工具全给它，含预设里的一切）；写错的名字会被丢掉并记 warn（白名单只能收窄，不能凭空给出能力）',
     ),
   resetCommand: z.string().default('/reset').description('新开一轮会话的指令：在 QQ 里单独发送该指令即生效（旧的会话留在磁盘上当存档，新的一轮从零开始）；留空表示禁用'),
   resetUsers: z.array(z.string()).default([]).description('允许使用 resetCommand 的 QQ 号白名单；留空表示**谁都不能**重置（群里任何一个人都能把会话记忆重置掉显然不合适，所以这一项默认就是关的）'),

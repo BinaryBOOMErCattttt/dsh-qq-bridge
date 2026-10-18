@@ -518,6 +518,60 @@ export function upsertStickerRow(markdown, entry, { collected } = {}) {
 }
 
 /**
+ * 给一条表情包目录条目**改名**（按旧名字匹配，两个区都找）。
+ *
+ * 为什么需要它（真实事故）：模型想给一张已收藏的表情换个名字，只能「用新名字再
+ * `qq_save_sticker` 存一遍」—— 于是目录里多出一张同画面、不同名的图，旧名那条还留着，
+ * 两张以后都会被挑中。改名是「同一个文件换个名字」，不是「再存一张」。
+ *
+ * 与 `upsertStickerRow` 的区别：那个按**新名字**找同一条，找不到就追加；这里按**旧名字**
+ * 找人，把它的字段（画面 / 含义 / 场景 / 日期 / 置信）整行搬到新名字下 —— 没显式给新值的
+ * 字段一律沿用旧的，免得改个名字就把含义丢了。旧名字那条不会留下。
+ *
+ * @param markdown - 现有内容。
+ * @param from - 旧名字（收藏区 / 未收藏区都找）。
+ * @param entry - `{ name, look?, meaning?, scene?, path, date?, confidence? }`，`name` 是新名字。
+ * @returns `{ text, section, renamed }`：`renamed` = 旧条目在不在（不在就只追加一条新的）。
+ */
+export function renameStickerRow(markdown, from, entry) {
+  const fromKey = compareKey(from);
+  const nameKey = compareKey(entry?.name);
+  if (fromKey.length === 0) throw new Error('rename needs the current sticker name');
+  if (nameKey.length === 0) throw new Error('rename needs the new sticker name');
+  const parsed = parseStickerCatalog(markdown);
+  const existing = [...parsed.collected, ...parsed.pending].find((row) => compareKey(row.name) === fromKey);
+  const pick = (value, fallback) => (String(value ?? '').trim().length > 0 ? value : fallback);
+  const merged = {
+    name: entry.name,
+    look: pick(entry.look, existing?.look),
+    meaning: pick(entry.meaning, existing?.meaning),
+    scene: pick(entry.scene, existing?.scene),
+    path: pick(entry.path, existing?.path),
+    date: pick(entry.date, existing?.date),
+    confidence: pick(entry.confidence, existing?.confidence),
+  };
+  // 有没有含义决定进哪个区：未收藏 → 改名时顺手补了含义就该升进已收藏（与 upsert 同一口径）。
+  const hasMeaning = String(merged.meaning ?? '').trim().length > 0;
+  const target = hasMeaning ? STICKER_COLLECTED : STICKER_PENDING;
+  const wasCollected = parsed.collected.includes(existing);
+  // 同一个区里改名就**原地换掉那一行**：改名不该把条目挪到目录末尾，否则前后顺序
+  // （模型先学的 / 后学的）会随一次改名整体错位，人也不好看 diff。
+  if (existing !== undefined && wasCollected === hasMeaning) {
+    const lines = String(markdown ?? '').split(/\r?\n/);
+    const at = lines.findIndex((line) => line.trim() === existing.line);
+    if (at >= 0) {
+      lines[at] = stickerRow(merged);
+      return { text: lines.join('\n'), section: target, renamed: true };
+    }
+  }
+  // 换区（未收藏 → 已收藏）只能先删再插：`appendStickerRow` 负责把行放进目标区的最后。
+  let body = String(markdown ?? '');
+  if (existing !== undefined) body = dropLines(body, (line) => line.trim() === existing.line);
+  const { text, section } = appendStickerRow(body, merged, { collected: hasMeaning });
+  return { text, section, renamed: existing !== undefined };
+}
+
+/**
  * 删掉一条表情包目录条目（按名字匹配，两个区都找）。
  * @returns `{ text, removed }`。
  */

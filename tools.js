@@ -2,14 +2,14 @@
  * QQ 桥接的**宿主平面**工具。
  *
  * 它们从 `index.js` 的闭包里搬出来，是为了把「工具声明」这件纯排版的事与「运行时
- * 状态与策略」分开：六份 `defineTool` 内联在闭包里时占了 500 多行、最深处缩进到 20 层，
+ * 状态与策略」分开：这些 `defineTool` 内联在闭包里时占了 500 多行、最深处缩进到 20 层，
  * 而它们本身没有任何策略 —— 每一份都只是「校验参数 → 调一个函数 → 拼人可读的 render」。
  *
  * **依赖全部显式传进来**（`deps`），模块自己不持有任何状态、不 import `index.js`
  * （那会形成环）。这样做的另一个好处是：这份文件里能一眼看出「工具到底能碰什么」，
  * 而不用去闭包里翻 29 张 Map 谁被谁改了。
  *
- * 六个工具都注册在宿主平面上，因此**任何** Agent 都能用（包括 Web UI 里的主会话）；
+ * 它们都注册在宿主平面上，因此**任何** Agent 都能用（包括 Web UI 里的主会话）；
  * 从 QQ 会话里调用时可以省略目标，默认发回调用它的那个会话（见 `resolveTarget`）。
  *
  * @module @qqbot/dsh-plugin-qq/tools
@@ -227,6 +227,80 @@ function qqSaveSticker(deps) {
     async execute(args) {
       if (deps.saveSticker === undefined) throw new Error('saving stickers is not available (the sticker directory is disabled, imageSend is off, or qq_save_sticker is not in allowTools)');
       return deps.saveSticker({ source: args.source, name: args.name, meaning: args.meaning, scene: args.scene });
+    },
+  });
+}
+
+/**
+ * 工具：qq_rename_sticker —— 给一张**已收藏**的表情改名（文件 + `STICKERS.md` 一起搬）。
+ *
+ * 为什么非得有它（真实事故）：模型想换名字 / 改含义时，手上只有 `qq_save_sticker`
+ * 这一条写盘通道，于是它会**用新名字把同一张图再存一遍** —— `.qq-stickers/` 里多出一张
+ * 同画面、不同名的重复表情，旧名字那条目录还留着，以后两张都会被挑中，而它自己删不掉
+ * 任何文件。改名本来只是「同一个文件换个名字」。
+ *
+ * 边界在 `deps.renameSticker` 里（只认收藏目录里已有的文件、名字同一个清洗函数、
+ * 目标名被占用就拒绝、目录那一步失败就回滚）；这里只管参数、报错和 render。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqRenameSticker(deps) {
+  return defineTool({
+    name: 'qq_rename_sticker',
+    description:
+      'Rename one sticker that is already saved in the QQ sticker directory. The image file and its STICKERS.md catalogue row are moved together: the file keeps its bytes (and its real extension) and the row keeps its meaning / scene / look unless you pass new ones. Use this instead of calling qq_save_sticker again with another name — saving the same picture under a second name leaves a duplicate and the old one cannot be deleted. "from" is the current sticker name (with or without extension, as it appears in the sticker list); "to" is the new short name. Refuses when the new name is already taken.',
+    parameters: {
+      from: {
+        type: 'string',
+        required: true,
+        description: 'The current sticker name, exactly as listed (e.g. "无语" or "无语.gif"). The file extension is optional and the real one is kept.',
+      },
+      to: {
+        type: 'string',
+        required: true,
+        description: 'The new sticker name, without the extension — a short, meaningful name ("无语、懒得吐槽" becomes "懒得吐槽"). It is what you will see in every prompt from now on.',
+      },
+      meaning: {
+        type: 'string',
+        description: 'Optional: replace the catalogue meaning in the same step ("委屈、求安慰"). Without it the existing meaning is kept.',
+      },
+      scene: {
+        type: 'string',
+        description: 'Optional: replace the catalogue "when to use it" note in the same step.',
+      },
+      look: {
+        type: 'string',
+        description: 'Optional: replace the one-line description of the picture in the same step.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true },
+          previous: { type: 'string', required: true },
+          bytes: { type: 'integer' },
+          renamed: { type: 'boolean' },
+          catalog: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: [
+            value.renamed === false
+              ? `${value.previous} already has that name — nothing to do.`
+              : `Renamed ${value.previous} → ${value.path} (${value.bytes} bytes). Send it with [[图片: ${value.path}]].`,
+            value.catalog === undefined
+              ? 'No sticker catalogue was updated (long-term memory is off, or the catalogue write rolled the rename back) — the file itself is unchanged.'
+              : `Sticker catalogue: ${value.catalog}`,
+          ].join('\n'),
+        },
+      ],
+    },
+    async execute(args) {
+      if (deps.renameSticker === undefined) throw new Error('renaming stickers is not available (the sticker directory is disabled, imageSend is off, or qq_rename_sticker is not in allowTools)');
+      return deps.renameSticker({ from: args.from, to: args.to, meaning: args.meaning, scene: args.scene, look: args.look });
     },
   });
 }
@@ -911,6 +985,9 @@ function qqRemindCancel(deps) {
  * @param {(options: object) => Promise<object>} [deps.saveSticker] -
  *   把一张图存进表情包目录（校验 + 清洗文件名 + 张数上限 + 往 STICKERS.md 补一行）；
  *   缺失 = 不注册 qq_save_sticker。
+ * @param {(options: object) => Promise<object>} [deps.renameSticker] -
+ *   给一张已收藏的表情改名（文件 + STICKERS.md 那一条一起搬，目标名占用就拒绝）；
+ *   缺失 = 不注册 qq_rename_sticker。
  * @param {boolean} deps.imageSend - `imageSend`，关掉时发图工具直接报错。
  * @param {number} deps.imageMaxBytes - 出站图片字节上限。
  * @param {() => object} deps.resolveRoute - 当前生效的模型路由（`qq_list_conversations` 回显）。
@@ -929,6 +1006,7 @@ export function registerQqTools(ctx, deps) {
   // 表情包目录不可用（没配 / 配到 cwd 外）或白名单里没有它时整个跳过：留一个必然报错的
   // 工具，只会让模型浪费一次调用去撞墙。
   if (deps.saveSticker !== undefined) ctx.tools.register(qqSaveSticker(deps));
+  if (deps.renameSticker !== undefined) ctx.tools.register(qqRenameSticker(deps));
   ctx.tools.register(qqPoke(deps));
   ctx.tools.register(qqListConversations(deps));
   if (deps.memory !== undefined) {

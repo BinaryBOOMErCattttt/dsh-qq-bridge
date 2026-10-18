@@ -101,7 +101,8 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
   `activeFollow` / `proactive` / `privateAfterthought` 默认开，是**刻意**放松了「只在被叫到时说话」，
   每一条都有自己的闸门与上限；不放心就关掉。
 - **`qq_save_sticker` 是唯一让 QQ 会话按自己给的字节直接写磁盘的工具**：只写表情包目录、
-  文件名洗成单层、同名不覆盖、张数受上限约束。`qq_remind_create` 也会落盘，但写的是
+  文件名洗成单层、同名不覆盖、张数受上限约束。`qq_rename_sticker` 也能动那个目录，但它只能
+  给已收藏的文件换个名字（不引入新字节、失败会回滚）。`qq_remind_create` 也会落盘，但写的是
   `reminderFile` 里由纯函数校验过字段的任务。除此之外 QQ 会话没有 write / edit / bash。
 - **会写全局状态的两处**：`apiKeyRotate` 改 `$DSH_HOME/.credentials.yaml`；
   `linkPreview` 默认关（开了等于替群里任何人访问任意 URL）。**定时提醒**会把「未来要说的话」

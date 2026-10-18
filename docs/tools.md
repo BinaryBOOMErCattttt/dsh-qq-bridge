@@ -10,6 +10,7 @@
 | `qq_send_message` | 向指定 QQ 号（私聊）或群号（群）发送文本，超长自动分段；正文里可以写 `[[@昵称]]` / `[[@全体成员]]` @ 人（见[「像真实群友一样说话」](speaking.md#像真实群友一样说话)的第 6 条） |
 | `qq_send_image` | 向指定 QQ 号或群发一张图 / 表情包：来源是 `cwd` 里的图片路径（含 `.qq-stickers/…`、`.qq-media/…`）或一个 http(s) 图片链接；从 QQ 会话里调用时默认发回当前会话 |
 | `qq_save_sticker` | 把一张图**存进表情包目录**（`.qq-stickers/<名字>.<真格式>`）变成以后能挑的表情：来源同上，名字会被清洗成单层文件名、同名不覆盖、张数受 `stickerMaxFiles` 限制；图片本身不可用（目录没配 / 配到 `cwd` 外）或白名单没放开时**根本不注册** |
+| `qq_rename_sticker` | 给一张**已收藏**的表情改名：文件与 `STICKERS.md` 那一条一起搬（含义 / 场景 / 日期跟着走），目标名被占用就拒绝；只改含义不用它（用 `qq_memory` 的 `upsert` 按原名改）。白名单按名字算，目录不可用时同样**根本不注册** |
 | `qq_list_conversations` | 列出在线群/好友列表，以及本 Harness 已处理过的 QQ 会话、当前 Session id 与轮次（`session_round`） |
 | `qq_transcript` | 读某个 QQ 会话的聊天记录：`list` / `read` / `search`（长期记忆的原料，见[长期记忆](memory.md#长期记忆聊天记录--摘要--认知)） |
 | `qq_memory` | 读 / 追加 / 覆盖 / 搜索 / **逐条 upsert / remove** 长期记忆文件：`conversations/<slug>/MEMORY.md`、`COGNITION.md`、`STICKERS.md`、`INDEX.md`；整份 `write` 有「条目数不能掉 10%」护栏，写前留 `.history/` 备份；写被限制在 `memoryDir` 之内 |
@@ -17,8 +18,8 @@
 | `qq_remind_list` | 列出提醒：默认这个会话的，`scope: "mine"` 只看自己建的，`scope: "all"` 只在 Web 操作员那里可用；带状态、下一次时间与失败原因 |
 | `qq_remind_cancel` | 按 id 取消一条还没发的提醒；只有创建者本人（或 Web 操作员）能取消 |
 
-这九个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
-`qq_send_image` / `qq_save_sticker` 见[它也能发表情包](media.md#它也能发表情包)；
+这十个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
+`qq_send_image` / `qq_save_sticker` / `qq_rename_sticker` 见[它也能发表情包](media.md#它也能发表情包)；
 `qq_transcript` / `qq_memory` 见[长期记忆](memory.md#长期记忆聊天记录--摘要--认知)，
 关掉 `memory` 后它们**根本不会注册**；关掉 `reminder`（或任务文件配到 `cwd` 外）后
 `qq_remind_*` 三个**根本不会注册**。
@@ -105,7 +106,7 @@ allowTools:
 
 - **只影响 QQ 会话**：收窄施加在「由 QQ 消息创建出来的那个 Agent」自己的作用域上
   （DSH 的 `tools.restrict()`），Web UI 主会话等其它 Agent 完全不受影响。
-- **默认就是收窄过的**（17 个：只读文件 + 检索 + 联网 + 十个 `qq_*`）—— 这样即使
+- **默认就是收窄过的**（18 个：只读文件 + 检索 + 联网 + 十一个 `qq_*`）—— 这样即使
   `agentPreset: qq` 的预设里带了 `write` / `edit`，QQ 会话也拿不到它们。
 - **显式写空数组 = 不限制**（与 `allowUsers` / `allowGroups` 同一套语义）：把这个 Agent
   继承到的工具全给它。想放开某一项，就把默认那 17 个抄下来再加减，别直接清空。

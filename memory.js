@@ -43,7 +43,7 @@ import { errorText, localDate, localStamp, memoryOneLine, memoryRelativePath, me
 import { readJsonl, readTextOrUndefined, readdirOrEmpty, writeJsonAtomic, writeTextAtomic } from './filestore.js';
 import { collectMedia, messageToText } from './onebot.js';
 import { insideDirectory } from './image.js';
-import { appendStickerRow, hotCognitionLines, normalizeCognitionDoc, normalizeStickerDoc, parseCognition, parseStickerCatalog, removeCognitionRow, removeStickerRow, stickerCatalogLines, upsertCognitionRow, upsertStickerRow } from './cognition.js';
+import { appendStickerRow, hotCognitionLines, normalizeCognitionDoc, normalizeStickerDoc, parseCognition, parseStickerCatalog, removeCognitionRow, removeStickerRow, renameStickerRow, stickerCatalogLines, upsertCognitionRow, upsertStickerRow } from './cognition.js';
 
 /** 认知库与表情包目录的文件名（都在 memoryDir 根下，与 INDEX.md 同级）。 */
 const COGNITION_FILE = 'COGNITION.md';
@@ -923,9 +923,40 @@ export function createMemory(deps) {
     return { ...written, action: 'remove', path: `${memoryLabel}/${relative}`, note: `removed «${String(name ?? '').trim()}»` };
   }
 
+  /**
+   * 给表情包目录里的一条改名字（`qq_rename_sticker` 更新 `STICKERS.md` 的那一半）。
+   *
+   * 文件改名由 `index.js` 的 `renameSticker` 做（它才知道 `stickerRoot`），这里只管目录：
+   * 按旧名字找到那条，把画面 / 含义 / 场景 / 日期 / 置信整行搬到新名字下，旧行删掉 ——
+   * 模型只给「改成什么」，字段由纯函数搬运，改个名字不会把含义改丢。
+   *
+   * 新名字本来就有条目时照样按**旧名字**那一条搬：这等于把两张合并成一张（旧名字是
+   * 要消失的那一个），所以不需要额外护栏。旧名字不存在时只追加一条新的，`renamed` 说清。
+   *
+   * @param {object} input - `{ from, to, path, meaning?, scene?, look?, date?, confidence? }`。
+   * @returns `{ ok, renamed, section }`：写盘失败时 `ok: false` + `reason`（调用方回滚文件改名）。
+   */
+  async function renameStickerEntry({ from, to, path, meaning, scene, look, date, confidence } = {}) {
+    if (!memoryEnabled) return { ok: false, reason: 'memory is disabled' };
+    const current = (await readTextOrUndefined(join(memoryBase, STICKERS_FILE))) ?? '';
+    let result;
+    try {
+      result = renameStickerRow(current, from, { name: to, path, meaning, scene, look, date, confidence });
+    } catch (error) {
+      return { ok: false, reason: errorText(error) };
+    }
+    try {
+      await writeMemoryFile(STICKERS_FILE, result.text, false, { force: true });
+    } catch (error) {
+      return { ok: false, reason: errorText(error) };
+    }
+    // 目录是每轮提示词的一部分：立刻失效缓存，下一轮就该看到新名字。
+    catalogCache = { at: 0, key: '', text: catalogCache.text };
+    return { ok: true, renamed: result.renamed, section: result.section };
+  }
+
   /** 一条转录记录在工具结果里的一行文本。 */
-  function describeTranscriptLine(line) {
-    if (line.conversation !== undefined) return `[${line.date ?? '?'}] ${line.conversation} — ${line.messages ?? 0} 条，最后 ${line.last_at ?? '?'} ${line.last_text ?? ''}`.trim();
+  function describeTranscriptLine(line) {    if (line.conversation !== undefined) return `[${line.date ?? '?'}] ${line.conversation} — ${line.messages ?? 0} 条，最后 ${line.last_at ?? '?'} ${line.last_text ?? ''}`.trim();
     const tags = [];
     if (line.kind !== undefined) tags.push(line.kind);
     if (line.addressed === true) tags.push('被叫到');
@@ -1404,6 +1435,8 @@ export function createMemory(deps) {
     catalog: catalogState,
     /** `qq_save_sticker` 存完图之后调：把这一行追加进 STICKERS.md（失败只返回原因）。 */
     appendSticker: appendStickerCatalog,
+    /** `qq_rename_sticker` 改名之后调：把目录里那一条搬到新名字下（返回 ok / reason）。 */
+    renameSticker: renameStickerEntry,
     /** 两个记忆工具是否可见（开关 + allowTools 白名单）。 */
     toolsAllowed: memoryToolsAllowed,
     /** 摘要定时器的装配（见上面的生命周期注释；index.js 在生命周期那一节调）。 */

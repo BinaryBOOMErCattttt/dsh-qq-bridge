@@ -695,9 +695,9 @@ test('控件映射：30 个布尔是 Switch、8 个枚举是 select、长文本�
   assert.ok(controlIn(listField, isInput), '列表行仍然是输入框');
   const pills = nodes(listField, (node) => node.type === primitivesStub.Pill);
   assert.equal(pills.length, 0, '默认值空列表时不渲染 Pill 预览');
-  // `allowTools` 的默认值不再为空（17 个工具名）：每个都渲染成一个可点的 Pill。
+  // `allowTools` 的默认值不再为空（18 个工具名）：每个都渲染成一个可点的 Pill。
   const allowToolsPills = nodes(fields.get('allowTools'), (node) => node.type === primitivesStub.Pill);
-  assert.equal(allowToolsPills.length, 17, '工具白名单的默认值应当逐个渲染成 Pill');
+  assert.equal(allowToolsPills.length, 18, '工具白名单的默认值应当逐个渲染成 Pill');
 });
 
 test('草稿口径：布尔收 true / 是 / 1，空串是「恢复默认」，胡说是非法', () => {

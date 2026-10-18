@@ -52,7 +52,9 @@
   受信者。详见[定时提醒](reminders.md)。
 - **`qq_save_sticker` 是唯一一个让 QQ 会话直接按自己给的字节写磁盘的工具**（`allowTools`
   里可以去掉它）：它只往 `stickerDir` 里写一个文件名被洗成单层的图片，字节还要先过魔数与
-  大小校验，张数受 `stickerMaxFiles` 限制，同名不覆盖。`qq_remind_create` 也会让插件写盘，
+  大小校验，张数受 `stickerMaxFiles` 限制，同名不覆盖。`qq_rename_sticker` 也能动那个目录，
+  但它只能给**已收藏的**文件换个名字（不引入新字节、不越出 `stickerDir`、目标名占用就拒绝，
+  目录写失败还会回滚文件改名）。`qq_remind_create` 也会让插件写盘，
   但写的是 `reminderFile` 里**由纯函数校验过字段**的任务（不是模型给的任意路径/字节），
   两者不是同一类能力。除此之外 QQ 会话没有 write / edit / bash ——
   这是「群里谁都能让它存一张图」与「工作区不能被群里的人写坏」之间的那条线，别随手挪。
