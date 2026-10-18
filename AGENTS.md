@@ -278,6 +278,10 @@ QQ ─▶ NapCat ─ws─▶ OneBotClient.onEvent ─▶ handleEvent
   只允许返回 undefined（不抛异常、不大块分配）。加格式（如 WebP）先补这几条上限。
 - **`sketchOf` 只读 `.qq-media` 里刚落盘的那一张**，别让它读工作目录里的任意文件（那等于把群
   消息变成读文件的入口）。
+- **「表情还是普通图片」要在链上累加**（`repeatStep` 的 `sticker = candidate.sticker || previous.sticker`）：
+  同一张图只要链上出现过一次表情（`sub_type` 非 0 / `emoji_id`），后面被另存/转发成普通图片
+  也按表情复读。别改回「只看触发复读的最后一条」—— 19:53 表情、19:54 同图当图片发，就会把
+  表情复读成照片样式的图（真实事故）。`sendRepeat` 必须收到补过 `sticker` 的链条目，不是原始 candidate。
 
 ### D. 长期记忆（转录 → 定时摘要 → 认知）
 
@@ -679,7 +683,7 @@ agent 轮在 `index.js`**。
 | 加一个 Agent 工具 | 在 `tools.js` 里照 `qqSendMessage` 抄结构（`defineTool` + `output.schema` + `render` + 中文报错），再在 `registerQqTools` 里注册、在 `index.js` 的 `deps` 里补上它需要的能力；**别 import `index.js`** |
 | 改分条/打字节奏 | `onebot.js` 的 `splitBurst` / `splitStickerLines` / `typingDelayMs`（**纯函数，优先在这里改**） |
 | 改图片落盘/去重/淘汰 | `media.js` |
-| 改出站图片校验或传输（含表情的 `sub_type` 大表情标记） | `image.js` 的 `imageSegment` + index.js 的 `isStickerFile`（收藏目录来源算表情）+ `onebot.js` 的 `isStickerSegment`（复读时原消息算不算表情）+ `replyPieces` / `sendRepeat` 两处调用 |
+| 改出站图片校验或传输（含表情的 `sub_type` 大表情标记） | `image.js` 的 `imageSegment` + index.js 的 `isStickerFile`（收藏目录来源算表情）+ `onebot.js` 的 `isStickerSegment`（复读时单条消息算不算表情）+ `repeatStep` 的链上 OR（`sendRepeat` 收到的是补过 `sticker` 的链条目）+ `replyPieces` / `sendRepeat` 两处调用 |
 | 改「存表情包」（写边界 / 名字清洗 / 张数上限 / 什么时候能存） | `util.js` 的 `stickerFileName`（纯函数写边界）+ index.js 的 `saveSticker` / `stickerSaveAllowed` + `tools.js` 的 `qq_save_sticker` + `Config.stickerMaxFiles` + `filestore.js` 的 `writeBytesAtomic` + `allowTools` |
 | 改「给表情改名」 | `cognition.js` 的 `renameStickerRow`（纯函数：按旧名字搬整行、同区原地替换）+ `memory.js` 的 `renameStickerEntry` + index.js 的 `renameSticker` / `stickerRenameAllowed`（文件 `rename` + 目录写失败回滚）+ `tools.js` 的 `qq_rename_sticker` + `docs/media.md` 同名小节 |
 | 改群触发/白名单/复读 | index.js 的 `admit` / `maybeRepeat` 区块 |

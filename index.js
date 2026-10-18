@@ -3087,7 +3087,13 @@ export function apply(ctx, config) {
     const count = chained ? previous.count + 1 : 1;
     const threshold = Math.max(2, Math.floor(Number(settings.repeatCount) || 0));
     const distinct = settings.repeatDistinct ? senders.length >= 2 : true;
-    const entry = { ...candidate, count, senders, at: arrivedAt };
+    // 「表情还是普通图片」在链上**累加**：同一张图只要在这条链上以表情出现过（`sub_type`
+    // 非 0 / 带 `emoji_id`），后面哪怕被另存或转发成普通图片再发一次，复读也按表情发。
+    // 真实事故：19:53 一条表情、19:54 同一张图被当图片发了一遍，复读跟的是后一条的
+    // `sub_type: 0`，群里看到的又是照片样式的图。反过来不成立：链里从没出现过表情的
+    // 截图/照片仍是普通图片（标成表情会被 QQ 裁小），所以这里只做 OR，不按「像不像」猜。
+    const sticker = candidate.sticker === true || (chained && previous?.sticker === true);
+    const entry = { ...candidate, sticker, count, senders, at: arrivedAt };
     if (!canAct || count < threshold || !distinct) {
       state.chain = entry;
       return;
@@ -3101,8 +3107,8 @@ export function apply(ctx, config) {
     // 跟过就断链，免得群里刷屏时它一句不落地跟着刷。
     state.chain = undefined;
     const conversation = targetConversation('group', groupId);
-    report('info', `→ ${describeConversation(conversation)}: ${describeRepeat(candidate)}（复读）`);
-    sendRepeat(conversation, candidate);
+    report('info', `→ ${describeConversation(conversation)}: ${describeRepeat(entry)}（复读）`);
+    sendRepeat(conversation, entry);
   }
 
   /**
@@ -3225,12 +3231,12 @@ export function apply(ctx, config) {
    * 把复读发出去（按候选类型选载体），全都挂在会话的发送队列上。
    *
    * 图片走 `loadOutgoingImage` + `imageSegment`：和 Agent 主动发表情包同一条出站链路
-   * （读本地文件、校验格式与大小、base64 交给 NapCat）；带不带「大表情」标记看**原消息**
-   * 是表情还是普通图片（`repeatCandidate` 里的 `sticker`）。发不出去只记一条 warn ——
-   * 复读本来就是插话，静默不跟比在群里喊一句「我发不出去」更像真人。
+   * （读本地文件、校验格式与大小、base64 交给 NapCat）；带不带「大表情」标记看链上
+   * 累加出来的 `sticker`（`repeatStep` 里把原消息的类型做 OR，见那里的注释）。发不出去
+   * 只记一条 warn —— 复读本来就是插话，静默不跟比在群里喊一句「我发不出去」更像真人。
    *
    * @param conversation - 目标会话。
-   * @param candidate - {@link repeatCandidate} 的结果。
+   * @param candidate - {@link repeatCandidate} 的结果（或 `repeatStep` 里补过 `sticker` 的链条目）。
    */
   function sendRepeat(conversation, candidate) {
     if (candidate.kind === 'text') {

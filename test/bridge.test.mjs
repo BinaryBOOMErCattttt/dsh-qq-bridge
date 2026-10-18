@@ -2116,6 +2116,26 @@ test('a repeated picture keeps its kind: sticker stays a sticker, photo stays a 
   }
 });
 
+// 用例：同一张图先以表情出现、后以普通图片出现（另存 / 转发会这样），复读仍按表情发 ——
+// `sticker` 在链上累加（`repeatStep` 里的 OR），不是只看触发复读的最后一条。
+// 真实事故：19:53 一条表情、19:54 同一张图被当成图片又发一遍，复读跟成了照片样式的图。
+test('a sticker chain stays a sticker even when the last one is a picture', async () => {
+  const images = await startImageServer(TINY_PNG);
+  const mediaRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
+  const { onebot } = await boot({ cwd: mediaRoot, mediaDir: 'media' });
+  const groupSends = () => onebot.calls.filter((call) => call.action === 'send_group_msg' && Array.isArray(call.params.message));
+  try {
+    onebot.push(groupSticker(images.url(), { messageId: 146, subType: 1 }));
+    onebot.push(groupSticker(images.url(), { messageId: 147, userId: 3333333333, card: 'iroha', subType: 0, summary: '' }));
+    await until(() => groupSends().length >= 1, 'the repeated sticker');
+    assert.equal(groupSends()[0].params.message[0].data.sub_type, 1);
+  } finally {
+    await onebot.close();
+    await images.close();
+    await rm(mediaRoot, { recursive: true, force: true });
+  }
+});
+
 // 用例：不同的两张表情包不跟；表情包同样会打断文字链。
 test('two different stickers do not repeat, and a sticker breaks a text chain', async () => {
   const first = await startImageServer(TINY_PNG);
