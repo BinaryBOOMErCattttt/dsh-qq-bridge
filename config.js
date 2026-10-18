@@ -123,6 +123,13 @@ export const Config = z.object({
   // ---- 一次只回一轮：前后脚到的消息先攒一攒，再合成一条交给 Agent ----
   batchWindowMs: z.number().default(2000).description('收到一条要回的消息后，先等这么久（毫秒）看还有没有下一条：群里几个人同时 @、或者一个人连发几句，都会攒成一条消息只回一轮；0 = 关闭（来一条回一条）'),
   batchMaxWaitMs: z.number().default(5000).description('一直有人接着说时，一批最多攒这么久（毫秒）就必须发出去，避免机器人一直不吭声；小于 batchWindowMs 时按 batchWindowMs 算'),
+  // ---- 长任务期间的 @：先攒着，忙完当「一波迟到的消息」一起接 ----
+  // 没有这一组的话，十分钟的长任务会按 batchMaxWaitMs 攒出上百批、上百个 turn，每批一条
+  // 回复、每轮重发一遍完整上下文，而且每条都在回答几分钟前的问题（见 backlog.js）。
+  batchBacklog: z.boolean().default(true).description('上一轮还没跑完时收到的 @ 是否先攒着，等它闲下来当成「一波迟到的消息」一起接（默认开）。关掉的话，它在忙时前后脚到的消息会每 batchMaxWaitMs 一批排进收件箱：几分钟的任务能攒出几十轮、几十条回复，而且每条都在回答几分钟前的问题；只在 batchWindowMs > 0 时生效'),
+  batchBacklogEntries: z.number().default(20).description('一波迟到的消息最多贴几条（至少 2）：超过就保留最早 2 条 + 最近的，中间折成一句「更早还有 N 条」—— 模型要看可以自己用 qq_transcript 翻记录'),
+  batchBacklogChars: z.number().default(2000).description('一波迟到的消息最多带多少字：超出时继续从最老的那条开始折掉，但永远保留最后一条（最新那句最可能还有活要干）'),
+  batchBacklogHoldMs: z.number().default(120000).description('一波迟到的消息最多憋多久（毫秒，默认 2 分钟）：还忙着就先投进队列（退回「排队等它忙完」的老行为），免得它卡住时这些消息永远投不出去；0 = 不憋（等于关掉这一项）'),
   // ---- 以下为「像真人一样在群里说话」的开关，默认全部开启 ----
   ambientMessages: z.number().default(12).description('群聊里注入给 Agent 的最近消息条数（让它知道大家在聊什么，不只是被 @ 的那一句）；0 = 关闭'),
   ambientLineChars: z.number().default(120).description('群聊上下文里每条消息最多保留的字符数'),

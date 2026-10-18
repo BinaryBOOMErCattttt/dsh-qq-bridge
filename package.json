@@ -28,6 +28,7 @@
     "util.js",
     "chatter.js",
     "speaking-rules.js",
+    "backlog.js",
     "memory.js",
     "memory-select.js",
     "config.js",

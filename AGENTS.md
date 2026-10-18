@@ -72,6 +72,7 @@ scripts/persona-check.mjs  307 行  人设自检 CLI：不启动机器人，直�
 chatter.js      171 行  群里「谁在说话」的三本账（插话序号 / 回答指向 / 热度窗口）：只暴露语义动作，不暴露 Map
 mention.js      209 行  `[[@昵称]]` → OneBot `at` 段：纯函数解析 + 「昵称 → QQ 号」名单（名单挂在会话记录上）
 speaking-rules.js 330 行  「什么时候该主动开口」的纯判据（闸门 / 抽卡 / 补一句 / 私聊补一句）：普通入参 → 布尔
+backlog.js     约 130 行  长任务期间那波「迟到的消息」的**纯函数**：裁条数 / 裁字数 / 相对时间 / 整段正文（见 §4.A 与 `docs/speaking.md` 1.1）
 util.js        410 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 写边界 / key 池解析与打码 / withinActiveHours 等（完整清单见本节末尾）
 filestore.js   108 行  「原子写 / 尽力而为读」（读不到返回空而不是抛错），记忆、转录、表情包都走它；`writeTextAtomicUtf16` 专给 Windows 那两个产物
 config.js      227 行  配置 schema（**唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段；**根上是 `.volatile()`**（设置页的前提，见 §5.12）
@@ -136,6 +137,7 @@ AGENTS.md             **本文件**：给改代码的智能体的说明书（DSH
 index.js ──▶ config.js（schema）/ settings.js ──▶ image.js（只借 DEFAULT_IMAGE_MAX_BYTES）
          ──▶ tools.js ──▶ mention.js / onebot.js / image.js
          ──▶ chatter.js（三本账）/ mention.js（`[[@昵称]]` → at 段）/ speaking-rules.js（纯判据）
+         ──▶ backlog.js（积压一波的裁剪与渲染，**纯函数**）
          ──▶ speech-policy.js ──▶ speaking-rules.js（intent 判定；C 路四条排除也在这里）
          ──▶ persona.js ──▶ docfile.js ──▶ util.js（pathInside）/ style.js ──▶ docfile.js
          ──▶ modalities.js（消息段渲染）/ interactions.js（戳一戳）/ links.js（卡片与 URL 预览）
@@ -184,7 +186,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 | 撤回 | `noteSeen` `findRecent` `handleRecall` `clearQuoteFor` `dropPending` `dropAmbient` `markReplied` | 通知事件（`notice/group_recall` / `friend_recall`）；判据在 `recall.js`；见 §4.I |
 | 主动说话 | `proactiveSweep` `proactiveEligible`（适配器）`proactiveSpeak` `proactiveNudge` `busyWithTurn` `proactiveTodayCount` | 见 §4.E；**闸门在 `speaking-rules.js`**（`proactiveEligible` / `proactiveSkip`），这里只是把会话记录凑成入参的适配器；`withinActiveHours`（util.js）是纯函数 |
 | 活跃对话 | `noteActiveMessage` `activeFollowAllows` / `activeTurnsLeft` / `activeTalkChance` / `activeTalkAllows` / `chimeAllows` / `chimeDelay` / `batchScale`（适配器）`groupTalkActive` `scheduleChime` `cancelChime` `runChime` `chimeSpeak` `chimeNudge` `chimeTodayUsed` | 见 §4.F；A（一对一免 @）与 C（多人搭话）在 `admit` 里判，够资格后共用一次抽卡（`talkMisses`）；倾听倍数在 `holdForBatch`，B（补一句）挂在 `turn/end` 之后 |
-| 攒批 | `enqueue` `holdForBatch` `flushBatch` `submitBatch` `renderBatch`；`batchWindow` / `batchCap` / `batchScale` 是 3 行适配器，算法在 `speaking-rules.js` | 前后脚到的消息合成一条再投给 Agent；多人搭话时窗口与上限同倍放大（见 §4.F） |
+| 攒批 | `enqueue` `holdForBatch` `flushBatch` `flushIfIdle` `backlogBusy` `backlogShouldHold` `submitBatch` `renderBatch` `renderBacklog`；`batchWindow` / `batchCap` / `batchScale` 是 3 行适配器，算法在 `speaking-rules.js` / `backlog.js` | 前后脚到的消息合成一条再投给 Agent；多人搭话时窗口与上限同倍放大（见 §4.F）。**上一轮还没跑完时**（`backlogBusy`，含 `submitting`）到的消息标 `held`、只攒不投，等 `turn/end` 后由 `flushIfIdle` 合成**一波迟到的消息**（带相对时间 + SKIP 出口），不再排成几十轮；上限见 `batchBacklog*`（见 §4.A） |
 | 媒体 | `resolveMessageMedia` `mediaFor` `resolveQuote` `hydrateAmbientMedia` | 环境上下文与复读**共用同一次下载**（`mediaResolutions` 这个 WeakMap 就是干这个的） |
 | 事件轮转 | `handleEvent`（约 77 行）+ 持久化事件路由 | 见 §4.A / §4.I；`notice`（戳一戳 / 撤回）先于 `message` 分流（`handlePoke` / `handleRecall`）；`turn/end` 里按 `owner.proactive` / `owner.intent` 分流 |
 | 定时提醒 | `reminders` `deliverReminderText` `deliverReminderModel` `runReminderTurn` `settleReminderTurn` `reminderNudge` `pendingReminderTurns` | 见 §4.J；任务生命周期在 `reminders.js`，这里只负责发送、agent 轮与守卫；@ 由 `sendParts` 的 `at` 注入 |

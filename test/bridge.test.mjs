@@ -1005,6 +1005,90 @@ test('the batch wait is capped even while people keep talking', async () => {
   }
 });
 
+// 长任务期间来的 @ 不排成 N 轮、N 条回复：先攒着，忙完当作「一波迟到的消息」只接一轮。
+test('mentions that arrive during a long turn become one backlog wave', async () => {
+  const { onebot, host } = await boot({ batchWindowMs: 80, batchMaxWaitMs: 150, batchBacklogHoldMs: 30000, replyStyle: 'auto' });
+  try {
+    onebot.push(mention('第一句', { messageId: 7501 }));
+    const agent = await untilInbox(host, 1, 'the first message to reach the Agent');
+    // 第一句开了一轮，但**不结束**：模拟一个还在跑的长任务（turn/end 一直不来）。
+    host.list.emit('agent/inbox/claimed', { agent, message: agent.inbox[0], turn: 1 });
+
+    onebot.push(mention('第二句', { messageId: 7502, userId: 3333333333, name: 'iroha', card: 'iroha' }));
+    onebot.push(mention('第三句', { messageId: 7503 }));
+    onebot.push(mention('第四句', { messageId: 7504 }));
+
+    // 早就超过攒批窗口与上限了，但它在忙 —— 一条都不该进收件箱。
+    await settle(400);
+    assert.equal(agent.inbox.length, 1, 'while the turn is running, the backlog must stay out of the inbox');
+
+    // 长任务结束：这一波作为**一条**消息投进来。
+    host.list.emit('session/event', { id: agent.id }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+    await until(() => (agent.inbox.length === 2 ? agent.inbox[1] : undefined), 'the backlog wave to reach the Agent');
+    const wave = agent.inbox[1].content[0].text;
+    assert.match(wave, /^（你刚才在忙别的事，/, wave);
+    assert.match(wave, /iroha（(刚刚|\d+ 秒前)）: 第二句/, wave);
+    assert.ok(wave.includes('第三句') && wave.includes('第四句'), wave);
+    assert.ok(wave.includes('就只写 SKIP'), wave);
+    // 场景提示词也得说清「你刚才在忙」，不能再写「几乎同时在跟你说话」。
+    const prompt = promptText(host, 'qq-bridge:channel');
+    assert.ok(prompt.includes('你刚才在忙别的事'), prompt);
+    assert.ok(!prompt.includes('几乎同时在跟你说话'), prompt);
+
+    // 接完这一波：只发裸文本（不引用几分钟前的那一条），整波共用一轮。
+    completeTurn(host, agent, '刚在忙，我看看', 2);
+    const sent = await until(() => onebot.calls.find((call) => call.action === 'send_group_msg'), 'the backlog reply');
+    assert.equal(sent.params.message, '刚在忙，我看看');
+    await settle(200);
+    assert.equal(agent.inbox.length, 2, 'the whole backlog must be answered in one turn');
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 憋的上限：长任务一直不结束也不能让这些消息永远投不出去（退回「排队等它忙完」）。
+test('the backlog hold gives up after batchBacklogHoldMs', async () => {
+  const { onebot, host } = await boot({ batchWindowMs: 80, batchMaxWaitMs: 150, batchBacklogHoldMs: 50 });
+  try {
+    onebot.push(mention('第一句', { messageId: 7601 }));
+    const agent = await untilInbox(host, 1, 'the first message to reach the Agent');
+    host.list.emit('agent/inbox/claimed', { agent, message: agent.inbox[0], turn: 1 });
+
+    onebot.push(mention('第二句', { messageId: 7602 }));
+    // 过了 50ms 的上限就直接投进队列（仍然是积压文案，但不再等它空闲）。
+    const queued = await until(
+      () => (agent.inbox.length >= 2 ? agent.inbox[1].content[0].text : undefined),
+      'the overdue backlog to be queued anyway',
+      3000,
+    );
+    assert.ok(queued.includes('第二句'), queued);
+    assert.match(queued, /^（你刚才在忙别的事，/, queued);
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 关掉这一项 = 回到「每 batchMaxWaitMs 一批排队」的老行为。
+test('batchBacklog: false keeps queueing one batch at a time', async () => {
+  const { onebot, host } = await boot({ batchWindowMs: 60, batchMaxWaitMs: 120, batchBacklog: false });
+  try {
+    onebot.push(mention('第一句', { messageId: 7701 }));
+    const agent = await untilInbox(host, 1, 'the first message to reach the Agent');
+    host.list.emit('agent/inbox/claimed', { agent, message: agent.inbox[0], turn: 1 });
+
+    onebot.push(mention('第二句', { messageId: 7702 }));
+    const queued = await until(
+      () => (agent.inbox.length >= 2 ? agent.inbox[1].content[0].text : undefined),
+      'the second batch to be queued as before',
+      3000,
+    );
+    // 老行为：普通批次（单个条目不包装），不是「刚才在忙」那一波。
+    assert.equal(queued, '第二句');
+  } finally {
+    await onebot.close();
+  }
+});
+
 // 用例：/reset 之前攒着的那批话要先投出去 —— 它们是重置前说的，不能被新一轮忘掉。
 test('the reset command delivers a pending batch before it starts the next round', async () => {
   const { onebot, host } = await boot({ batchWindowMs: 200, batchMaxWaitMs: 400, resetUsers: [String(PRIVATE_USER_ID)] });

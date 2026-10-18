@@ -105,6 +105,16 @@ export function createSettings(config, defaultCwd) {
   const batchWindowMs = Number.isFinite(batchWindowMsRaw) && batchWindowMsRaw > 0 ? batchWindowMsRaw : 0;
   const batchMaxWaitMsRaw = Math.floor(Number(config.batchMaxWaitMs));
   const batchMaxWaitMs = Number.isFinite(batchMaxWaitMsRaw) && batchMaxWaitMsRaw > 0 ? batchMaxWaitMsRaw : 0;
+  // 长任务期间的「一波迟到的消息」：条数与字数都有下限（0 没有意义 —— 那等于不贴，
+  // 但「不贴」不是用户想要的，他想要的是「别贴太多」）；0 条的配置按 2 算。
+  const batchBacklog = config.batchBacklog !== false;
+  const batchBacklogEntriesRaw = Math.floor(Number(config.batchBacklogEntries));
+  const batchBacklogEntries = Number.isFinite(batchBacklogEntriesRaw) && batchBacklogEntriesRaw > 0
+    ? Math.max(2, batchBacklogEntriesRaw)
+    : 20;
+  const batchBacklogCharsRaw = Math.floor(Number(config.batchBacklogChars));
+  const batchBacklogChars = Number.isFinite(batchBacklogCharsRaw) && batchBacklogCharsRaw > 0 ? batchBacklogCharsRaw : 2000;
+  const batchBacklogHoldMs = msOf(config.batchBacklogHoldMs, 120000);
 
   // —— 群聊环境上下文 ——
   const ambientMessages = Math.floor(Number(config.ambientMessages) || 0);
@@ -262,6 +272,10 @@ export function createSettings(config, defaultCwd) {
     repeatMaxChars,
     batchWindowMs,
     batchMaxWaitMs,
+    batchBacklog,
+    batchBacklogEntries,
+    batchBacklogChars,
+    batchBacklogHoldMs,
     ambientMessages,
     ambientLineChars,
     maxReplyChars,

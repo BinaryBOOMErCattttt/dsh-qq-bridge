@@ -55,6 +55,7 @@ import {
   proactiveSkip,
 } from './speaking-rules.js';
 import { createMemory } from './memory.js';
+import { renderBacklog } from './backlog.js';
 import { createReminders, describeTask, REMINDER_ROUTE_PATH } from './reminders.js';
 import { builtinStyle, classifyReply, createStyle, renderStyleContract, sanitizeBubble } from './style.js';
 import { createPersona, renderPersona } from './persona.js';
@@ -148,6 +149,15 @@ const STICKER_PROMPT_MAX = 40;
  * 但这条提醒是短时效的：十轮之后还在说「上一轮」，模型会以为那是一句没做完的指令。
  */
 const STICKER_FAILURE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * 长任务期间那波「迟到的消息」隔多久看一眼「它忙完了没有」（毫秒）。
+ *
+ * timers 只在**会话还忙**的时候存在：醒来一次，忙就再等一个短周期，不忙就把整波投出去
+ * （见 `flushBatch` / `backlogShouldHold`）。一秒一次是刻意选的：投递延迟的上限就是它，
+ * 而每次醒来只做一次 Map 查询；两分钟的任务也才 120 次，比给每个会话挂一堆状态便宜。
+ */
+const BACKLOG_POLL_MS = 1000;
 
 /**
  * 一个会话最多记住多少个「可以被 @ 的人」。
@@ -1081,6 +1091,11 @@ export function apply(ctx, config) {
       // 插话轮：这句不是冲它来的。元信息已经写在 user message 里了，这里只说清场景，
       // 不能再用「刚跟你说话的人」——那正是「莫名其妙」的来源（§2.2）。
       return '群里在聊天，下面那句不是叫你的；你只是刚好想接一句（接不住就不接）。';
+    }
+    if (conversation.pendingIntent === 'backlog') {
+      // 积压的一波：那些话不是「现在」说的，是它在忙别的事的时候陆续到的。
+      // 说成「刚跟你说话的人」会让模型把它们当成同一拍发生的（正文里有相对时间）。
+      return '你刚才在忙别的事，下面这些是那期间陆续到的消息；挑还活着的接，不用逐条回。';
     }
     if (speakers.length > 1) {
       const list = speakers.map((speaker) => speaker.name).join('、');
@@ -2218,6 +2233,8 @@ export function apply(ctx, config) {
     if (conversation.type !== 'group') return undefined;
     // 搭话（免 @ 接话 / 多人插话）不点名也不引用：见上面第 0 条。
     if (intent === 'continued' || intent === 'interject') return undefined;
+    // 积压的一波同样不挂：那一批里每一条都是几分钟前的，指谁都是错的。
+    if (intent === 'backlog') return undefined;
     // 引用一张表情没有意义（见第 1 条）；@ 不在此列。
     const quotable = target.emoji !== true;
     const style = settings.replyStyle;
@@ -2369,6 +2386,8 @@ export function apply(ctx, config) {
    * - `sending` 是出站串行链：拟人延迟会让一次回复持续若干秒，这期间的后续回复必须排队，
    *   否则群里会看到两条消息交错着冒出来。
    * - `pending` / `batchTimer` 是攒批状态：收下但还在等「有没有下一条」的消息，以及那个定时器。
+   * - `submitting` 是「已经决定要投、但 `submitBatch` 那个异步任务还没跑完」的计数：
+   *   这段窗口里 `submitted` 还是空的，光看它会把会话误判成空闲（见 `backlogBusy`）。
    * - `handle` 是 Harness 给出的 Agent 句柄，`/reset` 靠它销毁 Agent。
    */
   function blankConversation(key, type, id) {
@@ -2385,6 +2404,7 @@ export function apply(ctx, config) {
       sending: Promise.resolve(),
       pending: [],
       batchTimer: undefined,
+      submitting: 0,
       speakers: [],
       /**
        * 这个会话里「可以被 @ 的人」：`{ name, id }[]`，最近说过话的排在前面。
@@ -3582,6 +3602,8 @@ export function apply(ctx, config) {
   function scheduleChime(conversation, owner) {
     // 空消息（单纯的 @、一个空格）之后的轮次不补：那一轮本来就没有话题可言。
     if (owner?.blank === true) return;
+    // 刚接完一波积压也不补：它刚刚连着答完一群人的旧问题，再追一句「啊对了」是噪音。
+    if (owner?.intent === 'backlog') return;
     if (conversation.type === 'private') {
       // 私聊补一句（L2）：只受它自己的开关约束 —— 不该被群聊那个 `proactive` 总开关连坐。
       if (settings.privateAfterthought !== true || settings.privateAfterthoughtIdleMs <= 0) return;
@@ -3912,6 +3934,7 @@ export function apply(ctx, config) {
    * 队列是每个会话一条的串行链：媒体落盘、确保 Agent 就绪、投递消息都在这条链上，
    * 处理顺序因此与消息到达顺序一致（否则「先发图、再说那句话」会被下载耗时颠倒）。
    * 失败时把原因回给发消息的人 —— 静默会被群里当成「机器人不理人」。
+   * @returns 这条排进来的任务所在的队列承诺（`submitBatch` 用它在收尾时清 `submitting`）。
    */
   function enqueue(conversation, job) {
     conversation.queue = conversation.queue
@@ -3921,6 +3944,7 @@ export function apply(ctx, config) {
         report('warn', `could not queue for ${conversation.key}: ${detail}`);
         void sendToConversation(conversation, `（我这边出错了：${detail}）`);
       });
+    return conversation.queue;
   }
 
   /**
@@ -3936,6 +3960,11 @@ export function apply(ctx, config) {
    * 机器人会永远不吭声。多人搭话时这两个值一起按 `activeGroupBatchScale` 放大，
    * 于是它会多听几句再合成一轮（见 `batchScale`）。
    *
+   * 它**正在忙**（上一轮还没跑完）时，这条消息不按「2 秒窗口」算，而是进一波迟到的
+   * 消息（`entry.held`）：窗口到了也不投，等它闲下来合成一轮接（见 `flushBatch` /
+   * `backlogBusy`）。不这么做的话，十分钟的长任务会攒出上百个 turn、上百条回复，
+   * 每条都在回答几分钟前的问题。
+   *
    * @param conversation - 目标会话。
    * @param entry - 已准入的这条消息 `{ message, name, userId, quote, at }`。
    */
@@ -3946,6 +3975,9 @@ export function apply(ctx, config) {
       submitBatch(conversation, [entry]);
       return;
     }
+    // 忙的时候到的消息都属于「一波迟到的对话」：多憋一会儿、回头一起接。
+    // `batchBacklogHoldMs: 0` 是「不憋」—— 那样它就和关掉这一项一样，回到逐批排队。
+    if (settings.batchBacklog === true && settings.batchBacklogHoldMs > 0 && backlogBusy(conversation)) entry.held = true;
     conversation.pending.push(entry);
     const cap = batchCap(window, scale);
     const since = conversation.pending[0].at;
@@ -3956,15 +3988,81 @@ export function apply(ctx, config) {
     conversation.batchTimer.unref?.();
   }
 
-  /** 结束等待，把攒下的消息作为**一条** user message 投进会话队列。 */
-  function flushBatch(conversation) {
+  /**
+   * 这个会话现在算不算「忙着」—— 攒批这边用的口径。
+   *
+   * 比 `busyWithTurn` 多算一件事：`submitBatch` 已经排上、但还没跑到 `followup` 的那段
+   * 窗口。那段时间里 `submitted` 还是空的，只看它会把这个会话当成空闲，于是新到的消息
+   * 可能被算进另一批、和正在投的那批分成两轮。
+   * @param conversation - 目标会话。
+   * @returns 忙时为 true。
+   */
+  function backlogBusy(conversation) {
+    if (busyWithTurn(conversation)) return true;
+    return (conversation.submitting ?? 0) > 0;
+  }
+
+  /**
+   * 这一波还要不要继续憋着。
+   *
+   * 四个条件缺一不可：开关开着 · 这一波里确实有「忙的时候到的」条目 · 它现在还忙 ·
+   * 还没憋到 `batchBacklogHoldMs` 的上限。上限是为了兜住「它卡住了」：卡着的 turn
+   * 不会结束，没有上限的话这些消息就再也不会被投出去（比晚回糟得多）。
+   * @param conversation - 目标会话。
+   * @returns 需要继续等时为 true。
+   */
+  function backlogShouldHold(conversation) {
+    if (settings.batchBacklog !== true) return false;
+    if (!(settings.batchBacklogHoldMs > 0)) return false;
+    if (!conversation.pending.some((item) => item.held === true)) return false;
+    if (!backlogBusy(conversation)) return false;
+    const since = Number(conversation.pending[0]?.at) || 0;
+    return since > 0 && Date.now() - since < settings.batchBacklogHoldMs;
+  }
+
+  /**
+   * 结束等待，把攒下的消息作为**一条** user message 投进会话队列。
+   *
+   * 忙的时候就别投：先重新挂一个短定时器（`BACKLOG_POLL_MS`），等它闲下来再投 ——
+   * 那一整段会被 `submitBatch` 当成一波迟到的消息交给模型（见 `renderBacklog`）。
+   * `force` 只有一个调用点：`/reset`。那批话是重置前说的，必须照旧先投出去。
+   *
+   * @param conversation - 目标会话。
+   * @param options.force - 跳过「还忙着」的等待（`/reset` 用）。
+   */
+  function flushBatch(conversation, { force = false } = {}) {
     if (conversation.batchTimer !== undefined) {
       clearTimeout(conversation.batchTimer);
       conversation.batchTimer = undefined;
     }
+    if (conversation.pending.length === 0) return;
+    if (!force && backlogShouldHold(conversation)) {
+      const since = Number(conversation.pending[0]?.at) || 0;
+      const left = settings.batchBacklogHoldMs - (Date.now() - since);
+      const wait = Math.max(50, Math.min(left, BACKLOG_POLL_MS));
+      const timer = setTimeout(() => flushBatch(conversation), wait);
+      timer.unref?.();
+      conversation.batchTimer = timer;
+      return;
+    }
     const batch = conversation.pending.splice(0);
-    if (batch.length === 0) return;
     submitBatch(conversation, batch);
+  }
+
+  /**
+   * 一轮结束后看一眼：是不是有一波迟到的消息可以投了。
+   *
+   * 挂在 `turn/end` 上（而不是只靠定时器），是因为「忙完」这件事只有那里知道得最准：
+   * 定时器最多晚一个 `BACKLOG_POLL_MS`，而这里能让积压的那一轮紧接着开始。只处理
+   * `held` 的批次 —— 普通的 2 秒窗口有它自己的定时器，不该被提前截断。
+   * @param conversation - 目标会话。
+   */
+  function flushIfIdle(conversation) {
+    if (conversation === undefined) return;
+    if (conversation.pending.length === 0) return;
+    if (!conversation.pending.some((item) => item.held === true)) return;
+    if (backlogBusy(conversation)) return;
+    flushBatch(conversation);
   }
 
   /**
@@ -3974,16 +4072,26 @@ export function apply(ctx, config) {
    * 只带 @、没有正文的消息在这里也**不丢**：正文换成一句「他 @ 了你一下，没说什么」
    * —— 模型得知道轮到自己说话了，才能决定回一句「？」、发张表情，还是接上一句
    * （见 `blankReply`）。只有在引用也没取到、整批确实什么都没有时才什么都不发。
+   *
+   * 一批里只要有一条是「忙的时候到的」（`held`），整批就按**一波迟到的消息**渲染
+   * （见 `backlog.js` / `renderBacklog`）：它们不是几乎同时到的，而是它在忙别的事的
+   * 那段时间里陆续到的 —— 这个事实必须交给模型，它才知道可以挑着接、或者 SKIP。
    */
   function submitBatch(conversation, batch) {
+    // 排上队就算「忙」：到 `followup` 之前 `submitted` 还是空的（见 `backlogBusy`）。
+    conversation.submitting = (conversation.submitting ?? 0) + 1;
     enqueue(conversation, async () => {
       const selfId = client.selfId;
+      const held = batch.some((item) => item.held === true);
       const entries = [];
       for (const item of batch) {
         // 撤回的两种处理都在账上查：`action: 'drop'` 是「摘除的第二道」—— 这一批可能
         // 已经被 splice 出来、正在异步下媒体，那时数组里已经没有它，摘不掉了。
         const mark = findRecent(conversation.key, item.messageId);
         if (mark?.action === 'drop') continue;
+        // 积压波里的「改写」降级成丢弃：隔八分钟再为一句撤回调侃一句，不合时宜，
+        // 而且这一轮本来就不是为它开的（模型看到的是一大段别人的话）。
+        if (held && mark?.action === 'rewrite') continue;
         // 本条自己的图和「它在回复的那条」里的图一起取：两件事互不依赖，串起来等只是白等。
         const [resolved, quote] = await Promise.all([mediaFor(item.message), resolveQuote(item.message)]);
         // 再查一次：撤回可能就发生在这几十毫秒里（我们正在下媒体），而上面那次查是 await
@@ -4025,20 +4133,30 @@ export function apply(ctx, config) {
           // 投递之后要能对回账上那一条（`submitted` / `replied` 两个进度，见 handleRecall）。
           messageId: String(item.messageId ?? ''),
           blank: item.blankBody !== undefined && item.blankBody.length > 0 && withLinks === item.blankBody,
+          // 这一条是什么时候到的：一波迟到消息要按它算「几分钟前」，见 renderBacklog。
+          at: Number(item.at) || 0,
         });
       }
       if (entries.length === 0) return;
       // 这一轮为什么轮到它：必须在渲染正文**之前**算出来（插话轮的正文要用它），
-      // 写进会话记录，提示词（场景 / 人设的场景段）读它。
-      const intent = batchIntent(batch);
+      // 写进会话记录，提示词（场景 / 人设的场景段）读它。积压的一波单独一个 intent：
+      // 它既不是「刚有人跟我说话」，也不是免 @ 接话，场景提示词要说的是「你刚才在忙」。
+      const intent = held ? 'backlog' : batchIntent(batch);
       conversation.pendingIntent = intent;
-      // 插话轮的投递文案与普通回复**不同**（§7.2）：`kaguya: 晚上吃啥` 会让模型以为
-      // kaguya 在问它，群里看到的却是答非所问。所以先说清「这不是叫你的」，再给 SKIP 出口。
-      const text = intent === 'interject'
-        ? interjectBody(entries)
-        : renderBatch(entries);
+      // 三种投递文案：插话轮要说清「这不是叫你的」；积压的一波要带相对时间（否则模型
+      // 会把八分钟前的问题当成刚发生的）；其余照旧。
+      const text = held
+        ? renderBacklog(entries, {
+            now: Date.now(),
+            maxEntries: settings.batchBacklogEntries,
+            maxChars: settings.batchBacklogChars,
+            canLookup: memory.toolsAllowed() === true,
+          })
+        : intent === 'interject'
+          ? interjectBody(entries)
+          : renderBatch(entries);
       const names = [...new Set(entries.map((entry) => entry.name))].join('、');
-      report('info', `← ${describeConversation(conversation)} ${names}${entries.length > 1 ? `（${entries.length} 条）` : ''}: ${text.slice(0, 120)}`);
+      report('info', `← ${describeConversation(conversation)} ${names}${entries.length > 1 ? `（${entries.length} 条）` : ''}${held ? '〔积压〕' : ''}: ${text.slice(0, 120)}`);
       // 发言人：提示词里要说得清「现在是谁在跟你说话」，所以几个人的话都记下来。
       // 同一个登记顺手保证他们都能被 @ 到（名单以「刚刚说过话」为序，见 `registerParticipant`）。
       const speakers = new Map();
@@ -4072,8 +4190,19 @@ export function apply(ctx, config) {
         if (mark !== undefined) mark.submitted = true;
       }
       // `blank`：这一批整批都是「空消息的替身」时，回复之后不挂补一句（那一轮没话题）。
-      submitted.set(userMessage.id, { key: conversation.key, quote: batchQuote(batch), intent, batchIds, blank: entries.every((entry) => entry.blank === true) });
+      // `quote`：积压的一波不给指向 —— 引用八分钟前哪一条都像「我刚回的是他」；
+      // 想叫谁让模型自己写 `[[@昵称]]`（`quoteHead` 也认 `backlog` 这个 intent）。
+      submitted.set(userMessage.id, {
+        key: conversation.key,
+        quote: held ? { messageId: '', userId: '', seq: 0 } : batchQuote(batch),
+        intent,
+        batchIds,
+        blank: entries.every((entry) => entry.blank === true),
+      });
       agent.followup(userMessage);
+    }).finally(() => {
+      // 投递这一段（可能含媒体下载）结束：无论成功失败，会话都不再算「排着队」。
+      conversation.submitting = Math.max(0, (conversation.submitting ?? 1) - 1);
     });
   }
 
@@ -4607,7 +4736,9 @@ export function apply(ctx, config) {
         report('info', `ignored ${resetCommand} from ${conversation.key} by ${event.user_id}: not in resetUsers`);
         return;
       }
-      flushBatch(conversation);
+      // 这批话是重置前说的，必须照旧投出去：不能因为「它还在忙」就留在 pending 里 ——
+      // 销毁旧 Agent 之后，它们会被算到新一轮头上（见 resetConversation）。
+      flushBatch(conversation, { force: true });
       enqueue(conversation, async () => {
         const started = await resetConversation(conversation);
         await sendToConversation(conversation, started ? '已开始新会话（上一轮的记忆留在磁盘上，不再带进这一轮）。' : '（没能开始新会话：旧会话还活着，请查看机器人日志）');
@@ -4670,6 +4801,10 @@ export function apply(ctx, config) {
     if (owner === undefined) return;
     const conversation = conversations.get(owner.key);
     if (conversation === undefined) return;
+    // 这一轮收尾之后它可能就闲下来了：忙的时候攒着的那一波迟到的消息可以投了。
+    // 必须放在这里（而不是某个分支里）：下面每一条提前 return（提醒、aborted、error、
+    // 空回复、SKIP、主动搭话）都可能正是「它终于闲下来」的那一刻。
+    flushIfIdle(conversation);
     const reason = event.data.reason?.kind;
     // 只发该 turn 里最后一条有文本的 assistant 消息；中间步骤的工具调用等不发给 QQ。
     const reply = list?.[list.length - 1]?.trim() ?? '';

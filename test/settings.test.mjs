@@ -31,6 +31,10 @@ test('默认配置原样落到 settings 上', () => {
   const s = settings();
   assert.equal(s.batchWindowMs, 2000);
   assert.equal(s.batchMaxWaitMs, 5000);
+  assert.equal(s.batchBacklog, true);
+  assert.equal(s.batchBacklogEntries, 20);
+  assert.equal(s.batchBacklogChars, 2000);
+  assert.equal(s.batchBacklogHoldMs, 120000);
   assert.equal(s.maxReplyChars, 1500);
   assert.equal(s.activeWindowMs, 60 * 1000);
   assert.equal(s.activeGroupLines, 6);
@@ -53,6 +57,22 @@ test('攒批的 0 = 关闭（与「非法值退回默认」不是一回事）', 
   // 比当成「每 2 秒回一条」安全。
   assert.equal(settings({ batchWindowMs: NaN }).batchWindowMs, 0);
   assert.equal(settings({ batchMaxWaitMs: NaN }).batchMaxWaitMs, 0);
+});
+
+test('积压那一波的条数 / 字数 / 憋多久：非法退回默认，条数下限 2', () => {
+  // 条数与字数没有「0 = 关闭」的语义 —— 关掉这一项用 batchBacklog: false。
+  // 配 0 / 1 只能理解成「贴得尽量少」，那不是「一条都不贴」：至少留第一条 + 最后一条。
+  assert.equal(settings({ batchBacklogEntries: 0 }).batchBacklogEntries, 20);
+  assert.equal(settings({ batchBacklogEntries: 1 }).batchBacklogEntries, 2);
+  assert.equal(settings({ batchBacklogEntries: 5 }).batchBacklogEntries, 5);
+  assert.equal(settings({ batchBacklogEntries: NaN }).batchBacklogEntries, 20);
+  assert.equal(settings({ batchBacklogChars: 0 }).batchBacklogChars, 2000);
+  assert.equal(settings({ batchBacklogChars: 300 }).batchBacklogChars, 300);
+  assert.equal(settings({ batchBacklogChars: NaN }).batchBacklogChars, 2000);
+  // 憋多久和别的毫秒项同一口径：非法回默认，负数按 0（= 不憋）。
+  assert.equal(settings({ batchBacklogHoldMs: NaN }).batchBacklogHoldMs, 120000);
+  assert.equal(settings({ batchBacklogHoldMs: -1 }).batchBacklogHoldMs, 0);
+  assert.equal(settings({ batchBacklog: false }).batchBacklog, false);
 });
 
 test('活下来的一批毫秒项：非法退回默认，负数按 0', () => {
