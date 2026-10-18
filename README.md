@@ -21,7 +21,7 @@
 |---|---|---|
 | 双向聊天 | 一个 QQ 会话 = 一个持久 Session，重启后 `resume`，聊天记忆不丢 | [会话与轮次](docs/sessions.md) |
 | 人格与表达 | 「是谁」写 `PERSONA.md`，「怎么说」写 `STYLE.md`，都热读 | [人格与表达](docs/persona-style.md) |
-| 群友式说话 | 攒批、气泡计划、分条与打字延迟、引用 / @、`[[@昵称]]` | [说话方式与节奏](docs/speaking.md) |
+| 群友式说话 | 攒批、气泡条数（模型自己写）、分条与打字延迟、引用 / @、`[[@昵称]]` | [说话方式与节奏](docs/speaking.md) |
 | 自动复读 | 群里刷同一个字 / 同一张表情时，插件不经过模型跟着发 | [自动复读](docs/repeat.md) |
 | 主动开口 | 冷场冒泡、免 @ 接话、回完补一句（私聊永远不主动打扰） | [主动开口](docs/proactive.md) |
 | 图片与表情包 | 看图、发表情、存表情；链接 / 视频 / 语音 / 戳一戳各有下场 | [图片与感知](docs/media.md) |
@@ -116,7 +116,7 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | [Windows 桌面版](docs/windows.md) | 一键脚本、隐藏窗口、提权、装进 `desktop` profile、自检与排查 |
 | [配置项](docs/configuration.md) | 全部字段、Web UI 设置页、改配置的正确姿势 |
 | [人格与表达](docs/persona-style.md) | `PERSONA.md` / `STYLE.md` 的格式、组合规则、三道防线 |
-| [说话方式与节奏](docs/speaking.md) | 攒批、气泡计划、分条 / 打字延迟、指向、`[[@昵称]]`、空消息 |
+| [说话方式与节奏](docs/speaking.md) | 攒批、气泡条数（模型自己写）、分条 / 打字延迟、指向、`[[@昵称]]`、空消息 |
 | [自动复读](docs/repeat.md) | 文字与表情包复读、画面指纹、带宽账 |
 | [主动开口](docs/proactive.md) | 偶尔主动说话、活跃对话、私聊补一句 |
 | [图片、表情包与感知](docs/media.md) | 看图、发表情、存表情、base64、链接 / 视频 / 语音 / 戳一戳 |

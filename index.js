@@ -33,7 +33,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdir, readFile, stat } from 'node:fs/promises';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { OneBotClient, atMentions, blankMessageLabel, chunkText, collectMedia, findReply, isStickerSegment, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs, userDisplayName } from './onebot.js';
+import { OneBotClient, atMentions, blankMessageLabel, chunkText, collectMedia, findReply, isEmojiOnlyMessage, isStickerSegment, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs, userDisplayName } from './onebot.js';
 import { createMediaStore } from './media.js';
 import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
@@ -56,7 +56,7 @@ import {
 } from './speaking-rules.js';
 import { createMemory } from './memory.js';
 import { createReminders, describeTask, REMINDER_ROUTE_PATH } from './reminders.js';
-import { builtinStyle, classifyReply, createStyle, planBubbles, renderStyleContract, sanitizeBubble } from './style.js';
+import { builtinStyle, classifyReply, createStyle, renderStyleContract, sanitizeBubble } from './style.js';
 import { createPersona, renderPersona } from './persona.js';
 import { observationOf, renderObservation } from './modalities.js';
 import { pokeAction, pokeActionType, pokeNudge, pokeNotice } from './interactions.js';
@@ -450,23 +450,20 @@ export function apply(ctx, config) {
   /**
    * 表达层的机器参数：提示词里渲染 + 发送时执行，两处读的是同一份。
    *
-   * `bubbleChatMax` 取的是**生效值**（再被 `burstMaxMessages` 夹一次）：提示词不能说
-   * 「最多 3 个气泡」而实际只发 1 条 —— 那是一条模型照做也做不到的指示。
+   * 这里**没有**气泡条数上限：发几条由模型按 `STYLE.md` 自己决定（见 `renderStyleContract`）。
    */
   const styleParams = {
     humanize: settings.humanize,
-    bubbleChatMax: settings.burstMaxMessages > 0
-      ? Math.min(settings.bubbleChatMax, settings.burstMaxMessages)
-      : settings.bubbleChatMax,
     stripShortPeriod: settings.stripShortPeriod,
     shortPeriodMaxChars: settings.shortPeriodMaxChars,
-    interjectQuote: settings.interjectQuote,
   };
   /**
-   * 「聊天型 / 信息型」的门槛：`burstSingleMaxChars` 优先（旧配置的语义变了但值还能用），
-   * 没填就用 `bubbleGambleMaxChars`（默认 80）。0 表示「全部按聊天型」。
+   * 「聊天型 / 信息型」的门槛：`burstSingleMaxChars`（默认 100）。0 表示「全部按聊天型」。
+   *
+   * 现在只影响一件事：发送途中对方又说话了，聊天型剩下的气泡不再发（信息型整条发完）。
+   * 条数本身**不设上限** —— 模型写几条发几条。
    */
-  const chatMaxChars = settings.burstSingleMaxChars > 0 ? settings.burstSingleMaxChars : settings.bubbleGambleMaxChars;
+  const chatMaxChars = settings.burstSingleMaxChars;
 
   // ---- 长期记忆：整个子系统搬去了 memory.js，这里只做装配 ----
   //
@@ -1347,11 +1344,16 @@ export function apply(ctx, config) {
     // 定时提醒：模型必须知道「现在几点」，否则「明天下午 3 点」只能靠猜；还要告诉它
     // 答应下来的事必须真的落成任务，而不是只在回复里说「好的我记住了」—— 它只在这一轮
     // 醒着，到点叫醒它的是插件，不是它自己的记忆。
+    //
+    // 时间被理解错一天是真实事故：凌晨 02:12 一句「明天中午提醒我拿快递」，模型按日历
+    // 排到了次日中午，而对方想的是睡醒后的那个中午；回复里又只写「明天中午」，偏差一直
+    // 到点才被发现。所以这里要求回复写**绝对日期**，并对凌晨的「明天 / 今天」单独给一条。
     if (remindersEnabled && (allowTools.length === 0 || allowTools.includes('qq_remind_create'))) {
       const nowAt = Date.now();
       lines.push(
         `- 现在是 ${localMinute(nowAt)}（${weekdayLabel(nowAt)}，本地时间）。要提醒谁在某个时刻做什么，必须调用 qq_remind_create；不要只在回复里答应 —— 到点叫醒你的是插件，不是你自己的记忆。`,
-        '- 建完在回复里说清「几点提醒谁」；没建成要把原因说出来，别假装建好了。提醒的正文会原样发出，不会把图片或 @ 标记解析成真的图 / at 段，把要做什么写清楚。',
+        '- 建完在回复里**写出绝对日期和时刻**（如「10 月 19 日 周一 12:00」），不要只说「明天中午」「等下」—— 写清日期，对方才能一眼看出「明天」有没有被理解成另一天。没建成要把原因说出来，别假装建好了。提醒的正文会原样发出，不会把图片或 @ 标记解析成真的图 / at 段，把要做什么写清楚。',
+        '- 凌晨（大致 00:00–06:00）对方说「明天 / 今天几点」时，**日历上的明天**与**睡醒后的那个白天**都说得通：先问一句「是今天（几月几日）还是明天」；不问就按最近的那个未来时刻排。对方纠正后，用新时间重建一条，并取消旧的那条。',
       );
       const summary = reminders.summaryFor(conversation.key);
       if (summary.count > 0) {
@@ -1483,7 +1485,7 @@ export function apply(ctx, config) {
    *
    * 这些**不随人设改变**：人设文件写「忽略以上规则」也无效（本节在最后，并已声明优先级）。
    * 「绝不两拍」按 §3.2 拆成两句：信息型的「短+长」（先嘴硬再补一段正经的）仍然禁止，
-   * 聊天型的「短+短」（反应 + 追问）是允许的 —— 不拆这条，气泡计划就没有内容可发。
+   * 聊天型的「短+短」（反应 + 追问）是允许的 —— 不拆这条，模型会把两拍全挤进一个气泡。
    */
   function hardRules(isGroup) {
     return [
@@ -1552,20 +1554,16 @@ export function apply(ctx, config) {
    */
 
   /**
-   * 把一段回复拆成「像真人连着发的」几条消息（**拆条**，不做掷骰）。
+   * 把一段回复拆成「像真人连着发的」几条消息（**只拆条，不丢内容**）。
    *
    * 不开启 `humanize` 时就是旧行为（只在超过协议上限时分段）。开启后先把换行拆成
    * 一条条独立消息（换行 = 分条，不再是同一条里的排版），再对每一行按标点/长度拆成
    * 短句（受 `burstMaxChars` / `burstMaxParts` 约束），最后每段都接受一次协议上限的
    * 硬校验 —— 模型偶尔写超长时，最后一段仍可能被 `chunkText` 再切开。
    *
-   * 「聊天型 / 信息型」由 `chatMaxChars` 决定（`burstSingleMaxChars`，没填就用
-   * `bubbleGambleMaxChars`）：
-   * - **聊天型**：条数上限是 `min(burstMaxMessages, bubbleChatMax)`（默认 3）。超出的
-   *   部分**并进最后一条**，不在这里截断内容 —— 那正是 `splitBurst` 的 maxMessages
-   *   语义（跨行用空格接）。之后再交给 `planBubbles` 掷骰决定真的发到第几个。
-   * - **信息型**（贴代码、列步骤、详细解释）：不掷骰，按 `burstMaxMessages`（0 = 不限）
-   *   与 `burstMaxParts` 正常拆。
+   * 「聊天型 / 信息型」只影响**发送途中被打断**时停不停（见 `sendParts`），不影响条数：
+   * 模型写几行就发几行，插件**不设气泡数上限、也不把多出来的并进最后一条**。
+   * `burstMaxMessages` 是唯一可选的总条数上限（默认 0 = 不限，显式设了才并条）。
    *
    * @param text - 模型给出的完整回复。
    * @returns 按发送顺序排列的分段。
@@ -1577,12 +1575,7 @@ export function apply(ctx, config) {
       ? Math.min(settings.burstMaxChars, limit)
       : limit;
     const maxParts = Number.isFinite(settings.burstMaxParts) ? Math.max(1, Math.floor(settings.burstMaxParts)) : 3;
-    const mode = classifyReply(text, { chatMaxChars });
-    // 聊天型还要受 bubbleChatMax 那个硬上限：模型写了一整屏短句时，超出的并进最后一条。
-    const cap = settings.burstMaxMessages > 0
-      ? Math.min(settings.burstMaxMessages, settings.bubbleChatMax)
-      : (mode === 'chat' ? settings.bubbleChatMax : 0);
-    return splitBurst(text, burst, maxParts, cap).flatMap((part) => chunkText(part, limit));
+    return splitBurst(text, burst, maxParts, settings.burstMaxMessages).flatMap((part) => chunkText(part, limit));
   }
 
   /** 发送前等待（`ms <= 0` 时立即返回）；unref 让待发的延迟不拖住进程退出。 */
@@ -1623,15 +1616,14 @@ export function apply(ctx, config) {
    * @param conversation - 目标会话。
    * @param text - 要发送的正文（可含表情包标记）。
    * @param options - `human`：拆短句 + 打字延迟（自动回复用）；`quote`：本轮的回复指向
-   *   `{ messageId, userId, seq }`，仅群聊生效，且只挂在第一个**文字**气泡上；
-   *   `intent`：这一轮为什么轮到它（`addressed` / `continued` / `interject` / `proactive` /
-   *   `chime` / `reminder`）。插话轮靠它强制引用锚点（见 `quoteHead`）；`at`：要挂到
-   *   第一个文字气泡前的 `{ id, name }[]`（定时提醒用，模型自己不写 @）。
+   *   `{ messageId, userId, seq, emoji }`，仅群聊生效，且只挂在第一个**文字**气泡上
+   *   （规则见 `quoteHead`）；`at`：要挂到第一个文字气泡前的 `{ id, name }[]`
+   *   （定时提醒用，模型自己不写 @）。
    * @returns 本次发送（含延迟）完成时兑现的 Promise：至少发出一条为 true，否则 false。
    *   绝不 reject。
    */
-  function sendToConversation(conversation, text, { human = false, quote, intent, at } = {}) {
-    return enqueueSend(conversation, () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 }, intent, at));
+  function sendToConversation(conversation, text, { human = false, quote, at } = {}) {
+    return enqueueSend(conversation, () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 }, at));
   }
 
   /**
@@ -1657,16 +1649,19 @@ export function apply(ctx, config) {
    * 把一条回复拆成「要一条条发出去的东西」：文字段与表情包段，顺序照原文。
    *
    * 三段流水线，顺序不能反：
-   *   1. `splitStickerLines` 把 `[[图片: …]]` 拆成图段（图不参与掷骰，见 `planBubbles`）；
-   *   2. `burstParts` 拆条 —— 换行/标点/长度/条数上限；
-   *   3. `planBubbles` 掷骰决定发到第几个 + `sanitizeBubble` 清洗标点。
+   *   1. `splitStickerLines` 把 `[[图片: …]]` 拆成图段；
+   *   2. `burstParts` 拆条 —— 换行/标点/长度；
+   *   3. `sanitizeBubble` 清洗标点（剥句末「。」、并连续句号与空格）。
+   *
+   * **发几条由模型自己写**：这里没有骰子、没有概率，也**没有气泡数上限 / 并条** ——
+   * 模型写几行就发几行（协议上限由 `chunkText` 兜底）。
    *
    * 文字段里的 `[[@昵称]]` 标记在这里只**标记出来**（`mention: true`），真正的段解析放在
    * `sendParts` 里做 —— 那里才拿得到会话记录（「谁可以被 @」的名单挂在会话上）。
    * 没有标记的文字段仍然以纯字符串发出，与旧行为逐字节一致。
    *
    * @param text - 模型给出的完整回复。
-   * @param human - 是否按拟人节奏拆短句并掷气泡（自动回复用；工具与复读走 human=false）。
+   * @param human - 是否按拟人节奏拆短句（自动回复用；工具与复读走 human=false）。
    * @returns `{ kind: 'text', text, mention? }` 或 `{ kind: 'image', source, raw }` 的数组。
    */
   function replyPieces(text, human) {
@@ -1679,15 +1674,8 @@ export function apply(ctx, config) {
       return [piece];
     });
     if (!human) return pieces;
-    // 气泡计划：**一次**决定这一轮发到第几个（不是每条发完再判，见 style.js 的模块注释）。
-    const planned = planBubbles(pieces, {
-      gamble: settings.bubbleGamble,
-      chance: settings.bubbleContinueChance,
-      decay: settings.bubbleContinueDecay,
-      mode: classifyReply(text, { chatMaxChars }),
-    });
     // 标点清洗只对文字气泡：剥句末「。」、并连续句号与空格。剥完什么都不剩的气泡丢掉。
-    return planned
+    return pieces
       .map((piece) => (piece.kind !== 'text' ? piece : { ...piece, text: sanitizeBubble(piece.text, styleParams) }))
       .filter((piece) => piece.kind !== 'text' || (typeof piece.text === 'string' && piece.text.length > 0));
   }
@@ -1717,7 +1705,7 @@ export function apply(ctx, config) {
   }
 
   /** `sendToConversation` 的实际发送步骤（调用方已保证同一会话串行）。 */
-  async function sendParts(conversation, text, human, quote, intent, at) {
+  async function sendParts(conversation, text, human, quote, at) {
     const pieces = replyPieces(text, human);
     // 「昵称 → QQ 号」的名单在一次发送里只造一遍：几个分段共用同一份，也保证同一次回复里
     // 同名的解析结果一致。
@@ -1758,8 +1746,9 @@ export function apply(ctx, config) {
         }));
       }
       // 引用只挂第一个**文字**气泡：图段永远不挂（§6.6），整轮只有图时引用自然被丢弃。
+      // 被回复的那条本身只有表情时也不引用（见 `quoteHead`）。
       const head = piece.kind === 'text' && !firstTextSeen
-        ? quoteHead(conversation, { quote, intent })
+        ? quoteHead(conversation, { quote })
         : undefined;
       const atHere = piece.kind === 'text' && atPending ? atSegments : [];
       if (piece.kind === 'text') firstTextSeen = true;
@@ -1782,25 +1771,7 @@ export function apply(ctx, config) {
           atPending = false;
           continue;
         }
-        // 插话轮的锚点是**必须**的（§7.1）：引用发不出去就退化成 @ 说话人，再不行才裸文本。
-        // 宁可有指向地弱一点，也不要一句没有来由的话 —— 但只对插话轮这么做，别的轮次失败就算了。
-        if (head?.type === 'reply' && intent === 'interject' && quote.userId.length > 0) {
-          report('warn', `${describeConversation(conversation)}: 插话的引用发不出去，退化成 @ 说话人`);
-          const fallback = [{ type: 'at', data: { qq: quote.userId } }, ...atHere, ...segments];
-          if (await sendOne(conversation, fallback)) {
-            sentAny = true;
-            atPending = false;
-            continue;
-          }
-        }
-        if (head !== undefined && intent === 'interject') {
-          report('warn', `${describeConversation(conversation)}: 插话的引用与 @ 都发不出去，改为裸文本`);
-          if (await sendOne(conversation, [...atHere, ...segments])) {
-            sentAny = true;
-            atPending = false;
-            continue;
-          }
-        }
+        // 引用发不出去就算了：没有任何轮次是「必须有锚点」的（插话也一样，见 `quoteHead`）。
         return sentAny;
       }
       let bytes;
@@ -1856,7 +1827,7 @@ export function apply(ctx, config) {
    * 发提醒的固定文案：原样、不分气泡、不清标点、不加打字延迟。
    *
    * 为什么不复用 `sendToConversation(..., { human: true })`：提醒是「到点必须说出口」的
-   * 承诺，气泡掷骰与标点清洗都可能改变它，拟人延迟还会让它晚几秒。文本走
+   * 承诺，气泡并条与标点清洗都可能改变它，拟人延迟还会让它晚几秒。文本走
    * `chunkText` 只按协议上限分段；@ 只挂在第一段。
    *
    * @returns `{ ok, retryable, reason }`：断线可重试，其余按失败处理。
@@ -1889,7 +1860,6 @@ export function apply(ctx, config) {
     const conversation = targetConversation(task.type, task.targetId);
     const ok = await sendToConversation(conversation, text, {
       human: true,
-      intent: 'reminder',
       at: task.mentions,
     });
     return ok === false ? { ok: false, retryable: true, reason: 'send failed' } : { ok: true };
@@ -2093,37 +2063,33 @@ export function apply(ctx, config) {
   /**
    * 本轮回复第一个**文字**气泡上的「指向」段（引用 / @）。
    *
-   * 三条规则，顺序不能反：
-   *   1. **插话轮强制引用锚点**（`interjectQuote`，§7.1）：不再看 `replyStyle: auto`
-   *      的漂移判断 —— 那个判断在「紧接着回」时恰好不引用，而插话几乎总是紧接着回，
-   *      于是群里看到一句没头没尾的话。引用的是 `admit` 时快照下来的**具体 message_id**；
+   * 规则按顺序：
+   *   1. **被回复的那条只有表情时不引用**（`quote.emoji`）：引用块会把那张表情再贴一遍，
+   *      看着像在郑重地回复一张图；`replyStyle: 'at'` 不受影响（它只认 `userId`）；
    *   2. `replyStyle: quote` / `at` 照旧；
    *   3. `auto` 只在「我回的那条后面又出现了消息」时才引用 —— **包括我自己刚发出去的话**
    *      （上一轮的回复、复读、主动搭话）：紧挨着回时引用是纯噪音，一轮问答本来就看得出来
    *      在回谁；被后来的话挤远了才需要点名，不然看的人对不上话头。
    *
+   * 「这一轮为什么轮到它」（插话 / 补一句 / 主动）**不再影响指向**：插话轮也走同一套
+   * `replyStyle` 规则，没有「必须有锚点」这回事。
+   *
    * @param conversation - 目标会话。
-   * @param options.quote - 被回复消息的 `{ messageId, userId, seq }`。
-   * @param options.intent - 这一轮为什么轮到它（见 `speech-policy.js`）。
+   * @param options.quote - 被回复消息的 `{ messageId, userId, seq, emoji }`。
    * @returns 要挂在前面的段；不需要指向时 undefined。
    */
-  function quoteHead(conversation, { quote, intent } = {}) {
+  function quoteHead(conversation, { quote } = {}) {
     const target = quote ?? { messageId: '', userId: '', seq: 0 };
     if (conversation.type !== 'group') return undefined;
-    if (intent === 'interject' && settings.interjectQuote) {
-      if (target.messageId.length > 0) return { type: 'reply', data: { id: target.messageId } };
-      // 锚点没取到（撤回 / 实现不支持）时退化成 @ 说话人：有个指向总比裸奔好。
-      if (target.userId.length > 0) return { type: 'at', data: { qq: target.userId } };
-      return undefined;
-    }
-    if (intent === 'interject' && target.userId.length > 0) return { type: 'at', data: { qq: target.userId } };
+    // 引用一张表情没有意义（见第 1 条）；@ 不在此列。
+    const quotable = target.emoji !== true;
     const style = settings.replyStyle;
     if (style === 'auto') {
       const drifted = typeof target.seq === 'number' && chatter.anchor(conversation.id) > target.seq;
-      if (!drifted || target.messageId.length === 0) return undefined;
+      if (!quotable || !drifted || target.messageId.length === 0) return undefined;
       return { type: 'reply', data: { id: target.messageId } };
     }
-    if (style === 'quote' && target.messageId.length > 0) return { type: 'reply', data: { id: target.messageId } };
+    if (style === 'quote' && quotable && target.messageId.length > 0) return { type: 'reply', data: { id: target.messageId } };
     if (style === 'at' && target.userId.length > 0) return { type: 'at', data: { qq: target.userId } };
     return undefined;
   }
@@ -2623,7 +2589,13 @@ export function apply(ctx, config) {
         // 回复指向：引用被回复的那条消息（`reply` 段要 message_id），或 @ 回提问者（要 QQ 号）。
         // `seq` 是这条消息在群里的进度，供 `auto` 判断「等我回话时有没有人（包括我自己）
         // 又说了话」。三样都在这里一次性快照：发送在几秒后，那时会话记录和群里的进度都可能变了。
-        quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: chatter.anchor(groupId) },
+        // `emoji`：这条本身只有表情，回复它时不挂引用（见 `quoteHead`）。
+        quote: {
+          messageId: String(event.message_id ?? ''),
+          userId: String(event.user_id ?? ''),
+          seq: chatter.anchor(groupId),
+          emoji: isEmojiOnlyMessage(message),
+        },
       };
     }
     if (!settings.privateChat) return undefined;
@@ -2655,8 +2627,13 @@ export function apply(ctx, config) {
       continued: false,
       intent: 'addressed',
       displayName,
-      // 私聊始终是 plain，`seq` 只是让 quote 的字段形状保持一致。
-      quote: { messageId: String(event.message_id ?? ''), userId: String(event.user_id ?? ''), seq: 0 },
+      // 私聊始终是 plain，`seq` / `emoji` 只是让 quote 的字段形状保持一致。
+      quote: {
+        messageId: String(event.message_id ?? ''),
+        userId: String(event.user_id ?? ''),
+        seq: 0,
+        emoji: isEmojiOnlyMessage(message),
+      },
     };
   }
 
@@ -3903,7 +3880,7 @@ export function apply(ctx, config) {
       }
       if (entries.length === 0) return;
       // 这一轮为什么轮到它：必须在渲染正文**之前**算出来（插话轮的正文要用它），
-      // 写进会话记录，提示词（场景 / 人设的场景段）与发送侧（插话强制引用）读同一个值。
+      // 写进会话记录，提示词（场景 / 人设的场景段）读它。
       const intent = batchIntent(batch);
       conversation.pendingIntent = intent;
       // 插话轮的投递文案与普通回复**不同**（§7.2）：`kaguya: 晚上吃啥` 会让模型以为
@@ -4179,8 +4156,8 @@ export function apply(ctx, config) {
    * 整个 owner 对象搬到 `turnOwners`，`turn/end` 又原样交给 `sendToConversation`），
    * 所以一次遍历就三处生效 —— 反过来说，**别复制新对象**，那会让清引用只清到一处。
    *
-   * 只清 `messageId`、留着 `userId` 是刻意的：`quoteHead` 本来就有这条降级（「锚点没取到
-   * （撤回 / 实现不支持）时退化成 @ 说话人」），于是四档 `replyStyle` 全部自动正确。
+   * 只清 `messageId`、留着 `userId` 是刻意的：`replyStyle: 'at'` 只认 `userId`，照常 @；
+   * `auto` / `quote` 在没有 `messageId` 时自然退回裸文本，不会发出一个注定失败的引用段。
    *
    * 不这么做会怎样（真实链路）：`sendOne` 失败时只记一条 warn 并返回 false，
    * `sendParts` 的循环见到 false 就 `return` —— 这条回复**剩下的气泡一起不发**，
@@ -4586,7 +4563,7 @@ export function apply(ctx, config) {
       report('info', `→ ${conversation.key}: ${reply.slice(0, 120)}（主动）`);
       // 同一条「拟人」通道：拆短句 + 打字延迟。主动搭话没有可指向的消息，quote 为空。
       markReplied(owner);
-      void sendToConversation(conversation, reply, { human: true, quote: owner.quote, intent: owner.intent ?? 'proactive' });
+      void sendToConversation(conversation, reply, { human: true, quote: owner.quote });
       return;
     }
     report('info', `→ ${conversation.key}: ${reply.slice(0, 120)}（${intent}）`);
@@ -4596,7 +4573,7 @@ export function apply(ctx, config) {
     // 自动回复走「拟人」通道：拆短句 + 打字延迟 + 引用/@ 对方。
     // 等这一轮真的发完再挂「过一会儿也许补一句」的定时器（见 scheduleChime）：
     // 补一句必须排在它这次回复**之后**，而且得等打完字才算「对方安静了」。
-    void sendToConversation(conversation, reply, { human: true, quote: owner.quote, intent }).then(() => {
+    void sendToConversation(conversation, reply, { human: true, quote: owner.quote }).then(() => {
       scheduleChime(conversation, owner);
     });
   });
@@ -4940,7 +4917,7 @@ export function apply(ctx, config) {
     const entries = Object.values(styleProse.prose).reduce((sum, lines) => sum + lines.length, 0);
     report(
       'info',
-      `表达规则来自 ${styleDoc.path}（${sections} 节 / ${entries} 条）；气泡：最多 ${styleParams.bubbleChatMax} 个，第二个 ${Math.round(settings.bubbleContinueChance * 100)}% 起、每个 ×${settings.bubbleContinueDecay}${settings.bubbleGamble ? '' : '（掷骰已关）'}；聊天型门槛 ${chatMaxChars || '不限'} 字`,
+      `表达规则来自 ${styleDoc.path}（${sections} 节 / ${entries} 条）；气泡：模型写几条发几条（没有条数上限）；聊天型门槛 ${chatMaxChars > 0 ? `${chatMaxChars} 字` : '关（全部按聊天型）'}`,
     );
   } else {
     report('info', '表达规则用内置那份（写 .qq-persona/STYLE.md 可以换成自己的）');

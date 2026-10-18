@@ -1,26 +1,20 @@
 /**
- * 表达层：「怎么说」—— 气泡计划、标点清洗、图片与引用的关系。
+ * 表达层：「怎么说」—— 标点清洗、聊天型 / 信息型判定、图片与引用的关系。
  *
  * 这一层刻意分成两半，分界线是**能不能机械判断**：
  *
- *   - **能机械执行的放这里**（引擎）：一条回复发几个气泡、句末那个「。」要不要剥、
- *     图要不要挂引用、信息型回复不掷骰。判据是「字符串 + 数字 → 布尔」，不改语义。
- *   - **只能模型判断的写进 `STYLE.md`**（散文）：逗号多不多、这句话该不该分两拍、
+ *   - **能机械执行的放这里**（引擎）：句末那个「。」要不要剥、这条回复算聊天型还是
+ *     信息型、图要不要挂引用。判据是「字符串 + 数字 → 布尔」，不改语义。
+ *   - **只能模型判断的写进 `STYLE.md`**（散文）：发几条、逗号多不多、这句话该不该分两拍、
  *     是非题要不要追问、损人的分寸。这些交给提示词与 few-shot，**绝不做字符串替换**。
  *
- * 为什么「连续短句」是发送前一次计划，而不是每条发完再判（§3.2 的结论）：
- * 每条判一次意味着每条一次模型调用（成本 ×3、还会往会话里塞伪造消息），或者一次
- * 异步判定 —— 而发送队列是串行的，异步判定要么插进队列（乱序）要么另起一条队列
- * （交错），而且 OneBot 没有「对方正在输入」信号，追加判定拿不到任何新信息。
- * 计划时的骰子没有这个窗口期：用户观感等价，却确定、可测、零额外调用。
+ * 发几条由模型自己写：插件**不改条数、不并条、不掷骰** —— 模型写几行就发几行。
+ * 之前的「掷骰决定发到第几个」与「超出的并进最后一条」都已经删掉：那两套都会让
+ * 模型写出来的话少一截，私聊里看起来就是它没回（真实事故）。
  *
  * @module @qqbot/dsh-plugin-qq/style
  */
 import { createDocReader } from './docfile.js';
-
-/** 追问钩子的概率加成：以问号结尾的气泡更难被掷掉（封顶 0.9）。 */
-const HOOK_BOOST = 1.3;
-const HOOK_CAP = 0.9;
 
 /**
  * 内置的表达契约：`STYLE.md` 不存在时用它。
@@ -156,7 +150,7 @@ const STYLE_LINT_RULES = [
   {
     code: 'STRUCTURE',
     pattern: /(分点|列点|列成几点|条理|总结一下|要总结|概括|完整的答复|完整答复|先说[^。；\n]{0,6}再)/,
-    why: '和气泡计划、「不写列表」的硬规则对打，模型会平均成一段书面语',
+    why: '和「不写列表 / 一次别发太多条」的硬规则对打，模型会平均成一段书面语',
     fix: '改成「先给结论、要展开就接着说」，别要求分点或总结',
   },
   {
@@ -248,9 +242,7 @@ export function renderStyleContract({ prose, params, scene, imageAllowed = false
   const general = prose?.general ?? [];
   if (general.length > 0) lines.push(...general.map((line) => `- ${line}`));
   // 机器参数：每条都是「模型照做得到、引擎也真的执行」的硬规则。
-  if (Number(params?.bubbleChatMax) > 0) {
-    lines.push(`- 一条回复最多 ${params.bubbleChatMax} 个气泡（超出的并进最后一个）；聊天型回复发几个由插件决定，你只管把想说的按气泡写开。`);
-  }
+  // 「发几条」不在这里、也不在配置里：模型自己写，插件不加条数上限、不改写换行。
   if (params?.stripShortPeriod === true) {
     lines.push(`- 短句（不超过 ${params.shortPeriodMaxChars} 字）句末不要写「。」—— 插件也会替你剥掉；问号、感叹号、省略号照常用。`);
   }
@@ -264,71 +256,25 @@ export function renderStyleContract({ prose, params, scene, imageAllowed = false
   }
   const sceneLines = scene === 'private' ? (prose?.privateChat ?? []) : (prose?.group ?? []);
   if (sceneLines.length > 0) lines.push(...sceneLines.map((line) => `- ${line}`));
-  if (params?.interjectQuote === true) {
-    lines.push('- 群里插话那一轮，插件会引用你要接的那句话；你只管接住它，不用自己点名。');
-  }
   return lines;
 }
 
 /**
  * 这一轮回复算「聊天型」还是「信息型」。
  *
- * 判据是**内容**而不是长度：要贴代码 / 列步骤 / 解释一件事的回复不该被骰子吞掉，
- * 而闲聊再长也还是闲聊。这里能给引擎的只有长度这个代理指标，所以门槛可配
- * （`burstSingleMaxChars` 优先，否则 `bubbleGambleMaxChars`）。
+ * 现在只用来决定「发送途中对方又说话了，要不要停下来」：聊天型剩下的气泡不再发，
+ * 信息型（贴代码 / 列步骤 / 解释一件事）整条讲完。条数本身不设上限 —— 模型写几条发几条。
+ * 门槛可配（`burstSingleMaxChars`，0 = 全部按聊天型）。
  *
  * @param {string} text - 整轮回复正文（含标记也照算，长一点更安全）。
  * @param {object} options - `chatMaxChars`：超过它就算信息型；`<= 0` = 全部按聊天型。
  * @returns {'chat'|'informational'}
  */
-export function classifyReply(text, { chatMaxChars = 80 } = {}) {
+export function classifyReply(text, { chatMaxChars = 100 } = {}) {
   const max = Number(chatMaxChars) || 0;
   if (max <= 0) return 'chat';
   const length = String(text ?? '').replace(/\s+/g, '').length;
   return length > max ? 'informational' : 'chat';
-}
-
-/**
- * 气泡计划（§6.4 的核心算法）：**发送前一次**决定这一轮发到第几个气泡。
- *
- * 不变量（都写进了 test/style.test.mjs）：
- *   1. 第一个气泡永远发 —— 绝不出现「话说一半、连开头都没有」；
- *   2. 前缀性质：不会出现「发了第 1、3 条，跳过第 2 条」；
- *   3. 含图段不掷：只要这一轮有图，全部按原顺序发送（图不会被骰子吞掉，
- *      图前后的文字也不会被拆开 —— 顺序语义优先）；
- *   4. 信息型不掷：总长超过门槛、`gamble` 关着、`humanize` 关着时原样发；
- *   5. 概率递减：第 2 个 `chance`、第 3 个 `chance × decay`、第 4 个再乘一次；
- *   6. 追问钩子加保：第 i 个气泡以问号结尾时概率 ×1.3（封顶 0.9）——
- *      那是把对话接下去的关键，别让它总被掷掉；
- *   7. 可复现：`rng` 由调用方注入，测试传固定序列。
- *
- * @param {object[]} pieces - 已拆好的分段（`{ kind: 'text'|'image', text? }`）。
- * @param {object} options
- * @param {boolean} options.gamble - 总开关（`bubbleGamble`）。
- * @param {number} options.chance - 第二个气泡的保留概率。
- * @param {number} options.decay - 每多一个乘一次。
- * @param {'chat'|'informational'} options.mode - {@link classifyReply} 的结果。
- * @param {() => number} [options.rng] - 随机源（默认 `Math.random`）。
- * @returns {object[]} 要真正发出去的前缀子集。
- */
-export function planBubbles(pieces, { gamble = true, chance = 0.55, decay = 0.5, mode = 'chat', rng = Math.random } = {}) {
-  const list = Array.isArray(pieces) ? pieces : [];
-  if (list.length <= 1) return list;
-  if (gamble !== true || mode !== 'chat') return list;
-  if (list.some((piece) => piece?.kind === 'image')) return list;
-  const base = Math.min(1, Math.max(0, Number(chance)));
-  const decayRate = Math.min(1, Math.max(0, Number(decay)));
-  let keep = 1;
-  for (let index = 1; index < list.length; index += 1) {
-    // 递减：第 2 个用 base，第 3 个 base×decay，以此类推。
-    let probability = base * decayRate ** (index - 1);
-    if (/[？?]\s*$/.test(String(list[index]?.text ?? ''))) {
-      probability = Math.min(HOOK_CAP, probability * HOOK_BOOST);
-    }
-    if (!(rng() < probability)) break;
-    keep = index + 1;
-  }
-  return list.slice(0, keep);
 }
 
 /**

@@ -154,6 +154,39 @@ export function isStickerSegment(segment) {
 }
 
 /**
+ * 这条消息是不是「只有表情，没有一个字」。
+ *
+ * 只有一个用途：**回复它时不挂引用**。引用一段纯表情，QQ 会把那张表情在引用块里再贴
+ * 一遍 —— 看的人只会觉得它在郑重其事地回一张图，而表情本来就只是一个反应。带文字的
+ * 消息不算（文字才是那个可以「接」的话头，引用它是有意义的）。
+ *
+ * 表情按**协议字段**认（`mface` / `sub_type` 非 0 / `emoji_id` / `face`），不看渲染后的
+ * 占位符；`reply` / `at` 这类段落是元信息，不影响「这条消息里有没有字」的判断。
+ *
+ * @param message - OneBot 的 `message` 字段（通常是消息段数组；字符串形态一律当普通消息）。
+ * @returns 只有表情时为 true。
+ */
+export function isEmojiOnlyMessage(message) {
+  if (!Array.isArray(message) || message.length === 0) return false;
+  let emoji = false;
+  for (const segment of message) {
+    const type = segment?.type;
+    if (type === 'text') {
+      if (String(segment?.data?.text ?? '').trim().length > 0) return false;
+      continue;
+    }
+    if (type === 'reply' || type === 'at') continue;
+    if (isStickerSegment(segment) || type === 'face') {
+      emoji = true;
+      continue;
+    }
+    // 图 / 语音 / 视频 / 文件 / 卡片这些是「有内容的东西」，不算表情。
+    return false;
+  }
+  return emoji;
+}
+
+/**
  * 判断消息段数组里是否 @ 了某个确定的 QQ 号。
  * 用于群消息的 mention 触发判定。
  * @param message - OneBot 的 `message` 字段。

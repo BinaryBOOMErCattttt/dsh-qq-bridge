@@ -58,7 +58,7 @@
 告诉你文件存在时哪一项不生效、哪一项照常叠加。注意人设现在优先读
 `cwd/.qq-persona/PERSONA.md`：那个文件存在时 `persona` 这一项会被忽略（日志里有一条 info），
 见[人格与表达](persona-style.md#人格与表达personamd--stylemd)。「表达」tab 里的机器参数按
-**气泡 / 标点 / 群聊 / 私聊** 分了小标题，散文（`STYLE.md`）与参数互不解析。
+**标点 / 私聊** 分了小标题，散文（`STYLE.md`）与参数互不解析。
 
 保存时发生的事，值得先知道：
 
@@ -155,13 +155,13 @@
 | `humanize` | `true` | 自动回复是否拆成几条短消息 + 加打字延迟；`false` = 一条整段发出 |
 | `burstMaxChars` | `60` | 把一行长句拆开时的单条目标长度；`0` = 不按长度拆（换行仍然分条） |
 | `burstMaxParts` | `3` | 单行长句最多拆成几条；超出部分并进该行最后一条 |
-| `burstMaxMessages` | `0` | 一轮回复最多发几条消息（换行分出来的也算）：`1` = 永远只发一条，全并进这一条；`0` = 不限（换行 = 分条）。聊天型回复还要再过一次 `bubbleChatMax` 那个硬上限，取两者较小的 |
-| `burstSingleMaxChars` | `100` | **聊天型 / 信息型的门槛**（去掉空白算）：不超过它就按聊天处理、走 `bubbleGamble` 的气泡计划；超过就按信息型完整发送。`0` = 用 `bubbleGambleMaxChars`。想要「闲聊永远一条」请用 `bubbleChatMax: 1` + `bubbleGamble: false`（旧行为） |
+| `burstMaxMessages` | `0` | 一轮回复最多发几条消息（换行分出来的也算）：`1` = 永远只发一条，全并进这一条；`0` = 不限（默认）。这是唯一保留的条数上限，默认关着 —— 关着时模型写几条就发几条 |
+| `burstSingleMaxChars` | `100` | **聊天型 / 信息型的门槛**（去掉空白算）：不超过它就按聊天型处理 —— 发送途中对方又说话了，剩下的气泡不再发；超过就按信息型完整发完。`0` = 全部按聊天型。条数本身不设上限 |
 | `readDelayMs` | `800` | 发出第一条前的「读消息」基础延迟（毫秒） |
 | `charsPerSecond` | `15` | 模拟打字速度（字符/秒），用来按字数算延迟 |
 | `minDelayMs` / `maxDelayMs` | `300` / `5000` | 单条消息前延迟的上下限（毫秒） |
 | `delayJitter` | `0.4` | 延迟的随机抖动比例（0 = 固定延迟） |
-| `replyStyle` | `auto` | 群聊回复的指向：`auto` 只在中途又出现消息（包括机器人自己发的那几条）时引用 / `quote` 引用被回复的那条 / `at` @ 对方 / `plain` 直接发；只挂在第一条上 |
+| `replyStyle` | `auto` | 群聊回复的指向：`auto` 只在中途又出现消息（包括机器人自己发的那几条）时引用 / `quote` 引用被回复的那条 / `at` @ 对方 / `plain` 直接发；只挂在第一条上。被回复的那条**本身只有表情时不引用**（引用块会把那张图再贴一遍），`at` 不受影响 |
 | `persona` | `''` | **旧人设（回退用）**：整段替换内置的「群友口吻」段落（可以写多行）；空 = 用内置的那份。设置页里它在「人格」tab 的「人格与提示词（PERSONA.md 优先）」区块里、折进「兼容」、用多行框改，排在人设文件那几个参数**后面** —— 只要 `personaFile` 指向的文件存在且能解析，这一项就不生效 |
 | `instructions` | `''` | 额外要求：可以写多行，追加到 QQ 会话系统提示末尾；与内置口吻叠加，不替换任何东西 |
 | `personaFile` | `.qq-persona/PERSONA.md` | 人设文件（相对 `cwd`，必须落在 `cwd` 内）：身份 / 背景 / 性格（底色 + 点缀）/ 场景，见[人格与表达](persona-style.md#人格与表达personamd--stylemd)。留空或文件不存在 = 用 `persona`，再没有就用内置 |
@@ -169,14 +169,8 @@
 | `personaSceneOverlays` | `true` | 是否按场景叠加人设里的「私聊 / 群聊 / 主动搭话 / 被戳一戳」四段；`false` = 四场景共用一套（排查用） |
 | `styleFile` | `.qq-persona/STYLE.md` | 表达规则文件（相对 `cwd`）：气泡、标点、表情、私聊 / 群聊的散文；留空/不存在 = 只用内置契约 |
 | `styleMaxChars` | `2000` | 表达规则文件最多读多少字符 |
-| `bubbleGamble` | `true` | 聊天型回复是否按气泡计划掷骰（第一个永远发）；`false` = 模型写几个发几个 |
-| `bubbleContinueChance` | `0.55` | 第二个气泡被保留的概率；以「？」结尾的追问气泡 ×1.3（封顶 0.9） |
-| `bubbleContinueDecay` | `0.5` | 每多一个气泡，保留概率乘一次这个系数（第二个 55%、第三个 27.5%） |
-| `bubbleGambleMaxChars` | `80` | 超过这么多字就按信息型完整发送、不掷骰；`burstSingleMaxChars` 填了正数时以它为门槛 |
-| `bubbleChatMax` | `3` | 聊天型回复最多几个气泡（硬上限）：超出的并进最后一个，不截断内容 |
 | `stripShortPeriod` | `true` | 短气泡句末的「。」是否在发送前剥掉；只动句末唯一的一个「。」，不碰「！？…～」、不碰句中、不碰长气泡 |
 | `shortPeriodMaxChars` | `40` | 「短气泡」的字数门槛（去掉空白算） |
-| `interjectQuote` | `true` | 群聊插话轮是否**强制引用**它要接的那一句（引用失败退化成 @ 说话人）；关掉则按 `replyStyle` |
 | `privateAfterthought` | `true` | 私聊补一句：回完对方、对方安静一小会儿后，最多再开一轮看还有没有想补充的（可 SKIP）。**不搭 `proactive` 那趟车**，见[私聊补一句](proactive.md#私聊补一句l2默认开) |
 | `privateAfterthoughtChance` | `0.3` | 私聊补一句的概率 |
 | `privateAfterthoughtIdleMs` | `15000` | 对方安静多久之后才考虑补一句（毫秒，按 `delayJitter` 抖动） |

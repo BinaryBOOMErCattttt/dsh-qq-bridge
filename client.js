@@ -295,7 +295,7 @@ window.__ModuleLoader__.load({
     //
     // `fields` 的顺序就是渲染顺序（这是设计的一部分：人设页把「文件优先」的三个参数
     // 摆在已失效的旧 `persona` 前面）。前缀组沿用 schema 顺序。
-    // `subs` 只是组内小标题（表达页的 气泡 / 标点 / 群聊 / 私聊），不参与归属判断。
+    // `subs` 只是组内小标题（表达页的 标点 / 私聊），不参与归属判断。
 
     const SECTIONS = [
       {
@@ -340,28 +340,17 @@ window.__ModuleLoader__.load({
         fields: [
           'styleFile',
           'styleMaxChars',
-          'bubbleGamble',
-          'bubbleContinueChance',
-          'bubbleContinueDecay',
-          'bubbleGambleMaxChars',
-          'bubbleChatMax',
           'stripShortPeriod',
           'shortPeriodMaxChars',
-          'interjectQuote',
           'privateAfterthought',
           'privateAfterthoughtChance',
           'privateAfterthoughtIdleMs',
           'privateAfterthoughtDailyMax',
         ],
-        // 散文（文件路径）在上，机器参数按「气泡 / 标点 / 群聊 / 私聊」分段：
-        // 这几组开关语义不同，摊成一串会看不出谁管谁。
+        // 散文（文件路径）在上，机器参数按「标点 / 私聊」分段：
+        // 这两组开关语义不同，摊成一串会看不出谁管谁。气泡条数不在这里（由模型按 STYLE.md 决定）。
         subs: [
-          {
-            title: '气泡',
-            fields: ['bubbleGamble', 'bubbleContinueChance', 'bubbleContinueDecay', 'bubbleGambleMaxChars', 'bubbleChatMax'],
-          },
           { title: '标点', fields: ['stripShortPeriod', 'shortPeriodMaxChars'] },
-          { title: '群聊', fields: ['interjectQuote'] },
           {
             title: '私聊',
             fields: [
@@ -511,12 +500,8 @@ window.__ModuleLoader__.load({
       personaFile: '人设文件（优先）',
       personaSceneOverlays: '按场景叠加人设四段',
       styleFile: '表达规则文件（优先）',
-      bubbleContinueChance: '第二个气泡的概率',
-      bubbleContinueDecay: '每多一个气泡的保留系数',
-      bubbleGambleMaxChars: '聊天型字数门槛',
       stripShortPeriod: '短气泡剥句末句号',
       shortPeriodMaxChars: '短气泡字数门槛',
-      interjectQuote: '插话强制引用锚点',
       pokeReply: '被戳时是否回应',
       pokeReplyChance: '回戳的概率',
       privateAfterthought: '私聊补一句',
@@ -639,7 +624,7 @@ window.__ModuleLoader__.load({
       return [...rows].sort((a, b) => rankOf(a) - rankOf(b) || schemaIndex.get(a.key) - schemaIndex.get(b.key));
     }
 
-    /** 这一项上方要不要来一个小标题（表达页的 气泡 / 标点 / 群聊 / 私聊）。 */
+    /** 这一项上方要不要来一个小标题（表达页的 标点 / 私聊）。 */
     function subTitleOf(section, key) {
       for (const sub of section.subs ?? []) {
         if (!sub.fields.includes(key)) continue;
@@ -743,7 +728,6 @@ window.__ModuleLoader__.load({
       styleMaxChars: formatChars,
       burstMaxChars: formatChars,
       burstSingleMaxChars: formatChars,
-      bubbleGambleMaxChars: formatChars,
       shortPeriodMaxChars: formatChars,
       digestMaxChars: formatChars,
       // 本地小时
@@ -759,11 +743,9 @@ window.__ModuleLoader__.load({
       activeTalkChance: formatPercent,
       activeTalkChanceStep: formatPercent,
       activeTalkChanceMax: formatPercent,
-      bubbleContinueChance: formatPercent,
       privateAfterthoughtChance: formatPercent,
       // 倍率
       activeGroupBatchScale: formatScale,
-      bubbleContinueDecay: formatScale,
     };
 
     /** 显式豁免集合：后缀命中、但换算后反而不如原值直观的字段（目前没有）。 */

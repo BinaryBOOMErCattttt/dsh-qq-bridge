@@ -28,7 +28,7 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
 | `allowTools` | `[]`（不限制） | 17 个工具名 | 默认收窄到「只读文件 + 检索 + 联网 + 十个 `qq_*`」；`qq` 预设里的 `write` / `edit` 默认拿不到 |
 | `activeFollow` | `false` | `true` | 被叫到之后，窗口内同一个人接着说话也算数（还要过抽卡）；群里聊热了会进入多人搭话 |
 | `proactive` | `false` | `true` | 冷场后会自己开口（仍有 7 道闸，安静阈值 45 分钟） |
-| `burstSingleMaxChars` | `0`（用 80） | `100` | ≤100 字按聊天型走气泡计划，超过的按信息型完整发送 |
+| `burstSingleMaxChars` | `0`（用 80） | `100` | ≤100 字按聊天型处理（发送途中对方接话就停），超过的按信息型完整发送 |
 | `recallAddressed` | `answer` | `drop` | 被 @ 的消息撤回后**真的不回**（原本是「照常答、只是不引用」） |
 | `recallPrivate` | `false` | `true` | 私聊撤回也处理（还没投给模型的那条不回） |
 
@@ -60,6 +60,12 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
 
 ### 行为变化
 
+- **插话不再强制引用锚点**：`interjectQuote` 这一项删了（默认值一直是「开」，等于所有人都在用）。
+  群里插话那一轮和其它轮次走**同一套** `replyStyle` 规则；引用发不出去时也不再退化成 @ 说话人
+  —— 没有任何一轮是「必须有锚点」的。
+- **被回复的那条只有表情时不引用**：一条消息里只有表情包 / 商城表情 / 系统表情、一个字都没有时，
+  回复它不挂 `reply` 段（引用块会把那张图再贴一遍）。带文字的消息照常引用（文字才是可以「接」的
+  话头）；`replyStyle: 'at'` 不受影响（它 @ 的是人）。判据是新加的纯函数 `isEmojiOnlyMessage`。
 - **攒批窗口默认从 1.2 秒放到 2 秒**（`batchWindowMs: 1200 → 2000`）：1.2 秒常常只够接住
   「同一口气连发的两句」，群里几个人前后脚 @ 时第三句还是会掉到下一轮。要更快就自己调小，
   `0` 仍然是「来一条回一条」。`batchMaxWaitMs` 的上限逻辑不变（小于窗口时按窗口算）。
@@ -92,6 +98,9 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
 
 ### 修复
 
+- **气泡不再随机丢内容、也不再被并条**：私聊里模型写了「答案 + 追问」两个气泡，掷骰没掷中时
+  第二个会被直接丢掉，看起来就是它没回（真实事故：「面吧，什么面都行」只发出前半句）。现在
+  **掷骰机制与「超出的并进最后一条」都删了**：模型写几条就发几条，插件不改条数、不并条。
 - **表情目录带完整路径注入**：`STICKERS.md` 的「已收藏」条目以前只给「名字（含义）」，
   模型得自己猜扩展名（`.jpg` / `.gif` 混放），猜错时发送侧找不到文件，群里收到一句
   「那张表情我这儿没有」（真实事故：`敲盆.gif` 被写成 `敲盆.jpg`）。现在注入
@@ -156,7 +165,7 @@ if 里拆成可单独测试、可单独回滚的模块。**升级前请读「BRE
   - **数据不删**：`.qq-jm/` 里的旧 PDF、`.venv/` 里的 jmcomic 依赖都原样留着。要清就显式跑
     `node scripts/ops.mjs cleanup jm --apply`（只删 `.qq-jm/`，先列文件再生效，绝不碰 `.venv`）。
 - **`burstSingleMaxChars` 语义变了**：从「短回复强制并成一条」变成「聊天型 / 信息型的门槛」。
-  想要旧行为（闲聊永远一条）请用 `bubbleChatMax: 1` + `bubbleGamble: false`。
+  想要条数上限可以显式设 `burstMaxMessages`（默认 0 = 不限）。
 - **短气泡句末的「。」会在发送前被剥掉**（`stripShortPeriod`，默认开）。只动句末唯一的一个
   「。」；问号、感叹号、省略号、句中句号都不碰。
 - **图片不再挂引用**：整轮只有图时引用直接丢弃，有文字时引用只挂第一个**文字**气泡。
@@ -169,10 +178,9 @@ if 里拆成可单独测试、可单独回滚的模块。**升级前请读「BRE
   `PERSONA.md` 时仍然生效；文件存在时它被忽略并记一条 info（避免两套人设叠加）。
   文件写坏（半截、只剩标题）时退回上一版，再退回配置 / 内置人设 —— **人设写坏绝不让机器人不说话**。
 - **`style.js` + `cwd/.qq-persona/STYLE.md`**：表达只写「怎么说」——气泡、标点、表情、私聊 / 群聊。
-  机器参数（`bubble*` / `stripShortPeriod` / `interjectQuote`）在配置里，散文与参数互不解析。
-- **气泡计划**：一轮回复在**发送前**掷一次骰，决定发到第几个气泡（第一个永远发；
-  第二个 55%，之后每个 ×0.5；以问号结尾的追问钩子 ×1.3 封顶 0.9）。含图段不掷、信息型不掷
-  （超过门槛就完整发送），所以「要讲清楚的事」不会被骰子吞掉。发送途中对方又说话了，
+  机器参数（`burst*` / `stripShortPeriod` / `interjectQuote`）在配置里，散文与参数互不解析。
+- **气泡条数**：模型写几条就发几条，插件**没有**掷骰 / 概率、**没有**条数上限、也不把多出来的
+  并进最后一条。`burstMaxMessages` 是唯一可选的条数上限（默认 0 = 关）。发送途中对方又说话了，
   聊天型剩下的气泡就不再发（信息型该讲完还得讲完）。
 - **私聊补一句（L2，默认开）**：回完对方、对方安静 15 秒后，最多再开一轮看看有没有想补充的
   （可 SKIP）。它**不搭 `proactive` 那趟车**（那是群里主动开口的总开关），有自己的
@@ -241,12 +249,11 @@ if 里拆成可单独测试、可单独回滚的模块。**升级前请读「BRE
 
 ### 配置
 
-新增 28 项，全部有中文 `.description()` 并在设置页分了组（「表达（STYLE.md / 气泡 / 标点 / 补一句）」
+新增 23 项，全部有中文 `.description()` 并在设置页分了组（「表达（STYLE.md / 气泡 / 标点 / 补一句）」
 与「感知与互动（链接 / 视频 / 戳一戳）」两张新卡片）：
 
 - 人格与表达：`personaFile` / `personaMaxChars` / `personaSceneOverlays` / `styleFile` /
-  `styleMaxChars` / `bubbleGamble` / `bubbleContinueChance` / `bubbleContinueDecay` /
-  `bubbleGambleMaxChars` / `bubbleChatMax` / `stripShortPeriod` / `shortPeriodMaxChars` /
+  `styleMaxChars` / `stripShortPeriod` / `shortPeriodMaxChars` /
   `interjectQuote` / `privateAfterthought` / `privateAfterthoughtChance` /
   `privateAfterthoughtIdleMs` / `privateAfterthoughtDailyMax`
 - 感知与互动：`linkPreview` / `linkPreviewTimeoutMs` / `linkPreviewMaxBytes` /
@@ -266,7 +273,7 @@ if 里拆成可单独测试、可单独回滚的模块。**升级前请读「BRE
   补一句）」，展开时顶上多一行组说明（`personaNote` / `expressionNote`）：文件存在时哪一项不生效、
   机器参数照常叠加。光看字段名看不出这层关系，而这正是重构后最容易踩的坑。
 - **修掉自动标签截出来的半句**：`stripShortPeriod` 原来是「短气泡句末的「」、`pokeReplyChance`
-  是「pokeMode」、`bubbleContinueDecay` / `personaSceneOverlays` / `apiKeyRotate` 等被截成半句。
+  是「pokeMode」、`personaSceneOverlays` / `apiKeyRotate` 等被截成半句。
   补了 `LABEL_OVERRIDES`，并加了一条用例钉住「标签不以 `…` 或 `「` 结尾」。
 - **私聊 / 群聊的「补一句」不再撞名**：`activeChime*` 与 `privateAfterthought*` 原来都叫
   「补一句前的安静时间 / 每天最多补几句」，现在分别标明「群里」「私聊」。
@@ -310,7 +317,7 @@ if 里拆成可单独测试、可单独回滚的模块。**升级前请读「BRE
 
 - 基线从 **321** 变成 **476**：删掉 JM 的 19 条，新增 `persona` / `style` / `speech-policy` /
   `modalities` / `links` / `interactions` / `cognition` / `migrate-cognition` / `ops` 九个纯函数
-  测试文件，以及桥接层的插话锚点 / 准入收紧 / 气泡计划 / 私聊补一句 / 戳一戳 / 链接预览 /
+  测试文件，以及桥接层的插话锚点 / 准入收紧 / 气泡条数与中断 / 私聊补一句 / 戳一戳 / 链接预览 /
   视频封面 / 语音占位等端到端用例。
 - **沙箱里不再有「13 条跳过」**：那 13 条全是为 JM 的真 spawn 准备的探针，随 JM 一起删掉了。
 

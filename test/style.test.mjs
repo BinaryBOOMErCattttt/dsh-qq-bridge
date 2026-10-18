@@ -4,9 +4,9 @@
  * 这一层是「机械能判断的表达规则」，所以每条不变量都值得钉死 —— 它错的时候现象是
  * 「机器人话说一半」或者「该展开的回复被吞掉」，而在真机上极难复现。
  *
- * 重点：气泡计划的七条不变量（第一个必发 / 前缀 / 含图不掷 / 信息型不掷 / 递减 /
- * 钩子加保 / 可复现），标点清洗「能改」与「绝不改」的边界，以及两条「写歪了也不会
- * 静默失效」的约定：解析时未知节并进「总体」、体检（lintStyleDoc）只警告不阻断。
+ * 重点：标点清洗「能改」与「绝不改」的边界、聊天型 / 信息型的门槛，以及两条「写歪了
+ * 也不会静默失效」的约定：解析时未知节并进「总体」、体检（lintStyleDoc）只警告不阻断。
+ * 气泡发几条由模型自己写，`style.js` 里**没有**掷骰 / 随机数。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,21 +20,9 @@ import {
   createStyle,
   lintStyleDoc,
   parseStyleDoc,
-  planBubbles,
   renderStyleContract,
   sanitizeBubble,
 } from '../style.js';
-
-/** 一串固定的随机数，按顺序吐出来 —— 判据要可复现才测得动边界。 */
-function sequence(values) {
-  let at = 0;
-  return () => (at < values.length ? values[at++] : 1);
-}
-
-/** 只有文字的分段。 */
-function texts(...values) {
-  return values.map((text) => ({ kind: 'text', text }));
-}
 
 test('parseStyleDoc：五个节各归各位，段落说明也收进去', () => {
   const { prose, warnings } = parseStyleDoc(`# 表达
@@ -187,11 +175,11 @@ test('createStyle：未知节内容照样生效，warn 只在文件变化时报�
 
 test('renderStyleContract：散文 + 机器参数，按场景选段，不能发图时不提表情包', () => {
   const prose = builtinStyle();
-  const params = { bubbleChatMax: 3, stripShortPeriod: true, shortPeriodMaxChars: 40, interjectQuote: true };
+  const params = { stripShortPeriod: true, shortPeriodMaxChars: 40 };
   const group = renderStyleContract({ prose, params, scene: 'group', imageAllowed: false });
-  assert.ok(group.some((line) => line.includes('最多 3 个气泡')));
+  assert.ok(!group.some((line) => /一条回复最多 \d+ 个气泡/.test(line)), '插件不该在提示词里写气泡数上限');
   assert.ok(group.some((line) => line.includes('不超过 40 字')));
-  assert.ok(group.some((line) => line.includes('引用你要接的那句话')));
+  assert.ok(!group.some((line) => line.includes('引用你要接的那句话')), '插话不再强制引用，不该再有这条承诺');
   assert.ok(group.some((line) => line.includes('接不住就不接')), '群聊场景要选群聊那段');
   // 「行，」「好，」「嗯，」开场是硬性规则（index.js 的 hardRules），**不在**这份可被
   // STYLE.md 覆盖的散文里 —— 放在这里，部署者删掉那一条就等于把它关掉了。
@@ -216,48 +204,6 @@ test('classifyReply：超过门槛算信息型，门槛 <= 0 时全按聊天型'
   // 空白不算字数：排版不该把一条闲聊顶到信息型那一侧。
   assert.equal(classifyReply(`${'好 '.repeat(40)}`, { chatMaxChars: 40 }), 'chat');
   assert.equal(classifyReply('随便多长都算聊天', { chatMaxChars: 0 }), 'chat');
-});
-
-test('planBubbles：第一个气泡永远发，其余按前缀保留', () => {
-  const pieces = texts('在的', '刚吃完饭', '你呢');
-  // 全部掷中：三条都发。
-  assert.equal(planBubbles(pieces, { chance: 1, decay: 1, rng: () => 0 }).length, 3);
-  // 全部没掷中：只发第一条。
-  assert.deepEqual(planBubbles(pieces, { chance: 1, decay: 1, rng: () => 1 }), [pieces[0]]);
-  // 第二个中、第三个不中：前缀是 1、2，绝不会变成 1、3。
-  assert.deepEqual(planBubbles(pieces, { chance: 1, decay: 1, rng: sequence([0, 1]) }), pieces.slice(0, 2));
-});
-
-test('planBubbles：概率按 decay 递减（第 2 个 0.55、第 3 个 0.275）', () => {
-  const pieces = texts('一', '二', '三');
-  // 掷 0.3：第二个（0.55）留下，第三个（0.275）被拒。
-  assert.equal(planBubbles(pieces, { chance: 0.55, decay: 0.5, rng: sequence([0.3, 0.3]) }).length, 2);
-  // 掷 0.2：两个都留下。
-  assert.equal(planBubbles(pieces, { chance: 0.55, decay: 0.5, rng: sequence([0.2, 0.2]) }).length, 3);
-});
-
-test('planBubbles：追问钩子加保（×1.3，封顶 0.9）', () => {
-  const pieces = texts('在的', '你呢？');
-  // 0.55 的基准上，理论概率 0.715：掷 0.7 时普通气泡会被拒。
-  assert.equal(planBubbles(texts('在的', '刚吃完'), { chance: 0.55, rng: () => 0.7 }).length, 1);
-  assert.equal(planBubbles(pieces, { chance: 0.55, rng: () => 0.7 }).length, 2);
-  // 封顶 0.9：基准 1.0 ×1.3 会被夹到 0.9，所以掷 0.95 应当被拒、掷 0.85 应当留下。
-  assert.equal(planBubbles(texts('在的', '你呢？'), { chance: 1, rng: () => 0.95 }).length, 1);
-  assert.equal(planBubbles(texts('在的', '你呢？'), { chance: 1, rng: () => 0.85 }).length, 2);
-  assert.equal(planBubbles(texts('在的', '你呢？'), { chance: 0.4, rng: () => 0.6 }).length, 1, '0.4×1.3=0.52，掷 0.6 该停');
-});
-
-test('planBubbles：含图段不掷，整轮原样发（图不会被骰子吞掉）', () => {
-  const pieces = [{ kind: 'text', text: '给你' }, { kind: 'image', source: '.qq-stickers/笑死.gif' }, { kind: 'text', text: '这个' }];
-  assert.deepEqual(planBubbles(pieces, { chance: 0, decay: 0, rng: () => 1 }), pieces);
-});
-
-test('planBubbles：信息型 / 关掉总开关 / 只有一个气泡时原样发', () => {
-  const pieces = texts('一', '二');
-  assert.deepEqual(planBubbles(pieces, { gamble: false, rng: () => 1 }), pieces);
-  assert.deepEqual(planBubbles(pieces, { mode: 'informational', rng: () => 1 }), pieces);
-  assert.deepEqual(planBubbles(texts('只有一个'), { rng: () => 1 }).length, 1);
-  assert.deepEqual(planBubbles(undefined, { rng: () => 1 }), []);
 });
 
 test('sanitizeBubble：短气泡剥句末「。」，长气泡不剥', () => {

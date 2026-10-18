@@ -11,7 +11,7 @@
  * 把页面展开成节点树，断言设置页的那批契约（清单见 `client.js` 顶部注释）：
  *
  *   1. 注册位置与注入面；
- *   2. 141 个字段在 7 个 tab 的合集里恰好各出现一次、不落「其它」；
+ *   2. 135 个字段在 7 个 tab 的合集里恰好各出现一次、不落「其它」；
  *   3. 每个分组恰属一个 tab（`tabOf` 对未知分组返回 undefined）；
  *   4. 控件映射：布尔 → `Switch`、枚举 → `<select>`、数字 / 文本 → `<input>`（官方字段行
  *      几何）、长文本 → `textarea`；工具条里的搜索框才是 primitives 的 `Input`；
@@ -386,7 +386,7 @@ function fieldsIn(tree) {
   return map;
 }
 
-/** 依次点过全部 tab，收集每个字段那一行（用来做「141 个字段各自的控件」这类断言）。 */
+/** 依次点过全部 tab，收集每个字段那一行（用来做「135 个字段各自的控件」这类断言）。 */
 function allFields(session) {
   const found = new Map();
   mountTree(session);
@@ -497,7 +497,7 @@ test('字段覆盖：schema 里每一项都上了页面、都有标签、都不�
   }
 });
 
-test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来是 141', () => {
+test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来是 135', () => {
   const { mod } = mount();
   const fields = mod.describeFields(new z(SCHEMA_JSON()));
 
@@ -528,10 +528,10 @@ test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来
       .length;
   assert.deepEqual(
     Object.fromEntries(mod.TABS.map((tab) => [tab.id, countOf(tab)])),
-    { connect: 12, session: 23, persona: 19, group: 29, reminder: 11, perception: 32, memory: 15 },
+    { connect: 12, session: 23, persona: 13, group: 29, reminder: 11, perception: 32, memory: 15 },
     '字段数按设计 §3.1 分布',
   );
-  assert.equal(fields.length, 141, '合计 141 项');
+  assert.equal(fields.length, 135, '合计 135 项');
 });
 
 test('定时任务：提醒页最上面有一块只读列表，取数路径与 Host 路由一致', () => {
@@ -646,7 +646,7 @@ test('表单投影：7 个 tab 覆盖全部字段，每行带草稿状态与来�
   assert.equal(state.tabs.length, 7);
   assert.equal(state.shell.writable, true);
   const rows = state.tabs.flatMap((tab) => tab.sections.flatMap((section) => section.rows));
-  assert.equal(rows.length, 141, '投影必须覆盖全部字段');
+  assert.equal(rows.length, 135, '投影必须覆盖全部字段');
   for (const tab of state.tabs) {
     for (const section of tab.sections) {
       assert.ok(section.title.length > 0, `${section.id} 的区块标题不能空`);
@@ -662,10 +662,10 @@ test('表单投影：7 个 tab 覆盖全部字段，每行带草稿状态与来�
   }
 });
 
-test('控件映射：32 个布尔是 Switch、8 个枚举是 select、长文本是 textarea', () => {
+test('控件映射：30 个布尔是 Switch、8 个枚举是 select、长文本是 textarea', () => {
   const session = mount();
   const fields = allFields(session);
-  assert.equal(fields.size, 141, '七个 tab 加起来必须刚好是 141 行（每行只渲染一次）');
+  assert.equal(fields.size, 135, '七个 tab 加起来必须刚好是 135 行（每行只渲染一次）');
 
   const kinds = new Map();
   for (const [key, field] of fields) {
@@ -687,7 +687,7 @@ test('控件映射：32 个布尔是 Switch、8 个枚举是 select、长文本�
 
   const tally = {};
   for (const kind of kinds.values()) tally[kind] = (tally[kind] ?? 0) + 1;
-  assert.deepEqual(tally, { boolean: 32, choice: 8, long: 2, input: 99 }, '按 schema 的类型分布');
+  assert.deepEqual(tally, { boolean: 30, choice: 8, long: 2, input: 95 }, '按 schema 的类型分布');
 
   // 数字框带 `inputMode="numeric"`；列表行在输入框下面给 Pill 预览。
   assert.equal(controlIn(fields.get('proactiveChance'), isInput).props.inputMode, 'numeric');
@@ -849,9 +849,7 @@ test('重构新增的字段在设置页上有像样的短标签（不截成半�
   assert.equal(label('personaFile'), '人设文件（优先）');
   assert.equal(label('personaSceneOverlays'), '按场景叠加人设四段');
   assert.equal(label('stripShortPeriod'), '短气泡剥句末句号');
-  assert.equal(label('interjectQuote'), '插话强制引用锚点');
   assert.equal(label('pokeReplyChance'), '回戳的概率');
-  assert.equal(label('bubbleContinueDecay'), '每多一个气泡的保留系数');
   assert.equal(label('apiKeyRotate'), '每天轮换 API key');
   assert.equal(label('endpoint'), 'OneBot WebSocket 地址');
 
@@ -937,7 +935,7 @@ test('人格页：文件参数在上、旧 persona 折进「兼容」、额外�
   assert.equal(nodes(section, (node) => node.props?.className === 'qq-sectionNote').length, 1);
 });
 
-test('表达页：机器参数按 气泡 / 标点 / 群聊 / 私聊 分了小标题', () => {
+test('表达页：机器参数按 标点 / 群聊 / 私聊 分了小标题（气泡数不设上限）', () => {
   const session = mount();
   mountTree(session);
   const tree = openTab(session, '人格');
@@ -946,7 +944,7 @@ test('表达页：机器参数按 气泡 / 标点 / 群聊 / 私聊 分了小标
   assert.equal(textOf(nodes(expression, (node) => node.type === 'h3')[0]), '表达（STYLE.md / 气泡 / 标点 / 补一句）');
 
   const subTitles = nodes(expression, (node) => node.props?.className === 'qq-subTitle').map((node) => textOf(node));
-  assert.deepEqual(subTitles, ['气泡', '标点', '群聊', '私聊']);
+  assert.deepEqual(subTitles, ['标点', '私聊']);
   const order = nodes(expression, (node) => node.props?.['data-field'] !== undefined).map((node) => node.props['data-field']);
   assert.deepEqual(order.slice(0, 2), ['styleFile', 'styleMaxChars'], '散文（文件）在最前面');
   assert.deepEqual(order.slice(-4), [

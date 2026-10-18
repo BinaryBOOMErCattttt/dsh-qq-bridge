@@ -19,7 +19,7 @@ import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import yaml from 'js-yaml';
 import { Config, apply, inject, liveConfig, parseApiKeyPool, sessionIdFor, withinActiveHours } from '../index.js';
-import { blankMessageLabel, collectMedia, isStickerSegment, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
+import { blankMessageLabel, collectMedia, isEmojiOnlyMessage, isStickerSegment, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
 import { REMINDER_ROUTE_PATH } from '../reminders.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
@@ -639,10 +639,6 @@ async function boot(config = {}, hostOptions = {}, onebotOptions = {}) {
   // 用 Config() 过一遍真实 schema，测试里传的配置因此也顺带验证了默认值合并。
   // 延迟一律压到 0：拟人节奏不该让测试多等几秒，需要验证时序的用例自己覆盖。
   // 攒批窗口同理：默认关掉，要验证「几个人同时 @ 只回一轮」的用例自己给一个小窗口。
-  //
-  // **气泡掷骰也默认关掉**：默认配置下它按概率决定发 1~3 个气泡，那会让「这条回复应该
-  // 是两条消息」这类断言随机翻车。气泡计划本身由专门那一组用例用概率 0/1 钉死
-  // （见 `the bubble plan sends a 1..N prefix of the chat bubbles`）。
   apply(host.ctx, Config({
     endpoint: onebot.endpoint,
     cwd,
@@ -650,7 +646,6 @@ async function boot(config = {}, hostOptions = {}, onebotOptions = {}) {
     minDelayMs: 0,
     maxDelayMs: 0,
     batchWindowMs: 0,
-    bubbleGamble: false,
     ...config,
   }));
   // 先登记再启动：`start()` 跑的是 `ctx.effect` 的回调（OneBot 连接、摘要与主动说话的
@@ -2268,31 +2263,30 @@ test('burstMaxMessages: 1 collapses a whole reply into a single message', async 
   }
 });
 
-// 用例十六·补二：`burstSingleMaxChars` 现在的语义是「聊天型 / 信息型的门槛」。
-// 聊天型走气泡计划（发几个由骰子/配置决定），信息型照常拆 —— 不再强制并成一条。
-// 想要旧行为（闲聊永远一条）就是 `bubbleChatMax: 1` + `bubbleGamble: false`（§11.2）。
-test('burstSingleMaxChars is the chat/informational threshold, not a force-one switch', async () => {
+// 聊天型 / 信息型都按模型写的条数发：没有条数上限，也没有「超出的并进最后一条」。
+test('chat and informational replies both send every line the model wrote', async () => {
   const options = {
     burstMaxChars: 12,
     burstMaxParts: 3,
-    burstMaxMessages: 0, // 长回复不封顶：该拆几条拆几条
+    burstMaxMessages: 0,
     burstSingleMaxChars: 20,
-    bubbleChatMax: 1,
-    bubbleGamble: false,
     readDelayMs: 0,
     minDelayMs: 0,
     maxDelayMs: 0,
     delayJitter: 0,
   };
 
-  // 聊天型 + 旧行为兼容档：换行写的两段并成一条（内容还在，只是并条）。
+  // 聊天型（去掉空白 7 字 ≤ 门槛 20）：两行就是两条，不会被并成一条。
   const short = await boot(options);
   try {
     short.onebot.push(privateMessage('在吗'));
     const agent = await until(() => short.host.list.created[0], 'the Agent');
     completeTurn(short.host, agent, '在的\n刚吃完');
-    await until(() => sentTexts(short.onebot, 'send_private_msg')[0], 'the single reply');
-    assert.deepEqual(sentTexts(short.onebot, 'send_private_msg'), ['在的 刚吃完']);
+    const sent = await until(() => {
+      const list = sentTexts(short.onebot, 'send_private_msg');
+      return list.length === 2 ? list : undefined;
+    }, 'both chat bubbles');
+    assert.deepEqual(sent, ['在的', '刚吃完']);
   } finally {
     await short.onebot.close();
   }
@@ -2315,52 +2309,20 @@ test('burstSingleMaxChars is the chat/informational threshold, not a force-one s
   }
 });
 
-// 气泡计划（§6.4）：聊天型回复在**发送前**掷一次骰，决定发到第几个。
-// 用概率 1 / 0 把骰子钉死，别让用例靠运气。
-test('the bubble plan sends a 1..N prefix of the chat bubbles', async () => {
-  const base = { readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0 };
-  const reply = '在的\n刚吃完\n你呢';
-
-  // 概率 1：三个气泡都发（bubbleChatMax 默认 3）。
-  const all = await boot({ ...base, bubbleGamble: true, bubbleContinueChance: 1, bubbleContinueDecay: 1 });
+// 没有掷骰、也没有条数上限：模型写五条就发五条（旧版本默认最多 3 条，超出的并进最后一条）。
+test('bubble count has no cap: five lines become five messages', async () => {
+  const { onebot, host } = await boot({ readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0 });
   try {
-    all.onebot.push(privateMessage('在吗'));
-    const agent = await until(() => all.host.list.created[0], 'the first Agent');
-    completeTurn(all.host, agent, reply);
+    onebot.push(privateMessage('在吗'));
+    const agent = await until(() => host.list.created[0], 'the Agent');
+    completeTurn(host, agent, '在的\n刚吃完\n你呢\n要不要出去走走\n顺便吃个饭');
     const sent = await until(() => {
-      const list = sentTexts(all.onebot, 'send_private_msg');
-      return list.length === 3 ? list : undefined;
-    }, 'three bubbles');
-    assert.deepEqual(sent, ['在的', '刚吃完', '你呢']);
+      const list = sentTexts(onebot, 'send_private_msg');
+      return list.length === 5 ? list : undefined;
+    }, 'all five bubbles');
+    assert.deepEqual(sent, ['在的', '刚吃完', '你呢', '要不要出去走走', '顺便吃个饭']);
   } finally {
-    await all.onebot.close();
-  }
-
-  // 概率 0：只发第一个（第一个永远发 —— 绝不出现「话说一半、连开头都没有」）。
-  const one = await boot({ ...base, bubbleGamble: true, bubbleContinueChance: 0 });
-  try {
-    one.onebot.push(privateMessage('在吗'));
-    const agent = await until(() => one.host.list.created[0], 'the second Agent');
-    completeTurn(one.host, agent, reply);
-    await until(() => sentTexts(one.onebot, 'send_private_msg')[0], 'the single bubble');
-    assert.deepEqual(sentTexts(one.onebot, 'send_private_msg'), ['在的']);
-  } finally {
-    await one.onebot.close();
-  }
-
-  // 关掉骰子：模型写几个就发几个。
-  const off = await boot({ ...base, bubbleGamble: false });
-  try {
-    off.onebot.push(privateMessage('在吗'));
-    const agent = await until(() => off.host.list.created[0], 'the third Agent');
-    completeTurn(off.host, agent, reply);
-    const sent = await until(() => {
-      const list = sentTexts(off.onebot, 'send_private_msg');
-      return list.length === 3 ? list : undefined;
-    }, 'all bubbles with the gamble off');
-    assert.deepEqual(sent, ['在的', '刚吃完', '你呢']);
-  } finally {
-    await off.onebot.close();
+    await onebot.close();
   }
 });
 
@@ -2498,10 +2460,43 @@ test("auto reply style also counts the bot's own replies in between", async () =
   }
 });
 
+// 用例十七之四：被回复的那条本身只有表情时不引用，带文字的表情照旧引用。
+test('a reply never quotes a message that is only an emoji', async () => {
+  const { onebot, host } = await boot({ replyStyle: 'quote' });
+  try {
+    // 只有表情（系统表情 face 段）：引用块会把那张表情再贴一遍，所以裸文本回。
+    onebot.push(groupMessage(
+      [{ type: 'at', data: { qq: SELF_ID, name: '小助手' } }, { type: 'face', data: { id: '13' } }],
+      { messageId: 4250 },
+    ));
+    const agent = await untilInbox(host, 1, 'the emoji-only message');
+    completeTurn(host, agent, '？', 1);
+    assert.equal(await until(() => sentTexts(onebot)[0], 'the plain reply'), '？');
+
+    // 文字 + 表情：文字才是可以接的话头，引用照旧。
+    onebot.push(groupMessage(
+      [
+        { type: 'at', data: { qq: SELF_ID, name: '小助手' } },
+        { type: 'text', data: { text: '笑死' } },
+        { type: 'face', data: { id: '13' } },
+      ],
+      { messageId: 4251 },
+    ));
+    await until(() => agent.inbox.length === 2, 'the second message');
+    completeTurn(host, agent, '确实', 2);
+    const sent = await until(() => sentTexts(onebot)[1], 'the quoted reply');
+    assert.deepEqual(sent, [
+      { type: 'reply', data: { id: '4251' } },
+      { type: 'text', data: { text: '确实' } },
+    ]);
+  } finally {
+    await onebot.close();
+  }
+});
+
 // 用例十七之三：一次回复里的换行拆成多条独立消息，且引用只挂在第一条上。
 test('a multiline group reply becomes separate messages with the quote only on the first', async () => {
-  // 关掉气泡掷骰：这条用例验的是「换行 = 分条 + 引用只挂第一个文字气泡」，
-  // 骰子会决定「发到第几个」，那是另一组用例（见 bubble plan 那一组）。
+  // 这条用例验的是「换行 = 分条 + 引用只挂第一个文字气泡」；条数上限与并条是另一组用例。
   const { onebot, host } = await boot({ replyStyle: 'quote' });
   try {
     onebot.push(mention('在吗', { messageId: 4242 }));
@@ -2758,6 +2753,36 @@ test('isStickerSegment only trusts structural fields', () => {
   assert.equal(isStickerSegment({ type: 'image' }), false);
   assert.equal(isStickerSegment({ type: 'face', data: { id: '13' } }), false);
   assert.equal(isStickerSegment(undefined), false);
+});
+
+// 用例十九之四：被回复的那条「是不是只有表情」—— 回复它时不挂引用的判据。
+test('isEmojiOnlyMessage trusts structural fields and requires the absence of text', () => {
+  // 只有表情：表情包 / 商城表情 / 系统表情，都算。
+  assert.equal(isEmojiOnlyMessage([{ type: 'image', data: { sub_type: 1 } }]), true);
+  assert.equal(isEmojiOnlyMessage([{ type: 'image', data: { emoji_id: '42' } }]), true);
+  assert.equal(isEmojiOnlyMessage([{ type: 'mface', data: { emoji_id: '42' } }]), true);
+  assert.equal(isEmojiOnlyMessage([{ type: 'face', data: { id: '13' } }]), true);
+  // @ / reply 段是元信息，不影响「有没有字」的判断：@ 完发一张表情仍然只是表情。
+  assert.equal(isEmojiOnlyMessage([
+    { type: 'at', data: { qq: '100000002' } },
+    { type: 'face', data: { id: '13' } },
+  ]), true);
+  assert.equal(isEmojiOnlyMessage([
+    { type: 'reply', data: { id: '9' } },
+    { type: 'image', data: { sub_type: 1 } },
+  ]), true);
+  // 带文字的就不算：文字才是可以「接」的话头，引用它是有意义的。
+  assert.equal(isEmojiOnlyMessage([{ type: 'text', data: { text: '笑死' } }, { type: 'face', data: { id: '13' } }]), false);
+  // 纯空白文字不算「有字」：空白不是可以接的话头。
+  assert.equal(isEmojiOnlyMessage([{ type: 'text', data: { text: '   ' } }, { type: 'face', data: { id: '13' } }]), true);
+  // 普通图片 / 语音 / 纯文字 / 字符串形态：都不是「只有表情」。
+  assert.equal(isEmojiOnlyMessage([{ type: 'image', data: { sub_type: 0 } }]), false);
+  assert.equal(isEmojiOnlyMessage([{ type: 'image', data: {} }]), false);
+  assert.equal(isEmojiOnlyMessage([{ type: 'text', data: { text: '[CQ:face,id=13]' } }]), false);
+  assert.equal(isEmojiOnlyMessage([{ type: 'text', data: { text: '在吗' } }]), false);
+  assert.equal(isEmojiOnlyMessage('[CQ:face,id=13]'), false);
+  assert.equal(isEmojiOnlyMessage([]), false);
+  assert.equal(isEmojiOnlyMessage(undefined), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -5309,7 +5334,7 @@ test('napcatAutoConfig writes the missing server with a backup and asks for a Na
 // `repairNapcat` → `action: 'ok'`（幂等、不产生第二个备份）覆盖。
 
 
-// ---- 插话的锚点与准入（§7.1 / §7.3 / §7.5）------------------------------------
+// ---- 插话的准入与指向（§7.1 / §7.3 / §7.5）------------------------------------
 
 /**
  * 起一个「群已经聊热、插话必中」的实例，并让它被 @ 过一次（这样会话记录与一对一窗口都在）。
@@ -5330,7 +5355,7 @@ async function bootHotGroup(overrides = {}) {
   return { onebot, host, agent };
 }
 
-test('插话轮强制引用锚点：紧挨着回也照样引用它要接的那一句', async () => {
+test('插话轮不再强制引用锚点：紧挨着回时按 replyStyle: auto 走裸文本', async () => {
   const { onebot, host, agent } = await bootHotGroup();
   // 两个不同的人把热度顶过门槛（第 4 句才够热），第三句是那条被接的锚点。
   onebot.push(groupText('晚上吃啥', { messageId: 7101, userId: 10001, card: 'soyo' }));
@@ -5342,11 +5367,9 @@ test('插话轮强制引用锚点：紧挨着回也照样引用它要接的那�
 
   completeTurn(host, agent, '火锅吧', 2);
   const sent = await until(() => sentTexts(onebot)[1], 'the interject reply');
-  // 引用的必须正是锚点那条 message_id（不是「最近一条」，也不受 replyStyle: auto 的漂移判断影响）。
-  assert.deepEqual(sent, [
-    { type: 'reply', data: { id: '7102' } },
-    { type: 'text', data: { text: '火锅吧' } },
-  ]);
+  // 以前插话轮会强制挂 `reply` 段（引用 7102），不管漂移判断。那条规矩连同
+  // `interjectQuote` 一起删了：插话与别的轮次走同一套 `replyStyle`，紧挨着回时不引用。
+  assert.equal(sent, '火锅吧');
 });
 
 test('插话不接 @ 了别人的消息（那是别人在跟别人说话）', async () => {

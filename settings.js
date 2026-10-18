@@ -126,16 +126,8 @@ export function createSettings(config, defaultCwd) {
   const personaSceneOverlays = config.personaSceneOverlays !== false;
   const styleFile = trimmed(config.styleFile);
   const styleMaxChars = Math.max(200, Math.floor(Number(config.styleMaxChars) || 0) || 2000);
-  const bubbleGamble = config.bubbleGamble !== false;
-  // 概率三项：夹到 0~1，NaN 保持 NaN（与 activeTalkChance 同口径：NaN 进判据时 `roll < NaN`
-  // 恒假 = 不追加第二个气泡，是比「按随机数乱来」更安全的失败方向）。
-  const bubbleContinueChance = Math.min(1, Math.max(0, Number(config.bubbleContinueChance)));
-  const bubbleContinueDecay = Math.min(1, Math.max(0, Number(config.bubbleContinueDecay)));
-  const bubbleGambleMaxChars = Math.max(0, Math.floor(Number(config.bubbleGambleMaxChars) || 0));
-  const bubbleChatMax = Math.max(1, Math.floor(Number(config.bubbleChatMax) || 0) || 3);
   const stripShortPeriod = config.stripShortPeriod !== false;
   const shortPeriodMaxChars = Math.max(1, Math.floor(Number(config.shortPeriodMaxChars) || 0) || 40);
-  const interjectQuote = config.interjectQuote !== false;
   const privateAfterthought = config.privateAfterthought !== false;
   const privateAfterthoughtChance = Math.min(1, Math.max(0, Number(config.privateAfterthoughtChance)));
   const privateAfterthoughtIdleMs = msOf(config.privateAfterthoughtIdleMs, 15000);
@@ -271,14 +263,8 @@ export function createSettings(config, defaultCwd) {
     personaSceneOverlays,
     styleFile,
     styleMaxChars,
-    bubbleGamble,
-    bubbleContinueChance,
-    bubbleContinueDecay,
-    bubbleGambleMaxChars,
-    bubbleChatMax,
     stripShortPeriod,
     shortPeriodMaxChars,
-    interjectQuote,
     privateAfterthought,
     privateAfterthoughtChance,
     privateAfterthoughtIdleMs,

@@ -29,8 +29,8 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 - **长期记忆**：消息落盘成转录，定时由**独立摘要会话**照 `.dsh/skills/` 的 skill 整理；聊天时用
   `qq_transcript` / `qq_memory` 查，`learn-meme` / `learn-sticker` / `moegirl` 学梗与查二次元梗
   （见 §4.D）。认知（语言）与表情包（图）是两个文件：`COGNITION.md` / `STICKERS.md`。
-- **人格与表达**：`cwd/.qq-persona/PERSONA.md`（是谁）与 `STYLE.md`（怎么说）热读；气泡计划在
-  发送前一次决定发几个（见 §3 发送链路、§6）。
+- **人格与表达**：`cwd/.qq-persona/PERSONA.md`（是谁）与 `STYLE.md`（怎么说）热读；气泡由模型自己写，
+  插件不改条数、不并条、不掷骰（见 §3 发送链路、§6）。
 - **被撤回的消息**（`recallMode`，默认 `ignore`）：清掉指向已撤回消息的引用（不做会让整条回复
   发不出去），再按配置假装没看到 / 改写成调侃 / 已经回过的补一句（见 §4.I）。
 - **定时提醒**（`reminder`，默认开）：Agent 用 `qq_remind_create` 存一条到点的任务，插件到点直接发
@@ -54,9 +54,9 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 ## 2. 文件地图
 
 ```
-index.js      4938 行  插件本体：运行时状态、事件路由、发送/准入/复读/存表情包/戳一戳/主动说话/活跃对话、连接生命周期
+index.js      4963 行  插件本体：运行时状态、事件路由、发送/准入/复读/存表情包/戳一戳/主动说话/活跃对话、连接生命周期
 persona.js      273 行  `PERSONA.md` 的解析与渲染：身份 / 背景 / 性格（底色 + 点缀）/ 场景；坏文件回退上一版
-style.js        278 行  表达层：气泡计划（发送前掷一次骰）、标点清洗、表达契约渲染；`STYLE.md` 的热读
+style.js        361 行  表达层：聊天型 / 信息型判定、标点清洗、表达契约渲染；`STYLE.md` 的热读（**没有**掷骰 / 随机数）
 speech-policy.js 134 行  「这条群消息该不该进 Agent、以什么身份进」：intent（addressed / continued / interject / none）+ C 路四条排除
 cognition.js    345 行  认知库与表情包目录的**纯解析**：`COGNITION.md` / `STICKERS.md` 的条目、热梗段、目录行
 docfile.js       83 行  cwd 内的热读文档（同步 + `size:mtime` 缓存 + 截断 + 越界拒绝），人设与表达共用
@@ -73,9 +73,9 @@ mention.js      209 行  `[[@昵称]]` → OneBot `at` 段：纯函数解析 + �
 speaking-rules.js 330 行  「什么时候该主动开口」的纯判据（闸门 / 抽卡 / 补一句 / 私聊补一句）：普通入参 → 布尔
 util.js        410 行  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 写边界 / key 池解析与打码 / withinActiveHours 等（完整清单见本节末尾）
 filestore.js   108 行  「原子写 / 尽力而为读」（读不到返回空而不是抛错），记忆、转录、表情包都走它；`writeTextAtomicUtf16` 专给 Windows 那两个产物
-config.js      232 行  配置 schema（**唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段；**根上是 `.volatile()`**（设置页的前提，见 §5.12）
-settings.js    343 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
-client.js     2180 行  **浏览器半侧**（手写 bundle）：把 schema 投影成设置页自己的一页（`settings.section`），7 个 `TABS` / 15 个 `SECTIONS`；保存走 Host 的 settings 写路径（见 §5.12）
+config.js      227 行  配置 schema（**唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段；**根上是 `.volatile()`**（设置页的前提，见 §5.12）
+settings.js    331 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
+client.js     2181 行  **浏览器半侧**（手写 bundle）：把 schema 投影成设置页自己的一页（`settings.section`），7 个 `TABS` / 15 个 `SECTIONS`；保存走 Host 的 settings 写路径（见 §5.12）
 tools.js       943 行  宿主平面工具的**声明**（qq_send_* / qq_poke / qq_save_sticker / qq_list_conversations / qq_transcript / qq_memory / qq_remind_*），依赖由 index.js 显式传入
 memory.js     1414 行  长期记忆子系统：转录落盘、记忆文件读写（两个记忆工具的能力来源）、STICKERS.md 的追加、每日摘要循环；依赖由 index.js 显式传入
 onebot.js      637 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/@ 名单提取）；文本渲染委托 `modalities.js`
@@ -170,7 +170,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 | 配置的取值 | **不在这里**：`settings = createSettings(liveConfig(config), process.cwd())`（第 198 行）之后一律读 `settings.*` | 取默认值/夹紧/去空白都在 `settings.js`；`index.js` 里**没有一处**直接读 `config.xxx`。`liveConfig` 必须调：schema 是根 volatile（§5.12），`apply()` 拿到的是引用 |
 | 运行时状态 | 第 243–534 行 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / **`chatter`**（三本账，见 `chatter.js`；搬出去前叫 `chatterSeq` / `groupChatter` / `quoteSeq`）/ `repeatStates` / `mediaResolutions`（记忆的账已搬去 `memory.js`）/ **`recent`**（「最近看见过什么」，见 §4.I；不落盘）；会话记录里还挂着 `sessionGeneration`（第几轮，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` / `activeInterposeSeq`（插话序号快照）与主动说话、活跃对话的记账（见 `blankConversation`） |
 | Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` `personaLines` `styleLines` `hardRules` | 见 §7。`channelPrompt` 是**槽位化**的：场景 → 人设 → 表达契约 → 记忆/热梗 → 能力 → 额外要求 → **硬性规则（最后）** |
-| 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` `conversationMentions` | 串行队列保证同一会话不乱序；`sendOne` 顺带记 `lastBotSpeakAt`；`replyPieces` 走「拆标记 → 拆条 → **气泡计划 + 标点清洗**」；`quoteHead` 只给第一个**文字**气泡挂指向（图永不挂；插话轮强制引用锚点）；正文里的 `[[@昵称]]` 在 `sendParts` 里换成 `at` 段 |
+| 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendOne` `quoteHead` `conversationMentions` | 串行队列保证同一会话不乱序；`sendOne` 顺带记 `lastBotSpeakAt`；`replyPieces` 走「拆标记 → 拆条 → **标点清洗**」；**没有掷骰 / 随机数 / 条数上限**（模型写几行发几行）；`quoteHead` 只给第一个**文字**气泡挂指向（图永不挂；被回复的那条只有表情时也不引用；没有「插话必须引用」这条规矩）；正文里的 `[[@昵称]]` 在 `sendParts` 里换成 `at` 段 |
 | 会话管理 | `resetConversation` `conversationFor` `sessionIdFor` `resetMarkerDir` `loadConversationResetCounts` `writeConversationResetCount` `refreshSessionGeneration` | `/reset` 开新一轮（**不删旧会话**，代次 +1 并落盘），以及在线会话列表（新一轮时连主动说话的节奏一起清） |
 | 准入与复读 | `admit` `noteChatter` `touchActivity` `rememberAmbient` `registerParticipant` `maybeRepeat` `repeatStep` `sketchOf` `sameCandidate` | 白名单、群触发判定、环境上下文（**顺带登记「谁可以被 @」**）、复读状态机；`admit` 里的 A/C 抽卡与插话准入**收在 `speech-policy.js`**，这里只剩凑入参 + 记账 |
 | 戳一戳 | `handlePoke` `pokeBack` `pokeTodayUsed` | 通知事件（`notice/notify/poke`）；判据在 `interactions.js`，冷却 / 每日上限在会话记录上；回戳只打给戳它的人 |
@@ -507,7 +507,8 @@ notice 分支 ─▶ handleRecall
 - **清引用是正确性**：`quote` 在 `pending` / `submitted` / `turnOwners` 里是**同一个对象**
   （`batchQuote` 取的就是 `admit` 快照那个，所以**别在别处复制新对象**）。不清的话，引用一条
   已撤回消息的回复会在 `sendOne` 失败，而 `sendParts` 见到失败就 `return` —— 整条回复剩下的
-  气泡一起不发。只清 `messageId`、留 `userId`（`quoteHead` 的降级）。
+  气泡一起不发。只清 `messageId`、留 `userId`（`replyStyle: 'at'` 仍要用它，`auto` / `quote` 没
+  有 `messageId` 时自然退回裸文本）。
 - **`noteSeen` 在 `admit` 与所有提前 `return` 之前**；**`action` 记在 `recent` 账上而不是只改
   `pending` 数组**（那一批可能已被 splice 出去、正在 `submitBatch` 里异步下媒体）。
 - **`recalled` / `action` / `submitted` / `replied` 是四种东西，别合一个布尔**；`replied` 只在
@@ -630,7 +631,7 @@ agent 轮在 `index.js`**。
 | 加一个配置项 | `config.js` 的 schema（含中文 `.description()`）+ （需要兜底/夹紧时）`settings.js` 加一行 + docs/configuration.md 的配置表 + `test/settings.test.mjs` 补边界；界面不用改，但要在 `client.js` 的 `SECTIONS` 里给它一段（见 §5.12） |
 | 改 Web UI 设置页（分组 / 标签 / 控件 / 草稿口径） | 只改 `client.js`：`TABS` / `SECTIONS`（含 `subs` 小标题）、`LABEL_OVERRIDES`、`ENUM_LABELS`、`FIELD_HINTS`、`specFor`；版式契约见 `client.js` 顶部注释与 `test/client.test.mjs` |
 | 改提示词 / 人设 | `DEFAULT_PERSONA`（内置兜底）、`channelPrompt` 的槽位、`Config.persona` / `.instructions`；**「是谁」写 `.qq-persona/PERSONA.md`、「怎么说」写 `STYLE.md`**（`persona.js` / `style.js`） |
-| 改气泡数 / 标点 / 追问概率 / 引用规则 | `style.js`（`planBubbles` / `sanitizeBubble` / `renderStyleContract`）+ `Config` 的 `bubble*` / `stripShortPeriod` / `interjectQuote` + `index.js` 的 `replyPieces` / `sendParts` / `quoteHead` |
+| 改气泡数 / 标点 / 引用规则 | 气泡条数由模型按 `STYLE.md` 自己写，插件**不设上限**；标点与中断在 `style.js`（`sanitizeBubble` / `classifyReply` / `renderStyleContract`）+ `Config` 的 `burstSingleMaxChars` / `stripShortPeriod` / `replyStyle` + `index.js` 的 `burstParts` / `replyPieces` / `sendParts` / `quoteHead`（被回复的那条只有表情时不引用：`onebot.js` 的 `isEmojiOnlyMessage`） |
 | 改私聊补一句 | `speaking-rules.js` 的 `privateAfterthoughtAllows` + index.js 的 `scheduleChime` / `runChime` / `chimeNudge` + `Config.privateAfterthought*` |
 | 改群聊「谁该开口」 / 插话 | `speech-policy.js`（`decideGroupTurn` / `interjectExclusion` / `interjectLine`）+ `speaking-rules.js` + index.js 的 `admit` / `submitBatch` / `speakerLine` |
 | 改认知 / 表情包目录 | `cognition.js`（纯解析）+ `memory.js` 的 `catalogState` / `appendSticker` + `tools.js` 的 `qq_save_sticker` + 三个 skill + `scripts/migrate-cognition.mjs` |

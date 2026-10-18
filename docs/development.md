@@ -47,7 +47,7 @@ node --test test\
 > `test/speech-policy.test.mjs`、`test/modalities.test.mjs`、`test/links.test.mjs`、
 > `test/interactions.test.mjs`、`test/cognition.test.mjs`、`test/migrate-cognition.test.mjs`、
 > `test/ops.test.mjs`、`test/reminders.test.mjs`。行为层的新用例在 `test/bridge.test.mjs`：
-> 气泡计划、标点清洗、插话强制锚点、C 路四条排除、私聊补一句、戳一戳、链接预览、
+> 气泡条数与中断、标点清洗、引用指向（表情消息不引用）、C 路四条排除、私聊补一句、戳一戳、链接预览、
 > 视频封面、语音占位、定时提醒（text / agent / SKIP / 超时 / 重启 / 权限）。
 
 ### 改完源码必须重启 Harness

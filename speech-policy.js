@@ -5,7 +5,7 @@
  *
  *   - `addressed`  —— 被叫到（@ / 前缀 / `groupTrigger: all`）；
  *   - `continued`  —— A 路：一对一窗口里，正在跟它聊的那个人接着说；
- *   - `interject`  —— C 路：群里聊热了，抽中插话（**必须有锚点**，见 index.js 的 quoteHead）；
+ *   - `interject`  —— C 路：群里聊热了，抽中插话（这一轮回的是哪条见 `index.js` 的 quoteHead）；
  *   - `none`       —— 不接（只在内部用，调用方据此丢弃这条）。
  *
  * 为什么要把这件事从 `admit` 里搬出来（原先是四十多行 if 套 if）：
