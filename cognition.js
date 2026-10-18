@@ -144,6 +144,9 @@ export function parseCognition(markdown) {
       date: fields.date,
       confidence: fields.confidence.length > 0 ? fields.confidence : CONFIRMED,
       line,
+      // 文件里的行号：长期记忆的检索结果要能给出「出处」（`COGNITION.md#L12`），
+      // 模型据此自己 `qq_memory read` 深挖。解析层提供，别让调用方再数一遍。
+      lineNo: index + 1,
     });
   }
   return { entries, warnings };
@@ -154,10 +157,16 @@ export function parseCognition(markdown) {
  *
  * 「最近」按**首见日期**算，不按它在文件里排第几：条目顺序会被人整理、被合并分节
  * 动过，拿文件位置当时间轴的话，一次排版就等于悄悄换了它每轮记得什么（真实事故：
- * 合并两个同名标题时，谁在最后谁就还在「最近 15 条」里）。没有日期的条目算最旧 ——
- * 手写条目常常不写日期，不能让它挤掉有日期的；同日期按文件顺序、靠后的算更新。
+ * 合并两个同名标题时，谁在最后谁就还在「最近 15 条」里）。
+ *
+ * **没有日期的条目按文件位置参与排序**（越靠后越新），不再一律当最旧：那正是
+ * docs/memory.md「检索式注入」里说的那类事故 —— 34 条里有 17 条没有日期，于是它们一条都进不了
+ * 提示词，哪怕它写得完整、刚才还在群里被用。实现上给无日期条目继承**它前面最近一个
+ * 有日期的条目**的日期，同日期再按文件位置排（靠后的更新）；它前面一个日期都没有时，
+ * 继承文件里最早的那个日期 —— 位置在前，仍然算旧，但不再被整个丢掉。
  *
  * 这也是为什么它不能替代 `qq_memory search` —— 更早的条目仍然在文件里，要查的时候查得到。
+ * 消息里原样出现的梗由检索层（`memory-select.js`）直接捞出来，不看这里的日期顺序。
  *
  * 「置信：存疑」刻意不进：存疑的条目正是那些「大概是这个意思」的猜测，每轮摆在
  * 提示词里会让模型把猜测当事实用。
@@ -172,10 +181,10 @@ export function hotCognitionLines(entries, { limit = 15, maxChars = 1200 } = {})
     .map((entry, index) => ({ entry, index }));
   const cap = Math.max(0, Math.floor(Number(limit) || 0));
   const byRecency = confirmed.slice().sort((a, b) => {
-    const da = a.entry.date ?? '';
-    const db = b.entry.date ?? '';
+    const da = effectiveDate(confirmed, a.index);
+    const db = effectiveDate(confirmed, b.index);
     if (da !== db) return da < db ? 1 : -1;
-    return a.index - b.index;
+    return b.index - a.index;
   });
   // `cap === 0` 时要显式给空数组：`slice(0, -0)` 与 `slice(-0)` 都容易在这里出错。
   // 选完之后按文件顺序渲染：提示词里读起来仍是「先学的在前」，顺序稳定也好核对。
@@ -193,6 +202,48 @@ export function hotCognitionLines(entries, { limit = 15, maxChars = 1200 } = {})
     used += line.length + 1;
   }
   return lines;
+}
+
+/**
+ * 无日期条目的「有效日期」：继承它前面最近一个带日期的条目；前面没有就继承文件里
+ * 最早的那个日期；整个文件都没有日期时返回空串（调用方按位置排）。
+ *
+ * 这个函数是 `hotCognitionLines` 的排序依据，单独抽出来是因为「无日期不再算最旧」
+ * 这条行为需要一个能单测的落点（见 test/cognition.test.mjs 的无日期回归用例）。
+ */
+function effectiveDate(list, index) {
+  let inherited = '';
+  for (const item of list) {
+    if (item.index > index) break;
+    if ((item.entry.date ?? '').length > 0) inherited = item.entry.date;
+  }
+  if (inherited.length > 0) return inherited;
+  for (const item of list) {
+    if ((item.entry.date ?? '').length > 0) return item.entry.date;
+  }
+  return '';
+}
+
+/**
+ * 「词汇表」：**全部**梗的写法（含变体），按文件顺序。
+ *
+ * 它不是热梗段（不给含义、不占热梗预算），只是让模型知道「这个写法存在」——
+ * 听不懂时能主动 `qq_memory search`，这是最便宜的一道保险（设计 §7）。
+ * @param {object[]} entries - {@link parseCognition} 的 `entries`。
+ * @returns {string[]} 去重后的写法数组。
+ */
+export function cognitionVocabulary(entries) {
+  const seen = new Set();
+  const out = [];
+  for (const entry of entries ?? []) {
+    for (const word of [entry.writeup, ...(entry.variants ?? [])]) {
+      const text = String(word ?? '').trim();
+      if (text.length === 0 || seen.has(text)) continue;
+      seen.add(text);
+      out.push(text);
+    }
+  }
+  return out;
 }
 
 /**
@@ -255,6 +306,7 @@ export function parseStickerCatalog(markdown) {
       date: meta.date,
       confidence: meta.confidence.length > 0 ? meta.confidence : CONFIRMED,
       line,
+      lineNo: index + 1,
     });
   }
   return { collected, pending, warnings };

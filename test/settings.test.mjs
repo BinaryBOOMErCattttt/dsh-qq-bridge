@@ -242,3 +242,39 @@ test('定时提醒：默认值、0 = 不限、非法值退回默认', () => {
   assert.equal(settings({ reminderAgentTimeoutMs: 100 }).reminderAgentTimeoutMs, 5000);
   assert.equal(settings({ reminderAgentDailyMax: -1 }).reminderAgentDailyMax, 20);
 });
+
+test('长期记忆 v2 的检索 / 人物 / 归档配置：默认值、0 与非法值各有明确去处', () => {
+  const s = settings();
+  assert.equal(s.memoryPromptChars, 6000);
+  assert.equal(s.memoryRecallK, 12);
+  assert.equal(s.memoryPeopleMax, 20);
+  assert.equal(s.memoryArchive, true);
+  assert.equal(s.memoryArchiveRatio, 0.75);
+  assert.equal(s.memoryVocabHint, true);
+  assert.equal(s.digestRollover, true);
+  assert.equal(s.digestConsolidate, false);
+
+  // 预算地板 200：低于它的「记忆」没有意义；非法值退回默认 6000。
+  assert.equal(settings({ memoryPromptChars: 50 }).memoryPromptChars, 200);
+  assert.equal(settings({ memoryPromptChars: NaN }).memoryPromptChars, 6000);
+  assert.equal(settings({ memoryPromptChars: 0 }).memoryPromptChars, 6000);
+
+  // 取条数有上下界：recallK 至少 1，peopleMax 的 0 是明确的「不注入人物」。
+  assert.equal(settings({ memoryRecallK: 0 }).memoryRecallK, 1);
+  assert.equal(settings({ memoryRecallK: 500 }).memoryRecallK, 100);
+  assert.equal(settings({ memoryPeopleMax: 0 }).memoryPeopleMax, 0);
+  assert.equal(settings({ memoryPeopleMax: -5 }).memoryPeopleMax, 0);
+  assert.equal(settings({ memoryPeopleMax: 999 }).memoryPeopleMax, 200);
+
+  // 滚档阈值夹在 0.1~1：0 会让每次写都滚，>1 则永远不滚。
+  assert.equal(settings({ memoryArchiveRatio: 0 }).memoryArchiveRatio, 0.1);
+  assert.equal(settings({ memoryArchiveRatio: 3 }).memoryArchiveRatio, 1);
+  assert.equal(settings({ memoryArchiveRatio: NaN }).memoryArchiveRatio, 0.75);
+
+  // 三个布尔开关：只有明确的 false / true 才改变默认，非法值不翻转语义。
+  assert.equal(settings({ memoryArchive: false }).memoryArchive, false);
+  assert.equal(settings({ memoryVocabHint: false }).memoryVocabHint, false);
+  assert.equal(settings({ digestRollover: false }).digestRollover, false);
+  assert.equal(settings({ digestConsolidate: true }).digestConsolidate, true);
+  assert.equal(settings({ digestConsolidate: 'yes' }).digestConsolidate, false);
+});

@@ -1,7 +1,11 @@
 # 长期记忆：聊天记录 → 摘要 → 认知
 
-> 每句话落盘、每天摘要、聊天时能查。认知（语言）与表情包（图）是两个文件，
-> 写坏了有护栏与历史备份。实现全在 `memory.js`，读转录前先等写入。
+> 每句话落盘、每天摘要、聊天时按**当前消息检索**后再注入。认知（语言）与表情包（图）
+> 是两个文件，写坏了有护栏与历史备份。实现在 `memory.js`（落盘 / 摘要循环）与
+> `memory-select.js`（记录模型 / 检索 / 滚档的纯函数），读转录前先等写入。
+>
+> 为什么不再是「注入文件开头」：见下面「检索式注入」「scope」「滚档」三节。那几节就是
+> 当初的设计取舍，现在与代码一一对应。
 
 默认开着。三件事：**每一句话都落盘**、**定时把它总结成记忆**、**聊天时随时能查**。
 
@@ -13,10 +17,13 @@ QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写�
             独立「摘要会话」（qq_memory + qq_transcript + skill）
                  │  按 message-digest skill 读转录、写记忆
                  ▼
-  conversations/<slug>/MEMORY.md   这个群的记忆           ┐
-  COGNITION.md                     公共认知：语言梗 / 黑话  ├─ 摘要成 INDEX.md 的一行
-  STICKERS.md                      表情包目录：名字 + 含义  ┘  每次提示词都带上
-  INDEX.md                         短索引
+  conversations/<slug>/MEMORY.md   这个会话的热层记忆（只放还有效的）  ┐
+  conversations/<slug>/archive/YYYY-MM.md  冷层：滚下来的老条目       │ 按当前消息检索
+  PEOPLE.md                        全局人物表（QQ 号为主键）          ├─ 再按节配额打包
+  COGNITION.md                     公共认知：语言梗 / 黑话            │ 进提示词
+  STICKERS.md                      表情包目录：名字 + 含义            │
+  INDEX.md                         短索引（仍然每次带上）             ┘
+  memory.index.json                派生索引：命中次数 / 最近命中（可删可重建）
 ```
 
 **为什么是「摘要」而不是「把聊天记录塞回上下文」**：一个群一天的记录就能撑爆窗口，
@@ -30,10 +37,13 @@ QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写�
 | 路径 | 谁写 | 是什么 |
 |---|---|---|
 | `conversations/<slug>/log/YYYY-MM-DD.jsonl` | 插件 | 原始转录：每条**别人的**消息一行（含没 @ 机器人的群聊） |
-| `conversations/<slug>/MEMORY.md` | 摘要 Agent | 这个会话的长期记忆（人、约定、偏好、在追的东西） |
-| `COGNITION.md` | 摘要 Agent / 聊天中的模型 | 跨会话的公共认知：**只有语言**（梗、黑话、缩写、谐音；键是文字写法含变体） |
+| `conversations/<slug>/MEMORY.md` | 摘要 Agent | 这个会话的**热层**：只放「现在还有效」的人、约定、偏好、在追的事 |
+| `conversations/<slug>/archive/YYYY-MM.md` | 插件（滚档） | **冷层**：热层超过阈值时滚下来的老条目；不进提示词，但 `qq_memory search` 搜得到 |
+| `PEOPLE.md` | 摘要 Agent / 群会话里的模型 | **全局**人物表：QQ 号为主键，名字、别名、角色 / 关系一处一份 |
+| `COGNITION.md` | 摘要 Agent / 群会话里的模型 | 跨会话的公共认知：**只有语言**（梗、黑话、缩写、谐音；键是文字写法含变体） |
 | `STICKERS.md` | `qq_save_sticker` / `qq_rename_sticker` / 摘要 Agent | 表情包目录：名字、画面、含义、场景、**收藏后的文件路径**（改名时那一条跟着文件一起搬） |
-| `INDEX.md` | 摘要 Agent | 「去哪里找什么」的短索引，每次提示词都注入 |
+| `INDEX.md` | 摘要 Agent | 「去哪里找什么」的短索引，仍然每次提示词都注入（≤1500 字兜底） |
+| `memory.index.json` | 插件 | **派生**索引：每条记忆的命中次数与最近命中时间（打分里的 salience / 滚档里的「最不活跃」）。删了能重建，坏了只降级，不影响记忆本身 |
 | `digest.json` | 插件 | 摘要进度（上次摘要时间 + **本地日期**），重启后据此补课、并保证一天至多摘要一次 |
 
 `<slug>` 是会话 key 去掉冒号：`group:100000001` → `group-100000001`。
@@ -41,6 +51,75 @@ QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写�
 落到转录里的消息要**先过一遍准入规则**（私聊开关、群/私聊白名单）—— 记忆不会成为绕过
 白名单的后门。机器人自己发出去的话不进转录：那是它说的话，不是群里的历史（本机 NapCat 的
 `reportSelfMessage` 关着，这些消息其实也不会作为事件回来）。
+
+## 检索式注入：按当前消息挑，不再取文件开头
+
+提示词装配时（`channelPrompt` 的槽 4）不再把 `MEMORY.md` 从第 0 字节截一段，而是：
+
+1. **scope 硬过滤**：候选集里只有 `global` + 这个会话自己的记录。`private:<qq>` 的记录
+   对其他会话**连候选资格都没有**（不是降权、不是排后面）。
+2. **打分**（纯函数，`memory-select.js`）：实体命中（QQ / 昵称 / 别名 / 梗写法）3 分、
+   字符 bigram + IDF 的词汇命中 2 分、最近性 1 分、命中次数与置顶 0.8 分、节先验 0.5 分、
+   过期 -5 分。中文不分词，短查询（≤2 字）退化成 unigram —— 那个说法原样出现在消息里
+   必然命中，这是回归用例。
+3. **按节配额 + round-robin 打包**（`memoryPromptChars`，默认 6000 字）：人物、惯例、
+   在追、事实、认知各取几条，谁也不会把预算吃满。**说话人 / 被 @ 的人**（人物）与
+   **消息里原样出现的梗**是必进的，不看日期。每条都带出处（`MEMORY.md#L23`），
+   模型要细节自己 `qq_memory read`。
+4. **兜底**：没有任何命中时按 pinned / salience / 最近取，**绝不取文件头**。
+
+另外附一行「词汇表」：全部梗的写法（含变体，`memoryVocabHint`），只让模型知道这些写法
+存在，听不懂时能主动去 search —— 这是最便宜的一道保险。
+
+检索查询来自 `conversation.recallQuery`：`submitBatch` 在投递前写入这一批的正文与说话人；
+主动说话 / 补一句 / 提醒这些没有「来消息」的轮次退回到群环境（`ambient` 的最后几条）。
+
+## scope：私聊内容永不升级
+
+认知库与人物表是**全局**的，而私聊里知道的事一旦进去就会在群里被说出来。所以
+「私聊里学到的说法能不能在群里用」有确定答案：**不能**。三层都不给这条路：
+
+| 层 | 做法 |
+|---|---|
+| 存储层 | 文件就是 scope 的边界：`COGNITION.md` / `PEOPLE.md` 只收 `global`；`MEMORY.md` 的 scope 由那个会话决定 |
+| 写入闸门 | 私聊会话对 `COGNITION.md` / `PEOPLE.md` 的任何写请求（write / append / upsert / remove）**直接拒绝**，提示写进本会话的 `MEMORY.md`。摘要 Agent 在私聊的摘要轮里走同一条闸门（它拿不到那两个写通道） |
+| 检索层 | `private:<qq>` / `group:<id>` 的记录在打分**之前**被过滤掉，只对同一个会话可见 |
+
+宿主平面的 Web 主会话不受此限：那是部署者在操作，不是 QQ 消息。
+历史遗留的 `COGNITION.md` 条目无从判定来源，按 `global` 处理。
+
+## 滚档：文件满了不再等于开始忘
+
+`MEMORY.md` 超过 `memoryFileMaxBytes × memoryArchiveRatio`（默认 32KB × 0.75）时：
+
+1. 把最不活跃的条目（最近没被命中、事实日期最旧、文件位置最靠前，且**非置顶**）
+   先 append 到 `archive/YYYY-MM.md`；
+2. 归档写成功之后，才从热层删掉这些行并重写；
+3. `qq_memory search` 的搜索范围包含 `archive/`，`qq_memory list` 也列得出冷层文件。
+
+几条不变量（`archivePlan` 是纯函数，测试钉着）：只减不增；没有可滚的条目（全是置顶）
+时不滚、记一条 warn 让人处理；条目守恒；归档写失败时热层保持原样。
+
+**热层里不写指针。** 「更早的记忆：archive/ 下 14 个文件（2025-01 … 2026-10）」这一行是
+提示词里**现算的聚合行**，长度恒定；逐月明细用 `qq_memory list` 看。指针行会随滚档次数
+增长，几年后就会把正文挤走 —— 那正是这一版要修的病。
+
+「删掉过期的」和「滚到冷层」是两件事：前者是模型判断（`remove` / 更新），后者是机械规则。
+
+## 人物表（PEOPLE.md）
+
+旧版把「人」混在每个群的 `MEMORY.md` 里，跨群就丢（私聊里它不知道群友是谁），这是
+「分不清人」的根源。现在人物单独一份、**QQ 号为主键**：
+
+```markdown
+## 人物
+- kaguya（QQ 100000001）（别名：soyo）｜群主，周六常组织打本｜首见 2026-10-12｜置信：确认
+```
+
+用 `qq_memory` 的 upsert 写（`name` / `qq` / `aliases` / `meaning`）；检索时说话人与
+被 @ 的人命中的人物必进提示词（一人一行，受 `memoryPeopleMax` 约束）。
+首次启用时，插件会从各**群**的 `MEMORY.md` 的「## 人」小节抽取一遍到 `PEOPLE.md`
+（一次性、幂等、只补不覆盖；**不碰私聊**）。
 
 ## 定时摘要怎么跑
 
@@ -73,8 +152,9 @@ QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写�
   `force: true`）；每次写入前还会把旧版本存进 `<memory>/.history/`（每个文件留最近 20 份）。
   **写被限制在 `memoryDir` 之内**（`../`、绝对路径都直接报错），并有单文件字节上限 ——
   QQ 会话因此始终拿不到 `write` / `edit` / `bash`，能力面没有被记忆功能放大。
-- **`INDEX.md` + 本会话的 `MEMORY.md` 每次提示词都注入**（有 15 秒缓存，上限 4KB）：
-  模型一开口就「知道自己记得什么」，而不是先撞一次「不知道」再去查。
+- **记忆按当前消息检索后注入**（见上面「检索式注入」）：`INDEX.md` 仍然每轮带上，
+  `MEMORY.md` / `PEOPLE.md` / `COGNITION.md` 只挑相关的进；没看到的模型会用
+  `qq_memory search` / `qq_transcript search` 去查，提示词里写明了这条出口。
 
 两个工具都在**宿主平面**注册，所以 Web UI 里的主会话也能直接用来翻记录 / 读记忆。
 
@@ -128,10 +208,15 @@ skill 由**预设**发现（不是宿主）：`dsh-web-app` 把宿主的 `skill-
 注入（最多 40 条），模型看含义就能判断该不该发，不用先 `read_image` 猜；路径**原样给全**
 （带上 `.jpg` / `.gif` 扩展名），模型抄进 `[[图片: …]]` 就行 —— 只给名字时它会猜扩展名，
 猜错就是一次「那张表情我这儿没有」（真实事故：`敲盆.gif` 被写成 `敲盆.jpg`）。
-`COGNITION.md` 最近 15 条「置信：确认」的条目作为「最近学的梗」注入（≤1200 字），谐音梗
-不用先 search 再答。
-「最近」按**首见日期**算，不按它在文件里排第几 —— 否则整理一次文件（合并标题、分节）
-就等于悄悄换掉它每轮记得什么。没有日期的条目算最旧，同日期按文件顺序。
+
+`COGNITION.md` 的条目现在有两条进提示词的路：
+
+- **消息里原样出现的说法（含变体）→ 必进**，并带上「怎么用」—— 不看日期、不看它在文件里
+  排第几。这是 §1.2 那个事故的修复：旧实现把没有日期的条目当最旧，34 条里 17 条永远
+  进不了提示词。
+- **「最近学的梗」热段**（最多 15 条 / 1200 字）作为兜底：没有日期的条目现在按**文件位置**
+  参与排序（继承它前面最近一个有日期的条目的日期），不再一律当最旧。
+
 「置信：存疑」的条目**不进**提示词，只能被 `qq_memory search` 到 —— 那是给已经记下的猜测
 留的余地，不是「先写一条再猜」的借口。
 
@@ -143,6 +228,11 @@ qq_memory { action: "upsert", path: "COGNITION.md", name: "蚌埠住了",
             type: "谐音", variants: "绷不住/绷" }
 qq_memory { action: "upsert", path: "STICKERS.md", name: "无语",
             meaning: "无语、懒得吐槽", image: ".qq-stickers/无语.gif" }
+qq_memory { action: "upsert", path: "conversations/group-100000001/MEMORY.md",
+            name: "周五固定开黑", meaning: "晚上八点，别迟到",
+            section: "惯例与偏好", date: "2026-10-18" }
+qq_memory { action: "upsert", path: "PEOPLE.md", name: "kaguya", qq: "100000001",
+            aliases: "soyo/爽世", meaning: "群主，周六常组织打本" }
 ```
 
 `type` 决定落在哪个二级标题：`缩写` / `谐音` / `专名`（游戏、角色、选手、作品）/ `其它`。
@@ -192,3 +282,9 @@ journalctl --user -u qqbot | grep 'qq-bridge: memory'           # 目录、定�
 - **记忆文件越写越乱**：`doctor` 会报 `COGNITION_DUPLICATE_SECTION` / `STICKER_PATH_MISSING` /
   `STICKER_MEDIA_PATH`；下一次用 `upsert` 或整份 `write` 时，重复标题与完全相同的行会在落盘时
   自动合并。
+- **条目「搜得到但提示词里没有」**：先看它是不是刚滚进 `archive/` —— 冷层不进提示词，
+  只参与 search，这是设计如此。`qq_memory list` 能看到冷层文件。
+- **热层一直顶在上限**：确认 `memoryArchive` / `digestRollover` 没关；滚档只搬 pinned
+  以外的条目，如果 `MEMORY.md` 全是人物（置顶），它会记一条 warn 让人处理，而不是硬删。
+- **私聊里学的东西写不进 COGNITION.md**：这是 scope 规则（见上面），不是 bug。写进那个
+  私聊的 `MEMORY.md`；确实是公共知识的，从公开来源写。

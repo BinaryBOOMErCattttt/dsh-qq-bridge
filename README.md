@@ -13,7 +13,7 @@
   聊起来之后免 @ 接话、回完再补一句；别人撤回消息时会清掉引用（默认假装没看到）。
 - **图片与表情包**：能 `read_image` 真的看图；能发表情包；能把你发的表情**存进**自己的收藏目录。
 - **定时提醒**：让它在明早 8 点提醒谁、每周一 @ 谁开会 —— 到点由插件直接发，重启不丢。
-- **长期记忆**：每句话落盘，每天由独立摘要会话整理成「这个群记得什么」，聊天时随时能查。
+- **长期记忆**：每句话落盘，每天由独立摘要会话整理成「这个群记得什么」；聊天时按**当前消息检索**相关条目（含全局人物表与梗），不再只读文件开头，文件满了会滚进 `archive/` 而不是删掉。
 
 ## 它能做什么
 
@@ -27,7 +27,7 @@
 | 图片与表情包 | 看图、发表情、存表情；链接 / 视频 / 语音 / 戳一戳各有下场 | [图片与感知](docs/media.md) |
 | 被撤回的消息 | 清引用是安全层；要不要调侃是配置 | [被撤回的消息](docs/recall.md) |
 | 定时提醒 | 到点发固定文案 / 让模型换语气 / 到点做事，可 @ 人 | [定时提醒](docs/reminders.md) |
-| 长期记忆 | 转录 → 每日摘要 → `MEMORY.md` / `COGNITION.md` / `STICKERS.md` | [长期记忆](docs/memory.md) |
+| 长期记忆 | 转录 → 每日摘要 → `MEMORY.md` / `archive/` / `PEOPLE.md` / `COGNITION.md` / `STICKERS.md` → 检索式注入 | [长期记忆](docs/memory.md) |
 | 工具与能力面 | 自带最小 `qq` 预设 + `allowTools` 白名单 | [工具与能力面](docs/tools.md) |
 | 运维 | `doctor` / `status` / `logs` / `restart`，三套部署共用 | [运维](docs/ops.md) |
 
@@ -90,7 +90,7 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | `allowTools` | 17 个工具 | QQ 会话的工具白名单；默认没有 write / edit / bash |
 | `proactive` | `true` | 允许它在群里主动开口（私聊不会） |
 | `activeFollow` | `true` | 群里聊起来之后免 @ 接话（刻意放松「只在被 @ 时说话」） |
-| `memory` | `true` | 长期记忆：转录 + 每日摘要 + 认知库 + 两个记忆工具 |
+| `memory` | `true` | 长期记忆：转录 + 每日摘要 + 认知库 + 人物表 + 检索式注入 + 两个记忆工具 |
 | `recallMode` | `ignore` | 被撤回的消息：清引用永远做，调侃要显式开 `tease` |
 | `reminder` | `true` | 定时提醒；默认只能提醒自己，@ 别人 / @全体默认关 |
 | `apiKeyRotate` | `true` | 每天 04:00 从 `data/api-keys.txt` 轮换一把探测通过的 key |
@@ -123,7 +123,7 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | [图片、表情包与感知](docs/media.md) | 看图、发表情、存表情、base64、链接 / 视频 / 语音 / 戳一戳 |
 | [被撤回的消息](docs/recall.md) | 三层处理、模式矩阵、配置与实现要点 |
 | [定时提醒](docs/reminders.md) | 三种模式、时间规则、权限与额度、重启/断线/`/reset` |
-| [长期记忆](docs/memory.md) | 转录、每日摘要、认知库、表情包目录、五个 skill |
+| [长期记忆](docs/memory.md) | 转录、每日摘要、检索式注入、冷热分层、人物表、认知库、表情包目录、五个 skill |
 | [会话与轮次](docs/sessions.md) | 确定性 Session id、`/reset`、旧会话存档 |
 | [工具与能力面](docs/tools.md) | 工具表、`agentPreset`、`allowTools` |
 | [运维](docs/ops.md) | `scripts/ops.mjs`、`doctor` 的 finding、八个排查场景、key 轮换 |

@@ -477,6 +477,7 @@ export function apply(ctx, config) {
     report,
     conversations,
     sessionIndex,
+    ambientQuery: ambientQueryFor,
     allowTools,
     approvalPolicy,
     resolveRoute,
@@ -1032,6 +1033,33 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 把群里最近几条闲聊拼成一段检索查询（长期记忆的 `ambientQuery` 依赖）。
+   *
+   * 主动说话 / 补一句 / 提醒这些轮次没有「刚来的那条消息」，检索必须靠群环境；
+   * 条数刻意比 `ambientPrompt` 少（只取最后几条），够定位话题就行，不必整段。
+   * @param conversation - 目标会话。
+   * @returns 多行文本；私聊或没有环境上下文时为空串。
+   */
+  function ambientQueryFor(conversation) {
+    if (conversation?.type !== 'group') return '';
+    const list = ambient.get(conversation.id) ?? [];
+    return list.slice(-6).map((entry) => `${entry.name}: ${entry.text}`).join('\n');
+  }
+
+  /**
+   * 没有「刚来的那条消息」的轮次（主动说话 / 补一句 / 提醒 / 戳一戳）用群环境做检索查询。
+   *
+   * 取不到群环境（私聊、或者群里很安静）时**不清空**原有的查询：上一句话题仍然比
+   * 「什么都不给」更能捞出相关记忆。
+   * @param conversation - 目标会话。
+   */
+  function noteRecallFallback(conversation) {
+    const text = ambientQueryFor(conversation);
+    if (text.length === 0) return;
+    conversation.recallQuery = { text, at: Date.now(), speakers: conversation.speakers ?? [] };
+  }
+
+  /**
    * 「现在是谁在跟你说话」那一行。
    *
    * 只有一个人时就是原来那句；几个人几乎同时说话（一批攒到一起）时把人都列出来 ——
@@ -1398,24 +1426,15 @@ export function apply(ctx, config) {
     lines.push(...personaLines(conversation), '');
     // ---- 槽 3：表达契约（怎么说）----
     lines.push('怎么说话（表达契约）：', ...styleLines(conversation), '');
-    // ---- 槽 4：记忆索引 + 热梗段 ----
+    // ---- 槽 4：和当前话题相关的记忆（检索式注入，见 memory-select.js）----
+    //
+    // 与旧实现（注入 `INDEX.md` + `MEMORY.md` 的开头）的区别是**先按当前消息检索、
+    // 再按节配额打包**：文件后半段的内容不再永远看不见，没有命中的时候也不取文件头。
+    // 标题与「查证出口」都写清楚 —— 模型不知道有记忆时不会去 search（设计 §7）。
     if (memory.toolsAllowed()) {
-      const index = memory.indexText(conversation);
-      if (index.length > 0) {
-        lines.push('你记得的事（长期记忆的索引；原文件在 `' + memory.label + '/`）：', '', index, '');
-      } else {
-        lines.push(`你的长期记忆在 \`${memory.label}/\` 里（现在还是空的）。`, '');
-      }
-      // 热梗段：最近学到的说法摆在眼前，谐音梗才反应得过来（不用先 search 再答）。
-      // 只给「写法 + 一句话意思」，怎么用/来源留在文件里按需 qq_memory search。
-      const hot = memory.catalog().hot;
-      if (hot.length > 0) {
-        lines.push(
-          '最近学的梗（遇到同音/近音写法先按读音还原再理解；还原不出来就按字面接，或直接问「这是啥梗」，别硬编）：',
-          ...hot.map((line) => `  ${line}`),
-          '',
-        );
-      }
+      const recall = memory.recallText(conversation);
+      if (recall.length > 0) lines.push(recall, '');
+      else lines.push(`你的长期记忆在 \`${memory.label}/\` 里（现在还是空的）。`, '');
     }
     // ---- 槽 5：能力清单 ----
     // 被白名单挡住的工具不能在提示里推荐，否则模型会去调用一个它根本看不见的工具。
@@ -2049,6 +2068,7 @@ export function apply(ctx, config) {
             return;
           }
           conversation.pendingIntent = 'reminder';
+          noteRecallFallback(conversation);
           const agent = await ensureAgent(conversation);
           const message = createUserMessage({
             content: [{ type: 'text', text: reminderNudge(task) }],
@@ -2318,6 +2338,8 @@ export function apply(ctx, config) {
     conversation.activeInterposeSeq = 0;
     conversation.activeTurns = 0;
     conversation.pendingIntent = undefined;
+    // 检索查询也一起忘：新开一轮的第一句不该拿上一轮的话题去捞记忆。
+    conversation.recallQuery = undefined;
     // 撤回：上一轮那些消息连同「最近看见过」的账一起忘掉 —— 新开一轮不该拿上一轮的
     // 撤回开玩笑（那已经是另一段对话里的事了）。
     recent.delete(conversation.key);
@@ -2386,6 +2408,14 @@ export function apply(ctx, config) {
        * `turn/end` 清掉 —— 漏清的话下一轮会披着上一轮的意图说话。
        */
       pendingIntent: undefined,
+      /**
+       * 长期记忆的检索查询：`{ text, at, speakers? }`，**不落盘**。
+       *
+       * 由 `submitBatch` 在投递前写入（这一批的正文 + 说话人）；主动说话 / 补一句 /
+       * 提醒这些没有来消息的轮次退回到群环境（见 memory.js 的 `recallQueryFor`）。
+       * 它是「这一轮该捞哪些记忆」的输入，不是记忆本身，所以不存盘、/reset 清掉。
+       */
+      recallQuery: undefined,
       /**
        * 上一次「想发一张图但没发成」的记录：`{ path, reason, at }`。
        *
@@ -3340,6 +3370,7 @@ export function apply(ctx, config) {
     enqueue(conversation, async () => {
       try {
         const text = proactiveNudge(quietMs);
+        noteRecallFallback(conversation);
         const agent = await ensureAgent(conversation);
         const userMessage = createUserMessage({
           content: [{ type: 'text', text }],
@@ -3649,6 +3680,7 @@ export function apply(ctx, config) {
     report('info', `${describeConversation(conversation)} 对话还热着（对方安静了约 ${silenceSec} 秒），主动补一句`);
     enqueue(conversation, async () => {
       try {
+        noteRecallFallback(conversation);
         const agent = await ensureAgent(conversation);
         const userMessage = createUserMessage({
           content: [{ type: 'text', text: chimeNudge() }],
@@ -4008,6 +4040,20 @@ export function apply(ctx, config) {
       for (const entry of entries) speakers.set(entry.id, { name: entry.name, id: entry.id });
       conversation.speakers = [...speakers.values()];
       for (const speaker of conversation.speakers) registerParticipant(conversation, speaker.name, speaker.id);
+      // 长期记忆的检索查询：这一轮真正投进去的正文 + 说话人（设计 §5.1）。
+      // 只放**这一批**的正文（不是插话包装后的整段），检索要的是「他们在说什么」；
+      // 说话人（以及这一批里被 @ 的人）用来保证「人物必进」。不落盘、只留最近这一条。
+      const focusPeople = [...speakers.values()];
+      for (const item of batch) {
+        for (const mentioned of atMentions(item.message, selfId)) {
+          if (mentioned.name.length > 0) focusPeople.push({ name: mentioned.name, id: mentioned.id });
+        }
+      }
+      conversation.recallQuery = {
+        text: entries.map((entry) => entry.body).join('\n').slice(0, 4000),
+        at: Date.now(),
+        speakers: focusPeople,
+      };
       const agent = await ensureAgent(conversation);
       const userMessage = createUserMessage({
         content: [{ type: 'text', text }],
@@ -4222,6 +4268,7 @@ export function apply(ctx, config) {
     conversation.pendingIntent = 'poke';
     enqueue(conversation, async () => {
       try {
+        noteRecallFallback(conversation);
         const agent = await ensureAgent(conversation);
         const userMessage = createUserMessage({
           content: [{ type: 'text', text: pokeNudge({ userName: displayName }) }],

@@ -207,13 +207,21 @@ export const Config = z.object({
   // ---- 长期记忆：聊天记录落盘 + 定时摘要 + 认知库（见 docs/memory.md「长期记忆」）----
   memory: z.boolean().default(true).description('是否启用长期记忆：把聊天记录写进 memoryDir、每天在 digestAtHour 点让一个专用「摘要 Agent」写成摘要与认知，并提供 qq_transcript / qq_memory 工具（配套 skill 在 .dsh/skills/ 里）'),
   memoryDir: z.string().default('.qq-memory').description('长期记忆目录，相对 cwd（必须落在 cwd 内）：聊天记录、摘要、认知库都在这里；同时充当 qq_memory / qq_transcript 的写入边界'),
-  memoryFileMaxBytes: z.number().default(32768).description('单个记忆文件的字节上限：超过时 qq_memory 的 write 会报错，append 也只按剩余空间写入，逼着摘要 Agent 保持精炼'),
+  memoryFileMaxBytes: z.number().default(32768).description('单个记忆文件的字节上限：超过时 qq_memory 的 write / append 都会报错；热层超过 memoryArchiveRatio 时由滚档把最不活跃的条目挪进 archive/（不再靠删条目）'),
+  memoryPromptChars: z.number().default(6000).description('每轮注入提示词的记忆预算（字符）：按「和当前消息的相关度」检索后按节配额打包，不再是文件开头截断；0 或非法值退回 6000'),
+  memoryRecallK: z.number().default(12).description('每轮最多取多少条检索结果：人物与「消息里原样出现的梗」是必进的，其余按相关度+活跃度排序后取前 K 条'),
+  memoryPeopleMax: z.number().default(20).description('每轮最多注入多少个人物（PEOPLE.md 里的全局人物表）：够资格的人物全量给，一人一行；0 = 不注入人物'),
+  memoryArchive: z.boolean().default(true).description('是否启用冷层归档：热层 MEMORY.md 超过 memoryFileMaxBytes × memoryArchiveRatio 时，把最不活跃的非置顶条目挪进 archive/YYYY-MM.md —— 条目只是变冷，不再被删掉；qq_memory search 仍然搜得到'),
+  memoryArchiveRatio: z.number().default(0.75).description('热层占 memoryFileMaxBytes 的比例：超过它就开始滚档（夹在 0.1~1；默认 0.75）。归到冷层的条目按「最近命中 / 事实日期 / 文件位置」挑最不活跃的'),
+  memoryVocabHint: z.boolean().default(true).description('是否在提示词里附一行「全部梗的写法」词汇表（不给含义，只让模型知道这些写法存在，听不懂时能主动 qq_memory search）：这是最便宜的一道防「不懂装懂」保险'),
   memorySearchHits: z.number().default(40).description('qq_transcript / qq_memory 一次 search 最多返回多少条命中'),
   digestAtHour: z.number().default(4).description('每天几点做长期记忆的摘要（本地时间，0~23）：默认凌晨 4 点，群里没人说话的时候。同一个会话**一天至多摘要一次**（靠记忆目录里记的日期，重启也不会重复）；没有新消息的会话直接跳过'),
   digestMinLines: z.number().default(20).description('当天攒够多少条新消息才值得为这个会话跑一次摘要：不够就留到明天，避免为零星几句花费一次模型调用（首次摘要不受此限）'),
   digestMaxChars: z.number().default(24000).description('一次摘要最多把多少字符的聊天记录喂给摘要 Agent：超出部分按最近优先截断（更早的内容留给上一次摘要）'),
   digestTimeoutMs: z.number().default(10 * 60 * 1000).description('单次摘要的硬超时（毫秒）：超时就把摘要 Agent 销毁（下次重开一个），避免一个卡住的 turn 让摘要永远不再发生'),
   digestCatchUp: z.boolean().default(true).description('是否补课：如果今天的摘要点已经过了、而某个会话在重启之后才有人说话（或者摘要那一刻进程正在重启），它一开口就补一次摘要，不用等到明天；关掉则只在 digestAtHour 点摘要'),
+  digestRollover: z.boolean().default(true).description('摘要之后是否执行滚档：热层超过阈值就把最不活跃的条目先写进 archive/ 再从热层删掉（写归档失败时热层原样不动）。关掉后热层只能靠模型自己整理，文件会一直顶到 memoryFileMaxBytes'),
+  digestConsolidate: z.boolean().default(false).description('摘要之后是否再跑一次「周合并」：合并重复事实、刷新人物 one-liner、清掉过期计划（多一次模型调用，默认关）。它只是让文件更整齐，不开也不会丢记忆'),
   // ---- 每天轮换模型凭据（见 docs/ops.md「每天轮换 API key」）----
   // 池子是一个 cwd 里的纯文本文件而不是配置项：配置会显示在 Web UI 上、也会被复制粘贴到
   // 别处，key 不该走那条路（见 docs/security.md「安全提醒」）。

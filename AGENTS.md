@@ -77,7 +77,8 @@ config.js      227 行  配置 schema（**唯一真相来源**）：纯数据，
 settings.js    331 行  配置的运行时视图：取默认值 / 强制类型 / 夹紧 / 去空白全在这里，`index.js` 只读 settings.*
 client.js     2181 行  **浏览器半侧**（手写 bundle）：把 schema 投影成设置页自己的一页（`settings.section`），7 个 `TABS` / 15 个 `SECTIONS`；保存走 Host 的 settings 写路径（见 §5.12）
 tools.js       约 1090 行  宿主平面工具的**声明**（qq_send_* / qq_poke / qq_save_sticker / qq_rename_sticker / qq_list_conversations / qq_transcript / qq_memory / qq_remind_*），依赖由 index.js 显式传入
-memory.js     1414 行  长期记忆子系统：转录落盘、记忆文件读写（两个记忆工具的能力来源）、STICKERS.md 的追加、每日摘要循环；依赖由 index.js 显式传入
+memory.js     1971 行  长期记忆子系统：转录落盘、记忆文件读写（两个记忆工具的能力来源）、检索式注入的装配、人物迁移、滚档、每日摘要循环；依赖由 index.js 显式传入
+memory-select.js 860 行  长期记忆的**纯函数**：markdown → record（人物 / 事实 / 惯例 / 在追 / 梗）、scope 过滤与打分、按节配额打包、archivePlan 滚档、MEMORY.md / PEOPLE.md 的 upsert / remove
 onebot.js      637 行  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/@ 名单提取）；文本渲染委托 `modalities.js`
 media.js       327 行  入站媒体：QQ 的图/表情包 → 按内容哈希落盘 → 给模型 read_image 的本地路径
 image.js       149 行  出站图片：本地路径 / URL → 校验（大小、格式、目录越界）→ base64:// 段；收藏目录里的表情额外带 `sub_type: 1`（QQ 的「大表情」）
@@ -119,7 +120,7 @@ AGENTS.md             **本文件**：给改代码的智能体的说明书（DSH
 
 **数据目录**（运行时生成在 `cwd` 下）：`data/`（会话缓存 + `/reset` 标记 + `api-keys.txt` 池子 +
 `reminders.json` 提醒任务，gitignore）、`.qq-media/`（入站图 LRU，gitignore）、`.qq-stickers/`（表情包，gitignore）、
-`.qq-memory/`（转录 + 摘要 + 认知 + `STICKERS.md`，gitignore）、
+`.qq-memory/`（转录 + 摘要 + 认知 + `STICKERS.md` + `PEOPLE.md` + 冷层 `archive/`，gitignore）、
 `.qq-persona/`（**人设与表达规则，是部署者的资产，故意提交进仓库**）。前四个**必须在 `cwd`
 内**，否则各自记 warn 并停用；`.qq-persona/` 同样必须在 `cwd` 内，配到外面只记 warn 并回退
 到配置 / 内置人设。
@@ -134,8 +135,9 @@ index.js ──▶ config.js（schema）/ settings.js ──▶ image.js（只�
          ──▶ persona.js ──▶ docfile.js ──▶ util.js（pathInside）/ style.js ──▶ docfile.js
          ──▶ modalities.js（消息段渲染）/ interactions.js（戳一戳）/ links.js（卡片与 URL 预览）
          ──▶ cognition.js（认知与表情包目录的纯解析；memory.js 也用它）
+         ──▶ memory-select.js（记忆的记录模型 / 检索 / 滚档，**纯函数**；memory.js 用它）
          ──▶ docfile.js（人设 / 表达规则的热读）
-         ──▶ memory.js ──▶ util.js / filestore.js（长期记忆子系统）
+         ──▶ memory.js ──▶ util.js / filestore.js / memory-select.js（长期记忆子系统）
          ──▶ reminders.js ──▶ util.js / filestore.js（定时提醒的任务/调度；发送与 Agent 轮留在 index.js）
          ──▶ util.js（纯函数，无 IO）/ filestore.js（原子读写）
          ──▶ onebot.js / media.js / image.js / perceptual.js
@@ -181,7 +183,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 | 媒体 | `resolveMessageMedia` `mediaFor` `resolveQuote` `hydrateAmbientMedia` | 环境上下文与复读**共用同一次下载**（`mediaResolutions` 这个 WeakMap 就是干这个的） |
 | 事件轮转 | `handleEvent`（约 77 行）+ 持久化事件路由 | 见 §4.A / §4.I；`notice`（戳一戳 / 撤回）先于 `message` 分流（`handlePoke` / `handleRecall`）；`turn/end` 里按 `owner.proactive` / `owner.intent` 分流 |
 | 定时提醒 | `reminders` `deliverReminderText` `deliverReminderModel` `runReminderTurn` `settleReminderTurn` `reminderNudge` `pendingReminderTurns` | 见 §4.J；任务生命周期在 `reminders.js`，这里只负责发送、agent 轮与守卫；@ 由 `sendParts` 的 `at` 注入 |
-| 长期记忆 | 只剩一行装配（`const memory = createMemory({ … })`）与三个调用点（`handleEvent` / `channelPrompt` / 生命周期） | 整个子系统在 `memory.js`（见 §4.D）；依赖表就在那一行里 |
+| 长期记忆 | 只剩一行装配（`const memory = createMemory({ … })`）与几个调用点（`handleEvent` 的 `recallQuery` / `channelPrompt` 的 `memory.recallText` / 生命周期 / 各 nudge 的 `noteRecallFallback`） | 整个子系统在 `memory.js`，纯函数在 `memory-select.js`（见 §4.D）；依赖表就在那一行里 |
 | 模型凭据轮换 | `rotateApiKey` `probeApiKey` | 见 §4.H；每天到点挑下一个探测通过的 key 交给 `ctx.credentials.set()`（**不用重启**）。时段/超时/探测地址在 `settings` 上 |
 | 工具装配 | `registerQqTools(ctx, { … })` | 一张**依赖表**：把上面那些函数递给 `tools.js`（记忆是 `memory.tools`，存表情包是 `saveSticker`，戳一戳是 `poke`）。工具声明在 `tools.js`，不在这里 |
 | 生命周期 | `ctx.effect(...)` + `ctx.on('loader/volatile-update', …)` | 托管 socket、API key 轮换与主动说话的定时器；摘要定时器由 `memory.startDigestTimer()` 挂。volatile-update 监听是**设置页保存之后唯一的生效路径**（延后一拍 `ctx.fiber.restart()`，见 §5.12） |
@@ -272,13 +274,24 @@ QQ ─▶ NapCat ─ws─▶ OneBotClient.onEvent ─▶ handleEvent
 
 ### D. 长期记忆（转录 → 定时摘要 → 认知）
 
-实现全在 `memory.js`（`createMemory(deps)`，index.js 只装配并在三个点调用）；下面这张图是
-**行为规格**，改任何一处先对着它读。
+实现分两层：**落盘与摘要循环在 `memory.js`**，**记录模型 / 检索 / 滚档 / 逐条写入的纯函数在
+`memory-select.js`**（`createMemory(deps)` 只装配 `memory.js`，index.js 只装配并在几个点调用）。
+下面这张图是**行为规格**，改任何一处先对着它读。
 
 ```
 handleEvent ─▶ rememberTranscript ─▶ .qq-memory/conversations/<slug>/log/YYYY-MM-DD.jsonl
                                      （后台串行追加，不等落盘；路径按会话 key 派生）
+              ├─▶ submitBatch 写 conversation.recallQuery = { text, at, speakers }（不落盘）
               └─▶ maybeCatchUpDigest（错过了今天的摘要点就立刻补一轮，每次启动至多一轮）
+
+channelPrompt（槽 4）─▶ memory.recallText(conversation)
+       同步读 PEOPLE.md / COGNITION.md / 本会话 MEMORY.md（size:mtime 缓存）
+       ─▶ memory-select.renderMemoryBlock：
+            scope 硬过滤（global + 本会话；private 对其他会话不可见）
+            → 打分（entity 3 / lexical 2 / recency 1 / salience 0.8 / prior 0.5 / expired -5）
+            → 按节配额 + round-robin 打包（memoryPromptChars / memoryRecallK / memoryPeopleMax）
+            → 出处（MEMORY.md#L23）+ 词汇表（memoryVocabHint）+ archive 聚合行（现算）
+       ─▶ 命中的记录在 memory.index.json 里累加 hits / lastSeen（防抖写盘；坏了只降级）
 
 ctx.interval（排到下一个 digestAtHour，默认 04:00）─▶ runDigestSweep
        判据：今天这条会话还没摘要过（localDate(lastDigestAt) ≠ 今天）且 memoryDirty ≥ digestMinLines
@@ -288,9 +301,13 @@ ctx.interval（排到下一个 digestAtHour，默认 04:00）─▶ runDigestSwe
                      ▼
                  runDigest ─▶ ensureDigestAgent（sessionIdFor('bridge:digest')，独立会话）
                      │          followup(转录正文) → await whenIdle()（有 digestTimeoutMs 守卫）
+                     │          digestTarget = 被摘要的会话（私聊写入闸门靠它）
                      ▼
-                 模型自己用 qq_transcript / qq_memory 读转录、写 MEMORY.md / COGNITION.md
-                     └─▶ 成功后才写 digest.json 的 lastDigestAt + lastDigestDate（失败/超时不推进）
+                 模型自己用 qq_transcript / qq_memory 读转录、upsert MEMORY.md / PEOPLE.md
+                     │  （私聊轮写 COGNITION.md / PEOPLE.md 会被工具直接拒绝）
+                     ├─▶ 成功后才滚档（digestRollover）：archivePlan → 先写 archive/、成功才改热层
+                     ├─▶ 可选周合并（digestConsolidate）：第二次 followup 只整理、不新增事实
+                     └─▶ 最后才写 digest.json 的 lastDigestAt + lastDigestDate（失败/超时不推进）
 ```
 
 几条不能踩的：
@@ -320,9 +337,21 @@ ctx.interval（排到下一个 digestAtHour，默认 04:00）─▶ runDigestSwe
 | 整份重写的护栏 | `writeMemoryFile` 里「条目数掉到 90% 以下就拒绝」（`force: true` 放行） | 模型漏抄几行时文件照样「写成功」，护栏是唯一能拦住它的地方 |
 | `.history/` 备份 | `backupMemoryFile`，每次写入前留一份，每个文件最近 20 份 | 写坏了至少能人工翻回去 |
 
+- **私聊内容永不升级（scope）**：`COGNITION.md` / `PEOPLE.md` 只收 `global`；私聊会话对这两个
+  文件的任何写请求在 `memory.js` 的 `assertGlobalWrite` 里**直接拒绝**（摘要 Agent 走
+  `digestTarget` 同一条闸门）；检索在打分**之前**按 scope 硬过滤。`PEOPLE.md` 的启动迁移
+  只扫群目录，不碰 `private-*`。
+- **无日期条目按文件位置排**（`hotCognitionLines` 的 `effectiveDate`）：继承它前面最近一个
+  有日期的条目的日期，不再一律当最旧（设计 §1.2 的回归）。
+- **滚档只搬不删**：`archivePlan`（纯函数）只减不增、没有可滚条目时返回原因、热层不写指针行；
+  `memory.js` 先写 `archive/`、成功才重写热层，失败时热层原样不动。`qq_memory search` 覆盖
+  `archive/`，`list` 也列得出冷层。
+- **检索的兜底绝不取文件头**：没有命中时按 pinned / salience / 最近取；每人每轮看到的记忆由
+  `memoryPromptChars` 预算约束，而不是文件长度。
 - **`type` → 二级标题的路由在 `sectionForType`**：`缩写`/`谐音`/`专名`/`其它`。认知条目
-  **按首见日期**注入（`hotCognitionLines`），不按文件里的位置 —— 否则整理一次文件就等于
-  换掉它每轮记得什么。
+  **有日期的按首见日期、没有日期的按文件位置**参与排序（`hotCognitionLines` 的
+  `effectiveDate` 让无日期条目继承前面最近一个日期）—— 否则整理一次文件就等于换掉它
+  每轮记得什么，而没写日期的老条目会被永远当成最旧。
 - **认不出来的行不删**：`parseCognition` / `parseStickerCatalog` 只记 warn；`qq_memory read`
   会把它们点出来（`readWarningNote`），`ops doctor` 也会（`COGNITION_UNPARSED` 等五条）。
 
@@ -659,8 +688,11 @@ agent 轮在 `index.js`**。
 | 改 `/reset` 的行为（轮次的算法 / 标记落盘 / 清哪些记账） | `sessionIdFor` + `resetConversation` + `resetMarkerDir` / `loadConversationResetCounts`（见 §4.G、§5.3、§5.4） |
 | 改「谁能重置会话」 | `Config.resetUsers` + `canReset` + `handleEvent` 里的 `/reset` 分支（**空白名单 = 谁都不能**，别改成 `allowUsers` 那种语义）+ docs/sessions.md「新开一轮会话」 |
 | 改 QQ 会话能用哪些工具 | `cordis.patch.yml` 的 `preset-qq` + `Config.allowTools`（见 §7） |
-| 改长期记忆的行为 | `Config` 的 `memory*` / `digest*` + `memory.js`（整个子系统）+ docs/memory.md「长期记忆」（见 §4.D） |
-| 改记忆文件的写入方式（逐条 / 归一化 / 护栏 / 历史） | `cognition.js` 的 `upsert*` / `remove*` / `normalize*` / `sectionForType` + `memory.js` 的 `writeMemoryFile` / `backupMemoryFile` + `tools.js` 的 `qq_memory` 参数 + `test/cognition.test.mjs` 与 bridge 里搜索 `upsert` 的那组 |
+| 改长期记忆的行为 | `Config` 的 `memory*` / `digest*` + `memory.js`（落盘 / 摘要 / 装配）+ `memory-select.js`（记录模型 / 检索 / 滚档）+ docs/memory.md「长期记忆」（见 §4.D） |
+| 改检索 / 打分 / 打包 | `memory-select.js`（`renderMemoryBlock` / `scoreRecords` / `queryTokens`）+ `memory.js` 的 `recallText` / `recallQueryFor` + index.js 的 `submitBatch`（写 `recallQuery`）与 `noteRecallFallback` + `test/memory-select.test.mjs` |
+| 改记忆文件的写入方式（逐条 / 归一化 / 护栏 / 历史） | `cognition.js` 的 `upsert*` / `remove*` / `normalize*` / `sectionForType` + `memory-select.js` 的 `upsertMemoryRow` / `upsertPersonRow` + `memory.js` 的 `writeMemoryFile` / `backupMemoryFile` + `tools.js` 的 `qq_memory` 参数 + `test/cognition.test.mjs` / `test/memory-select.test.mjs` 与 bridge 里搜索 `upsert` 的那组 |
+| 改滚档（热层 → `archive/`） | `memory-select.js` 的 `archivePlan` / `archiveLineOf` + `memory.js` 的 `rolloverMemory` / `searchMemoryFile`（覆盖 archive）/ `listMemoryFiles` + `Config.memoryArchive*` / `digestRollover` + `test/memory-select.test.mjs` 的滚档组 |
+| 改人物表 / scope 闸门 | `memory-select.js` 的 `parsePeopleDoc` / `upsertPersonRow` + `memory.js` 的 `assertGlobalWrite` / `writeScopeOf` / `migratePeopleDoc` + `tools.js` 的 `qq` / `aliases` 参数 + `test/memory-select.test.mjs` 与 bridge 的私聊写入用例 |
 | 改「发表情只能从收藏目录发」 | `index.js` 的 `stickerSendSource` + `channelPrompt` 里的标记文案与 `stickerFailure` 回灌 + bridge 里「只认收藏目录」那组；`qq_send_image` 是显式动作，**没有**这条限制 |
 | 改摘要的触发时刻 | `digestAtHour` + `msUntilDailyHour`（模块级纯函数）+ `memory.js` 里 `runDigestSweep` 的日期判据 |
 | 改 API key 轮换（池子格式 / 探测 / 什么时候换） | `Config` 的 `apiKeyRotate*` + index.js 的凭据轮换区块（`rotateApiKey` / `probeApiKey`）+ 模块级 `parseApiKeyPool` / `apiKeyFingerprint` + docs/ops.md「每天轮换 API key」（见 §4.H） |

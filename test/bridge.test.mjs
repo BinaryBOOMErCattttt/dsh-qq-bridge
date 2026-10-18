@@ -216,6 +216,15 @@ function makeHost({
   const timers = { timeouts: [], intervals: [], cleared: new Set() };
   /** 用例把 `host.list.stallIdle` 置真后创建的 Agent，`whenIdle()` 永不 resolve。 */
   let stalledIdle = false;
+  /**
+   * 用例注入的 `followup` 钩子：模拟「模型在 turn 里调了工具」。
+   *
+   * 摘要 Agent 的 turn 在真宿主里是模型跑一轮；假 Host 里它什么都不做，所以像
+   * 「私聊摘要写不写全局文件」这类用例需要在这里替模型动手。`whenIdle()` 会等钩子
+   * 跑完，摘要的 settle 顺序才与真实一致。
+   */
+  let followupHook;
+  let followupWork = Promise.resolve();
   /** 每次摘要都挂一个超时守卫；用例可以伪造「卡住」来验证超时后的自愈。 */
   const fakeTimer = {
     timeout(callback, delay) {
@@ -307,13 +316,19 @@ function makeHost({
           inbox: [],
           followup(message) {
             this.inbox.push(message);
+            if (typeof followupHook === 'function') {
+              const agent = this;
+              followupWork = followupWork
+                .then(() => followupHook(agent, message))
+                .catch(() => {});
+            }
           },
           /** 摘要链路会 `await agent.whenIdle()`；桩里这一轮「已经结束了」。 */
           whenIdle() {
             // `host.list.stallIdle = true` 模拟一个卡死的模型请求：永不 resolve，
             // 用来验证摘要的硬超时会把这个 Agent 收掉（而不是让摘要永远排队）。
             if (stalledIdle) return new Promise(() => {});
-            return Promise.resolve();
+            return followupWork;
           },        };
         agents.set(options.sessionId, agent);
         created.push(agent);
@@ -414,6 +429,13 @@ function makeHost({
       },
       set stallIdle(value) {
         stalledIdle = value === true;
+      },
+      get onFollowup() {
+        return followupHook;
+      },
+      set onFollowup(value) {
+        followupHook = value;
+        followupWork = Promise.resolve();
       },
       created,
       prompts,
@@ -3654,8 +3676,11 @@ test('the marker stays literal text when image sending is off or whitelisted awa
  * 默认 `digestCatchUp: false` —— 补课会在第一条消息到达时就摘要一次，用例希望自己
  * 决定什么时候触发摘要（`host.list.timers.fireInterval()`）；要验补课就显式打开。
  */
-async function bootMemory(config = {}, hostOptions = {}, onebotOptions = {}) {
+async function bootMemory(config = {}, hostOptions = {}, onebotOptions = {}, seed) {
   const cwd = await mkdtemp(join(tmpdir(), 'qq-bridge-memory-'));
+  // `seed` 在**插件 apply 之前**往 cwd 里铺文件：用来验启动期的一次性迁移
+  // （PEOPLE.md 从各群 MEMORY.md 的「## 人」小节抽取）。
+  if (typeof seed === 'function') await seed(cwd);
   return boot(
     // `proactive: false`：主动说话默认开着，它会多挂一个周期定时器；记忆这一组用例要数的
     // 是「摘要定时器」的个数，先把它关掉才能数得清。
@@ -3785,7 +3810,13 @@ test('qq_memory appends, reads back and overwrites, and refuses paths outside th
   assert.match(read.text, /不喜欢被叫/);
   assert.match(read.text, /^\s+1 \| /m, 'read should number the lines');
 
-  const overwritten = await tool.execute({ action: 'write', path: target, text: '- 只留这一条' }, {});
+  // 整份重写把条目砍掉一大截要 `force`（与认知库 / 表情包目录同一条护栏：
+  // 模型漏抄几行时文件照样「写成功」，护栏是唯一能拦住它的地方）。
+  await assert.rejects(
+    () => tool.execute({ action: 'write', path: target, text: '- 只留这一条' }, {}),
+    /keep only 1 of 2 entries/,
+  );
+  const overwritten = await tool.execute({ action: 'write', path: target, text: '- 只留这一条', force: true }, {});
   assert.equal(overwritten.action, 'write');
   assert.doesNotMatch(await readMemory(cwd, target), /群主叫kaguya/);
 
@@ -3956,8 +3987,8 @@ test('digestCatchUp: false leaves a missed digest until the next daily run', asy
   assert.equal(host.list.created.length, 1, 'no digest session without a timer tick');
 });
 
-/** 索引 + 本会话记忆会出现在渠道提示里，好让模型「知道自己记得什么」。 */
-test('the channel prompt carries the memory index once it exists', async () => {
+/** `INDEX.md` 会出现在渠道提示里，好让模型「知道自己记得什么」。 */
+test('the channel prompt carries the global INDEX.md once it exists', async () => {
   const { onebot, host, cwd } = await bootMemory();
   await mkdir(join(cwd, '.qq-memory'), { recursive: true });
   await writeFile(join(cwd, '.qq-memory', 'INDEX.md'), '- kaguya：群主，周六常组织打本', 'utf8');
@@ -3968,7 +3999,229 @@ test('the channel prompt carries the memory index once it exists', async () => {
     const current = promptText(host, 'qq-bridge:channel');
     return current.includes('群主，周六常组织打本') ? current : undefined;
   }, 'the memory index to reach the channel prompt');
-  assert.match(text, /长期记忆的索引/);
+  assert.match(text, /和当前话题相关的记忆/);
+  assert.match(text, /### 全局索引（INDEX.md）/);
+});
+
+/**
+ * 检索式注入：消息里原样出现的写法（哪怕条目没有日期）必须进提示词。
+ *
+ * 这是设计 §1.2 的真实事故回归：那条老梗在 COGNITION.md 里写得完整，但没有「首见日期」，
+ * 旧实现把它当最旧，于是永远进不了热梗段。现在它由「消息里出现 → 命中」捞出来，
+ * 不看日期、也不看它在文件里排第几。
+ */
+test('a no-date cognition row is recalled when the incoming message uses it', async () => {
+  const { onebot, host, cwd } = await bootMemory();
+  const memoryDir = join(cwd, '.qq-memory');
+  await mkdir(memoryDir, { recursive: true });
+  const dated = Array.from({ length: 20 }, (_, index) => `- 新梗${index}｜刚学的｜2026-10-${String((index % 9) + 10).padStart(2, '0')}`).join('\n');
+  await writeFile(
+    join(memoryDir, 'COGNITION.md'),
+    `# 公共认知\n\n## 黑话与缩写\n${dated}\n- 老说法｜很久以前学的，从来没写日期\n`,
+    'utf8',
+  );
+  onebot.push(privateMessage('你懂那个老说法是什么意思吗'));
+  await until(() => host.list.created[0], 'the private Agent');
+  const text = await until(() => {
+    const current = promptText(host, 'qq-bridge:channel');
+    return current.includes('老说法 —— 很久以前学的') ? current : undefined;
+  }, 'the no-date cognition row to reach the prompt');
+  assert.match(text, /老说法 —— 很久以前学的/);
+  assert.match(text, /词汇表（全部梗的写法/);
+});
+
+/** 群隔离：另一个群的 MEMORY.md 不会出现在这个群的提示词里（连候选都不是）。 */
+test('another group\'s MEMORY.md never leaks into this group\'s prompt', async () => {
+  const { onebot, host, cwd } = await bootMemory();
+  const memoryDir = join(cwd, '.qq-memory');
+  await mkdir(join(memoryDir, 'conversations', 'group-200000001'), { recursive: true });
+  await writeFile(
+    join(memoryDir, 'conversations', 'group-200000001', 'MEMORY.md'),
+    '# 另一个群\n\n## 事实与事件\n- 另一个群的暗号｜只有那个群知道\n',
+    'utf8',
+  );
+  onebot.push(mention('另一个群的暗号是什么'));
+  await until(() => host.list.created[0], 'the group Agent');
+  const text = promptText(host, 'qq-bridge:channel');
+  assert.doesNotMatch(text, /另一个群的暗号/);
+});
+
+/** 私聊写入闸门：私聊会话对全局 COGNITION.md / PEOPLE.md 的写请求一律拒绝。 */
+test('a private chat cannot write the global COGNITION.md or PEOPLE.md', async () => {
+  const { onebot, host, cwd } = await bootMemory();
+  const tool = host.tools.get('qq_memory');
+  onebot.push(privateMessage('私聊里聊点事'));
+  const privateId = sessionIdFor('private:100000002');
+  const privateAgent = await until(() => host.list.created.find((agent) => agent.id === privateId), 'the private Agent');
+  await assert.rejects(
+    () => tool.execute({ action: 'upsert', path: 'COGNITION.md', name: '私聊梗', meaning: '私聊里学的说法' }, { agent: privateAgent }),
+    /private chat must not write/,
+  );
+  await assert.rejects(
+    () => tool.execute({ action: 'append', path: 'PEOPLE.md', text: '- 某人｜私聊里知道的人' }, { agent: privateAgent }),
+    /private chat must not write/,
+  );
+  assert.equal(existsSync(join(cwd, '.qq-memory', 'COGNITION.md')), false, '被拒绝的写入不能留下文件');
+  assert.equal(existsSync(join(cwd, '.qq-memory', 'PEOPLE.md')), false);
+
+  // 同一段私聊写自己的 MEMORY.md 是允许的 —— 闸门只挡「升级到全局」。
+  const own = await tool.execute(
+    { action: 'upsert', path: 'conversations/private-100000002/MEMORY.md', name: '私聊事实', meaning: '只有这段私聊知道', section: '事实与事件' },
+    { agent: privateAgent },
+  );
+  assert.equal(own.action, 'upsert');
+  assert.match(await readMemory(cwd, 'conversations/private-100000002/MEMORY.md'), /私聊事实｜只有这段私聊知道/);
+
+  // 对照：群会话写同一个全局文件是允许的（闸门不是一刀切）。
+  onebot.push(mention('群里也说一个梗'));
+  const groupId = sessionIdFor('group:100000001');
+  const groupAgent = await until(() => host.list.created.find((agent) => agent.id === groupId), 'the group Agent');
+  await tool.execute({ action: 'upsert', path: 'COGNITION.md', name: '公共梗', meaning: '群里公开说的' }, { agent: groupAgent });
+  assert.match(await readMemory(cwd, 'COGNITION.md'), /公共梗｜群里公开说的/);
+  // 人物表与热层记忆也支持逐条 upsert（新的结构化路径）。
+  const person = await tool.execute(
+    { action: 'upsert', path: 'PEOPLE.md', name: 'kaguya', qq: '100000001', aliases: 'soyo', meaning: '群主，周六常组织打本' },
+    { agent: groupAgent },
+  );
+  assert.equal(person.note, 'added in «人物»');
+  assert.match(await readMemory(cwd, 'PEOPLE.md'), /kaguya（QQ 100000001）（别名：soyo）｜群主，周六常组织打本/);
+  const fact = await tool.execute(
+    { action: 'upsert', path: 'conversations/group-100000001/MEMORY.md', name: '周五固定开黑', meaning: '晚上八点', section: '惯例与偏好', date: '2026-10-18' },
+    { agent: groupAgent },
+  );
+  assert.equal(fact.action, 'upsert');
+  assert.match(await readMemory(cwd, 'conversations/group-100000001/MEMORY.md'), /## 惯例与偏好\n- 周五固定开黑｜晚上八点｜首见 2026-10-18/);
+});
+
+/**
+ * 私聊摘要不升级：摘要 Agent 在私聊那一轮里对全局文件的写同样被拒绝，
+ * 新事实只能落进那个私聊的 MEMORY.md。
+ *
+ * 摘要 Agent 不是任何 QQ 会话的 Agent（不在 sessionIndex 里），所以这条用例同时钉住
+ * 「`digestTarget` 把被摘要的会话传进写入闸门」这条实现细节。
+ */
+test('a private digest cannot promote facts into COGNITION.md or PEOPLE.md', async () => {
+  const { onebot, host, cwd } = await bootMemory({ digestAtHour: 0, digestMinLines: 1, digestCatchUp: true });
+  const digestId = sessionIdFor('bridge:digest');
+  const errors = [];
+  host.list.onFollowup = async (agent) => {
+    if (agent.id !== digestId) return;
+    const tool = host.tools.get('qq_memory');
+    for (const path of ['COGNITION.md', 'PEOPLE.md']) {
+      try {
+        await tool.execute({ action: 'upsert', path, name: '私聊里学的', meaning: '只在这段私聊成立', qq: '123456' }, { agent });
+      } catch (error) {
+        errors.push(String(error?.message ?? error));
+      }
+    }
+    await tool.execute(
+      { action: 'upsert', path: 'conversations/private-100000002/MEMORY.md', name: '私聊事实', meaning: '只留在这段私聊', section: '事实与事件' },
+      { agent },
+    );
+  };
+  onebot.push(privateMessage('私聊里说了个只有我俩知道的事'));
+  await waitForDigestRecord(cwd, 'private:100000002');
+  assert.equal(errors.length, 2, `两个全局写入都该被拒绝，实际：${errors.join(' | ')}`);
+  assert.ok(errors.every((message) => /private chat must not write/.test(message)), errors.join(' | '));
+  assert.equal(existsSync(join(cwd, '.qq-memory', 'COGNITION.md')), false, '私聊摘要不能创建 COGNITION.md');
+  assert.equal(existsSync(join(cwd, '.qq-memory', 'PEOPLE.md')), false, '私聊摘要不能创建 PEOPLE.md');
+  assert.match(await readMemory(cwd, 'conversations/private-100000002/MEMORY.md'), /私聊事实｜只留在这段私聊/);
+});
+
+/**
+ * 滚档：热层超过阈值时，最不活跃的条目先进 archive/、再从热层删掉；search 仍然搜得到。
+ */
+test('memory rollover archives the least active rows instead of deleting them', async () => {
+  const { onebot, host, cwd } = await bootMemory({ memoryFileMaxBytes: 4096, memoryArchiveRatio: 0.5, digestCatchUp: false });
+  const tool = host.tools.get('qq_memory');
+  onebot.push(privateMessage('你好'));
+  const privateId = sessionIdFor('private:100000002');
+  const agent = await until(() => host.list.created.find((item) => item.id === privateId), 'the private Agent');
+  const rows = [];
+  for (let index = 0; index < 40; index += 1) {
+    rows.push(`- 事实${index}｜一句话事实一句话事实｜首见 2026-10-0${(index % 9) + 1}`);
+  }
+  const markdown = `# 记忆\n\n## 事实与事件\n${rows.join('\n')}\n`;
+  const bytes = Buffer.byteLength(markdown, 'utf8');
+  assert.ok(bytes > 2048 && bytes < 4096, `测试数据要落在阈值与上限之间，实际 ${bytes}`);
+  await tool.execute({ action: 'write', path: 'conversations/private-100000002/MEMORY.md', text: markdown }, { agent });
+
+  const archiveDir = join(cwd, '.qq-memory', 'conversations', 'private-100000002', 'archive');
+  const archived = await until(async () => {
+    if (!existsSync(archiveDir)) return undefined;
+    const files = (await readdir(archiveDir)).filter((name) => name.endsWith('.md'));
+    if (files.length === 0) return undefined;
+    return { files, text: await readFile(join(archiveDir, files[0]), 'utf8') };
+  }, 'the archive file to appear');
+
+  const hot = await readMemory(cwd, 'conversations/private-100000002/MEMORY.md');
+  assert.ok(Buffer.byteLength(hot, 'utf8') <= 2048, `热层要滚回阈值以下，实际 ${Buffer.byteLength(hot, 'utf8')}`);
+  assert.doesNotMatch(hot, /见 archive|更早的/, '热层里不许写指针行');
+  const hotRows = hot.split('\n').filter((line) => /^- /.test(line.trim())).length;
+  const archivedRows = archived.text.split('\n').filter((line) => /^- /.test(line.trim())).length;
+  assert.equal(hotRows + archivedRows, 40, '滚档只搬不删：条目总数守恒');
+
+  // 冷层仍然搜得到（qq_memory search 覆盖 archive/）。
+  const found = await tool.execute({ action: 'search', path: 'conversations/private-100000002/MEMORY.md', query: '事实0' }, { agent });
+  assert.ok(found.returned > 0, '归档的条目必须仍然能搜到');
+  assert.match(found.text, /archive\//);
+  const listed = await tool.execute({ action: 'list' }, {});
+  assert.ok(listed.files.some((file) => file.includes('/archive/')), `list 要能列出冷层，实际：${listed.files.join(' | ')}`);
+});
+
+/**
+ * 归档写失败 → 热层原样不动：宁可暂时超一点，也不丢条目。
+ *
+ * 这里把 `archive/` 这个路径先占成**普通文件**，`mkdir` 就会失败 —— 用来复现磁盘权限 /
+ * 路径被占住那一类真实故障。断言的是「热层一条不少」，不是「有没有报错」。
+ */
+test('a failed archive write leaves the hot layer untouched', async () => {
+  const { onebot, host, cwd } = await bootMemory({ memoryFileMaxBytes: 4096, memoryArchiveRatio: 0.5 });
+  onebot.push(privateMessage('你好'));
+  const privateId = sessionIdFor('private:100000002');
+  const agent = await until(() => host.list.created.find((item) => item.id === privateId), 'the private Agent');
+  const convDir = join(cwd, '.qq-memory', 'conversations', 'private-100000002');
+  await mkdir(convDir, { recursive: true });
+  // 占住 archive/ 这个路径：rollover 的 mkdir 会失败。
+  await writeFile(join(convDir, 'archive'), 'blocked', 'utf8');
+  const rows = [];
+  for (let index = 0; index < 40; index += 1) {
+    rows.push(`- 事实${index}｜一句话事实一句话事实｜首见 2026-10-0${(index % 9) + 1}`);
+  }
+  const markdown = `# 记忆\n\n## 事实与事件\n${rows.join('\n')}\n`;
+  assert.ok(Buffer.byteLength(markdown, 'utf8') > 2048);
+  const tool = host.tools.get('qq_memory');
+  await tool.execute({ action: 'write', path: 'conversations/private-100000002/MEMORY.md', text: markdown }, { agent });
+  await until(
+    () => host.list.warnings.some((warning) => warning.includes('could not write archive/')),
+    'the rollover failure to be reported',
+  );
+  const hot = await readMemory(cwd, 'conversations/private-100000002/MEMORY.md');
+  assert.equal(hot.split('\n').filter((line) => /^- /.test(line.trim())).length, 40, '归档失败时热层一条都不能少');
+  assert.equal(await readFile(join(convDir, 'archive'), 'utf8'), 'blocked', '占位文件本身不该被改');
+});
+
+/** PEOPLE.md 首次为空时从各群 MEMORY.md 的「## 人」小节抽取（一次性、幂等、只补不覆盖）。 */
+test('PEOPLE.md is seeded once from conversation MEMORY.md person sections', async () => {
+  const { cwd } = await bootMemory({}, {}, {}, async (root) => {
+    const dir = join(root, '.qq-memory', 'conversations', 'group-100000001');
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, 'MEMORY.md'),
+      '# 群记忆\n\n## 人\n- kaguya（QQ 100000001）（别名：soyo）｜群主，周六常组织打本｜首见 2026-10-12\n- iroha｜爱看展的群友\n',
+      'utf8',
+    );
+  });
+  const people = await until(async () => {
+    try {
+      return await readMemory(cwd, 'PEOPLE.md');
+    } catch {
+      return undefined;
+    }
+  }, 'PEOPLE.md to be seeded at startup');
+  assert.match(people, /kaguya（QQ 100000001）（别名：soyo）｜群主，周六常组织打本/);
+  assert.match(people, /iroha｜爱看展的群友/);
+  assert.equal(people.split('\n').filter((line) => line.startsWith('- kaguya')).length, 1, '迁移必须幂等：一人一行');
 });
 
 /** memoryDir 配到 cwd 外面时整个功能停用（与 mediaDir / stickerDir 一致）。 */

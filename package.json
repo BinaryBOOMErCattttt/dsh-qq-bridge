@@ -29,6 +29,7 @@
     "chatter.js",
     "speaking-rules.js",
     "memory.js",
+    "memory-select.js",
     "config.js",
     "tools.js",
     "onebot.js",

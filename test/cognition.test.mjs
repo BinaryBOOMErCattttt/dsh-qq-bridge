@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import {
   appendStickerRow,
   cognitionPathViolations,
+  cognitionVocabulary,
   duplicateSectionNames,
   hotCognitionLines,
   normalizeCognitionDoc,
@@ -192,6 +193,44 @@ function describeStructuredWrites() {
     const b = parseCognition(['## 黑话与缩写', '- 新梗｜刚学的｜2026-10-17', '- 旧梗｜很早学的｜2026-09-01'].join('\n')).entries;
     assert.deepEqual(hotCognitionLines(a, { limit: 1 }), ['新梗 —— 刚学的']);
     assert.deepEqual(hotCognitionLines(b, { limit: 1 }), ['新梗 —— 刚学的'], '换个排列不该换成另一条');
+  });
+
+  test('hotCognitionLines：无日期条目按文件位置参与排序，不再一律当最旧（设计 §1.2 的回归）', () => {
+    // 一条老梗写在文件中间、没有日期；后面还有两条有日期的新梗。旧实现把它当最旧，
+    // 于是 15 条上限一满它就永远进不了提示词。
+    const entries = parseCognition([
+      '## 黑话与缩写',
+      '- 老说法｜很久以前学的，没写日期',
+      '- 新梗｜刚学的｜2026-10-17',
+      '- 更新梗｜更近学的｜2026-10-18',
+    ].join('\n')).entries;
+    // 只留最近两条：老说法紧跟在新梗之前（位置），应当挤掉它、留下两条有日期的，
+    // 而不是被当成「最旧」直接出局。
+    assert.deepEqual(hotCognitionLines(entries, { limit: 2 }), ['新梗 —— 刚学的', '更新梗 —— 更近学的']);
+    // 换个位置：没有日期的条目写在**最新**的那条后面 → 继承它的日期并排在它之后，
+    // 于是能进前两条（这正是「写在文件后半段的老条目不再被静默丢掉」）。
+    const tail = parseCognition([
+      '## 黑话与缩写',
+      '- 新梗｜刚学的｜2026-10-17',
+      '- 更新梗｜更近学的｜2026-10-18',
+      '- 老说法｜很久以前学的，没写日期',
+    ].join('\n')).entries;
+    const picked = hotCognitionLines(tail, { limit: 2 });
+    assert.ok(picked.some((line) => line.startsWith('老说法')), `无日期条目应当能进热梗段，实际：${picked.join(' | ')}`);
+  });
+
+  test('cognitionVocabulary：全部梗的写法（含变体）按文件顺序去重', () => {
+    const { entries } = parseCognition(COGNITION);
+    assert.deepEqual(cognitionVocabulary(entries), [
+      '典',
+      '急了',
+      '绷不住了',
+      '蚌埠住了',
+      '绷不住',
+      '绷',
+      '尊嘟假嘟',
+    ]);
+    assert.deepEqual(cognitionVocabulary([]), []);
   });
 
   test('upsertCognitionRow：同写法原地替换，别的条目一字不动', () => {

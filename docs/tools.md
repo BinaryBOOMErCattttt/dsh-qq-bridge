@@ -13,7 +13,7 @@
 | `qq_rename_sticker` | 给一张**已收藏**的表情改名：文件与 `STICKERS.md` 那一条一起搬（含义 / 场景 / 日期跟着走），目标名被占用就拒绝；只改含义不用它（用 `qq_memory` 的 `upsert` 按原名改）。白名单按名字算，目录不可用时同样**根本不注册** |
 | `qq_list_conversations` | 列出在线群/好友列表，以及本 Harness 已处理过的 QQ 会话、当前 Session id 与轮次（`session_round`） |
 | `qq_transcript` | 读某个 QQ 会话的聊天记录：`list` / `read` / `search`（长期记忆的原料，见[长期记忆](memory.md#长期记忆聊天记录--摘要--认知)） |
-| `qq_memory` | 读 / 追加 / 覆盖 / 搜索 / **逐条 upsert / remove** 长期记忆文件：`conversations/<slug>/MEMORY.md`、`COGNITION.md`、`STICKERS.md`、`INDEX.md`；整份 `write` 有「条目数不能掉 10%」护栏，写前留 `.history/` 备份；写被限制在 `memoryDir` 之内 |
+| `qq_memory` | 读 / 搜索 / **逐条 upsert / remove** / 整理用的 write 长期记忆文件：`conversations/<slug>/MEMORY.md`、`PEOPLE.md`、`COGNITION.md`、`STICKERS.md`、`INDEX.md`；整份 `write` 有「条目数不能掉 10%」护栏（四个结构化文件都管），写前留 `.history/` 备份；写被限制在 `memoryDir` 之内，**私聊不能写 `COGNITION.md` / `PEOPLE.md`**（scope 闸门）；搜会话 `MEMORY.md` 时包含 `archive/` |
 | `qq_remind_create` | 建一条到点的提醒：到点由插件直接发消息（`text` 原样 / `agent` 让模型换语气 / `prompt` 到点做事），可 `@` 创建者或名单里的人；时间用本地 `YYYY-MM-DDTHH:MM` 或 `in_minutes`，周期支持每天 / 工作日 / 每周 / 每月，见[定时提醒](reminders.md) |
 | `qq_remind_list` | 列出提醒：默认这个会话的，`scope: "mine"` 只看自己建的，`scope: "all"` 只在 Web 操作员那里可用；带状态、下一次时间与失败原因 |
 | `qq_remind_cancel` | 按 id 取消一条还没发的提醒；只有创建者本人（或 Web 操作员）能取消 |

@@ -187,13 +187,21 @@
 | `recallMemoryMark` | `true` | 被撤回的消息是否在长期记忆（转录）里追加一行「已撤回」：摘要时不会把它当成事实；`false` = 彻底假装没看到 |
 | `memory` | `true` | 是否启用长期记忆（聊天记录落盘 + 定时摘要 + 认知库 + 两个记忆工具 + `.dsh/skills` 里的 `message-digest` / `update-cognition` skill） |
 | `memoryDir` | `.qq-memory` | 长期记忆目录，相对 `cwd`；必须落在 `cwd` 内，否则整个功能记 warn 并停用 |
-| `memoryFileMaxBytes` | `32768` | 单个记忆文件的字节上限：超了 `qq_memory` 的 append 会报错、逼着摘要重写得更精炼 |
-| `memorySearchHits` | `40` | `qq_memory` / `qq_transcript` 一次 search 最多返回多少条命中 |
+| `memoryFileMaxBytes` | `32768` | 单个记忆文件的字节上限：整份 `write` 超了会报错；热层超过 `memoryArchiveRatio` 时由滚档把最不活跃的条目挪进 `archive/`（不再靠删条目） |
+| `memoryPromptChars` | `6000` | 每轮注入提示词的记忆预算（字符）：按当前消息检索后按节配额打包；低于 200 按 200、非法值退回 6000 |
+| `memoryRecallK` | `12` | 每轮最多取多少条检索结果（人物与消息里原样出现的梗是必进的，不占这个名额的硬上限） |
+| `memoryPeopleMax` | `20` | 每轮最多注入多少个人物（`PEOPLE.md`）；`0` = 不注入人物 |
+| `memoryArchive` | `true` | 是否启用冷层归档：热层超阈值时把最不活跃的非置顶条目挪进 `archive/YYYY-MM.md`，`qq_memory search` 仍然搜得到 |
+| `memoryArchiveRatio` | `0.75` | 热层占 `memoryFileMaxBytes` 的比例，超过就滚档（夹在 0.1~1） |
+| `memoryVocabHint` | `true` | 是否在提示词里附一行「全部梗的写法」词汇表（不给含义，只让模型知道这些写法存在） |
+| `memorySearchHits` | `40` | `qq_memory` / `qq_transcript` 一次 search 最多返回多少条命中（搜会话 `MEMORY.md` 时包含 `archive/`） |
 | `digestAtHour` | `4` | 每天几点做摘要（本地时间，0~23）：默认凌晨 4 点，群里没人说话的时候 |
 | `digestMinLines` | `20` | 当天至少攒够多少条新消息才值得跑一次摘要；不够就留到明天 |
 | `digestMaxChars` | `24000` | 一次摘要最多喂给摘要 Agent 多少字符（超出按最近优先截断） |
 | `digestTimeoutMs` | `600000` | 单次摘要的硬超时；卡住的摘要 Agent 会被销毁，下次重开 |
 | `digestCatchUp` | `true` | 错过摘要点（那一刻进程在重启、或会话是之后才有人说话的）时，一开口就补一次，不用等到明天 |
+| `digestRollover` | `true` | 摘要成功之后是否执行滚档（先写 `archive/`，成功才改热层；写失败时热层原样不动） |
+| `digestConsolidate` | `false` | 摘要之后再跑一次「周合并」：合并重复事实、刷新人物 one-liner、清过期计划（多一次模型调用） |
 | `apiKeyRotate` | `true` | 每天在 `apiKeyRotateHour` 点尝试把 `apiKeyRef` 指向的模型凭据换成 `apiKeyFile` 里的下一个 key；池子文件不存在 / 只有一个 key 时什么都不做，见[每天轮换 API key](ops.md#每天轮换-api-keyapikeyrotate) |
 | `apiKeyRotateHour` | `4` | 每天几点尝试轮换模型凭据（本地时间，0~23）：默认凌晨 4 点，与摘要同一个时刻 |
 | `apiKeyFile` | `data/api-keys.txt` | 候选 API key 池：一行一个 key，`#` 开头的行是注释；相对 `cwd`，必须落在 `cwd` 内，否则整个轮换记 warn 并停用 |

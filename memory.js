@@ -44,10 +44,28 @@ import { readJsonl, readTextOrUndefined, readdirOrEmpty, writeJsonAtomic, writeT
 import { collectMedia, messageToText } from './onebot.js';
 import { insideDirectory } from './image.js';
 import { appendStickerRow, hotCognitionLines, normalizeCognitionDoc, normalizeStickerDoc, parseCognition, parseStickerCatalog, removeCognitionRow, removeStickerRow, renameStickerRow, stickerCatalogLines, upsertCognitionRow, upsertStickerRow } from './cognition.js';
+import {
+  archivePlan,
+  parseMemoryDoc,
+  parsePeopleDoc,
+  personEntriesOf,
+  recordsFromCognition,
+  removeMemoryRow,
+  removePersonRow,
+  renderMemoryBlock,
+  upsertMemoryRow,
+  upsertPersonRow,
+} from './memory-select.js';
 
-/** 认知库与表情包目录的文件名（都在 memoryDir 根下，与 INDEX.md 同级）。 */
+/** 认知库、表情包目录与全局人物表的文件名（都在 memoryDir 根下，与 INDEX.md 同级）。 */
 const COGNITION_FILE = 'COGNITION.md';
 const STICKERS_FILE = 'STICKERS.md';
+/** 全局人物表（设计 §3）：QQ 号为主键，跨群共用。 */
+const PEOPLE_FILE = 'PEOPLE.md';
+/** 派生索引：命中次数 / 最近命中时间（可删可重建，键在 memory-select.js 的 record.id）。 */
+const STATS_FILE = 'memory.index.json';
+/** 冷层目录（会话目录下）：滚下来的老条目，只参与 search，不进提示词。 */
+const ARCHIVE_DIR = 'archive';
 /** 表情包目录注入提示词的上限：与旧 STICKER_PROMPT_MAX 一致，别让目录把提示词撑爆。 */
 const STICKER_CATALOG_MAX = 40;
 /** 热梗段的上限：15 条 / 1200 字（见 cognition.js 的 hotCognitionLines）。 */
@@ -59,8 +77,16 @@ const CATALOG_CACHE_MS = 5000;
 /** 每个记忆文件在 `.history/` 里最多留几份旧版本（写坏时人工翻回去用）。 */
 const HISTORY_KEEP = 20;
 
-/** 索引片段（INDEX.md）最多这么大：它每次提示词装配都会被读一遍，不能无节制地长。 */
-const MEMORY_INDEX_MAX_CHARS = 4096;
+/**
+ * `INDEX.md` 注入提示词的上限。
+ *
+ * 索引是部署者 / 摘要 Agent 手写的**短**索引，不是记忆正文；这里的截断只是兜底，
+ * 防止一份被写坏的索引把 `memoryPromptChars` 吃光。真正的记忆走检索（memory-select）。
+ */
+const INDEX_PROMPT_MAX_CHARS = 1500;
+
+/** 派生索引统计写的防抖（毫秒）：提示词每轮都会装配，不能每次都写一次盘。 */
+const STATS_SAVE_MS = 2000;
 
 /** 转录里单条消息最多保留多少字：摘要只需要「大概说了什么」，不需要全文。 */
 const MEMORY_LINE_MAX_CHARS = 500;
@@ -83,6 +109,8 @@ const MEMORY_FILE_RETURN_CHARS = 12000;
  *   - `cwd`：Agent 工作目录，同时也是 `memoryDir` 越界校验的基准。
  *   - `report`：`(level, msg)` 运维日志（index.js 里那个 logger + stderr 的镜像）。
  *   - `conversations` / `sessionIndex`：会话表与 session id → key 的反查，解析「在说哪个会话」用。
+ *   - `ambientQuery`：`(conversation) => string`，把这个群最近几条闲聊拼成检索查询；
+ *     主动说话 / 补一句 / 提醒这些「没有来消息」的轮次靠它决定这一轮该捞哪些记忆。
  *   - `allowTools`：工具白名单 —— 「记忆工具到底可不可见」跟着它走。
  *   - `approvalPolicy`：摘要 Agent 也按这个策略收审批。
  *
@@ -101,6 +129,7 @@ export function createMemory(deps) {
     report,
     conversations,
     sessionIndex,
+    ambientQuery,
     allowTools,
     approvalPolicy,
     resolveRoute,
@@ -167,6 +196,35 @@ export function createMemory(deps) {
   const memoryWrites = new Map();
   /** 这次启动是否已经跑过一轮「补课」摘要（见 maybeCatchUpDigest）。 */
   let digestCatchUpKicked = false;
+  /**
+   * 派生索引里的统计：`{ [record.id]: { hits, lastSeen } }`。
+   *
+   * 它不是真相（删掉也能从 markdown 重建记录），只影响打分里的 salience / recency
+   * 与滚档时「谁最不活跃」。读写失败一律降级成「没有统计」，绝不让它挡住装配。
+   */
+  let memoryStats = {};
+  /** 统计是否从磁盘读过（第一次装配提示词是同步的，来不及 await）。 */
+  let statsLoaded = false;
+  /** 统计的防抖写盘定时器。 */
+  let statsTimer;
+  /**
+   * 摘要会话**正在处理哪个会话**（`group:<id>` / `private:<qq>`）。
+   *
+   * `qq_memory` 的写入闸门要判断「这次写是不是从私聊里发起的」，而摘要 Agent 不是任何
+   * QQ 会话的 Agent（不在 `sessionIndex` 里）。所以摘要轮开始时把目标记在这里，
+   * `runDigest` 结束时清掉 —— 见 `writeScopeOf`。
+   */
+  let digestTarget;
+  /** 全局人物表的一次性迁移是否跑过（每个进程一次）。 */
+  let peopleMigrated = false;
+  /** 同步读数缓存：绝对路径 → `{ key, text }`（key = size:mtime）。 */
+  const fileTextCache = new Map();
+  /** 全局文件（PEOPLE / COGNITION）的解析缓存，按两份文件的 mtime 失效。 */
+  let globalRecordsCache = { key: '', records: [], warnings: [] };
+  /** 会话热层的解析缓存：会话 key → `{ key, records, warnings }`。 */
+  const conversationRecordsCache = new Map();
+  /** `archive/` 月份清单的缓存：会话 key → `{ at, months }`。 */
+  const archiveMonthsCache = new Map();
 
   /** 摘要 Agent 的会话 id（确定性派生，重启后 resume，摘要历史不会断）。 */
   const digestSessionId = sessionIdFor('bridge:digest');
@@ -188,7 +246,7 @@ export function createMemory(deps) {
     return slug;
   }
 
-  /** 某个会话在记忆目录下的绝对路径集合（会话目录、转录目录、记忆文件）。 */
+  /** 某个会话在记忆目录下的绝对路径集合（会话目录、转录目录、记忆文件、冷层）。 */
   function memoryPaths(key) {
     const slug = memorySlugFor(key);
     const dir = join(memoryRoot, 'conversations', slug);
@@ -196,6 +254,7 @@ export function createMemory(deps) {
       slug,
       dir: `${dir}${sep}`,
       logDir: `${join(dir, 'log')}${sep}`,
+      archiveDir: `${join(dir, ARCHIVE_DIR)}${sep}`,
       memoryFile: join(dir, 'MEMORY.md'),
       metaFile: join(dir, 'meta.json'),
     };
@@ -203,6 +262,9 @@ export function createMemory(deps) {
 
   /** 索引片段与认知库的绝对路径（两者都在记忆目录顶层）。 */
   const memoryIndexFile = memoryEnabled ? join(memoryRoot, 'INDEX.md') : undefined;
+  /** 全局人物表与派生索引的绝对路径。 */
+  const memoryPeopleFile = memoryEnabled ? join(memoryRoot, PEOPLE_FILE) : undefined;
+  const memoryStatsFile = memoryEnabled ? join(memoryRoot, STATS_FILE) : undefined;
 
   /**
    * 某个目录下已经排队的转录写入（用来在**读**之前把写等干净）。
@@ -486,7 +548,7 @@ export function createMemory(deps) {
         name: 'qq-bridge:digest',
         order: channelSectionOrder + 10,
         interpolate: false,
-        text: () => digestPrompt(notice),
+        text: () => digestPrompt(digestNotice),
       });
     };
     let handle;
@@ -516,59 +578,210 @@ export function createMemory(deps) {
 
   /** 摘要 Agent 的句柄（只在 /reset 之外的生命周期里复用；超时销毁后置空）。 */
   let digestHandle;
+  /** 摘要 Agent 提示词里「这一轮要处理哪个会话」：resume 复用时由 runDigestTurn 更新。 */
+  let digestNotice;
 
   /**
-   * 提示词里那段「记忆索引」的缓存。
+   * 同步读一个记忆文件（提示词装配用），带 `size:mtime` 缓存。
    *
-   * `SystemPrompt.section()` 的 text provider 是**同步**求值的（每次装配提示词都会
-   * 重新算），所以这里只能读缓存、由后台异步刷新 —— 与表情包目录用同步 readdir 的
-   * 理由一样，只是记忆文件在磁盘上、大小不定，同步读会把一次可观测的 IO 放进装配路径。
-   * @type {{ at: number, text: string }}
+   * `SystemPrompt.section()` 的 text provider 是**同步**求值的，没法 await。记忆文件
+   * 单份有 `memoryFileMaxBytes` 兜底（默认 32KB），一次 stat + 命中缓存时零读取 ——
+   * 比再引入一套异步刷新与失效简单得多，也不会出现「这一轮看的是上一轮的缓存」。
+   * @param {string|undefined} absolute - 绝对路径。
+   * @returns `{ text, key }`：文件不存在时 `{ text: '', key: 'missing' }`。
    */
-  let memoryIndexCache = { at: 0, text: '' };
-
-  /**
-   * 读一小段记忆索引（`INDEX.md` + 当前会话的 `MEMORY.md`）供提示词使用。
-   *
-   * 只取开头的 `MEMORY_INDEX_MAX_CHARS` 个字：索引是「摘要 Agent 替大家维护的目录」，
-   * 它的长度由摘要 Agent 的写法决定，插件这边只做兜底截断 —— 提示词被记忆撑爆比
-   * 记忆不够详细糟糕得多。
-   * @param conversation - 目标会话。
-   * @returns 可直接拼进提示词的若干行；没有内容时为空串。
-   */
-  function memoryIndexText(conversation) {
-    if (!memoryEnabled) return '';
-    if (Date.now() - memoryIndexCache.at > 15000) {
-      // 先发一次刷新（不 await），这一轮用上一份缓存 —— 冷启动时是空的，15 秒后就位。
-      memoryIndexCache.at = Date.now();
-      if (!memoryIndexRefreshing) {
-        memoryIndexRefreshing = true;
-        void (async () => {
-          try {
-            const paths = memoryPaths(conversation.key);
-            const parts = [];
-            const index = await readTextOrUndefined(memoryIndexFile);
-            if (index !== undefined && index.trim().length > 0) parts.push(index.trim());
-            const own = await readTextOrUndefined(paths.memoryFile);
-            if (own !== undefined && own.trim().length > 0) {
-              parts.push(`### ${conversation.type === 'group' ? '本群' : '与这个人'}的记忆（${memoryLabel}/conversations/${paths.slug}/MEMORY.md）\n${own.trim()}`);
-            }
-            const text = parts.join('\n\n').slice(0, MEMORY_INDEX_MAX_CHARS);
-            memoryIndexCache = { at: Date.now(), text };
-          } catch (error) {
-            report('warn', `could not read the memory index: ${errorText(error)}`);
-            memoryIndexCache = { at: Date.now(), text: memoryIndexCache.text };
-          } finally {
-            memoryIndexRefreshing = false;
-          }
-        })();
-      }
+  function readSyncText(absolute) {
+    if (absolute === undefined) return { text: '', key: 'missing' };
+    try {
+      const info = statSync(absolute);
+      const key = `${info.size}:${info.mtimeMs}`;
+      const cached = fileTextCache.get(absolute);
+      if (cached !== undefined && cached.key === key) return cached;
+      const fresh = { key, text: readFileSync(absolute, 'utf8') };
+      fileTextCache.set(absolute, fresh);
+      return fresh;
+    } catch {
+      return { text: '', key: 'missing' };
     }
-    return memoryIndexCache.text;
   }
 
-  /** 索引刷新是否正在进行（避免一个慢磁盘把刷新任务堆起来）。 */
-  let memoryIndexRefreshing = false;
+  /**
+   * 全局记录：`PEOPLE.md` 的人物 + `COGNITION.md` 的梗。
+   *
+   * 两者都是 `scope: 'global'`，所有会话可见；缓存按两份文件的 `size:mtime` 失效，
+   * 摘要 Agent 刚写完的条目下一次装配就能看见。
+   */
+  function globalRecords() {
+    const people = readSyncText(memoryPeopleFile);
+    const cognition = readSyncText(join(memoryBase, COGNITION_FILE));
+    const key = `${people.key}|${cognition.key}`;
+    if (globalRecordsCache.key === key) return globalRecordsCache;
+    const peopleParsed = parsePeopleDoc(people.text, { file: PEOPLE_FILE });
+    const cognitionParsed = parseCognition(cognition.text);
+    const records = [
+      ...peopleParsed.records,
+      ...recordsFromCognition(cognitionParsed.entries, { file: COGNITION_FILE }),
+    ];
+    const warnings = [...peopleParsed.warnings, ...cognitionParsed.warnings];
+    // 一份文件写坏不能让提示词装配失败：坏条目丢掉，只留前三条 warn 供排查。
+    for (const warning of warnings.slice(0, 3)) report('warn', warning);
+    globalRecordsCache = { key, records, warnings };
+    return globalRecordsCache;
+  }
+
+  /**
+   * 这个会话自己的热层记录（`conversations/<slug>/MEMORY.md`）。
+   *
+   * 冷层（`archive/`）**不进提示词**：它只参与 `qq_memory search`。热层才是「现在还
+   * 有效」的那批事实，滚档规则见 {@link rolloverMemory}。
+   */
+  function conversationRecords(key) {
+    const paths = memoryPaths(key);
+    const own = readSyncText(paths.memoryFile);
+    const cached = conversationRecordsCache.get(key);
+    if (cached !== undefined && cached.key === own.key) return cached;
+    const parsed = parseMemoryDoc(own.text, { file: `conversations/${paths.slug}/MEMORY.md`, scope: key });
+    for (const warning of parsed.warnings.slice(0, 3)) report('warn', warning);
+    const fresh = { key: own.key, records: parsed.records, warnings: parsed.warnings };
+    conversationRecordsCache.set(key, fresh);
+    return fresh;
+  }
+
+  /**
+   * `archive/` 下有哪些月份（给提示词里那行**现算的**聚合行）。
+   *
+   * 不往 `MEMORY.md` 里写指针：指针会随滚档次数增长，几年后就会把正文挤走 ——
+   * 那正是设计 §6.2 点名要修的病。这里只是 readdir + 10 秒缓存。
+   */
+  function archiveMonthsOf(key) {
+    const cached = archiveMonthsCache.get(key);
+    if (cached !== undefined && Date.now() - cached.at < 10000) return cached.months;
+    let months = [];
+    try {
+      months = readdirSync(memoryPaths(key).archiveDir)
+        .filter((name) => /^\d{4}-\d{2}\.md$/.test(name))
+        .map((name) => name.slice(0, 7))
+        .sort();
+    } catch {
+      months = []; // 还没建 / 读不到：当作「没有归档」，不影响这一轮。
+    }
+    archiveMonthsCache.set(key, { at: Date.now(), months });
+    return months;
+  }
+
+  /**
+   * 这一轮的检索查询：当前消息（`conversation.recallQuery`）+ 群环境 + 说话人。
+   *
+   * 主动说话 / 补一句 / 提醒这些没有「来消息」的轮次，`recallQuery` 会退回上一条消息
+   * 或群环境（`deps.ambientQuery`）—— 设计 §5.1。说话人用来保证「人物必进」。
+   * @param conversation - 目标会话。
+   * @returns `{ text, focus }`。
+   */
+  function recallQueryFor(conversation) {
+    const recent = conversation?.recallQuery;
+    const parts = [];
+    if (recent !== undefined && String(recent.text ?? '').trim().length > 0) parts.push(String(recent.text));
+    const ambient = typeof ambientQuery === 'function' ? String(ambientQuery(conversation) ?? '') : '';
+    if (ambient.trim().length > 0) parts.push(ambient.trim());
+    const speakers = recent?.speakers ?? conversation?.speakers ?? [];
+    const focus = speakers.map((speaker) => String(speaker?.name ?? '').trim()).filter((name) => name.length > 0);
+    return { text: parts.join('\n').slice(0, 4000), focus };
+  }
+
+  /** 记一次「被命中」：salience 与滚档的「最不活跃」都靠它。 */
+  function bumpStats(records) {
+    if (!statsLoaded) return; // 统计还没从磁盘读进来，别用空表覆盖它
+    const now = Date.now();
+    for (const record of records) {
+      const entry = memoryStats[record.id] ?? { hits: 0, lastSeen: 0 };
+      entry.hits = Math.max(0, Number(entry.hits) || 0) + 1;
+      entry.lastSeen = now;
+      memoryStats[record.id] = entry;
+    }
+    scheduleStatsSave();
+  }
+
+  /** 统计写盘防抖：提示词每轮都装配，不能每次都写一次盘。 */
+  function scheduleStatsSave() {
+    if (statsTimer !== undefined) return;
+    statsTimer = setTimeout(() => {
+      statsTimer = undefined;
+      void saveStats();
+    }, STATS_SAVE_MS);
+    statsTimer.unref?.();
+  }
+
+  /** 把派生索引写到 `memory.index.json`（写失败只记 warn：它只是派生物）。 */
+  async function saveStats() {
+    if (!memoryEnabled || !statsLoaded || memoryStatsFile === undefined) return;
+    try {
+      await mkdir(memoryRoot, { recursive: true });
+      await writeJsonAtomic(memoryStatsFile, { version: 1, builtAt: new Date().toISOString(), stats: memoryStats });
+    } catch (error) {
+      report('warn', `could not write ${STATS_FILE}: ${errorText(error)}`);
+    }
+  }
+
+  /**
+   * 读派生索引。文件缺失 / 损坏 → 统计为空（降级成「按 pinned / 板块 / 最近取」），
+   * 不抛错、不空注入 —— 见设计 §10「降级」。
+   */
+  async function loadStats() {
+    if (!memoryEnabled || statsLoaded) return;
+    statsLoaded = true;
+    try {
+      const text = await readTextOrUndefined(memoryStatsFile);
+      if (text === undefined) return;
+      const parsed = JSON.parse(text);
+      const stats = parsed?.stats ?? parsed;
+      if (stats !== null && typeof stats === 'object' && !Array.isArray(stats)) {
+        memoryStats = Object.fromEntries(Object.entries(stats).filter(([, value]) => value !== null && typeof value === 'object'));
+      }
+    } catch (error) {
+      report('warn', `could not read ${STATS_FILE} (rebuilding stats from scratch): ${errorText(error)}`);
+      memoryStats = {};
+    }
+  }
+
+  /**
+   * 记忆注入的总入口（设计 §5 / §7）：检索 + 按节配额打包 + 出处 + 词汇表 + 归档聚合行。
+   *
+   * 与旧的 `memoryIndexText` 的区别不是「读得更多」，而是**先按 scope 硬过滤、再按当前
+   * 消息打分**：文件开头的几条无关内容不再永远占着预算，写在后半段的条目也不会永远
+   * 看不见。没有命中时按 pinned / salience / 最近兜底，**绝不取文件头**。
+   * @param conversation - 目标会话。
+   * @returns 可直接拼进提示词的整段；没有任何内容时为空串。
+   */
+  function recallText(conversation) {
+    if (!memoryEnabled) return '';
+    const index = readSyncText(memoryIndexFile);
+    const indexText = index.text.trim().slice(0, INDEX_PROMPT_MAX_CHARS);
+    const now = Date.now();
+    const query = recallQueryFor(conversation);
+    const own = conversationRecords(conversation.key);
+    const global = globalRecords();
+    const archiveMonths = archiveMonthsOf(conversation.key);
+    const block = renderMemoryBlock({
+      records: [...global.records, ...own.records],
+      query: query.text,
+      scope: conversation.key,
+      focus: query.focus,
+      indexText,
+      archiveMonths,
+      stats: memoryStats,
+      config: {
+        promptChars: settings.memoryPromptChars,
+        recallK: settings.memoryRecallK,
+        peopleMax: settings.memoryPeopleMax,
+        vocabHint: settings.memoryVocabHint,
+      },
+      now,
+    });
+    // 一条都没有、连索引也没写：让 index.js 说「记忆还是空的」，而不是给一个空标题。
+    if (block.picked.length === 0 && indexText.length === 0 && archiveMonths.length === 0) return '';
+    bumpStats(block.picked);
+    return block.text;
+  }
 
   /**
    * 认知库与表情包目录的同步读数（提示词装配用）。
@@ -678,12 +891,17 @@ export function createMemory(deps) {
   /** 记忆目录下已存在的文件（相对路径），按名称排序；没有时是空数组。 */
   async function listMemoryFiles() {
     const out = [];
-    for (const top of ['INDEX.md', COGNITION_FILE, STICKERS_FILE, 'digest.json']) {
+    for (const top of ['INDEX.md', COGNITION_FILE, STICKERS_FILE, PEOPLE_FILE, STATS_FILE, 'digest.json']) {
       if ((await readTextOrUndefined(join(memoryBase, top))) !== undefined) out.push(`${memoryLabel}/${top}`);
     }
     for (const slug of await readdirOrEmpty(join(memoryBase, 'conversations'))) {
       for (const name of await readdirOrEmpty(join(memoryBase, 'conversations', slug))) {
         if (name.endsWith('.md') || name.endsWith('.json')) out.push(memoryRelativeConvPath(slug, name));
+      }
+      // 冷层：`archive/YYYY-MM.md`。它不进提示词，但 search 会搜（见 searchMemoryFile），
+      // 所以 list 也必须列得出来 —— 否则模型不知道「更早的记忆」在哪。
+      for (const name of await readdirOrEmpty(join(memoryBase, 'conversations', slug, ARCHIVE_DIR))) {
+        if (name.endsWith('.md')) out.push(memoryRelativeConvPath(slug, `${ARCHIVE_DIR}/${name}`));
       }
     }
     return { action: 'list', files: out.sort(), returned: out.length, truncated: false };
@@ -716,7 +934,7 @@ export function createMemory(deps) {
   }
 
   /**
-   * 读这两个文件时，把「解析不了、因此永远不会进提示词」的行直接点出来。
+   * 读这几个文件时，把「解析不了、因此永远不会进提示词」的行直接点出来。
    *
    * 这些行是静默失效的：写在文件里、search 找得到、模型每轮却看不到（真实事故：
    * 31 条里 3 条只有一段，从来没进过提示词）。不点出来，谁都不会去修它。
@@ -726,40 +944,203 @@ export function createMemory(deps) {
       ? parseCognition(text)
       : relative === STICKERS_FILE
         ? parseStickerCatalog(text)
-        : undefined;
+        : relative === PEOPLE_FILE
+          ? parsePeopleDoc(text)
+          : relative.endsWith('MEMORY.md')
+            ? parseMemoryDoc(text, { file: relative })
+            : undefined;
     if (parsed === undefined || parsed.warnings.length === 0) return undefined;
     return `⚠ ${parsed.warnings.length} 行不会被注入/选中（字段不全，补齐或删掉）：\n${parsed.warnings.slice(0, 3).map((line) => `  - ${line}`).join('\n')}`;
   }
 
   /**
    * 在记忆文件里按子串搜索（不区分大小写），返回命中行及其上下文。
+   *
+   * 搜一个会话的 `MEMORY.md` 时**连它的 `archive/` 一起搜**：滚到冷层的条目只是不进
+   * 提示词，不是消失了（设计 §6.2）。命中行前会标出文件名，模型据此用 `qq_memory read`
+   * 深挖。
    * @param relative - 记忆目录内的相对路径。
    * @param query - 要找的文本。
    * @param limit - 最多返回多少条命中。
    * @returns 工具输出。
    */
   async function searchMemoryFile(relative, query, limit) {
-    const text = await readTextOrUndefined(join(memoryBase, relative));
+    const max = Math.max(1, Math.floor(Number(limit) || Number(settings.memorySearchHits) || 40));
+    const needle = query.trim().toLowerCase();
+    const targets = [{ path: relative, label: '' }];
+    // `conversations/<slug>/MEMORY.md` → 同一个目录下的 archive/*.md 也搜。
+    const conv = /^conversations\/([^/]+)\/MEMORY\.md$/.exec(relative);
+    if (conv !== null) {
+      const dir = join(memoryBase, 'conversations', conv[1], ARCHIVE_DIR);
+      for (const name of (await readdirOrEmpty(dir)).filter((item) => item.endsWith('.md')).sort()) {
+        targets.push({ path: `conversations/${conv[1]}/${ARCHIVE_DIR}/${name}`, label: `${ARCHIVE_DIR}/${name}` });
+      }
+    }
     const hits = [];
-    if (text !== undefined) {
+    let bytes = 0;
+    let searched = 0;
+    for (const target of targets) {
+      const text = await readTextOrUndefined(join(memoryBase, target.path));
+      if (text === undefined) continue;
+      searched += 1;
+      bytes += Buffer.byteLength(text, 'utf8');
       const lines = text.split('\n');
-      const needle = query.trim().toLowerCase();
-      const max = Math.max(1, Math.floor(Number(limit) || Number(settings.memorySearchHits) || 40));
       for (let index = 0; index < lines.length && hits.length < max; index += 1) {
         if (!lines[index].toLowerCase().includes(needle)) continue;
         const from = Math.max(0, index - 2);
         const to = Math.min(lines.length, index + 3);
-        hits.push(lines.slice(from, to).map((line, offset) => `${String(from + offset + 1).padStart(4, ' ')} | ${line}`).join('\n'));
+        const prefix = target.label.length > 0 ? `${target.label}:` : '';
+        hits.push(`${prefix}${lines.slice(from, to).map((line, offset) => `${String(from + offset + 1).padStart(4, ' ')} | ${line}`).join('\n')}`);
       }
+      if (hits.length >= max) break;
     }
     return {
       action: 'search',
       path: `${memoryLabel}/${relative}`,
       returned: hits.length,
-      truncated: hits.length >= Math.max(1, Math.floor(Number(limit) || Number(settings.memorySearchHits) || 40)),
+      truncated: hits.length >= max,
       text: hits.length > 0 ? hits.join('\n---\n') : '(no match)',
-      bytes: text === undefined ? 0 : Buffer.byteLength(text, 'utf8'),
+      bytes,
+      note: searched > 1 ? `searched ${searched} files (MEMORY.md + ${ARCHIVE_DIR}/)` : undefined,
     };
+  }
+
+  /**
+   * 这次工具调用「是从哪个会话发起的」。
+   *
+   * 三个来源：QQ 会话的 Agent（`sessionIndex` 反查）、摘要 Agent（`digestTarget`）、
+   * 宿主平面的 Web 主会话（都不是 → undefined，不受私聊写入闸门限制 —— 那是部署者
+   * 在操作，不是 QQ 消息）。
+   */
+  function writeScopeOf(exec) {
+    const agentId = exec?.agent?.id;
+    if (agentId === undefined) return undefined;
+    const key = sessionIndex.get(agentId);
+    if (key !== undefined) return key;
+    if (agentId === digestSessionId) return digestTarget;
+    return undefined;
+  }
+
+  /**
+   * 私聊写入闸门（设计 §4「scope：只降不升」的第二层）。
+   *
+   * `COGNITION.md` / `PEOPLE.md` 是**全局**文件；私聊里知道的事一旦写进去，就会在群里
+   * 被说出来。所以这里不给「尽量避免」的余地：私聊会话对这两个文件的任何写请求
+   * （write / append / upsert / remove）一律拒绝，并提示写进本会话的 `MEMORY.md`。
+   *
+   * 摘要 Agent 走同一条闸门（`digestTarget` 是被摘要的那个会话），它在私聊的摘要轮里
+   * 一样拿不到这两个写通道。
+   */
+  function assertGlobalWrite(relative, exec) {
+    if (relative !== COGNITION_FILE && relative !== PEOPLE_FILE) return;
+    const scope = writeScopeOf(exec);
+    if (scope === undefined || !String(scope).startsWith('private:')) return;
+    throw new Error(
+      `qq_memory: ${memoryLabel}/${relative} is shared by every conversation — a private chat must not write it ` +
+        `(the same thing learned in a group, or verified from a public source, can be written there instead). ` +
+        `Write it into conversations/<this chat>/MEMORY.md.`,
+    );
+  }
+
+  /**
+   * 热层 → 冷层的滚档（设计 §6.2）。
+   *
+   * 顺序是**先写归档、成功之后再重写热层**：归档失败时热层原样不动，宁可暂时超一点，
+   * 也不丢条目。规则本身（挪哪些、挪完多长）在 `archivePlan`（纯函数）里，这里只碰盘。
+   *
+   * @param key - 会话 key。
+   * @param {object} [options] - `reason` 只用于日志。
+   * @returns `{ rolled, removed?, reason? }`。
+   */
+  async function rolloverMemory(key, { reason = 'digest' } = {}) {
+    if (!memoryEnabled || !settings.memoryArchive) return { rolled: false, reason: 'disabled' };
+    const paths = memoryPaths(key);
+    const text = (await readTextOrUndefined(paths.memoryFile)) ?? '';
+    const plan = archivePlan(text, {
+      maxBytes: settings.memoryFileMaxBytes,
+      ratio: settings.memoryArchiveRatio,
+      stats: memoryStats,
+      now: Date.now(),
+    });
+    if (!plan.needed) return { rolled: false, reason: 'below threshold' };
+    if (!plan.rolled) {
+      report('warn', `memory rollover for ${key} skipped: ${plan.reason ?? 'nothing removable'} (${plan.beforeBytes} bytes)`);
+      return { rolled: false, reason: plan.reason };
+    }
+    try {
+      for (const file of plan.archive) {
+        const absolute = join(paths.dir, ARCHIVE_DIR, `${file.month}.md`);
+        const existing = (await readTextOrUndefined(absolute)) ?? '';
+        // 同一条（完全相同的行）已经归档过就不再写第二遍：按 id 去重的最后一道保险，
+        // 也是「同一条不会既在热层又在冷层」这条不变量的落点。
+        const known = new Set(existing.split(/\r?\n/).map((line) => line.trim()));
+        const rows = file.rows.filter((row) => !known.has(row.trim()));
+        if (rows.length === 0) continue;
+        const header = existing.trim().length === 0 ? `# 记忆归档 ${file.month}\n\n` : `${existing.replace(/\s*$/, '')}\n`;
+        await mkdir(dirname(absolute), { recursive: true });
+        await writeTextAtomic(absolute, `${header}${rows.join('\n')}\n`);
+      }
+    } catch (error) {
+      // 归档写失败 → 热层保持原样：宁可暂时超一点，也不丢条目。
+      report('warn', `memory rollover for ${key} could not write ${ARCHIVE_DIR}/: ${errorText(error)}`);
+      return { rolled: false, reason: errorText(error) };
+    }
+    try {
+      await writeTextAtomic(paths.memoryFile, plan.hot);
+    } catch (error) {
+      report('warn', `memory rollover for ${key} wrote ${ARCHIVE_DIR}/ but could not rewrite the hot layer: ${errorText(error)}`);
+      return { rolled: false, reason: errorText(error) };
+    }
+    archiveMonthsCache.delete(key);
+    report(
+      'info',
+      `memory rollover for ${key}: ${plan.removed.length} row(s) → ${ARCHIVE_DIR}/ (${plan.beforeBytes} → ${plan.afterBytes} bytes, ${reason})`,
+    );
+    return { rolled: true, removed: plan.removed.length };
+  }
+
+  /**
+   * 从各会话 `MEMORY.md` 的「## 人」小节补一遍 `PEOPLE.md`（设计 §9，一次性、幂等）。
+   *
+   * 只补不覆盖：已经按 QQ 号 / 名字 / 别名认得的条目原样不动。文件不存在时也不会
+   * 建一个空表 —— 没有人物就不写，免得提示词里多一段空标题。
+   */
+  async function migratePeopleDoc() {
+    if (!memoryEnabled || peopleMigrated) return;
+    peopleMigrated = true;
+    try {
+      const root = join(memoryBase, 'conversations');
+      const slugs = await readdirOrEmpty(root);
+      let people = (await readTextOrUndefined(memoryPeopleFile)) ?? '';
+      const known = new Set(
+        parsePeopleDoc(people).records.flatMap((record) => [record.qq, record.name, record.topic, ...(record.aliases ?? [])])
+          .map((item) => String(item ?? '').trim().toLowerCase())
+          .filter((item) => item.length > 0),
+      );
+      let added = 0;
+      for (const slug of slugs) {
+        // 只扫**群**目录：人物表是全局的，把私聊里知道的人提上去就是 scope 升级
+        // （设计 §4「只降不升」）。私聊的人物留在它自己的 MEMORY.md 里。
+        if (!slug.startsWith('group-')) continue;
+        const text = (await readTextOrUndefined(join(root, slug, 'MEMORY.md'))) ?? '';
+        for (const entry of personEntriesOf(text)) {
+          const keys = [entry.qq, entry.name, ...(entry.aliases ?? [])]
+            .map((item) => String(item ?? '').trim().toLowerCase())
+            .filter((item) => item.length > 0);
+          if (keys.some((key) => known.has(key))) continue;
+          people = upsertPersonRow(people, entry).text;
+          for (const key of keys) known.add(key);
+          added += 1;
+        }
+      }
+      if (added > 0) {
+        await mkdir(memoryRoot, { recursive: true });
+        await writeTextAtomic(memoryPeopleFile, people);
+        report('info', `migrated ${added} person row(s) from conversation MEMORY.md files into ${PEOPLE_FILE}`);
+      }
+    } catch (error) {
+      report('warn', `could not migrate ${PEOPLE_FILE}: ${errorText(error)}`);
+    }
   }
 
   /**
@@ -768,18 +1149,24 @@ export function createMemory(deps) {
    * 顺序是「先校验大小、再写盘」：写一半才发现超限会留下一个半截文件（记忆文件是
    * 摘要 Agent 下一次开工要读的输入，半截比不写更坏）。写走 `writeMemoryFile` 的
    * 串行队列 —— 同一个文件的两次写入可能来自同一轮里的两个并行工具调用。
+   *
+   * `exec` 只用来判断「这次写是不是私聊发起的」（见 `assertGlobalWrite`）；内部调用
+   * （存表情包的目录、滚档）不带它，因此不受闸门影响。
    * @param relative - 记忆目录内的相对路径。
    * @param text - 要写入的 markdown。
    * @param append - true = 追加，false = 覆盖。
    * @returns 工具输出。
    */
-  async function writeMemoryFile(relative, text, append, { force = false } = {}) {
+  async function writeMemoryFile(relative, text, append, { force = false, exec } = {}) {
+    assertGlobalWrite(relative, exec);
     const absolute = join(memoryBase, relative);
     const maxBytes = Math.max(256, Math.floor(Number(settings.memoryFileMaxBytes) || 0));
     const previousRaw = (await readTextOrUndefined(absolute)) ?? '';
     const previousBytes = Buffer.byteLength(previousRaw, 'utf8');
     const isCognition = relative === COGNITION_FILE;
     const isStickers = relative === STICKERS_FILE;
+    const isPeople = relative === PEOPLE_FILE;
+    const isMemory = relative.endsWith('MEMORY.md');
     // 1) 落盘前归一化：重复二级标题只留一个、同键条目只留最后一条。
     //    写在**写入路径**而不是读路径：读要如实反映磁盘上到底有什么，否则人看不出问题。
     let next = append
@@ -789,12 +1176,17 @@ export function createMemory(deps) {
     else if (isStickers) next = normalizeStickerDoc(next);
     // 2) 护栏：整份重写把条目数砍掉一大截就拒绝。模型漏抄几行是这类文件最常见的破坏方式，
     //    而它自己完全不会察觉（文件「写成功了」）。确实要精简时用 force。
-    if (!append && (isCognition || isStickers)) {
-      const countOf = (value) => (isCognition
-        ? parseCognition(value).entries.length
-        : parseStickerCatalog(value).collected.length + parseStickerCatalog(value).pending.length);
+    if (!append && (isCognition || isStickers || isPeople || isMemory)) {
+      const countOf = (value) => {
+        if (isCognition) return parseCognition(value).entries.length;
+        if (isStickers) return parseStickerCatalog(value).collected.length + parseStickerCatalog(value).pending.length;
+        if (isPeople) return parsePeopleDoc(value).records.length;
+        return parseMemoryDoc(value, { file: relative }).records.length;
+      };
       const before = countOf(previousRaw);
       const after = countOf(next);
+      // 护栏对**所有结构化文件**生效：整份重写漏抄几行是模型最常见的破坏方式，而它
+      // 完全不会察觉（文件「写成功了」）。确实要精简时用 force。
       if (!force && before > 0 && after < Math.ceil(before * 0.9)) {
         throw new Error(
           `qq_memory: this write would keep only ${after} of ${before} entries in ${memoryLabel}/${relative} — ` +
@@ -823,6 +1215,14 @@ export function createMemory(deps) {
       });
     memoryWrites.set(queueKey, done);
     await done;
+    // 热层写完之后看一眼要不要滚档：先写 archive、成功才重写热层（见 rolloverMemory）。
+    const convKey = conversationKeyForRelative(relative);
+    if (convKey !== undefined && settings.memoryArchive) {
+      archiveMonthsCache.delete(convKey);
+      void rolloverMemory(convKey, { reason: 'write' }).catch((error) => {
+        report('warn', `memory rollover after writing ${relative} failed: ${errorText(error)}`);
+      });
+    }
     return {
       action: append ? 'append' : 'write',
       path: `${memoryLabel}/${relative}`,
@@ -832,6 +1232,16 @@ export function createMemory(deps) {
       truncated: false,
       note: append ? `appended ${bodyBytes} bytes` : `replaced ${previousBytes} bytes with ${bodyBytes} bytes`,
     };
+  }
+
+  /** `conversations/<slug>/MEMORY.md` → 会话 key（认不出来时 undefined）。 */
+  function conversationKeyForRelative(relative) {
+    const match = /^conversations\/([^/]+)\/MEMORY\.md$/.exec(String(relative ?? ''));
+    if (match === null) return undefined;
+    for (const key of memorySlugs.keys()) {
+      if (memorySlugFor(key) === match[1]) return key;
+    }
+    return undefined;
   }
 
   /**
@@ -858,12 +1268,18 @@ export function createMemory(deps) {
    * 写入或更新单条记忆（`qq_memory` 的 upsert）。
    *
    * 这是「不要让模型整份重写 markdown」的正解：它只给字段，格式、分节、去重都由
-   * `cognition.js` 的纯函数负责（见 `upsertCognitionRow` / `upsertStickerRow`）。
-   * @param relative - 只能是 `COGNITION.md` 或 `STICKERS.md`。
+   * 纯函数负责（`cognition.js` 的 `upsertCognitionRow` / `upsertStickerRow`，
+   * `memory-select.js` 的 `upsertMemoryRow` / `upsertPersonRow`）。
+   *
+   * 四个文件、四种键：认知库按**文字写法**，表情包目录按**收藏名**，`MEMORY.md` 按
+   * **主题**，`PEOPLE.md` 按 **QQ 号 / 名字**。私聊的闸门在 `writeMemoryFile`。
+   * @param relative - 记忆目录内的相对路径。
    * @param entry - 字段集合。
+   * @param exec - 工具执行上下文（只用于私聊写入闸门）。
    * @returns 工具输出。
    */
-  async function upsertMemoryEntry(relative, entry) {
+  async function upsertMemoryEntry(relative, entry, exec) {
+    assertGlobalWrite(relative, exec);
     const current = (await readTextOrUndefined(join(memoryBase, relative))) ?? '';
     let result;
     if (relative === STICKERS_FILE) {
@@ -887,38 +1303,65 @@ export function createMemory(deps) {
         variants: String(entry?.variants ?? '').split(/[\/／、,，]/).map((item) => item.trim()).filter((item) => item.length > 0),
         type: entry?.type,
       });
+    } else if (relative === PEOPLE_FILE) {
+      result = upsertPersonRow(current, {
+        name: entry?.name,
+        qq: entry?.qq,
+        aliases: String(entry?.aliases ?? '').split(/[\/／、,，]/).map((item) => item.trim()).filter((item) => item.length > 0),
+        note: entry?.meaning,
+        date: entry?.date,
+        confidence: entry?.confidence,
+      });
+    } else if (relative.endsWith('MEMORY.md')) {
+      result = upsertMemoryRow(current, {
+        topic: entry?.name,
+        text: entry?.meaning,
+        section: entry?.section,
+        kind: entry?.kind,
+        date: entry?.date,
+        confidence: entry?.confidence,
+        expires: entry?.expires,
+        pinned: entry?.pinned === true,
+      });
     } else {
-      throw new Error('qq_memory: action "upsert" only works on COGNITION.md and STICKERS.md (use "append" for other files)');
+      throw new Error('qq_memory: action "upsert" works on COGNITION.md, STICKERS.md, PEOPLE.md and */MEMORY.md (use "append" for other files)');
     }
-    const written = await writeMemoryFile(relative, result.text, false, { force: true });
+    const written = await writeMemoryFile(relative, result.text, false, { force: true, exec });
     // 目录/热梗是每轮提示词的一部分：立刻失效缓存，别等 TTL。
     catalogCache = { at: 0, key: '', text: catalogCache.text };
+    const needle = String(entry?.name ?? '').trim();
     return {
       ...written,
       action: 'upsert',
       path: `${memoryLabel}/${relative}`,
       note: `${result.replaced ? 'replaced' : 'added'} in «${result.section}»`,
-      text: result.text.split(/\r?\n/).find((line) => line.includes(String(entry?.name ?? ''))) ?? '',
+      text: result.text.split(/\r?\n/).find((line) => needle.length > 0 && line.includes(needle)) ?? '',
     };
   }
 
   /**
    * 删掉单条记忆（`qq_memory` 的 remove）。
-   * @param relative - 只能是 `COGNITION.md` 或 `STICKERS.md`。
-   * @param name - 认知条目的写法 / 表情包的名字。
+   * @param relative - 认知库 / 表情包目录 / 人物表 / 会话热层。
+   * @param name - 认知条目的写法 / 表情包的名字 / 记忆主题 / 人物名。
+   * @param exec - 工具执行上下文（只用于私聊写入闸门）。
    * @returns 工具输出。
    */
-  async function removeMemoryEntry(relative, name) {
+  async function removeMemoryEntry(relative, name, exec) {
+    assertGlobalWrite(relative, exec);
     const current = (await readTextOrUndefined(join(memoryBase, relative))) ?? '';
     const result = relative === STICKERS_FILE
       ? removeStickerRow(current, name)
       : relative === COGNITION_FILE
         ? removeCognitionRow(current, name)
-        : (() => { throw new Error('qq_memory: action "remove" only works on COGNITION.md and STICKERS.md'); })();
+        : relative === PEOPLE_FILE
+          ? removePersonRow(current, name)
+          : relative.endsWith('MEMORY.md')
+            ? removeMemoryRow(current, name)
+            : (() => { throw new Error('qq_memory: action "remove" works on COGNITION.md, STICKERS.md, PEOPLE.md and */MEMORY.md'); })();
     if (!result.removed) {
       return { action: 'remove', path: `${memoryLabel}/${relative}`, bytes: Buffer.byteLength(current, 'utf8'), lines_total: current.split('\n').length, returned: 0, truncated: false, note: `no entry named «${String(name ?? '').trim()}»` };
     }
-    const written = await writeMemoryFile(relative, result.text, false, { force: true });
+    const written = await writeMemoryFile(relative, result.text, false, { force: true, exec });
     catalogCache = { at: 0, key: '', text: catalogCache.text };
     return { ...written, action: 'remove', path: `${memoryLabel}/${relative}`, note: `removed «${String(name ?? '').trim()}»` };
   }
@@ -1157,7 +1600,11 @@ export function createMemory(deps) {
 
   /**
    * 摘要 Agent 的系统提示：不放人格，只放规矩与「今天要处理哪个会话」。
-   * @param notice - `{ key, label, since, until }`。
+   *
+   * 这里的措辞跟着长期记忆 v2 走了（见 docs/memory.md「定时摘要怎么跑」）：摘要只判断
+   * 「这条新不新、真不真」，不再让它维护一个长度上限 —— 长度由滚档（archive）负责，
+   * 写不出来时选择「不写」比硬编一句可靠。
+   * @param notice - `{ key, label, slug, type, since, until, queue }`。
    * @returns 系统提示小节正文。
    */
   function digestPrompt(notice) {
@@ -1173,6 +1620,7 @@ export function createMemory(deps) {
         '- 没有实质内容就什么都不写，回一句「无事」即可 —— 空摘要比编造的摘要好。',
       ].join('\n');
     }
+    const isPrivate = notice.type === 'private';
     return [
       '## 记忆维护会话',
       '',
@@ -1185,49 +1633,95 @@ export function createMemory(deps) {
       '做法：',
       `1. 用 \`skill\` 工具加载 \`message-digest\` skill，按它写的流程做（它是这一步的准绳）。`,
       `2. 用 \`qq_transcript\` 读这个会话在这个时间窗里的记录${notice.queue && notice.queue.length > 0 ? `；本批还有其它会话排队（${notice.queue.join('、')}），它们各有自己的一轮，不用在这里处理` : ''}。`,
-      `3. 用 \`qq_memory\` 更新 \`conversations/${notice.slug}/MEMORY.md\`。遇到新东西先分诊：**只有文字**的梗 / 黑话 / 谐音走 \`learn-meme\` skill 写 \`COGNITION.md\`；**有图**的表情包走 \`learn-sticker\` skill（先收藏再写 \`STICKERS.md\`）；图文都有就两边互相写名字，不要在一个文件里写两遍。`,
-      `4. 严格止步于 \`${memoryLabel}/\` 之内：不要读源码、不要改仓库里任何其它文件、不要发 QQ 消息。`,
+      `3. 写 \`conversations/${notice.slug}/MEMORY.md\` 时用 \`qq_memory\` 的 **upsert**，一次一条：\`name\` 是主题（例如 \`kaguya\`、\`周五固定开黑\`），\`meaning\` 是一句话事实，\`section\` 是 人 / 惯例与偏好 / 在追 / 事实与事件 之一，能确定日期就带 \`date\`（YYYY-MM-DD）。同一个主题再出现时 upsert 会原地替换，不会重复。**不要整份重写 MEMORY.md**，也不要为了控制长度删掉还成立的事实 —— 文件太长时会由插件自动滚档到 \`archive/\`，冷层仍然搜得到。`,
+      `4. 人物单独维护：用 \`qq_memory\` 的 upsert 写 \`${PEOPLE_FILE}\`（\`name\` 是名字，\`qq\` 是 QQ 号，\`aliases\` 是别名，\`meaning\` 是一句话的「这个人的角色 / 跟群的关系」）。人物表是**全局**的，一个群十几个人也就几行。`,
+      `5. 遇到新东西先分诊：**只有文字**的梗 / 黑话 / 谐音走 \`learn-meme\` skill 写 \`COGNITION.md\`；**有图**的表情包走 \`learn-sticker\` skill（先收藏再写 \`STICKERS.md\`）；图文都有就两边互相写名字，不要在一个文件里写两遍。`,
+      `6. 严格止步于 \`${memoryLabel}/\` 之内：不要读源码、不要改仓库里任何其它文件、不要发 QQ 消息。`,
+      '',
+      // 隐私边界（设计 §4）：这不是「尽量不要」，是写通道直接拒绝 —— 这里先说清楚，
+      // 让它一开始就别走错路。
+      isPrivate
+        ? `**这是私聊。** 私聊里知道的事只能写进 \`conversations/${notice.slug}/MEMORY.md\`：\`COGNITION.md\` 与 \`PEOPLE.md\` 是全局的，私聊的摘要轮**写不进去**（工具会直接拒绝）。确实是公共知识（网上查到的、别的群也这么用）的，从公开来源写，不要从这段私聊里提上去。`
+        : `**scope 规则：** 这个人 / 这件事只在这个群成立 → 写本群 \`MEMORY.md\`；公共的梗、公开的信息才进全局的 \`COGNITION.md\` / \`PEOPLE.md\`。私聊里知道的事永远不要写进全局文件（工具会拒绝，这里是同一件事）。`,
       '',
       '如果这个时间窗里没有值得一提的内容，就什么都不写，回一句「无事」即可 —— 空摘要比编造的摘要好。',
     ].join('\n');
   }
 
   /**
-   * 真正跑一次摘要：把转录窗口交给摘要 Agent，等这一轮结束。
+   * 真正跑一轮摘要 Agent：把一条 user message 交给它，等这一轮结束（带硬超时）。
    *
-   * 摘要 Agent 的上下文只由转录与它自己写下的记忆两样东西决定，所以「模型忘了」
-   * 不构成丢记忆的理由：记忆在磁盘上，摘要只是它的读者与改写者。
+   * `digestTarget` 在这一轮里指向被摘要的会话 —— 私聊写入闸门靠它判断「这次写是不是
+   * 从私聊的摘要轮发起的」（摘要 Agent 不在 `sessionIndex` 里）。
    * @param notice - 见 {@link digestPrompt}。
+   * @param text - 这一轮要它做的事（转录窗口 / 周合并指令）。
    * @returns 消耗的字符数，供日志用。
    */
-  async function runDigest(notice) {
+  async function runDigestTurn(notice, text) {
+    // 摘要 Agent 会被 resume 复用；提示词里「这一轮要处理哪个会话」必须跟着改，
+    // 否则第二个会话的摘要轮会看到第一个会话的名字（提示词是创建时注册的 provider）。
+    digestNotice = notice;
     const agent = await ensureDigestAgent(notice);
     const message = createUserMessage({
-      content: [{ type: 'text', text: notice.instruction }],
+      content: [{ type: 'text', text }],
       source: { kind: 'user' },
     });
-    agent.followup(message);
-    const timeoutMs = Math.max(1000, Math.floor(Number(settings.digestTimeoutMs) || 0));
-    let timer;
-    const timeout = new Promise((resolve) => {
-      // ctx.timeout 把定时器挂在当前 fiber 上，插件卸载时自动清掉；它返回 disposer。
-      timer = typeof ctx.timeout === 'function' ? ctx.timeout(() => resolve('timeout'), timeoutMs) : setTimeout(() => resolve('timeout'), timeoutMs);
-      timer?.unref?.();
-    });
-    const outcome = await Promise.race([agent.whenIdle?.().then(() => 'idle') ?? Promise.resolve('idle'), timeout]);
-    if (typeof timer === 'function') timer();
-    else clearTimeout(timer);
-    if (outcome === 'timeout') {
-      // 卡住的 turn 不该把摘要永久堵死：销毁这个 Agent，下一次重新开一个（转录还在磁盘上）。
-      report('warn', `digest for ${notice.key} timed out after ${timeoutMs}ms; disposing the digest agent`);
-      try {
-        await digestHandle?.dispose();
-      } catch (error) {
-        report('warn', `could not dispose the digest agent: ${errorText(error)}`);
+    const previousTarget = digestTarget;
+    digestTarget = notice?.key;
+    try {
+      agent.followup(message);
+      const timeoutMs = Math.max(1000, Math.floor(Number(settings.digestTimeoutMs) || 0));
+      let timer;
+      const timeout = new Promise((resolve) => {
+        // ctx.timeout 把定时器挂在当前 fiber 上，插件卸载时自动清掉；它返回 disposer。
+        timer = typeof ctx.timeout === 'function' ? ctx.timeout(() => resolve('timeout'), timeoutMs) : setTimeout(() => resolve('timeout'), timeoutMs);
+        timer?.unref?.();
+      });
+      const outcome = await Promise.race([agent.whenIdle?.().then(() => 'idle') ?? Promise.resolve('idle'), timeout]);
+      if (typeof timer === 'function') timer();
+      else clearTimeout(timer);
+      if (outcome === 'timeout') {
+        // 卡住的 turn 不该把摘要永久堵死：销毁这个 Agent，下一次重新开一个（转录还在磁盘上）。
+        report('warn', `digest for ${notice.key} timed out after ${timeoutMs}ms; disposing the digest agent`);
+        try {
+          await digestHandle?.dispose();
+        } catch (error) {
+          report('warn', `could not dispose the digest agent: ${errorText(error)}`);
+        }
+        digestHandle = undefined;
+        throw new Error(`digest timed out after ${timeoutMs}ms`);
       }
-      digestHandle = undefined;
-      throw new Error(`digest timed out after ${timeoutMs}ms`);
+    } finally {
+      digestTarget = previousTarget;
     }
+  }
+
+  /** 摘要本身：把转录窗口交给摘要 Agent，等这一轮结束。 */
+  async function runDigest(notice) {
+    return runDigestTurn(notice, notice.instruction);
+  }
+
+  /**
+   * 周合并（`digestConsolidate`，默认关）：摘要之后的第二次调用，只整理不新增事实。
+   *
+   * 为什么值得单独一次：摘要那一轮在「这批又发生了什么」，让它同时维护人物 one-liner、
+   * 合并重复事实、清过期计划，它就会顾此失彼（设计 §6.3）。这里只给整理指令，写还是
+   * 走同样的 `qq_memory` upsert / remove。
+   */
+  async function runConsolidate(notice) {
+    const isPrivate = notice.type === 'private';
+    const instruction = [
+      `整理 ${notice.label}（\`${notice.key}\`）的记忆，不新增事实、只做聚合：`,
+      isPrivate
+        ? `1. 只读 \`conversations/${notice.slug}/MEMORY.md\`（这是私聊：不要碰 \`${PEOPLE_FILE}\` / \`COGNITION.md\`，写了会被拒绝）。`
+        : `1. 读 \`conversations/${notice.slug}/MEMORY.md\` 与 \`${PEOPLE_FILE}\`。`,
+      '2. 合并重复的条目（同一件事写了两遍 → 留一条更完整的）；把还成立的「在追 / 在做」的日期刷新一下；已经明确过期的计划用 `qq_memory` 的 remove 删掉。',
+      isPrivate
+        ? '3. 私聊里的人物 / 偏好留在本会话的 `MEMORY.md` 里，不要写全局人物表。'
+        : `3. 人物表里这个会话相关的人，把 \`meaning\` 那一句 one-liner 刷新成最新、最短的版本。`,
+      '4. 改动用 `qq_memory` 的 upsert / remove 逐条做，**不要整份重写**；没有可整理的就什么都不写。',
+    ].join('\n');
+    await runDigestTurn(notice, instruction);
   }
 
   /**
@@ -1309,15 +1803,30 @@ export function createMemory(deps) {
           `（窗口起点：${since > 0 ? new Date(since).toLocaleString('zh-CN', { hour12: false }) : '首次摘要，看你能拿到的全部'}）\n\n` +
           `${header}${rendered.text}`;
         report('info', `digest ${conversation.key}: ${rendered.included}/${window.length} lines, ${rendered.text.length} chars`);
-        await runDigest({
+        const notice = {
           key: conversation.key,
           label,
           slug: paths.slug,
+          type: conversation.type,
           since: since > 0 ? new Date(since).toLocaleString('zh-CN', { hour12: false }) : '（此前没有摘要）',
           until,
           queue: [...digestQueued].filter((key) => key !== conversation.key),
           instruction,
-        });
+        };
+        await runDigest(notice);
+        // 滚档与周合并都在摘要**成功之后**做：摘要失败时不推进状态、也不动文件。
+        // 顺序也是刻意的：先滚档（机械规则），再整理（模型判断）—— 整理看到的是已经
+        // 落进冷层之后的热层，不会把刚滚走的条目又写回来。
+        if (settings.digestRollover) await rolloverMemory(conversation.key, { reason: 'digest' });
+        if (settings.digestConsolidate) {
+          // 周合并只是「让文件更整齐」，它失败不该把一轮成功的摘要判成失败
+          // （否则 digest.json 不推进，明天会把同一批转录再摘要一遍）。
+          try {
+            await runConsolidate(notice);
+          } catch (error) {
+            report('warn', `consolidation for ${conversation.key} failed (the digest itself succeeded): ${errorText(error)}`);
+          }
+        }
         const state = await readDigestState();
         const finishedAt = Date.now();
         memoryLastDigest.set(conversation.key, finishedAt);
@@ -1370,6 +1879,11 @@ export function createMemory(deps) {
       } catch (error) {
         report('warn', `could not load digest state: ${errorText(error)}`);
       }
+      // 派生索引（hits / lastSeen）与人物表迁移也在启动时并行预热：
+      //   - 统计读到之前 `recallText` 会把 salience 当 0（降级，不抛错）；
+      //   - 迁移只补不覆盖、幂等，跑一次就够。
+      await loadStats();
+      await migratePeopleDoc();
     })();
     let digestTimerDisposer;
     ctx.effect(() => {
@@ -1429,8 +1943,18 @@ export function createMemory(deps) {
     rememberTranscript,
     /** 收到撤回通知时调一次：在转录里追加一行「已撤回」标记（见 `noteRecall`）。 */
     noteRecall,
-    /** 渠道提示里那段记忆索引（原文 `memoryIndexText`）。 */
-    indexText: memoryIndexText,
+    /**
+     * 渠道提示里的记忆段落（检索式注入，见 `recallText`）。
+     *
+     * 旧名字 `indexText` 保留成同一个函数：它的语义已经从「读索引」变成「按当前消息
+     * 检索」，但调用点只有 index.js 一处，不值得为改名再造一次破坏。
+     */
+    recallText,
+    indexText: recallText,
+    /** 手动跑一次滚档（测试与 ops 排查用；正常路径由摘要 / 写入自己触发）。 */
+    rollover: rolloverMemory,
+    /** 重新从磁盘读一次统计（摘要写完 / 人工改了 index json 之后用）。 */
+    reloadStats: loadStats,
     /** 渠道提示里的表情包目录与热梗段（同步读数，见 `catalogState`）。 */
     catalog: catalogState,
     /** `qq_save_sticker` 存完图之后调：把这一行追加进 STICKERS.md（失败只返回原因）。 */

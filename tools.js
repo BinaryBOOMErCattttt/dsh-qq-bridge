@@ -610,12 +610,12 @@ function qqMemory(deps) {
   return defineTool({
     name: 'qq_memory',
     description:
-      'Read, append to, search, or overwrite a long-term memory file for the QQ bridge. All paths live under the memory directory and are relative to it, for example "conversations/group-100000001/MEMORY.md" (one conversation\'s memory, "write"/"append" create it if missing), "COGNITION.md" (language memes / slang / homophones — never file paths), "STICKERS.md" (the sticker catalogue: name, meaning, scene and the saved file path), or "INDEX.md" (the short index that is injected into every QQ agent\'s prompt — keep it to a handful of lines). Prefer "upsert" (one row at a time) over "write" for COGNITION.md and STICKERS.md: "write" replaces the whole file and is only for reorganising. Paths outside the memory directory are rejected.',
+      'Read, append to, search, or overwrite a long-term memory file for the QQ bridge. All paths live under the memory directory and are relative to it, for example "conversations/group-100000001/MEMORY.md" (one conversation\'s memory, "write"/"append" create it if missing), "PEOPLE.md" (the global people table, keyed by QQ number), "COGNITION.md" (language memes / slang / homophones — never file paths), "STICKERS.md" (the sticker catalogue: name, meaning, scene and the saved file path), or "INDEX.md" (the short index that is injected into every QQ agent\'s prompt — keep it to a handful of lines). Prefer "upsert" (one row at a time) over "write" for every structured file (MEMORY.md / PEOPLE.md / COGNITION.md / STICKERS.md): "write" replaces the whole file and is only for reorganising, and it silently drops rows. Paths outside the memory directory are rejected. A private chat must not write the global files COGNITION.md / PEOPLE.md — the tool refuses it.',
     parameters: {
       action: {
         type: 'string',
         enum: ['read', 'append', 'write', 'search', 'list', 'upsert', 'remove'],
-        description: 'read = full file (with line numbers); append = add text at the end (normal for MEMORY.md / INDEX.md); write = replace the whole file (reorganising only); search = substring match with context lines; list = the files that already exist; upsert = add or replace ONE row in COGNITION.md / STICKERS.md by name; remove = delete one row by name.',
+        description: 'read = full file (with line numbers); append = add text at the end (normal for INDEX.md); write = replace the whole file (reorganising only, silently drops rows); search = substring match with context lines (a conversation MEMORY.md search also covers its archive/); list = the files that already exist; upsert = add or replace ONE row in MEMORY.md / PEOPLE.md / COGNITION.md / STICKERS.md; remove = delete one row by name / topic.',
       },
       path: {
         type: 'string',
@@ -639,11 +639,11 @@ function qqMemory(deps) {
       },
       name: {
         type: 'string',
-        description: 'One row to upsert/remove: the word or phrase itself for COGNITION.md (e.g. "蚌埠住了"), the sticker name for STICKERS.md (e.g. "无语"). Matching is exact after trimming.',
+        description: 'One row to upsert/remove: the word or phrase itself for COGNITION.md (e.g. "蚌埠住了"), the sticker name for STICKERS.md (e.g. "无语"), the subject / topic for MEMORY.md (e.g. "kaguya" or "周五固定开黑"), the person\'s name for PEOPLE.md. Matching is exact after trimming.',
       },
       meaning: {
         type: 'string',
-        description: 'One sentence: what it means (COGNITION.md) or what mood the sticker expresses (STICKERS.md). A row without a meaning is not injected into the prompt, so it is required for upsert.',
+        description: 'One sentence: what it means (COGNITION.md), what mood the sticker expresses (STICKERS.md), the fact itself (MEMORY.md) or this person\'s role / relation to the group (PEOPLE.md). A row without a meaning is not injected into the prompt, so it is required for upsert.',
       },
       usage: {
         type: 'string',
@@ -664,6 +664,26 @@ function qqMemory(deps) {
       type: {
         type: 'string',
         description: 'COGNITION.md only: category used to place the row — 缩写 / 谐音 / 专名 / 其它 (专名 = game, character, player, work names).',
+      },
+      section: {
+        type: 'string',
+        description: 'MEMORY.md only: which section the row belongs to — 人 / 惯例与偏好 / 在追 / 事实与事件. Defaults to 事实与事件 when omitted.',
+      },
+      qq: {
+        type: 'string',
+        description: 'PEOPLE.md only: the person\'s QQ number (the primary key of the global people table).',
+      },
+      aliases: {
+        type: 'string',
+        description: 'PEOPLE.md only: alternative names, separated by "/" — they are written into the same row and made searchable.',
+      },
+      expires: {
+        type: 'string',
+        description: 'MEMORY.md only: expiry date YYYY-MM-DD for a plan / thread. Expired rows are de-ranked (not deleted) by the retrieval.',
+      },
+      pinned: {
+        type: 'boolean',
+        description: 'MEMORY.md only: pin the row — pinned rows are always considered first and are never rolled into archive/.',
       },
       variants: {
         type: 'string',
@@ -723,15 +743,15 @@ function qqMemory(deps) {
         const name = String(args.name ?? '').trim();
         if (name.length === 0) throw new Error('qq_memory: "name" is required for action "upsert"');
         if (String(args.meaning ?? '').trim().length === 0) throw new Error('qq_memory: "meaning" is required for action "upsert" (a row without a meaning is never injected)');
-        return memory.upsertEntry(path, { ...args, name, date: String(args.date ?? '').trim() || undefined });
+        return memory.upsertEntry(path, { ...args, name, date: String(args.date ?? '').trim() || undefined }, exec);
       }
       if (args.action === 'remove') {
         const name = String(args.name ?? '').trim();
         if (name.length === 0) throw new Error('qq_memory: "name" is required for action "remove"');
-        return memory.removeEntry(path, name);
+        return memory.removeEntry(path, name, exec);
       }
       if (typeof args.text !== 'string' || args.text.trim().length === 0) throw new Error(`qq_memory: "text" is required for action "${args.action}"`);
-      return memory.writeFile(path, args.text, args.action === 'append', { force: args.force === true });
+      return memory.writeFile(path, args.text, args.action === 'append', { force: args.force === true, exec });
     },
   });
 }

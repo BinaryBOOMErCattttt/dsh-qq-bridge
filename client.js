@@ -547,6 +547,14 @@ window.__ModuleLoader__.load({
       reminderAgentDailyMax: '每个会话每天最多跑几次 Agent',
       memoryFileMaxBytes: '记忆文件的字节上限',
       memorySearchHits: '搜索最多返回几条',
+      memoryPromptChars: '每轮记忆注入预算',
+      memoryRecallK: '每轮最多取几条记忆',
+      memoryPeopleMax: '人物表最多注入几人',
+      memoryArchive: '启用冷层归档',
+      memoryArchiveRatio: '归档触发比例',
+      memoryVocabHint: '附一行全部梗的写法',
+      digestRollover: '摘要后执行滚档',
+      digestConsolidate: '摘要后跑周合并',
     };
 
     /**
@@ -730,6 +738,7 @@ window.__ModuleLoader__.load({
       burstSingleMaxChars: formatChars,
       shortPeriodMaxChars: formatChars,
       digestMaxChars: formatChars,
+      memoryPromptChars: formatChars,
       // 本地小时
       proactiveFromHour: formatHour,
       proactiveToHour: formatHour,
@@ -744,6 +753,7 @@ window.__ModuleLoader__.load({
       activeTalkChanceStep: formatPercent,
       activeTalkChanceMax: formatPercent,
       privateAfterthoughtChance: formatPercent,
+      memoryArchiveRatio: formatPercent,
       // 倍率
       activeGroupBatchScale: formatScale,
     };

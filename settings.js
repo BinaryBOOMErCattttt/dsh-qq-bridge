@@ -210,10 +210,22 @@ export function createSettings(config, defaultCwd) {
   const memoryOn = config.memory !== false;
   const memorySearchHits = Math.max(1, Math.floor(Number(config.memorySearchHits) || 40));
   const memoryFileMaxBytes = Math.max(256, Math.floor(Number(config.memoryFileMaxBytes) || 0));
+  // 注入预算：低于 200 字的「记忆」没有意义，非法值退回默认的 6000（而不是 200）。
+  const memoryPromptCharsRaw = Math.floor(Number(config.memoryPromptChars));
+  const memoryPromptChars = Number.isFinite(memoryPromptCharsRaw) && memoryPromptCharsRaw > 0 ? Math.max(200, memoryPromptCharsRaw) : 6000;
+  const memoryRecallK = clampedInt(config.memoryRecallK, 1, 100, 12);
+  const memoryPeopleMax = clampedInt(config.memoryPeopleMax, 0, 200, 20);
+  // 滚档阈值夹在 0.1~1：0 会让「每次写都滚」变成常态，大于 1 则永远不滚。
+  const memoryArchiveRatioRaw = Number(config.memoryArchiveRatio);
+  const memoryArchiveRatio = Number.isFinite(memoryArchiveRatioRaw) ? Math.min(1, Math.max(0.1, memoryArchiveRatioRaw)) : 0.75;
+  const memoryArchive = config.memoryArchive !== false;
+  const memoryVocabHint = config.memoryVocabHint !== false;
   const digestAtHour = clampedInt(config.digestAtHour, 0, 23, 4);
   const digestMinLines = Math.max(1, Math.floor(Number(config.digestMinLines) || 1));
   const digestMaxChars = Math.max(1000, Math.floor(Number(config.digestMaxChars) || 0));
   const digestTimeoutMs = Math.max(1000, Math.floor(Number(config.digestTimeoutMs) || 0));
+  const digestRollover = config.digestRollover !== false;
+  const digestConsolidate = config.digestConsolidate === true;
 
   // —— 每天轮换模型凭据 ——
   const apiKeyRotateHour = clampedInt(config.apiKeyRotateHour, 0, 23, 4);
@@ -316,10 +328,18 @@ export function createSettings(config, defaultCwd) {
     memoryOn,
     memorySearchHits,
     memoryFileMaxBytes,
+    memoryPromptChars,
+    memoryRecallK,
+    memoryPeopleMax,
+    memoryArchive,
+    memoryArchiveRatio,
+    memoryVocabHint,
     digestAtHour,
     digestMinLines,
     digestMaxChars,
     digestTimeoutMs,
+    digestRollover,
+    digestConsolidate,
     apiKeyRotateHour,
     apiKeyRef,
     apiKeyFile,
