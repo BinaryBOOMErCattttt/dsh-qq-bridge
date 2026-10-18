@@ -136,6 +136,32 @@ test('builtinStyle：标点那条讲频率、不讲「一句最多一个」的�
   assert.ok(punctuation.includes('多数句子不带逗号'));
   assert.ok(!/最多一个/.test(punctuation), '不能写成按句配给的额度');
   assert.ok(/反例/.test(punctuation), '要有 few-shot：反例 → 正例才落地');
+  // 逗号被压下去之后模型会找别的分隔符：这条禁令必须留在内置契约里（硬规则里也有一份）。
+  assert.ok(punctuation.includes('不许拿空格当标点'), '空格不是标点，这条不能被删掉');
+});
+
+test('lintStyleDoc：把标点整类禁掉的规则会被点出来（空格断句的根因）', () => {
+  // 真实事故：标点契约收紧成「多数句子不带逗号」之后，群里的回复全变成
+  // 「才没有 是你没跟上我」—— 逗号没了，模型就拿空格当分隔符。所以「整类禁标点」
+  // 这种写法要和「逗号写成配额」一样被点名，修正方向是把逗号还回去。
+  for (const line of ['不要用标点', '别加标点', '标点一律去掉', '去掉标点符号', '不许用标点']) {
+    const hits = lintStyleDoc({ punctuation: [line] });
+    assert.equal(hits.length > 0, true, `应当报出：${line}`);
+    assert.equal(hits[0].code, 'NO_PUNCTUATION');
+    assert.ok(hits[0].why.includes('空格'), '要说清后果是空格断句');
+    assert.ok(hits[0].fix.includes('句末'), '要给出「只禁句末句号」的替代做法');
+  }
+  // 只禁具体的那几条（句末句号、逗号别每句都配、别拿空格当标点）是对的，不能被报成噪声。
+  assert.deepEqual(
+    lintStyleDoc({
+      punctuation: [
+        '短句句末不加「。」；问号、感叹号、省略号照常用',
+        '多数句子不带逗号：逗号只留给不带就会读错的地方',
+        '两个分句要放在同一条里就用逗号分开；不许拿空格当标点',
+      ],
+    }),
+    [],
+  );
 });
 
 

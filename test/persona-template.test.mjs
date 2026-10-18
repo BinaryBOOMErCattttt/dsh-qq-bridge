@@ -85,6 +85,10 @@ test('表达模板：零警告、零体检命中、不带会读进提示词的 H
   });
   assert.ok(contract.length > 0);
   assert.ok(contract.some((line) => line.includes('多数句子不带逗号')), '逗号要讲频率（示例必须留在模板里）');
+  assert.ok(
+    contract.some((line) => line.includes('不许拿空格当标点')),
+    '空格不是标点：逗号被压下去之后模型会拿空格顶替分句',
+  );
   assert.ok(text.length <= 2000, '模板不能超过 styleMaxChars 的默认值');
 });
 

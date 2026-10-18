@@ -6011,6 +6011,11 @@ test('PERSONA.md 优先于配置 persona，且按场景选段', async () => {
       prompt.indexOf('这类应答开场') > hardRulesAt,
       '应答开场禁令属于硬性规则，STYLE.md 删不掉',
     );
+    // 空格断句（「才没有 是你没跟上我」）同样是排版地板：STYLE.md 删掉那一条也还留在这里。
+    assert.ok(
+      prompt.indexOf('不许拿空格当标点') > hardRulesAt,
+      '空格不是标点的禁令属于硬性规则，STYLE.md 删不掉',
+    );
   } finally {
     await group.onebot.close();
   }
