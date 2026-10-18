@@ -1749,12 +1749,13 @@ export function apply(ctx, config) {
    * @param options - `human`：拆短句 + 打字延迟（自动回复用）；`quote`：本轮的回复指向
    *   `{ messageId, userId, seq, emoji }`，仅群聊生效，且只挂在第一个**文字**气泡上
    *   （规则见 `quoteHead`）；`at`：要挂到第一个文字气泡前的 `{ id, name }[]`
-   *   （定时提醒用，模型自己不写 @）。
+   *   （定时提醒用，模型自己不写 @）；`intent`：这一轮为什么轮到它（`addressed` /
+   *   `continued` / `interject`），决定挂不挂指向（搭话轮不挂，见 `quoteHead`）。
    * @returns 本次发送（含延迟）完成时兑现的 Promise：至少发出一条为 true，否则 false。
    *   绝不 reject。
    */
-  function sendToConversation(conversation, text, { human = false, quote, at } = {}) {
-    return enqueueSend(conversation, () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 }, at));
+  function sendToConversation(conversation, text, { human = false, quote, at, intent } = {}) {
+    return enqueueSend(conversation, () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 }, at, intent));
   }
 
   /**
@@ -1836,7 +1837,7 @@ export function apply(ctx, config) {
   }
 
   /** `sendToConversation` 的实际发送步骤（调用方已保证同一会话串行）。 */
-  async function sendParts(conversation, text, human, quote, at) {
+  async function sendParts(conversation, text, human, quote, at, intent) {
     const pieces = replyPieces(text, human);
     // 「昵称 → QQ 号」的名单在一次发送里只造一遍：几个分段共用同一份，也保证同一次回复里
     // 同名的解析结果一致。
@@ -1877,9 +1878,9 @@ export function apply(ctx, config) {
         }));
       }
       // 引用只挂第一个**文字**气泡：图段永远不挂（§6.6），整轮只有图时引用自然被丢弃。
-      // 被回复的那条本身只有表情时也不引用（见 `quoteHead`）。
+      // 被回复的那条本身只有表情时也不引用，搭话轮整个不挂（见 `quoteHead`）。
       const head = piece.kind === 'text' && !firstTextSeen
-        ? quoteHead(conversation, { quote })
+        ? quoteHead(conversation, { quote, intent })
         : undefined;
       const atHere = piece.kind === 'text' && atPending ? atSegments : [];
       if (piece.kind === 'text') firstTextSeen = true;
@@ -2196,6 +2197,10 @@ export function apply(ctx, config) {
    * 本轮回复第一个**文字**气泡上的「指向」段（引用 / @）。
    *
    * 规则按顺序：
+   *   0. **搭话轮不挂任何指向**（`intent === 'continued'` / `'interject'`）：这两种轮次不是
+   *      「有人在问它、它回那一条」，而是它自己顺着群里的气氛凑一句。真人凑话时不会先引用
+   *      一句再开口（也不会先 @ 一下再开口）—— 那正是「人机感」最重的那个动作；群里本来就
+   *      看得出它在接谁的话（`replyStyle` 再显式也不改变这一点，「搭话」不是「回答」）；
    *   1. **被回复的那条只有表情时不引用**（`quote.emoji`）：引用块会把那张表情再贴一遍，
    *      看着像在郑重地回复一张图；`replyStyle: 'at'` 不受影响（它只认 `userId`）；
    *   2. `replyStyle: quote` / `at` 照旧；
@@ -2203,16 +2208,16 @@ export function apply(ctx, config) {
    *      （上一轮的回复、复读、主动搭话）：紧挨着回时引用是纯噪音，一轮问答本来就看得出来
    *      在回谁；被后来的话挤远了才需要点名，不然看的人对不上话头。
    *
-   * 「这一轮为什么轮到它」（插话 / 补一句 / 主动）**不再影响指向**：插话轮也走同一套
-   * `replyStyle` 规则，没有「必须有锚点」这回事。
-   *
    * @param conversation - 目标会话。
    * @param options.quote - 被回复消息的 `{ messageId, userId, seq, emoji }`。
+   * @param options.intent - 这一轮为什么轮到它（`addressed` / `continued` / `interject`）。
    * @returns 要挂在前面的段；不需要指向时 undefined。
    */
-  function quoteHead(conversation, { quote } = {}) {
+  function quoteHead(conversation, { quote, intent } = {}) {
     const target = quote ?? { messageId: '', userId: '', seq: 0 };
     if (conversation.type !== 'group') return undefined;
+    // 搭话（免 @ 接话 / 多人插话）不点名也不引用：见上面第 0 条。
+    if (intent === 'continued' || intent === 'interject') return undefined;
     // 引用一张表情没有意义（见第 1 条）；@ 不在此列。
     const quotable = target.emoji !== true;
     const style = settings.replyStyle;
@@ -4729,10 +4734,10 @@ export function apply(ctx, config) {
     // 这一轮的回复真的要发出去了：账上那几条标成「已回复」，之后有人撤回时才说得出
     // 「撤得有点晚，我都回了」。SKIP / 出错 / 中止的分支在前面就 return 了，不会走到这里。
     markReplied(owner);
-    // 自动回复走「拟人」通道：拆短句 + 打字延迟 + 引用/@ 对方。
+    // 自动回复走「拟人」通道：拆短句 + 打字延迟 + 引用/@ 对方（搭话轮除外，见 `quoteHead`）。
     // 等这一轮真的发完再挂「过一会儿也许补一句」的定时器（见 scheduleChime）：
     // 补一句必须排在它这次回复**之后**，而且得等打完字才算「对方安静了」。
-    void sendToConversation(conversation, reply, { human: true, quote: owner.quote }).then(() => {
+    void sendToConversation(conversation, reply, { human: true, quote: owner.quote, intent }).then(() => {
       scheduleChime(conversation, owner);
     });
   });

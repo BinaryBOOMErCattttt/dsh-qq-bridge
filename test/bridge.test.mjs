@@ -5710,9 +5710,37 @@ test('插话轮不再强制引用锚点：紧挨着回时按 replyStyle: auto �
 
   completeTurn(host, agent, '火锅吧', 2);
   const sent = await until(() => sentTexts(onebot)[1], 'the interject reply');
-  // 以前插话轮会强制挂 `reply` 段（引用 7102），不管漂移判断。那条规矩连同
-  // `interjectQuote` 一起删了：插话与别的轮次走同一套 `replyStyle`，紧挨着回时不引用。
+  // 插话不挂指向：它不是在「回某一条」，而是顺着气氛自己凑一句（见 `quoteHead` 第 0 条）。
+  // 紧挨着回时本来就该是裸文本 —— 以前那条「插话必须引用锚点」的规矩连同
+  // `interjectQuote` 一起删了。
   assert.equal(sent, '火锅吧');
+});
+
+test('插话轮不挂引用：replyStyle: quote 也只发裸文本', async () => {
+  // `replyStyle` 是「回别人的时候怎么指向」的配置，插话不是回答，不该被它钉上一个引用块。
+  const { onebot, host, agent } = await bootHotGroup({ replyStyle: 'quote' });
+  onebot.push(groupText('晚上吃啥', { messageId: 7101, userId: 10001, card: 'soyo' }));
+  onebot.push(groupText('随便', { messageId: 7102, userId: 10002, card: 'rana' }));
+  await until(() => agent.inbox.length >= 2, 'the interject turn');
+  completeTurn(host, agent, '火锅吧', 2);
+  const sent = await until(() => sentTexts(onebot)[1], 'the interject reply');
+  assert.equal(sent, '火锅吧', '搭话不是「回某一条」，引用块会让人觉得是在处理工单');
+});
+
+test('免 @ 接话也不挂指向：replyStyle: at 的那一轮只发裸文本', async () => {
+  // A 路（窗口里接上的一句）与 C 路（插话）同一口径：都是它自己凑上来的，不点名。
+  const { onebot, host } = await bootActive({ replyStyle: 'at' });
+  onebot.push(mention('在吗'));
+  const agent = await until(() => host.list.created[0], 'the group Agent');
+  await until(() => agent.inbox.length >= 1, 'the mention');
+  completeTurn(host, agent, '在的', 1);
+  await until(() => sentTexts(onebot).length === 1, 'the first reply');
+
+  onebot.push(groupText('那你说呢', { messageId: 7001 }));
+  await until(() => agent.inbox.length >= 2, 'the follow-up without a mention');
+  completeTurn(host, agent, '就这样吧', 2);
+  const sent = await until(() => sentTexts(onebot)[1], 'the follow-up reply');
+  assert.equal(sent, '就这样吧', '免 @ 接话不是回提问者，不该再 @ 一次');
 });
 
 test('插话不接 @ 了别人的消息（那是别人在跟别人说话）', async () => {
