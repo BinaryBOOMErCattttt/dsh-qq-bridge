@@ -3,9 +3,13 @@
 版本号按[语义化版本](https://semver.org/lang/zh-CN/)走。0.x 阶段配置项与行为都可能变，
 每次改动以 `Config` 的 schema 与 `docs/` 下的分册为准。
 
-## 未发布
+## 0.2.0 — 2026-10-18
 
-这一版是六块改动的合集，各有各的来由：
+这一版是两段。前半段按重构设计做了**四层拆分** —— **人格 / 表达 / 感知 / 运维**：把「你是谁」
+「怎么说」「看到了什么」「出事了怎么查」从 `index.js` 那一坨提示词与 if 里拆成可单独测试、
+可单独回滚的模块（`persona.js` / `style.js` / `modalities.js` + `links.js` + `interactions.js` /
+`ops.js` + `scripts/ops.mjs`），设置页也跟着重做（扁平区块 / 搜索 / 官方控件）。后半段是随后一周
+按真实事故补齐的六块，各有各的来由：
 
 - **默认值改成「本仓库这套配置」**：安全面（`agentPreset` / `allowTools`）与主动行为
   （`proactive` / `activeFollow` / 撤回的处理方式）都换成实际在跑的这套，影响见下面「默认值变化」。
@@ -20,6 +24,207 @@
   引用（不清的话整条回复都发不出去），再按配置决定假装没看到 / 就地调侃 / 补一句。
 - **人设模板与编写提示词**（新功能，见[写人设：模板与问答](docs/persona-workshop.md)）：两份复制
   就能用的模板、一份会一题一题问你的提示词、一个不启动机器人就能跑的自检脚本。
+
+**升级前先读两节**：`BREAKING`（删掉 JM 下载旁路、`burstSingleMaxChars` 语义变了）与
+「默认值变化」—— 新装默认就按本仓库这套跑：群里会自己开口、没被 @ 也会接话。
+
+### BREAKING
+
+- **移除 JM（禁漫）下载旁路**。`jm.js`、`scripts/jm_download.py`、`qq_jm_pdf` 工具、`/jm` 指令、
+  15 个 `jm*` 配置项与 `test/jm.test.mjs` 全部删除；`package.json` 的 `exports["./jm.js"]` 与
+  `files` 里的 `jm.js`、`.gitignore` 里的 `.qq-jm/` 一并去掉。
+  - `cordis.patch.yml` 里残留的 `jm*` 会变成**惰性字段**（schemastery 对未知键透传），不会启动失败；
+    `allowTools` 里残留 `qq_jm_pdf` 时插件只记一条 warn（白名单里有不存在的工具名）。
+  - `/jm 422866` 不再是特殊指令，作为普通消息进模型（群里仍然要 @ 或满足触发条件）。
+  - **数据不删**：`.qq-jm/` 里的旧 PDF、`.venv/` 里的 jmcomic 依赖都原样留着。要清就显式跑
+    `node scripts/ops.mjs cleanup jm --apply`（只删 `.qq-jm/`，先列文件再生效，绝不碰 `.venv`）。
+- **`burstSingleMaxChars` 语义变了**：从「短回复强制并成一条」变成「聊天型 / 信息型的门槛」。
+  想要条数上限可以显式设 `burstMaxMessages`（默认 0 = 不限）。
+- **短气泡句末的「。」会在发送前被剥掉**（`stripShortPeriod`，默认开）。只动句末唯一的一个
+  「。」；问号、感叹号、省略号、句中句号都不碰。
+- **图片不再挂引用**：整轮只有图时引用直接丢弃，有文字时引用只挂第一个**文字**气泡。
+
+### 默认值变化（可能影响已有部署）
+
+**`config.js` 的 schema 默认值改成了「本仓库这套配置」**，新装即按这套跑。老部署如果在
+profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先；没写的会跟着变：
+
+| 字段 | 旧默认 | 新默认 | 影响 |
+|---|---|---|---|
+| `agentPreset` | `''`（部署默认预设） | `qq` | 新装默认挂本 bundle 的最小预设，而不是可能带 shell 的 `standard` |
+| `allowTools` | `[]`（不限制） | 17 个工具名 | 默认收窄到「只读文件 + 检索 + 联网 + 十个 `qq_*`」；`qq` 预设里的 `write` / `edit` 默认拿不到 |
+| `activeFollow` | `false` | `true` | 被叫到之后，窗口内同一个人接着说话也算数（还要过抽卡）；群里聊热了会进入多人搭话 |
+| `proactive` | `false` | `true` | 冷场后会自己开口（仍有 7 道闸，安静阈值 45 分钟） |
+| `burstSingleMaxChars` | `0`（用 80） | `100` | ≤100 字按聊天型处理（发送途中对方接话就停），超过的按信息型完整发送 |
+| `recallAddressed` | `answer` | `drop` | 被 @ 的消息撤回后**真的不回**（原本是「照常答、只是不引用」） |
+| `recallPrivate` | `false` | `true` | 私聊撤回也处理（还没投给模型的那条不回） |
+
+想回到「最保守」的那一套，在部署的 patch 里显式写回去即可：
+`agentPreset: ''`（或 `none`）、`allowTools: []`、`activeFollow: false`、`proactive: false`、
+`recallAddressed: answer`、`recallPrivate: false`。
+
+### 人格与表达（新的两层）
+
+- **`persona.js` + `cwd/.qq-persona/PERSONA.md`**：人设只写「是谁」——身份 / 背景 / 性格 / 场景。
+  性格按 `名字｜底色/点缀｜强度｜触发条件｜表现｜禁忌` 一行一条，**底色最多一条**（始终在场，
+  是语气的地板不是台词），点缀按触发条件上场、一次最多演一个。旧配置 `persona` 在没有
+  `PERSONA.md` 时仍然生效；文件存在时它被忽略并记一条 info（避免两套人设叠加）。
+  文件写坏（半截、只剩标题）时退回上一版，再退回配置 / 内置人设 —— **人设写坏绝不让机器人不说话**。
+- **`style.js` + `cwd/.qq-persona/STYLE.md`**：表达只写「怎么说」——气泡、标点、表情、私聊 / 群聊。
+  机器参数（`burst*` / `stripShortPeriod` / `interjectQuote`）在配置里，散文与参数互不解析。
+- **气泡条数**：模型写几条就发几条，插件**没有**掷骰 / 概率、**没有**条数上限、也不把多出来的
+  并进最后一条。`burstMaxMessages` 是唯一可选的条数上限（默认 0 = 关）。发送途中对方又说话了，
+  聊天型剩下的气泡就不再发（信息型该讲完还得讲完）。
+- **私聊补一句（L2，默认开）**：回完对方、对方安静 15 秒后，最多再开一轮看看有没有想补充的
+  （可 SKIP）。它**不搭 `proactive` 那趟车**（那是群里主动开口的总开关），有自己的
+  `privateAfterthought*` 开关 / 概率 / 日上限；空消息、命令、出错、SKIP 之后的轮次不补，
+  对方在这期间接了话也不补。
+- **提示词槽位化**：场景 → 人设 → 表达契约 → 记忆索引 + 热梗 → 能力清单 → 额外要求 →
+  **硬性规则（最后，最高优先级）**。每条规则只出现一次；「绝不两拍」拆成两句（信息型的
+  「短 + 长」仍然禁止，聊天型的「短 + 短」允许）。
+- 本部署那份混着风格规则的 `persona` 已从 `cordis.patch.yml` 搬进 `.qq-persona/PERSONA.md`
+  与 `.qq-persona/STYLE.md`（蓝毛女仆人设拆成「身份 / 背景 / 温柔底色 / 傲娇点缀 / 场景」+
+  「总体 / 标点 / 表情包 / 私聊 / 群聊」）。
+
+### 群聊搭话（治「莫名其妙」）
+
+- **`speech-policy.js`**：把准入、A/C 抽卡、插话准入收成一个纯判据，返回 `intent`
+  （`addressed` / `continued` / `interject` / `none`）。`admit` 只剩「凑入参 + 记账」。
+- **插话的投递文案换了**：不再是 `kaguya: 晚上吃啥`（kaguya 并没有问它），而是
+  「（群里在聊天，这句不是叫你的。kaguya 说：晚上吃啥）」+「你要接就接这一句……不想接就只写
+  SKIP」。`speakerLine` 也按 intent 换措辞，不再一律说「刚跟你说话的人」。
+- **插话强制引用锚点**（`interjectQuote`，默认开）：引用的是 `admit` 时快照的具体
+  `message_id`，不再看 `replyStyle: auto` 的漂移判断（那个判断在「紧接着回」时恰好不引用，
+  于是插话裸奔）。引用发不出去 → 退化成 @ 说话人 → 再不行才裸文本，都记 warn。
+- **C 路准入收紧四条**：@ 了别人、命令、纯媒体（没有文字）、机器人自己 —— 一条都不接。
+
+### 认知与表情包分离
+
+- **`cognition.js`** + 两个文件：`COGNITION.md` 只装**语言**（梗 / 黑话 / 缩写 / 谐音，键是
+  文字写法含变体），`STICKERS.md` 装**表情包**（键是收藏后的文件名）。认知库里**不许出现
+  文件路径**，表情包目录里**不许出现 `.qq-media`**（那是会过期的缓存）。
+- `qq_save_sticker` 新增可选 `meaning` / `scene`：存完图顺手往 `STICKERS.md` 补一行；没给
+  `meaning` 时进「未收藏」待办区（不进提示词）。目录写失败**不回滚图片**。
+- 提示词里的表情包目录改成「名字（含义）」而不是裸文件名；新增「最近学的梗」段（最近 15 条
+  「置信：确认」，≤1200 字），谐音梗不用先 search 再答。
+- skill 拆分：新增 `learn-meme`（文字梗 → `COGNITION.md`）与 `learn-sticker`（表情包 →
+  先收藏再写 `STICKERS.md`）；`update-cognition` 保留为**一句话分诊**的兼容壳；
+  `message-digest` 的认知段落改成分诊写法。
+- 新增 `scripts/migrate-cognition.mjs`：把老 `COGNITION.md` 里「以路径为键」的条目一次性迁到
+  `STICKERS.md`（用画面指纹认同一张重新编码过的图；认不出就标「原图已过期」放进未收藏区）。
+  **默认 dry-run**，`--apply` 才写，写前备份，`--json` 给报告。
+
+### 感知层
+
+- **`modalities.js`**：消息段 → `Observation` → 占位符渲染。系统表情带名字、语音给时长、
+  视频给时长 + 封面路径、文件给大小、合并转发给条数、`json`/`xml` 卡片解析出标题 / 域名 / 链接。
+  `onebot.js` 的 `messageToText` 改为委托它（既有输出逐字节不变）。
+- **`links.js`**：卡片解析 + 可选的 URL 预览（`linkPreview` **默认关**）。SSRF 防护覆盖
+  scheme / userinfo / localhost / `*.local` / `*.internal` / 私有与保留网段 / 各种数值变形的
+  IPv4 / IPv6 回环与内网，每一跳重定向都重新校验；超时、字节上限、只收 `text/html`/`text/plain`。
+- **`interactions.js` + 戳一戳**：以前 `handleEvent` 第一行就把 `notice` 全丢了，现在被戳会回应。
+  `pokeMode` = `random`（默认，按 `pokeReplyChance` 回戳或走一轮）/ `poke` / `text` / `ignore`；
+  每个会话 `pokeCooldownMs` 冷却 + `pokeDailyMax` 每日上限（防两个机器人互戳）。
+  只回应**戳机器人自己**的，戳别人一律不记。新增 `qq_poke` 工具（群里必须显式指定戳谁）。
+- 视频只下封面（`videoCover` 默认开，`videoMaxBytes: 0` 不下载整段）；语音只做时长占位，
+  **不下载、不转写、不起任何外部进程**。
+
+### 运维
+
+- **`ops.js`（纯计划）+ `scripts/ops.mjs`（执行器）**：一套命令跨平台。
+  `doctor` / `status` / `restart` / `logs` / `install` / `uninstall` / `napcat` /
+  `migrate cognition` / `cleanup jm` / `selftest`，都支持 `--json`（stdout 只有一个对象，
+  版本号 `schema: 1`；人话走 stderr）。
+- 退出码：`0` 全部通过 / `1` 有 error 级 findings / `2` 需要人工或提权 / `3` 脚本自身出错。
+- `--apply` **默认关**：写 cwd 外的步骤（systemd unit、计划任务、NapCat 配置、profile）都带
+  `requires: human|root`，agent 默认只拿计划、把命令原样贴给人。幂等（写前备份，重复执行不重复写）。
+- 新增 `docs/ops.md`（给 agent 的排查配方）。
+
+### 新增：定时提醒
+
+- **`qq_remind_create` / `qq_remind_list` / `qq_remind_cancel`**：让 Agent 把「明早 8 点提醒我
+  交作业」变成一条持久化任务；到点由插件直接发 `@目标 + 文本`，**不经过模型**，重启不丢。
+- **三种模式**：`text` 原样发固定文案（最可靠、不花 token）；`agent` 让模型用自己的语气说，
+  失败 / 超时 / SKIP 都退回固定文案；`prompt` 到点按指令做事（可调工具，默认关闭，只给受信者）。
+  `reminderModes` 是上限，默认 `agent`。
+- **时间**：一次性或每天 / 工作日 / 每周 / 每月；`at` 用本地 `YYYY-MM-DDTHH:MM`，也接受
+  `in_minutes`；周期任务的第一次已过去时自动滚到下一个未来时刻，`monthly` 在小月夹到月末。
+- **安全默认值**：只能提醒创建者自己；`@` 别人与 `@全体` 默认关（`reminderMentionOthers` /
+  `reminderAllowAll`）；每人每天 5 条、每会话 20 条待发；`reminderUsers` 是受信名单。
+  提醒正文原样发送、**不解析** `[[图片]]` / `[[@]]` 标记，@ 只来自创建时解析好的 QQ 号。
+- **重启 / 断线**：任务文件 `data/reminders.json`；错过时刻在 `reminderGraceMs`（默认 10 分钟）
+  内补发，超过标 `missed`；周期任务不补历史；agent 轮跑到一半进程被杀时补一条固定文案。
+- **发送是 at-most-once**：先记账再发，宁可重启后补一条文本，也不重复 @ 全体。
+- **`/reset` 不影响提醒**：任务属于会话而不是某一轮 Session。
+- **设置页能看见记着的任务**：新增独立的「提醒」tab（提醒同样服务私聊，不再塞在「群聊」
+  里），列表放在这一页最上面，按状态列出待发与最近历史（时间 / 模式 / 目标 / @ 名单 /
+  创建者 / 已发次数 / 上次错误），每 15 秒自动重读，也可以手动刷新；数据走 Connection
+  认证栅栏内的一条只读路由。
+- 详见[定时提醒](docs/reminders.md)；设置页在「提醒」tab。
+
+### 被撤回的消息（新功能，见 `docs/recall.md`）
+
+三层：**安全层与数据层永远生效，行为层才是配置项**。
+
+- **不再引用一条已经不在的消息**（安全层，所有人受益）：回复本来是带着 `reply` 段指向被回复的
+  那条发出去的，而 `sendOne` 失败时 `sendParts` 会整条停下 —— 撤回一到，那条回复剩下的气泡
+  一起发不出去，群里看到的只是「它没理人」。现在撤回事件到达时先清掉这个会话里所有指向它的
+  引用（`messageId` 清空、`userId` 留着，于是 `replyStyle` 四档都自动退化成正确的降级）。
+- **记一份「最近看见过什么」**（数据层）：QQ 不提供回查已撤回消息的接口，所以每个会话在内存
+  里留最近 30 条（id / 发送者 / 显示名 / 占位符正文 / 有没有 @ 过它 / 投递与回复进度）。不落盘，
+  重启即清；对不上的撤回只记一条 info（「没看见」是有效状态，不是错误）。
+- **`recallMode`**：`off`（只做上面两层）/ `ignore`（默认，还没投递的那条不再投给模型；被 @ 的
+  再按 `recallAddressed` 决定）/ `tease`（被 @ 的那条**就地改写成撤回提示**，这一轮直接调侃；
+  已经回过的按闸门补一句）。
+- **`recallAddressed`**（默认 `drop`）：被 @ 的那条还没投出去就撤回时，`drop` 是**真的不回**
+  （「撤回 = 当没收到」），`answer` 才照常答、只是不引用（@ 是明确点名，认为点名了就该有回应
+  的话选它）。
+- **`recallScope`**（默认 `to-me`）：`all` 才会为群里别人的撤回开口（那等于承认它每条都看，
+  语义接近 `proactive`，所以默认关）。
+- 补一句要过一串闸门：`recallChance` / `recallCooldownMs` / `recallDailyMax` / `recallMaxAgeMs`
+  / `recallScope`，外加几条硬性的 —— 自己的消息被撤不处理、管理员代撤（`operator_id ≠ user_id`）
+  不调侃、这一轮还在飞时不补刀。掷中即消耗（`SKIP` 也算）。
+- **默认不给原文**（`recallTeaseQuote: false`）：复述别人撤掉的话是最常见的社交事故。
+- **`recallPrivate`**（默认开）：私聊撤回也处理（还没投给模型的那条同样不回）；`tease` 时建议
+  关掉 —— 私聊里调侃「你撤什么」很容易变成冒犯。清引用照做。
+- **长期记忆留一行 tombstone**（`recallMemoryMark`，默认开）：转录是只追加的原料，所以追加一行
+  `kind: "recall"` 而不是删行 —— 摘要 Agent 一眼看得出「这条撤了、别当事实」，原文仍然在。
+- 本仓库的 `cordis.patch.yml` 把这三项显式写出来钉住：`recallMode: ignore` +
+  `recallAddressed: drop` + `recallPrivate: true`（现在也是 schema 的默认值；写出来是为了将来
+  改默认时本部署不跟着漂）。
+- 新模块 `recall.js`（4 个纯函数，12 条闸门可单测）+ `test/recall.test.mjs`（15 条）+ bridge
+  里 `bootRecall` 那组（11 条：三种位置 × 三种模式、环境上下文摘除、转录标记）。
+
+### 新增：长期记忆 v2（检索式注入 / 人物表 / 冷热分层）
+
+起因是一个真实事故：群里的一个说法机器人记过、文件里也还在，但聊天时完全接不住 ——
+`COGNITION.md` 里 34 条有 17 条没有日期，按旧排序它们永远进不了每轮热梗段；而
+`MEMORY.md` 只注入文件开头，越晚写的内容越看不见。
+
+- **按当前消息检索，不再注入文件开头**：新增 `memory-select.js`（纯函数）解析 markdown →
+  record，按 scope 硬过滤后打分（实体 3 / 词汇 bigram+IDF 2 / 最近性 1 / 命中与置顶 0.8 /
+  节先验 0.5 / 过期 -5），再按节配额 + round-robin 打包。人物与「消息里原样出现的梗」必进；
+  每条带出处（`MEMORY.md#L23`）；没有任何命中时按 pinned / 命中次数 / 最近兜底，**绝不取文件头**。
+  预算换成配置项 `memoryPromptChars`（默认 6000）。
+- **`PEOPLE.md` 全局人物表**（QQ 号为主键）：人物不再混在每个群的 `MEMORY.md` 里；首次启用时
+  从各**群**的「## 人」小节一次性抽取（幂等、只补不覆盖、不碰私聊）。每轮最多注入
+  `memoryPeopleMax` 人（默认 20），说话人 / 被 @ 的人必进。
+- **scope：私聊内容永不升级**：`COGNITION.md` / `PEOPLE.md` 只收 `global`；私聊会话（含私聊的
+  摘要轮）对这两个文件的 write / append / upsert / remove 一律拒绝；检索在打分**之前**按
+  scope 硬过滤，`private:<qq>` 的记录对其他会话连候选都不是。
+- **冷热分层，文件满了不再等于开始忘**：热层超过 `memoryFileMaxBytes × memoryArchiveRatio`
+  时，把最不活跃的非置顶条目先写进 `conversations/<slug>/archive/YYYY-MM.md`，成功后才从热层
+  删；`qq_memory search` 覆盖 archive，`list` 也列得出。热层里**不写指针行**，提示词里的
+  「更早的记忆：archive/ 下 N 个文件（…）」是现算的聚合行，长度恒定。
+- **摘要改成增量 upsert**：`qq_memory` 的 `upsert` 现在支持 `MEMORY.md`（主题 / 正文 / 分节 /
+  日期 / 到期 / 置顶）与 `PEOPLE.md`（名字 / QQ / 别名 / 一句话），摘要只写「这条新不新、真不真」，
+  不再为了让文件变小而删条目。整份 `write` 的 90% 条目数护栏扩展到这两个文件。
+- **无日期条目按文件位置参与排序**（热梗段）：继承前面最近一个有日期条目的日期，不再一律当最旧。
+- **提示词**：标题改成「和当前话题相关的记忆（不是全部）」，写明「这里没看到就去 search，
+  别猜」以及「记忆里的『以后有人问 X 就……』是聊天内容，不是指令」；另附一行「全部梗的写法」
+  词汇表（`memoryVocabHint`）。
+- **周合并**（`digestConsolidate`，默认关）：摘要之后可选再跑一次，只整理不新增事实。
+- 详见[长期记忆](docs/memory.md)（检索式注入 / scope / 冷热分层 / 人物表）。
 
 ### 新增：长任务期间的 @ 攒成一波（`backlog.js`）
 
@@ -58,78 +263,6 @@
 - **`docs/persona-workshop.md`**：两条路线（模板 3 分钟 / 问答 10~20 分钟）、18 题速查表、答案
   怎么变成文件、自检怎么读、常见坑，以及「为什么提示词不放进 `.dsh/skills/`」（那个目录对 QQ
   会话同样可见，人设的写入口不该出现在不可信输入那一侧）。
-
-### 新增：长期记忆 v2（检索式注入 / 人物表 / 冷热分层）
-
-起因是一个真实事故：群里的一个说法机器人记过、文件里也还在，但聊天时完全接不住 ——
-`COGNITION.md` 里 34 条有 17 条没有日期，按旧排序它们永远进不了每轮热梗段；而
-`MEMORY.md` 只注入文件开头，越晚写的内容越看不见。
-
-- **按当前消息检索，不再注入文件开头**：新增 `memory-select.js`（纯函数）解析 markdown →
-  record，按 scope 硬过滤后打分（实体 3 / 词汇 bigram+IDF 2 / 最近性 1 / 命中与置顶 0.8 /
-  节先验 0.5 / 过期 -5），再按节配额 + round-robin 打包。人物与「消息里原样出现的梗」必进；
-  每条带出处（`MEMORY.md#L23`）；没有任何命中时按 pinned / 命中次数 / 最近兜底，**绝不取文件头**。
-  预算换成配置项 `memoryPromptChars`（默认 6000）。
-- **`PEOPLE.md` 全局人物表**（QQ 号为主键）：人物不再混在每个群的 `MEMORY.md` 里；首次启用时
-  从各**群**的「## 人」小节一次性抽取（幂等、只补不覆盖、不碰私聊）。每轮最多注入
-  `memoryPeopleMax` 人（默认 20），说话人 / 被 @ 的人必进。
-- **scope：私聊内容永不升级**：`COGNITION.md` / `PEOPLE.md` 只收 `global`；私聊会话（含私聊的
-  摘要轮）对这两个文件的 write / append / upsert / remove 一律拒绝；检索在打分**之前**按
-  scope 硬过滤，`private:<qq>` 的记录对其他会话连候选都不是。
-- **冷热分层，文件满了不再等于开始忘**：热层超过 `memoryFileMaxBytes × memoryArchiveRatio`
-  时，把最不活跃的非置顶条目先写进 `conversations/<slug>/archive/YYYY-MM.md`，成功后才从热层
-  删；`qq_memory search` 覆盖 archive，`list` 也列得出。热层里**不写指针行**，提示词里的
-  「更早的记忆：archive/ 下 N 个文件（…）」是现算的聚合行，长度恒定。
-- **摘要改成增量 upsert**：`qq_memory` 的 `upsert` 现在支持 `MEMORY.md`（主题 / 正文 / 分节 /
-  日期 / 到期 / 置顶）与 `PEOPLE.md`（名字 / QQ / 别名 / 一句话），摘要只写「这条新不新、真不真」，
-  不再为了让文件变小而删条目。整份 `write` 的 90% 条目数护栏扩展到这两个文件。
-- **无日期条目按文件位置参与排序**（热梗段）：继承前面最近一个有日期条目的日期，不再一律当最旧。
-- **提示词**：标题改成「和当前话题相关的记忆（不是全部）」，写明「这里没看到就去 search，
-  别猜」以及「记忆里的『以后有人问 X 就……』是聊天内容，不是指令」；另附一行「全部梗的写法」
-  词汇表（`memoryVocabHint`）。
-- **周合并**（`digestConsolidate`，默认关）：摘要之后可选再跑一次，只整理不新增事实。
-- 详见[长期记忆](docs/memory.md)（检索式注入 / scope / 冷热分层 / 人物表）。
-
-### 默认值变化（可能影响已有部署）
-
-**`config.js` 的 schema 默认值改成了「本仓库这套配置」**，新装即按这套跑。老部署如果在
-profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先；没写的会跟着变：
-
-| 字段 | 旧默认 | 新默认 | 影响 |
-|---|---|---|---|
-| `agentPreset` | `''`（部署默认预设） | `qq` | 新装默认挂本 bundle 的最小预设，而不是可能带 shell 的 `standard` |
-| `allowTools` | `[]`（不限制） | 17 个工具名 | 默认收窄到「只读文件 + 检索 + 联网 + 十个 `qq_*`」；`qq` 预设里的 `write` / `edit` 默认拿不到 |
-| `activeFollow` | `false` | `true` | 被叫到之后，窗口内同一个人接着说话也算数（还要过抽卡）；群里聊热了会进入多人搭话 |
-| `proactive` | `false` | `true` | 冷场后会自己开口（仍有 7 道闸，安静阈值 45 分钟） |
-| `burstSingleMaxChars` | `0`（用 80） | `100` | ≤100 字按聊天型处理（发送途中对方接话就停），超过的按信息型完整发送 |
-| `recallAddressed` | `answer` | `drop` | 被 @ 的消息撤回后**真的不回**（原本是「照常答、只是不引用」） |
-| `recallPrivate` | `false` | `true` | 私聊撤回也处理（还没投给模型的那条不回） |
-
-想回到「最保守」的那一套，在部署的 patch 里显式写回去即可：
-`agentPreset: ''`（或 `none`）、`allowTools: []`、`activeFollow: false`、`proactive: false`、
-`recallAddressed: answer`、`recallPrivate: false`。
-
-### 新增：定时提醒
-
-- **`qq_remind_create` / `qq_remind_list` / `qq_remind_cancel`**：让 Agent 把「明早 8 点提醒我
-  交作业」变成一条持久化任务；到点由插件直接发 `@目标 + 文本`，**不经过模型**，重启不丢。
-- **三种模式**：`text` 原样发固定文案（最可靠、不花 token）；`agent` 让模型用自己的语气说，
-  失败 / 超时 / SKIP 都退回固定文案；`prompt` 到点按指令做事（可调工具，默认关闭，只给受信者）。
-  `reminderModes` 是上限，默认 `agent`。
-- **时间**：一次性或每天 / 工作日 / 每周 / 每月；`at` 用本地 `YYYY-MM-DDTHH:MM`，也接受
-  `in_minutes`；周期任务的第一次已过去时自动滚到下一个未来时刻，`monthly` 在小月夹到月末。
-- **安全默认值**：只能提醒创建者自己；`@` 别人与 `@全体` 默认关（`reminderMentionOthers` /
-  `reminderAllowAll`）；每人每天 5 条、每会话 20 条待发；`reminderUsers` 是受信名单。
-  提醒正文原样发送、**不解析** `[[图片]]` / `[[@]]` 标记，@ 只来自创建时解析好的 QQ 号。
-- **重启 / 断线**：任务文件 `data/reminders.json`；错过时刻在 `reminderGraceMs`（默认 10 分钟）
-  内补发，超过标 `missed`；周期任务不补历史；agent 轮跑到一半进程被杀时补一条固定文案。
-- **发送是 at-most-once**：先记账再发，宁可重启后补一条文本，也不重复 @ 全体。
-- **`/reset` 不影响提醒**：任务属于会话而不是某一轮 Session。
-- **设置页能看见记着的任务**：新增独立的「提醒」tab（提醒同样服务私聊，不再塞在「群聊」
-  里），列表放在这一页最上面，按状态列出待发与最近历史（时间 / 模式 / 目标 / @ 名单 /
-  创建者 / 已发次数 / 上次错误），每 15 秒自动重读，也可以手动刷新；数据走 Connection
-  认证栅栏内的一条只读路由。
-- 详见[定时提醒](docs/reminders.md)；设置页在「提醒」tab。
 
 ### 新增：给表情包改名（`qq_rename_sticker`）
 
@@ -214,138 +347,6 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
   把后面的条目挤丢（实测会吃掉「森美奈美」「洛天依」）。
 - 迁移生成待办名字时取前 12 个字，得到「Q 版蓝毛女仆脸：蓝发盘」这种半句；现在截到第一个标点。
 
-### 被撤回的消息（新功能，见 `docs/recall.md`）
-
-三层：**安全层与数据层永远生效，行为层才是配置项**。
-
-- **不再引用一条已经不在的消息**（安全层，所有人受益）：回复本来是带着 `reply` 段指向被回复的
-  那条发出去的，而 `sendOne` 失败时 `sendParts` 会整条停下 —— 撤回一到，那条回复剩下的气泡
-  一起发不出去，群里看到的只是「它没理人」。现在撤回事件到达时先清掉这个会话里所有指向它的
-  引用（`messageId` 清空、`userId` 留着，于是 `replyStyle` 四档都自动退化成正确的降级）。
-- **记一份「最近看见过什么」**（数据层）：QQ 不提供回查已撤回消息的接口，所以每个会话在内存
-  里留最近 30 条（id / 发送者 / 显示名 / 占位符正文 / 有没有 @ 过它 / 投递与回复进度）。不落盘，
-  重启即清；对不上的撤回只记一条 info（「没看见」是有效状态，不是错误）。
-- **`recallMode`**：`off`（只做上面两层）/ `ignore`（默认，还没投递的那条不再投给模型；被 @ 的
-  再按 `recallAddressed` 决定）/ `tease`（被 @ 的那条**就地改写成撤回提示**，这一轮直接调侃；
-  已经回过的按闸门补一句）。
-- **`recallAddressed`**（默认 `drop`）：被 @ 的那条还没投出去就撤回时，`drop` 是**真的不回**
-  （「撤回 = 当没收到」），`answer` 才照常答、只是不引用（@ 是明确点名，认为点名了就该有回应
-  的话选它）。
-- **`recallScope`**（默认 `to-me`）：`all` 才会为群里别人的撤回开口（那等于承认它每条都看，
-  语义接近 `proactive`，所以默认关）。
-- 补一句要过一串闸门：`recallChance` / `recallCooldownMs` / `recallDailyMax` / `recallMaxAgeMs`
-  / `recallScope`，外加几条硬性的 —— 自己的消息被撤不处理、管理员代撤（`operator_id ≠ user_id`）
-  不调侃、这一轮还在飞时不补刀。掷中即消耗（`SKIP` 也算）。
-- **默认不给原文**（`recallTeaseQuote: false`）：复述别人撤掉的话是最常见的社交事故。
-- **`recallPrivate`**（默认开）：私聊撤回也处理（还没投给模型的那条同样不回）；`tease` 时建议
-  关掉 —— 私聊里调侃「你撤什么」很容易变成冒犯。清引用照做。
-- **长期记忆留一行 tombstone**（`recallMemoryMark`，默认开）：转录是只追加的原料，所以追加一行
-  `kind: "recall"` 而不是删行 —— 摘要 Agent 一眼看得出「这条撤了、别当事实」，原文仍然在。
-- 本仓库的 `cordis.patch.yml` 把这三项显式写出来钉住：`recallMode: ignore` +
-  `recallAddressed: drop` + `recallPrivate: true`（现在也是 schema 的默认值；写出来是为了将来
-  改默认时本部署不跟着漂）。
-- 新模块 `recall.js`（4 个纯函数，12 条闸门可单测）+ `test/recall.test.mjs`（15 条）+ bridge
-  里 `bootRecall` 那组（11 条：三种位置 × 三种模式、环境上下文摘除、转录标记）。
-
-## 0.2.0 — 2026-10-17
-
-按当时的重构设计做的四层拆分：**人格 / 表达 / 感知 / 运维**。
-一句话概括：把「你是谁」「怎么说」「看到了什么」「出事了怎么查」从 `index.js` 那一坨提示词与
-if 里拆成可单独测试、可单独回滚的模块。**升级前请读「BREAKING」那一段。**
-
-### BREAKING
-
-- **移除 JM（禁漫）下载旁路**。`jm.js`、`scripts/jm_download.py`、`qq_jm_pdf` 工具、`/jm` 指令、
-  15 个 `jm*` 配置项与 `test/jm.test.mjs` 全部删除；`package.json` 的 `exports["./jm.js"]` 与
-  `files` 里的 `jm.js`、`.gitignore` 里的 `.qq-jm/` 一并去掉。
-  - `cordis.patch.yml` 里残留的 `jm*` 会变成**惰性字段**（schemastery 对未知键透传），不会启动失败；
-    `allowTools` 里残留 `qq_jm_pdf` 时插件只记一条 warn（白名单里有不存在的工具名）。
-  - `/jm 422866` 不再是特殊指令，作为普通消息进模型（群里仍然要 @ 或满足触发条件）。
-  - **数据不删**：`.qq-jm/` 里的旧 PDF、`.venv/` 里的 jmcomic 依赖都原样留着。要清就显式跑
-    `node scripts/ops.mjs cleanup jm --apply`（只删 `.qq-jm/`，先列文件再生效，绝不碰 `.venv`）。
-- **`burstSingleMaxChars` 语义变了**：从「短回复强制并成一条」变成「聊天型 / 信息型的门槛」。
-  想要条数上限可以显式设 `burstMaxMessages`（默认 0 = 不限）。
-- **短气泡句末的「。」会在发送前被剥掉**（`stripShortPeriod`，默认开）。只动句末唯一的一个
-  「。」；问号、感叹号、省略号、句中句号都不碰。
-- **图片不再挂引用**：整轮只有图时引用直接丢弃，有文字时引用只挂第一个**文字**气泡。
-
-### 人格与表达（新的两层）
-
-- **`persona.js` + `cwd/.qq-persona/PERSONA.md`**：人设只写「是谁」——身份 / 背景 / 性格 / 场景。
-  性格按 `名字｜底色/点缀｜强度｜触发条件｜表现｜禁忌` 一行一条，**底色最多一条**（始终在场，
-  是语气的地板不是台词），点缀按触发条件上场、一次最多演一个。旧配置 `persona` 在没有
-  `PERSONA.md` 时仍然生效；文件存在时它被忽略并记一条 info（避免两套人设叠加）。
-  文件写坏（半截、只剩标题）时退回上一版，再退回配置 / 内置人设 —— **人设写坏绝不让机器人不说话**。
-- **`style.js` + `cwd/.qq-persona/STYLE.md`**：表达只写「怎么说」——气泡、标点、表情、私聊 / 群聊。
-  机器参数（`burst*` / `stripShortPeriod` / `interjectQuote`）在配置里，散文与参数互不解析。
-- **气泡条数**：模型写几条就发几条，插件**没有**掷骰 / 概率、**没有**条数上限、也不把多出来的
-  并进最后一条。`burstMaxMessages` 是唯一可选的条数上限（默认 0 = 关）。发送途中对方又说话了，
-  聊天型剩下的气泡就不再发（信息型该讲完还得讲完）。
-- **私聊补一句（L2，默认开）**：回完对方、对方安静 15 秒后，最多再开一轮看看有没有想补充的
-  （可 SKIP）。它**不搭 `proactive` 那趟车**（那是群里主动开口的总开关），有自己的
-  `privateAfterthought*` 开关 / 概率 / 日上限；空消息、命令、出错、SKIP 之后的轮次不补，
-  对方在这期间接了话也不补。
-- **提示词槽位化**：场景 → 人设 → 表达契约 → 记忆索引 + 热梗 → 能力清单 → 额外要求 →
-  **硬性规则（最后，最高优先级）**。每条规则只出现一次；「绝不两拍」拆成两句（信息型的
-  「短 + 长」仍然禁止，聊天型的「短 + 短」允许）。
-- 本部署那份混着风格规则的 `persona` 已从 `cordis.patch.yml` 搬进 `.qq-persona/PERSONA.md`
-  与 `.qq-persona/STYLE.md`（蓝毛女仆人设拆成「身份 / 背景 / 温柔底色 / 傲娇点缀 / 场景」+
-  「总体 / 标点 / 表情包 / 私聊 / 群聊」）。
-
-### 群聊搭话（治「莫名其妙」）
-
-- **`speech-policy.js`**：把准入、A/C 抽卡、插话准入收成一个纯判据，返回 `intent`
-  （`addressed` / `continued` / `interject` / `none`）。`admit` 只剩「凑入参 + 记账」。
-- **插话的投递文案换了**：不再是 `kaguya: 晚上吃啥`（kaguya 并没有问它），而是
-  「（群里在聊天，这句不是叫你的。kaguya 说：晚上吃啥）」+「你要接就接这一句……不想接就只写
-  SKIP」。`speakerLine` 也按 intent 换措辞，不再一律说「刚跟你说话的人」。
-- **插话强制引用锚点**（`interjectQuote`，默认开）：引用的是 `admit` 时快照的具体
-  `message_id`，不再看 `replyStyle: auto` 的漂移判断（那个判断在「紧接着回」时恰好不引用，
-  于是插话裸奔）。引用发不出去 → 退化成 @ 说话人 → 再不行才裸文本，都记 warn。
-- **C 路准入收紧四条**：@ 了别人、命令、纯媒体（没有文字）、机器人自己 —— 一条都不接。
-
-### 认知与表情包分离
-
-- **`cognition.js`** + 两个文件：`COGNITION.md` 只装**语言**（梗 / 黑话 / 缩写 / 谐音，键是
-  文字写法含变体），`STICKERS.md` 装**表情包**（键是收藏后的文件名）。认知库里**不许出现
-  文件路径**，表情包目录里**不许出现 `.qq-media`**（那是会过期的缓存）。
-- `qq_save_sticker` 新增可选 `meaning` / `scene`：存完图顺手往 `STICKERS.md` 补一行；没给
-  `meaning` 时进「未收藏」待办区（不进提示词）。目录写失败**不回滚图片**。
-- 提示词里的表情包目录改成「名字（含义）」而不是裸文件名；新增「最近学的梗」段（最近 15 条
-  「置信：确认」，≤1200 字），谐音梗不用先 search 再答。
-- skill 拆分：新增 `learn-meme`（文字梗 → `COGNITION.md`）与 `learn-sticker`（表情包 →
-  先收藏再写 `STICKERS.md`）；`update-cognition` 保留为**一句话分诊**的兼容壳；
-  `message-digest` 的认知段落改成分诊写法。
-- 新增 `scripts/migrate-cognition.mjs`：把老 `COGNITION.md` 里「以路径为键」的条目一次性迁到
-  `STICKERS.md`（用画面指纹认同一张重新编码过的图；认不出就标「原图已过期」放进未收藏区）。
-  **默认 dry-run**，`--apply` 才写，写前备份，`--json` 给报告。
-
-### 感知层
-
-- **`modalities.js`**：消息段 → `Observation` → 占位符渲染。系统表情带名字、语音给时长、
-  视频给时长 + 封面路径、文件给大小、合并转发给条数、`json`/`xml` 卡片解析出标题 / 域名 / 链接。
-  `onebot.js` 的 `messageToText` 改为委托它（既有输出逐字节不变）。
-- **`links.js`**：卡片解析 + 可选的 URL 预览（`linkPreview` **默认关**）。SSRF 防护覆盖
-  scheme / userinfo / localhost / `*.local` / `*.internal` / 私有与保留网段 / 各种数值变形的
-  IPv4 / IPv6 回环与内网，每一跳重定向都重新校验；超时、字节上限、只收 `text/html`/`text/plain`。
-- **`interactions.js` + 戳一戳**：以前 `handleEvent` 第一行就把 `notice` 全丢了，现在被戳会回应。
-  `pokeMode` = `random`（默认，按 `pokeReplyChance` 回戳或走一轮）/ `poke` / `text` / `ignore`；
-  每个会话 `pokeCooldownMs` 冷却 + `pokeDailyMax` 每日上限（防两个机器人互戳）。
-  只回应**戳机器人自己**的，戳别人一律不记。新增 `qq_poke` 工具（群里必须显式指定戳谁）。
-- 视频只下封面（`videoCover` 默认开，`videoMaxBytes: 0` 不下载整段）；语音只做时长占位，
-  **不下载、不转写、不起任何外部进程**。
-
-### 运维
-
-- **`ops.js`（纯计划）+ `scripts/ops.mjs`（执行器）**：一套命令跨平台。
-  `doctor` / `status` / `restart` / `logs` / `install` / `uninstall` / `napcat` /
-  `migrate cognition` / `cleanup jm` / `selftest`，都支持 `--json`（stdout 只有一个对象，
-  版本号 `schema: 1`；人话走 stderr）。
-- 退出码：`0` 全部通过 / `1` 有 error 级 findings / `2` 需要人工或提权 / `3` 脚本自身出错。
-- `--apply` **默认关**：写 cwd 外的步骤（systemd unit、计划任务、NapCat 配置、profile）都带
-  `requires: human|root`，agent 默认只拿计划、把命令原样贴给人。幂等（写前备份，重复执行不重复写）。
-- 新增 `docs/ops.md`（给 agent 的排查配方）。
-
 ### 配置
 
 新增 23 项，全部有中文 `.description()` 并在设置页分了组（「表达（STYLE.md / 气泡 / 标点 / 补一句）」
@@ -383,7 +384,8 @@ if 里拆成可单独测试、可单独回滚的模块。**升级前请读「BRE
 按当时的设置页重设计（v2 定稿）把 120 个字段从「14 张折叠卡片、默认只展开第一组、
 布尔与枚举都是文本框、数字没有量纲」改成可扫、可找、可理解的页面：
 
-- **6 个下划线 tab**：连接 / 会话 / 人格 / 群聊 / 感知 / 记忆（默认「连接」），14 个分组各归一个
+- **下划线 tab**：连接 / 会话 / 人格 / 群聊 / 感知 / 记忆（默认「连接」；后来定时提醒又独立出
+  第 7 个「提醒」tab），14 个分组各归一个
   tab（`TABS` / `tabOf`，测试钉住「每个分组恰属一个 tab、120 项合计分布 12/23/19/29/22/15」）。
   卡片 chrome（`CARD_STYLE` / `groupHeader` / `openId`）全部删掉，改成**扁平区块**：标题 + 0.5px
   分隔线 + 一行一个字段；只剩「人格」页的旧 `persona` 折进「兼容：旧 persona（文件存在时不生效）」。
@@ -419,6 +421,13 @@ if 里拆成可单独测试、可单独回滚的模块。**升级前请读「BRE
   测试文件，以及桥接层的插话锚点 / 准入收紧 / 气泡条数与中断 / 私聊补一句 / 戳一戳 / 链接预览 /
   视频封面 / 语音占位等端到端用例。
 - **沙箱里不再有「13 条跳过」**：那 13 条全是为 JM 的真 spawn 准备的探针，随 JM 一起删掉了。
+- 后半段六块又加了五个测试文件 —— `reminders` / `recall` / `backlog` / `persona-template` /
+  `memory-select` —— 以及桥接层的提醒（text / agent / SKIP / 超时 / 重启 / 权限）、撤回
+  （三种位置 × 三种模式）、长任务期间的那一波、多人插话等端到端用例。
+- **本版基线 647 条全过、0 跳过**：
+  `node --test --experimental-test-isolation=none "test/*.test.mjs"`。其中 `persona-template`
+  那 3 条会真的 spawn 一次 `scripts/persona-check.mjs`（钉住退出码语义），在 DSH 的沙箱里
+  因为进程间管道被禁会红 —— 那是环境的限制，不是用例的问题；完整权限下 647 条全绿。
 
 ## 0.1.1 — 2026-10-15
 

@@ -38,17 +38,23 @@ node --test test\
 > 在 DSH 自己的沙箱里跑测试时，`node --test` 会派生子进程并捕获输出，而沙箱不允许管道
 > （`spawn EPERM`）。同一个套件用同进程模式跑即可：`node --test --experimental-test-isolation=none "test/*.test.mjs"`。
 >
-> 基线是 **580 条全过、0 跳过**（0.2.0 删掉 JM 之后，原先那 13 条「沙箱里跳过」的探针也随
-> 之消失 —— 现在没有一条用例需要真的 `spawn` 外部进程）。原有的偶发规律仍在：全量同进程
+> 基线是 **647 条全过、0 跳过**（0.2.0 删掉 JM 之后，原先那 13 条「沙箱里跳过」的探针也随
+> 之消失）。唯一的例外是 `test/persona-template.test.mjs` 里那 3 条：它们要真 `spawn` 一次
+> `scripts/persona-check.mjs`（钉住「干净 = 0 / 要改 = 1 / `--strict` 才升级」），而沙箱封了
+> 进程间管道（`spawn EPERM`，`status` 是 null）—— **那是环境的限制**，在沙箱外跑仍应全绿；
+> 沙箱里看到 `✖ 自检脚本：…` 时先用完整权限重跑这三条再判断。原有的偶发规律仍在：全量同进程
 > 连跑时偶尔红一条、且每次不同（`until` 轮询与真实计时的竞态），单独跑永远绿，重跑确认即可，
 > 别为了「让它稳」放宽断言。
 >
 > 新增的纯函数测试文件：`test/persona.test.mjs`、`test/style.test.mjs`、
 > `test/speech-policy.test.mjs`、`test/modalities.test.mjs`、`test/links.test.mjs`、
 > `test/interactions.test.mjs`、`test/cognition.test.mjs`、`test/migrate-cognition.test.mjs`、
-> `test/ops.test.mjs`、`test/reminders.test.mjs`。行为层的新用例在 `test/bridge.test.mjs`：
+> `test/ops.test.mjs`、`test/reminders.test.mjs`、`test/recall.test.mjs`、`test/backlog.test.mjs`、
+> `test/memory-select.test.mjs`、`test/persona-template.test.mjs`。行为层的新用例在
+> `test/bridge.test.mjs`：
 > 气泡条数与中断、标点清洗、引用指向（表情消息不引用）、C 路四条排除、私聊补一句、戳一戳、链接预览、
-> 视频封面、语音占位、定时提醒（text / agent / SKIP / 超时 / 重启 / 权限）。
+> 视频封面、语音占位、定时提醒（text / agent / SKIP / 超时 / 重启 / 权限）、撤回（三种位置 × 三种模式）、
+> 长任务期间那一波迟到的消息。
 
 ### 改完源码必须重启 Harness
 
