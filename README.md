@@ -41,6 +41,9 @@
 4. 起常驻进程：`dsh --profile qqbot --port 3081 --no-open`（或 `deploy/qqbot.service`）。
 5. 私聊机器人发一句话，它在 QQ 里回你就说明整条链路通了。
 
+想让它像某个具体的人：照[写人设：模板与问答](docs/persona-workshop.md)走 —— 复制两份模板改四处，
+或者让 agent 用 18 道选择题问你一遍，再跑一个自检脚本看看「模型会看到什么」。
+
 | 你的平台 | 照着哪一页装 |
 |---|---|
 | Windows（桌面版 DSH 与 NapCat 在同一台机器上） | [Windows 桌面版](docs/windows.md) |
@@ -117,6 +120,7 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | [Windows 桌面版](docs/windows.md) | 一键脚本、隐藏窗口、提权、装进 `desktop` profile、自检与排查 |
 | [配置项](docs/configuration.md) | 全部字段、Web UI 设置页、改配置的正确姿势 |
 | [人格与表达](docs/persona-style.md) | `PERSONA.md` / `STYLE.md` 的格式、组合规则、三道防线 |
+| [写人设：模板与问答](docs/persona-workshop.md) | 两份复制就能用的模板、一份会提问的提示词、一个不用启动机器人的自检脚本 |
 | [说话方式与节奏](docs/speaking.md) | 攒批、气泡条数（模型自己写）、分条 / 打字延迟、指向、`[[@昵称]]`、空消息 |
 | [自动复读](docs/repeat.md) | 文字与表情包复读、画面指纹、带宽账 |
 | [主动开口](docs/proactive.md) | 偶尔主动说话、活跃对话、私聊补一句 |

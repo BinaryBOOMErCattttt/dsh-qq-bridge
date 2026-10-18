@@ -68,6 +68,7 @@ reminders.js   1000 行  定时提醒：时间推算 / 校验 / 模式决策（�
 ops.js          913 行  运维的**纯计划**：平台识别、doctor findings、service/install 步骤、退出码
 scripts/ops.mjs 1671 行  运维执行器 + CLI（`doctor` / `status` / `restart` / `logs` / `install` / `napcat` / `migrate` / `cleanup` / `selftest`），`--json` + `--apply`
 scripts/migrate-cognition.mjs 364 行  老 `COGNITION.md` 的路径条目一次性迁到 `STICKERS.md`（画面指纹认图、默认 dry-run、写前备份）
+scripts/persona-check.mjs  307 行  人设自检 CLI：不启动机器人，直接跑 `parsePersonaDoc` / `renderPersona` / `parseStyleDoc` / `lintStyleDoc`，打印「模型会看到什么」+ findings；退出码 0/1/2，`--json` / `--strict`
 chatter.js      171 行  群里「谁在说话」的三本账（插话序号 / 回答指向 / 热度窗口）：只暴露语义动作，不暴露 Map
 mention.js      209 行  `[[@昵称]]` → OneBot `at` 段：纯函数解析 + 「昵称 → QQ 号」名单（名单挂在会话记录上）
 speaking-rules.js 330 行  「什么时候该主动开口」的纯判据（闸门 / 抽卡 / 补一句 / 私聊补一句）：普通入参 → 布尔
@@ -90,6 +91,7 @@ scripts/dev-node-modules.mjs      Windows 上铺 `node_modules`（按依赖闭�
 scripts/release.mjs               打发布包（`git archive` 源码树 + 干净的 NapCat → `dist/<名>.zip`），打完体检，命中账号配置/登录态就整体失败
 docs/{install,windows,configuration}.md  安装与运行 / Windows 桌面版 / 配置项
 docs/{persona-style,speaking,repeat,proactive,media,recall,memory,reminders}.md  行为分册（人格 / 说话 / 复读 / 主动开口 / 媒体 / 撤回 / 记忆 / 定时提醒）
+docs/persona-workshop.md  写人设的入口：模板 / 18 题问答 / 组装规则 / 自检脚本怎么读 / 常见坑 / 为什么提示词不进 `.dsh/skills`
 docs/{sessions,tools,security,ops,development}.md  会话 / 工具与能力面 / 安全 / 运维排查 / 开发测试
 .dsh/skills/message-digest/SKILL.md    聊天记录 → 长期记忆的流程（定时摘要与「以前说过什么」用它）
 .dsh/skills/learn-meme/SKILL.md        文字梗 / 黑话 / 谐音 → COGNITION.md 的流程
@@ -109,10 +111,13 @@ test/util.test.mjs      纯函数边界：写边界、memorySlug、本地时间�
 test/client.test.mjs    设置页契约测试（假模块系统 + 迷你渲染器）：字段全覆盖 / tab / 控件 / 草稿 / 搜索 / 只看已改 / 量纲
 test/filestore.test.mjs 原子读写与「读不到就返回空/undefined，不抛错」这条失败语义
 test/perceptual.test.mjs  图片指纹的单元测试（同图不同编码 / 异图 / 畸形输入 / 解压炸弹）
+test/persona-template.test.mjs  人设模板 / 提示词 / 自检脚本的契约：零解析警告、STYLE 零体检、只一条底色、长度不超上限、文档不失链、退出码语义
 test/image-fixtures.mjs  上面两个测试共用的图片 fixture（真编码的字节，不是 test 文件）
 cordis.patch.yml      插件自带 bundle patch：注册 `qq` Agent 预设（含 skill 平面）+ 插件 config
 locale/{zh,en}.json   插件在 Web UI 里的标题/描述
 deploy/qqbot.{service,env.example}  systemd user unit 与凭据模板
+deploy/persona/{PERSONA,STYLE}.template.md  复制就能用的两份模板（零解析警告 / 零体检命中，`test/persona-template.test.mjs` 钉着）
+deploy/persona/PROMPT.md  人设编写提示词：先问「一次答完还是一题一题来」，再 18 道选择题，最后落盘 + 自检；**刻意不放进 `.dsh/skills/`**（那个目录对 QQ 会话也可见）
 README.md             用户文档摘要 + 文档地图（细节在 docs/；改行为要同步对应分册；「30 秒开始」一节指路 Releases）
 CHANGELOG.md          更新记录（发 Release 的说明从对应那一节里粘）
 AGENTS.md             **本文件**：给改代码的智能体的说明书（DSH 会自动注入上下文）
@@ -662,6 +667,7 @@ agent 轮在 `index.js`**。
 | 加一个配置项 | `config.js` 的 schema（含中文 `.description()`）+ （需要兜底/夹紧时）`settings.js` 加一行 + docs/configuration.md 的配置表 + `test/settings.test.mjs` 补边界；界面不用改，但要在 `client.js` 的 `SECTIONS` 里给它一段（见 §5.12） |
 | 改 Web UI 设置页（分组 / 标签 / 控件 / 草稿口径） | 只改 `client.js`：`TABS` / `SECTIONS`（含 `subs` 小标题）、`LABEL_OVERRIDES`、`ENUM_LABELS`、`FIELD_HINTS`、`specFor`；版式契约见 `client.js` 顶部注释与 `test/client.test.mjs` |
 | 改提示词 / 人设 | `DEFAULT_PERSONA`（内置兜底）、`channelPrompt` 的槽位、`Config.persona` / `.instructions`；**「是谁」写 `.qq-persona/PERSONA.md`、「怎么说」写 `STYLE.md`**（`persona.js` / `style.js`） |
+| 改「怎么写人设」（模板 / 题库 / 自检） | `deploy/persona/{PERSONA,STYLE}.template.md`（必须能直接跑）+ `deploy/persona/PROMPT.md` 的 18 题题库 + `docs/persona-workshop.md` 的速查表 + `scripts/persona-check.mjs` + `test/persona-template.test.mjs`；**题库 / 速查表 / 模板 / 测试要一起改**，测试会红 |
 | 改气泡数 / 标点 / 引用规则 | 气泡条数由模型按 `STYLE.md` 自己写，插件**不设上限**；标点与中断在 `style.js`（`sanitizeBubble` / `classifyReply` / `renderStyleContract`）+ `Config` 的 `burstSingleMaxChars` / `stripShortPeriod` / `replyStyle` + `index.js` 的 `burstParts` / `replyPieces` / `sendParts` / `quoteHead`（被回复的那条只有表情时不引用：`onebot.js` 的 `isEmojiOnlyMessage`） |
 | 改私聊补一句 | `speaking-rules.js` 的 `privateAfterthoughtAllows` + index.js 的 `scheduleChime` / `runChime` / `chimeNudge` + `Config.privateAfterthought*` |
 | 改群聊「谁该开口」 / 插话 | `speech-policy.js`（`decideGroupTurn` / `interjectExclusion` / `interjectLine`）+ `speaking-rules.js` + index.js 的 `admit` / `submitBatch` / `speakerLine` |

@@ -3,6 +3,10 @@
 > 「是谁」写在 `<cwd>/.qq-persona/PERSONA.md`，「怎么说」写在 `STYLE.md`。
 > 这一页讲两个文件的格式、组合规则与三道防线；气泡 / 标点这些机器参数见
 > [speaking.md](speaking.md) 与 [configuration.md](configuration.md)。
+>
+> **不知道从哪下手**：先看[写人设：模板、问答与自检](persona-workshop.md) —— 两份复制就能用的
+> 模板、一份会一题一题问你的提示词、一个不启动机器人就能跑的自检脚本
+> （`node scripts/persona-check.mjs`）。
 
 **「是谁」与「怎么说」是两个文件、两层东西。** 以前它们混在一段 `persona` 配置里：改一次
 口吻要动人设、句号这种能机械执行的规则也写进了「你是谁」、而且没有任何校验。现在：
@@ -125,3 +129,5 @@
    `STYLE.md` 里再写一遍「别用行，开场」是冗余的，删掉也不影响。
 
 启动日志会报 `<N 节 / M 条>`，改完文件对一下条数，就知道内容有没有真的读进去。
+不想翻日志也行：`node scripts/persona-check.mjs` 会把解析计数、提示词预览和体检结果一次打出来
+（见[写人设：模板、问答与自检](persona-workshop.md)）。
