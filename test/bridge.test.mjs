@@ -185,6 +185,12 @@ function makeHost({
    * `ctx.fiber.restart()` 重启自己。不传 = 最小组合里没有 fiber（插件只记一条 warn）。
    */
   fiber,
+  /**
+   * 让前 N 次 `agentCtx.get('systemPrompt')` 返回 undefined，模拟真宿主的竞态：
+   * `ctx.get()` 是 strict 的，服务 fiber 还没 active 时就是拿不到。Agent 的 resume 可能
+   * 赶在服务 active 之前（真实事故：19:48 那次 resume 之后渠道提示整段丢了）。
+   */
+  promptSetupFailures = 0,
 } = {}) {
   const listeners = new Map();
   const tools = new Map();
@@ -195,6 +201,31 @@ function makeHost({
   /** 所有 info 日志（轮换成功／没配置时的自述都在这一级）—— 用来验「key 没被整条打出来」。 */
   const infos = [];
   const disposers = [];
+  /** `systemPrompt` 还剩几次「服务不可见」；见 makeHost 的 promptSetupFailures。 */
+  let promptFailuresLeft = promptSetupFailures;
+  /**
+   * 假 `systemPrompt` 服务：注册时把条目推进 `prompts`，返回的 disposer 能撤销。
+   *
+   * disposer 是必须的：插件在补挂渠道小节前会先撤上一份（同名注册会抛 duplicate），
+   * 没有撤销能力的桩测不出那条重试路径。
+   */
+  const promptService = () => {
+    if (promptFailuresLeft > 0) {
+      promptFailuresLeft -= 1;
+      return undefined;
+    }
+    const remember = (entry) => {
+      prompts.push(entry);
+      return () => {
+        const at = prompts.indexOf(entry);
+        if (at >= 0) prompts.splice(at, 1);
+      };
+    };
+    return {
+      section: (s) => remember({ kind: 'section', ...s }),
+      variable: (name, provider) => remember({ kind: 'variable', name, provider }),
+    };
+  };
   const cleanups = [];
   /**
    * 用例中途才 provide 出来的服务（`host.list.provide`）。
@@ -289,13 +320,7 @@ function makeHost({
         // create 时宿主会调用 setup；插件在其中 join 预设、注入模型变量、施加工具白名单，
         // 并注册 QQ 渠道提示小节。
         const agentCtx = {
-          get: (service) =>
-            service === 'systemPrompt'
-              ? {
-                  section: (s) => prompts.push({ kind: 'section', ...s }),
-                  variable: (name, provider) => prompts.push({ kind: 'variable', name, provider }),
-                }
-              : undefined,
+          get: (service) => (service === 'systemPrompt' ? promptService() : undefined),
           // 真实宿主里 agentCtx.tools 是作用域绑定的服务：restrict() 只收窄这个
           // Agent，且遇到它继承不到的工具名会抛错 —— 这里如实照搬这两条语义。
           tools: {
@@ -313,6 +338,8 @@ function makeHost({
         const agent = {
           id: options.sessionId,
           options: options.agentOptions,
+          // 真宿主的 Agent 自带作用域上下文；热路径补挂提示小节时插件要用它。
+          ctx: agentCtx,
           inbox: [],
           followup(message) {
             this.inbox.push(message);
@@ -750,6 +777,60 @@ test('a private message becomes an Agent turn whose reply returns to QQ', async 
     // 多条 assistant 文本在同一个 turn 内累积（用换行连接）；humanize 下换行 = 分条，
     // 所以这是两条独立的消息，而不是一条消息里换行。
     assert.deepEqual(sent, ['我先看看', '你好呀，很高兴认识你']);
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：setup 时 `systemPrompt` 服务还没 active（strict get 返回 undefined），渠道提示
+// 小节没挂上 —— 下一条消息复用 Agent 时必须补挂回来。
+//
+// 真实事故：19:48 那次 resume 正好赶在服务可见之前，旧代码拿不到服务就静默 return，
+// 于是这个 Agent 带着**裸系统提示词**一直跑到下次重启：人设与表达规则全丢，群里的回复
+// 又退化成「才没有 是你没跟上我」这种空格断句（而 STYLE.md 明明写着不许）。重启能修好，
+// 但没人知道要重启 —— 所以这里钉的是「不重启也能自愈」。
+test('the channel prompt is retried on the next message when systemPrompt is not ready yet', async () => {
+  // 把 setup 里的三次尝试（0ms / 50ms / 200ms）全部打空，模拟服务一直不可见。
+  const { onebot, host } = await boot({}, { promptSetupFailures: 3 });
+  try {
+    onebot.push(privateMessage('你好'));
+    await untilInbox(host, 1, 'the first message to reach the Agent');
+    // 第一轮服务不可见：没有渠道小节，但必须留下一条 warn（否则这次丢失永远没人发现）。
+    const hasSection = () => host.list.prompts.some((entry) => entry.kind === 'section' && entry.name === 'qq-bridge:channel');
+    assert.equal(hasSection(), false, '第一轮拿不到服务时确实挂不上');
+    assert.ok(
+      host.list.warnings.some((line) => line.includes('systemPrompt') && line.includes('channel prompt')),
+      '服务不可见要留 warn，不能静默跳过',
+    );
+
+    // 第二条消息复用同一个 Agent（走 ensureAgent 的热路径），这一次服务已经可见：
+    // 渠道小节（连同 {{model}} / {{provider}} 变量）必须补挂回来。
+    onebot.push(privateMessage('还在吗'));
+    await until(hasSection, 'the channel prompt to be re-attached on the next message');
+    assert.equal(promptText(host, 'qq-bridge:channel').includes('不许拿空格当标点'), true, '补挂的是完整那一节');
+    assert.equal(host.list.prompts.find((entry) => entry.kind === 'variable' && entry.name === 'model').provider(), 'deepseek-flash');
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：竞态只晚一拍时（第一次 get 失败、50ms 后服务出现），setup 里的重试要当场把它接住 ——
+// 第一条回复就不该落在「没有渠道提示词」的状态。
+test('the channel prompt waits out a one-tick systemPrompt race inside setup', async () => {
+  const { onebot, host } = await boot({}, { promptSetupFailures: 1 });
+  try {
+    onebot.push(privateMessage('你好'));
+    await untilInbox(host, 1, 'the first message to reach the Agent');
+    assert.equal(
+      host.list.prompts.some((entry) => entry.kind === 'section' && entry.name === 'qq-bridge:channel'),
+      true,
+      '第一次 get 失败后要重试到服务出现',
+    );
+    assert.equal(
+      host.list.warnings.some((line) => line.includes('systemPrompt') && line.includes('channel prompt')),
+      false,
+      '重试成功时不该报「整轮缺提示词」的 warn',
+    );
   } finally {
     await onebot.close();
   }

@@ -115,6 +115,12 @@ qq-bridge: 表达规则来自 .qq-persona/STYLE.md；气泡：最多 3 个，第
 - 只改了一部分没生效：`personaSceneOverlays: false` 会让四个场景共用一套；
   `### 私聊` 之类的 `###` 标题必须准确（只认 私聊 / 群聊 / 主动搭话 / 被戳一戳）。
 - 文件被写成半截：日志里会有「没有可用的内容，继续用上一版/内置人设」—— 那是刻意回退。
+- **整段丢**（人设、表达契约、硬性规则都没了，回复退化成空格断句 / 客服腔）：先 grep
+  `the systemPrompt service is not available while binding`。那是 Agent 创建 / resume
+  赶在服务 active 之前，渠道小节没挂上；从当前版本起下一条消息会自动补挂（成功时另有
+  一条 `attached the QQ channel prompt … (retried …)` 的 info），不需要重启。若只见到
+  那条 warn、始终没有补挂成功的 info，说明宿主本身没提供 `systemPrompt` 服务（组合问题），
+  那几条规则确实进不去。
 
 ### 4. 摘要没跑
 

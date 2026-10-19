@@ -89,6 +89,10 @@ test('表达模板：零警告、零体检命中、不带会读进提示词的 H
     contract.some((line) => line.includes('不许拿空格当标点')),
     '空格不是标点：逗号被压下去之后模型会拿空格顶替分句',
   );
+  assert.ok(
+    contract.some((line) => line.includes('才没有，是你没跟上我')),
+    '模板要给出改好的那一句，别只给反例',
+  );
   assert.ok(text.length <= 2000, '模板不能超过 styleMaxChars 的默认值');
 });
 

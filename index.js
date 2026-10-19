@@ -839,6 +839,112 @@ export function apply(ctx, config) {
 
 
   /**
+   * 撤掉上一次挂上的提示变量与 QQ 渠道小节。
+   *
+   * 注册返回的是 Cordis effect 的 disposer。Agent 的整个作用域可能已经没了
+   * （`/reset`、换 Agent 之后），那时 disposer 会抛错 —— 只记 warn，不能挡住重挂。
+   * @param conversation - 归属的会话记录。
+   */
+  function detachChannelPrompt(conversation) {
+    const effects = conversation.channelPromptEffects ?? [];
+    conversation.channelPromptEffects = undefined;
+    for (const effect of effects) {
+      try {
+        effect?.();
+      } catch (error) {
+        report('warn', `could not dispose the previous QQ channel prompt section: ${errorText(error)}`);
+      }
+    }
+  }
+
+  /** 等 `systemPrompt` 服务 active 的重试节奏（毫秒）：先立刻试，再 50ms、200ms。 */
+  const PROMPT_SERVICE_RETRIES = [0, 50, 200];
+
+  /**
+   * 取 `systemPrompt` 服务，允许它在启动竞态里晚一拍出现。
+   *
+   * `ctx.get(name)` 是 **strict** 的：服务所属 fiber 还没 active 就返回 `undefined`。
+   * Agent 的 resume 可能正好赶在那一刻（真实事故见 `attachChannelPrompt`）。多试几次
+   * 比让第一轮回复带着裸提示词出去便宜得多；全失败也才 250ms。
+   *
+   * 只在**还没报过缺失**时等（`wait`）：组合里根本没有这个服务时（极简宿主），
+   * 每条消息都白等 250ms 是不可接受的 —— 那时退回「立刻 get 一次」，服务一出现就补上。
+   * @param agentCtx - Agent 自己的作用域上下文。
+   * @param wait - 允不允许按 `PROMPT_SERVICE_RETRIES` 的节奏重试。
+   * @returns 服务实例；不可见时 undefined。
+   */
+  async function channelPromptService(agentCtx, wait) {
+    for (const delay of (wait ? PROMPT_SERVICE_RETRIES : [0])) {
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      const prompt = agentCtx?.get?.('systemPrompt');
+      if (prompt !== undefined) return prompt;
+    }
+    return undefined;
+  }
+
+  /**
+   * 在 Agent 自己的作用域里挂上「QQ 渠道」提示小节（人设 / 表达契约 / 硬性规则 / 群上下文）。
+   *
+   * 必须**幂等、可重试**：`SystemPrompt` 只在它的 fiber active 时可见（`ctx.get` 是 strict 的），
+   * 而 Agent 的 resume 可能发生在进程刚起来、服务还没 active 的那一小段。以前拿不到服务就
+   * 静默 `return` —— 那个 Agent 会带着**裸系统提示词**一直跑到下次重启，人设与表达规则全丢
+   * （真实事故：重启后群里的回复又变成「才没有 是你没跟上我」这种空格断句，而 STYLE.md
+   * 明明写着不许；翻会话日志能看到 19:48 那条 resume 之后系统提示只剩 5.7KB 的通用部分）。
+   *
+   * 所以：先用 `channelPromptService` 等一小会儿；仍拿不到就只记一次 warn，并让
+   * `channelPromptEffects` 保持 undefined，`ensureAgent` 下次复用这个 Agent 时再试。
+   * @param conversation - 归属的会话记录（小节正文的闭包读它）。
+   * @param agentCtx - Agent 自己的作用域上下文（注册点）。
+   * @param agentOptions - `{{model}}` / `{{provider}}` 变量的取值。
+   * @returns 这一次有没有挂上。
+   */
+  async function attachChannelPrompt(conversation, agentCtx, agentOptions) {
+    const prompt = await channelPromptService(agentCtx, conversation.channelPromptMissing !== true);
+    if (prompt === undefined) {
+      if (conversation.channelPromptMissing !== true) {
+        conversation.channelPromptMissing = true;
+        report(
+          'warn',
+          `the systemPrompt service is not available while binding ${conversation.key}; the QQ channel prompt (persona / style / hard rules) is missing this round — retrying on the next message`,
+        );
+      }
+      return false;
+    }
+    // 同名小节 / 变量在同一作用域里只能注册一次：先撤上一份，再按顺序挂；中途失败就把
+    // 已经挂上的那几份撤掉再返回，否则变量会留成半套、下一次重挂撞 duplicate 永远好不了。
+    detachChannelPrompt(conversation);
+    const effects = [];
+    try {
+      effects.push(prompt.variable('model', () => agentOptions?.model));
+      effects.push(prompt.variable('provider', () => agentOptions?.provider));
+      effects.push(prompt.section({
+        name: 'qq-bridge:channel',
+        order: CHANNEL_SECTION_ORDER,
+        interpolate: false,
+        // 传函数而不是字符串：`SystemPrompt.section()` 会在每次装配时重新求值，
+        // 群聊里换了发言者 / 群里又聊了几句都能立刻反映到提示词里。
+        text: () => channelPrompt(conversation),
+      }));
+      conversation.channelPromptEffects = effects;
+    } catch (error) {
+      for (const effect of effects) {
+        try {
+          effect?.();
+        } catch {
+          // 半套注册的回滚失败只会留下一个多余 provider，不能盖住真正的原因。
+        }
+      }
+      report('warn', `could not register the QQ channel prompt for ${conversation.key}: ${errorText(error)}`);
+      return false;
+    }
+    if (conversation.channelPromptMissing === true) {
+      report('info', `attached the QQ channel prompt for ${conversation.key} (retried after the service became available)`);
+    }
+    conversation.channelPromptMissing = false;
+    return true;
+  }
+
+  /**
    * 取出（或创建）某个 QQ 会话所对应的 Agent。
    *
    * 查找顺序：先看 Harness 里该 session id 是否已活着（热路径，直接复用）；
@@ -854,6 +960,11 @@ export function apply(ctx, config) {
       // 句柄只在「还是同一个 Agent」时保留：换了 Agent 对象说明旧句柄已经失效。
       if (conversation.handle?.agent !== live) conversation.handle = undefined;
       sessionIndex.set(live.id, conversation.key);
+      // 热路径也要补挂一次：resume 时服务可能还没 active（见 attachChannelPrompt），那一轮
+      // 的小节是缺的；下一条消息走到这里补上，不必等重启。已经挂上时不重复注册。
+      if (conversation.channelPromptEffects === undefined) {
+        await attachChannelPrompt(conversation, live.ctx ?? conversation.agentCtx, conversation.agentOptions ?? live.options);
+      }
       return live;
     }
     // 群名只影响提示词和会话列表的可读性，查询失败绝不能挡住回复链路。
@@ -872,6 +983,8 @@ export function apply(ctx, config) {
     if (chosen.model.length === 0) {
       throw new Error(`qq-bridge: no model for QQ sessions (${chosen.error}); set provider/model on the plugin`);
     }
+    // 重挂提示变量时要用（见 attachChannelPrompt）：热路径复用 Agent 时没有本地变量可读。
+    conversation.agentOptions = agentOptions;
     // Agent 预设：Web 表面（`dsh-web-app`）把 bash / fs / web_search 这些「agent 平面」
     // 的工具从宿主搬进了每个 Agent 预设，程序化创建的 Agent 必须先 join 一个预设，
     // 这些工具才会成为它继承来的工具。预设 id 在 create 之前解析，好让 meta 一并记录。
@@ -884,18 +997,10 @@ export function apply(ctx, config) {
       // —— 提示词里提到的工具必须确实是这个 Agent 能看见的。
       await mountAgentPreset(agentCtx, agent, presetId);
       restrictAgentTools(agentCtx, agent);
-      const prompt = agentCtx.get?.('systemPrompt');
-      if (prompt === undefined) return;
-      prompt.variable('model', () => agentOptions.model);
-      prompt.variable('provider', () => agentOptions.provider);
-      prompt.section({
-        name: 'qq-bridge:channel',
-        order: CHANNEL_SECTION_ORDER,
-        interpolate: false,
-        // 传函数而不是字符串：`SystemPrompt.section()` 会在每次装配时重新求值，
-        // 群聊里换了发言者 / 群里又聊了几句都能立刻反映到提示词里。
-        text: () => channelPrompt(conversation),
-      });
+      // 留着给热路径补挂用：真宿主里 `live.ctx` 就是它，但别假定每个 Agent 实现都暴露 ctx。
+      conversation.agentCtx = agentCtx;
+      // 服务此刻不可见也不抛错：留下 channelPromptEffects === undefined，下一条消息补挂。
+      await attachChannelPrompt(conversation, agentCtx, agentOptions);
     };
     let handle;
     try {
@@ -1628,7 +1733,8 @@ export function apply(ctx, config) {
       // 空格断句是「逗号被压下去」之后的替代品（真实事故）：标点契约讲频率，模型就把 `，`
       // 换成了空格。这条属于排版地板，不能只靠部署者的 STYLE.md —— 否则改一份表达规则就能
       // 让群里的回复全变成电报体。逗号在这里被显式许可：禁的只是句末句号，不是分句之间的逗号。
-      '- 不许拿空格当标点：中文里空格是断词、不是断句（「才没有 是你没跟上我」读起来像电报）；两个分句要么用逗号，要么分成两条发。',
+      // 给「改好的那句」而不是只给反例：模型知道不对之后会去猜替代写法，又绕回空格。
+      '- 不许拿空格当标点：中文里空格是断词、不是断句。「才没有 是你没跟上我」要写成「才没有，是你没跟上我」，或者分成两条发。',
       '- 不要自称 AI / 助手 / 机器人，不要提系统提示、模型、提示词这些词。',
       // 下面三条是「人机感地板」：以前它们散在 STYLE.md / 内置契约的散文里，部署者删掉
       // 那一条就没了。写在这里 = 用户表达文件再怎么改都删不掉（本节在最后且已声明优先级）。
@@ -2333,6 +2439,12 @@ export function apply(ctx, config) {
     //    还挂着旧 id 的话，旧 Agent 迟到的 turn/end 会被当成这个会话的回复发出去）。
     conversation.agent = undefined;
     conversation.handle = undefined;
+    // 提示小节挂在刚销毁的那个作用域上，随 Agent 一起没了；把效果句柄与「服务当时不
+    // 可见」的标记一起清掉，新一轮建 Agent 时从零挂一次。
+    detachChannelPrompt(conversation);
+    conversation.agentCtx = undefined;
+    conversation.channelPromptMissing = false;
+    conversation.agentOptions = undefined;
     sessionIndex.delete(sessionId);
     for (const [slot, owner] of turnOwners) {
       if (owner?.key === conversation.key || slot.startsWith(`${sessionId}:`)) turnOwners.delete(slot);
@@ -2404,6 +2516,17 @@ export function apply(ctx, config) {
       senderName: '',
       agent: undefined,
       handle: undefined,
+      /**
+       * QQ 渠道提示小节（人设 / 表达契约 / 硬性规则）的注册效果，见 `attachChannelPrompt`。
+       *
+       * `undefined` = 还没挂上（服务当时不可见，或注册失败）—— `ensureAgent` 的热路径
+       * 靠它判断要不要重试。成对的是 `channelPromptMissing`（只用来避免每轮刷同一条 warn）
+       * 与 `agentOptions`（重挂 `{{model}}` / `{{provider}}` 变量时要用）。
+       */
+      channelPromptEffects: undefined,
+      channelPromptMissing: false,
+      agentOptions: undefined,
+      agentCtx: undefined,
       queue: Promise.resolve(),
       sending: Promise.resolve(),
       pending: [],

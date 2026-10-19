@@ -735,6 +735,16 @@ workflow**。理由写在 patch 的注释里，其中一个是硬 bug 规避：`
 检索 + 联网 + 十一个 `qq_*`），所以 `qq` 预设里带的 `write` / `edit` 默认拿不到；显式写空数组才是
 「不限制」。名字写错会被丢掉并记 warn（白名单只能收窄）。
 
+**渠道提示小节必须可重试地挂**（`attachChannelPrompt` / `detachChannelPrompt`）：
+`agentCtx.get('systemPrompt')` 是 **strict** 的 —— 服务所属 fiber 还没 active 就返回
+`undefined`，而 Agent 的 resume 可能正好赶在那一小段。旧代码拿不到就静默 `return`，
+于是那个 Agent 带着**裸系统提示词**跑到下次重启：人设、表达契约、硬性规则全丢
+（真实事故：重启后群里的回复又变成「才没有 是你没跟上我」这种空格断句，
+会话日志里系统提示从 16KB 掉到 5.7KB）。现在的约定是：拿不到只记一次 warn、
+把 `conversation.channelPromptEffects` 留成 `undefined`，`ensureAgent` 的热路径
+在**下一条消息**上补挂（含 `{{model}}` / `{{provider}}` 变量）；`/reset` 时清掉。
+**别改回「拿不到就 return」**，也别在注册前不撤旧的那一份（同名注册会抛 duplicate）。
+
 ## 8. 测试与验证
 
 ```bash

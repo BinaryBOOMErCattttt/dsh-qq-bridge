@@ -138,6 +138,8 @@ test('builtinStyle：标点那条讲频率、不讲「一句最多一个」的�
   assert.ok(/反例/.test(punctuation), '要有 few-shot：反例 → 正例才落地');
   // 逗号被压下去之后模型会找别的分隔符：这条禁令必须留在内置契约里（硬规则里也有一份）。
   assert.ok(punctuation.includes('不许拿空格当标点'), '空格不是标点，这条不能被删掉');
+  // 只给反例不够：模型知道「空格不对」之后会去猜替代写法，又绕回空格。改好的那句要在。
+  assert.ok(punctuation.includes('才没有，是你没跟上我'), '要给出改好的同一句（反例 → 正例）');
 });
 
 test('lintStyleDoc：把标点整类禁掉的规则会被点出来（空格断句的根因）', () => {
