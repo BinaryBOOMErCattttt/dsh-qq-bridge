@@ -960,6 +960,15 @@ export function apply(ctx, config) {
       // 句柄只在「还是同一个 Agent」时保留：换了 Agent 对象说明旧句柄已经失效。
       if (conversation.handle?.agent !== live) conversation.handle = undefined;
       sessionIndex.set(live.id, conversation.key);
+      // 预设也补挂一次：resume 时 agentPresets 服务可能还没 active（见 attachAgentPreset），
+      // 那一轮挂上的是部署默认预设；下一条消息把它换成 qq（工具白名单 + 更低压缩门槛）。
+      // 不补这一段，上下文会一路涨到默认门槛（0.8×1M）才压缩 —— 真实事故。
+      if (conversation.presetMounted !== true) {
+        const presetCtx = live.ctx ?? conversation.agentCtx;
+        if (presetCtx !== undefined && (await attachAgentPreset(conversation, presetCtx, live, conversation.presetId))) {
+          restrictAgentTools(presetCtx, live);
+        }
+      }
       // 热路径也要补挂一次：resume 时服务可能还没 active（见 attachChannelPrompt），那一轮
       // 的小节是缺的；下一条消息走到这里补上，不必等重启。已经挂上时不重复注册。
       if (conversation.channelPromptEffects === undefined) {
@@ -988,17 +997,18 @@ export function apply(ctx, config) {
     // Agent 预设：Web 表面（`dsh-web-app`）把 bash / fs / web_search 这些「agent 平面」
     // 的工具从宿主搬进了每个 Agent 预设，程序化创建的 Agent 必须先 join 一个预设，
     // 这些工具才会成为它继承来的工具。预设 id 在 create 之前解析，好让 meta 一并记录。
-    const presetId = await resolveAgentPreset();
+    const presetId = await resolveAgentPreset(false);
     // 部署 persona 会用 `agent.options` 里的值替换 `{{model}}`；这里再在 Agent 自己的
     // 作用域里覆盖一次，让「早于本次模型选择就存在」的 resume 会话也能正常渲染提示词，
     // 而不会让整个 turn 失败。同时把 QQ 渠道说明作为独立小节注入系统提示。
     const setup = async (agentCtx, agent) => {
-      // 顺序不能反：先 join 预设（工具此刻才存在），再按白名单收窄，最后装配提示词
-      // —— 提示词里提到的工具必须确实是这个 Agent 能看见的。
-      await mountAgentPreset(agentCtx, agent, presetId);
-      restrictAgentTools(agentCtx, agent);
       // 留着给热路径补挂用：真宿主里 `live.ctx` 就是它，但别假定每个 Agent 实现都暴露 ctx。
       conversation.agentCtx = agentCtx;
+      // 顺序不能反：先 join 预设（工具与压缩插件此刻才存在），再按白名单收窄，最后装配
+      // 提示词 —— 提示词里提到的工具必须确实是这个 Agent 能看见的。
+      // 预设服务此刻不可见也不抛错：留下 presetMounted === false，下一条消息补挂。
+      await attachAgentPreset(conversation, agentCtx, agent, presetId);
+      restrictAgentTools(agentCtx, agent);
       // 服务此刻不可见也不抛错：留下 channelPromptEffects === undefined，下一条消息补挂。
       await attachChannelPrompt(conversation, agentCtx, agentOptions);
     };
@@ -1045,42 +1055,138 @@ export function apply(ctx, config) {
    * （例如从 `dsh-base` 起的 headless 部署，工具本来就在宿主上）。
    * @returns 预设 id；不需要/无法挂载时为空串。
    */
-  async function resolveAgentPreset() {
+  async function agentPresetService(wait) {
+    // 与 `channelPromptService` 同一套路：`ctx.get()` 是 strict 的，服务所属 fiber 还没
+    // active 时返回 undefined；启动后第一条 QQ 消息完全可能赶在预设平面 active 之前。
+    for (const delay of (wait ? PROMPT_SERVICE_RETRIES : [0])) {
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      const presets = ctx.get('agentPresets');
+      if (presets !== undefined) return presets;
+    }
+    return undefined;
+  }
+
+  /**
+   * 解析要挂的预设 id。
+   *
+   * 解析结果为 '' 表示不挂载：要么配置成 `none`，要么这个组合根本没有预设平面
+   * （例如从 `dsh-base` 起的 headless 部署，工具本来就在宿主上），要么服务还没 active。
+   * 第三种情况由 `attachAgentPreset` 在下一条消息上重试 —— 这条路径不能只在 setup 里
+   * 走一次：重启后第一次 resume 若撞上竞态，整个 Agent 生命周期都会用部署默认预设
+   * （0.8 × 1M 的压缩门槛、带 shell 的 standard），群里再聊几百轮就开始烧 token。
+   * @param wait - 允不允许按 `PROMPT_SERVICE_RETRIES` 等一小会儿。
+   * @returns 预设 id；不需要/暂时无法挂载时为空串。
+   */
+  async function resolveAgentPreset(wait = true) {
     const wanted = settings.agentPreset.trim();
     if (wanted.toLowerCase() === PRESET_NONE) return '';
-    const presets = ctx.get('agentPresets');
+    const presets = await agentPresetService(wait);
     // 没有预设平面：工具仍按老样子在宿主上，照常走白名单收窄即可。
     if (presets === undefined) return '';
     try {
       return (await presets.resolve(wanted.length > 0 ? wanted : undefined)).id;
     } catch (error) {
       // 配错预设名不能打死回复链路；但没有预设就没有 agent 平面的工具，白名单会
-      // 退化成「只有 qq_*」，所以这条 warn 必须带上原因。
-      report('warn', `could not resolve agent preset "${wanted.length > 0 ? wanted : '(default)'}": ${error?.message ?? error}`);
+      // 退化成「只有 qq_*」，所以这条 warn 必须带上原因。补挂路径每条消息都会重试
+      // （见 attachAgentPreset），同一条 warn 只报一次，别刷屏。
+      const label = wanted.length > 0 ? wanted : '(default)';
+      if (!presetResolveWarned.has(label)) {
+        presetResolveWarned.add(label);
+        report('warn', `could not resolve agent preset "${label}": ${error?.message ?? error}`);
+      }
       return '';
     }
   }
+
+  /** 预设名解析失败的 warn 只报一次（配错时补挂路径每条消息都会重试）。 */
+  const presetResolveWarned = new Set();
 
   /**
    * 把某个 Agent join 到预设修订上（`agentPresets.mount()`）。
    *
    * 必须在 setup 里、用 Agent 自己的 ctx 调用：join 会把 Agent 作用域的父节点绑到
    * 预设的 standing key 上，预设里的工具随之成为 Agent **继承**来的工具，
-   * `tools.restrict()` 才可能按白名单收窄它们。
+   * `tools.restrict()` 才可能按白名单收窄它们；预设里的 `compaction` 也是同一条路挂上的
+   * —— 这就是「预设没挂上 → 上下文到 220k 也不压缩」的根因（真实事故，2026-10-19）。
    * @param agentCtx - Agent 自己的作用域上下文（setup 的第一个参数）。
    * @param agent - 刚创建/恢复的 Agent（仅用于日志）。
    * @param presetId - 已解析的预设 id；空串表示不挂载。
+   * @returns 有没有真的挂上（空串 / 服务不可见 / mount 失败都算 false）。
    */
   async function mountAgentPreset(agentCtx, agent, presetId) {
-    if (presetId.length === 0) return;
-    const presets = ctx.get('agentPresets');
-    if (presets === undefined) return;
+    if (presetId.length === 0) return false;
+    const presets = await agentPresetService(false);
+    if (presets === undefined) return false;
     try {
       await presets.mount(agentCtx, presetId);
       report('info', `${agent?.id ?? 'agent'} joined agent preset ${presetId}`);
+      return true;
     } catch (error) {
       report('warn', `could not mount agent preset ${presetId} on ${agent?.id ?? 'agent'}: ${error?.message ?? error}`);
+      return false;
     }
+  }
+
+  /** 预设补挂失败后的重试间隔：下一条消息再来，不必每轮都白试一次 mount。 */
+  const PRESET_RETRY_MS = 30000;
+
+  /**
+   * 幂等、可重试地把会话的 Agent 挂到预设上。
+   *
+   * 为什么需要重试：`agentPresets` 服务在启动竞态里可能还不可见（`ctx.get()` strict），
+   * 而 `ensureAgent` 的 setup 只跑一次。旧代码拿不到就静默跳过，那个 Agent 会一直用部署
+   * 默认预设跑到下次重启 —— 表现是**上下文不再压缩**（默认门槛 0.8×1M，永远到不了）、
+   * 群里几百轮后每轮都背着几百 k token，看起来就是「智力下降」；白名单还会把 standard
+   * 的 shell 一起收窄，把真正的安全边界交给 allowTools 兜底。现在的约定是：setup 失败
+   * 只记一次 warn，`ensureAgent` 的热路径在下一条消息上补挂。
+   * @param conversation - 归属的会话记录。
+   * @param agentCtx - Agent 自己的作用域上下文。
+   * @param agent - 目标 Agent（日志用）。
+   * @param presetId - setup 时已经解析到的 id；空串则在重试时重新解析。
+   * @returns 这一次有没有挂上（或本来就不需要挂）。
+   */
+  async function attachAgentPreset(conversation, agentCtx, agent, presetId) {
+    if (conversation.presetMounted === true) return true;
+    const wanted = settings.agentPreset.trim();
+    if (wanted.toLowerCase() === PRESET_NONE) {
+      conversation.presetMounted = true;
+      conversation.presetMissing = false;
+      return true;
+    }
+    const now = Date.now();
+    if (now < (conversation.presetRetryAt ?? 0)) return false;
+    let chosen = typeof presetId === 'string' ? presetId : '';
+    if (chosen.length === 0) chosen = await resolveAgentPreset(false);
+    if (chosen.length === 0) {
+      if (conversation.presetMissing !== true) {
+        conversation.presetMissing = true;
+        report(
+          'warn',
+          `the agent preset for ${conversation.key} is not available yet; the QQ agent preset (tools + compaction) is missing this round — retrying on the next message`,
+        );
+      }
+      // 服务还没出现：**下一条消息立刻再试**（只多一次 `ctx.get`，很便宜）。这里不
+      // 退避 30s —— 启动竞态通常只差几十毫秒，退避会把「补挂」推到半分钟后。
+      conversation.presetRetryAt = 0;
+      return false;
+    }
+    const mounted = await mountAgentPreset(agentCtx, agent, chosen);
+    if (!mounted) {
+      if (conversation.presetMissing !== true) {
+        conversation.presetMissing = true;
+        report('warn', `the agent preset ${chosen} is not mounted for ${conversation.key}; retrying on the next message`);
+      }
+      conversation.presetRetryAt = now + PRESET_RETRY_MS;
+      return false;
+    }
+    conversation.presetMounted = true;
+    conversation.presetId = chosen;
+    conversation.presetRetryAt = 0;
+    if (conversation.presetMissing === true) {
+      report('info', `attached the agent preset ${chosen} for ${conversation.key} (retried after the service became available)`);
+    }
+    conversation.presetMissing = false;
+    return true;
   }
 
   /**
@@ -1190,6 +1296,14 @@ export function apply(ctx, config) {
     // 模型很容易回一句「怎么了」，而不是把该提醒的事说出来。
     if (conversation.pendingIntent === 'reminder') {
       return '这条不是谁发给你的，是你自己到点要提醒的事。';
+    }
+    // 主动搭话 / 补一句 / 撤回调侃都不是「有人在跟你说话」：说成「刚跟你说话的人」
+    // 会让模型把它当成一次新的提问，回一句「怎么了」。
+    if (conversation.pendingIntent === 'proactive' || conversation.pendingIntent === 'chime') {
+      return '这一轮没有人在叫你，是你自己想开口 —— 别把它当成谁在问你。';
+    }
+    if (conversation.pendingIntent === 'recall') {
+      return '这一轮是插件在提醒你：刚才有人说的话被撤回了。';
     }
     const speakers = conversation.speakers ?? [];
     if (conversation.pendingIntent === 'interject') {
@@ -1506,20 +1620,89 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 生成「每个会话各不相同」的系统提示补充段落。
+   * 「这一轮」的动态情境：每轮都会变，所以**不能**放进系统提示。
    *
-   * 注意这个函数是作为 `text` 的 provider 注册的、每次提示词装配都会被调用：
-   * 群聊里换个人说话、或者群里又聊了几句，模型下一轮就能看到最新的 —— 若改成
-   * 建 Agent 时算一次的字符串，提示词里的「当前发言者」会永远停在第一个人。
+   * 为什么不能（真实事故，2026-10-19）：`systemPrompt.section()` 的 text provider 每次
+   * 装配都会重新求值，而这些内容每轮都不同（现在几点、谁在说话、群里刚聊了什么、检索到
+   * 哪几条记忆、这一轮是不是主动搭话）。DeepSeek 路由声明了 `systemPromptUpdate:
+   * 'in-history'`，DSH 为了不打断前缀缓存，会把**变化后的整段系统提示**作为一条新的
+   * system 消息追加到会话里，而不是替换旧的。于是每一轮上下文都多出整整一份人设 / 表达
+   * 契约 / 硬性规则（约 9k token），十几轮就把上下文塞到 220k，紧接着是不间断的压缩、
+   * 失忆和「变笨」。把动态部分挂到 user message 的第二个 text block 上，每轮只追加这一
+   * 小节，系统提示保持稳定（只在人设 / 表达 / 表情目录 / 配置真的改了时才变一次）。
    *
-   * **槽位顺序**（照设计文档 §4.4，模型对最后看到的指令更听话）：
-   *   1. 场景：谁在跟你说话 / 为什么轮到你 / 群里最近的消息
-   *   2. 人设：身份 / 背景 / 性格（`PERSONA.md`，见 `persona.js`）
-   *   3. 表达契约：气泡、标点、表情、简答（`STYLE.md`，见 `style.js`）
-   *   4. 记忆索引 + 最近学的梗
-   *   5. 能力清单：哪些工具 / 图片 / 表情真的可用
-   *   6. 部署者的额外要求
-   *   7. **硬性规则（最后，最高优先级）**
+   * @param conversation - 目标会话。
+   * @returns 动态情境正文；没有可写的内容时返回空串。
+   */
+  function channelTurnContext(conversation) {
+    const isGroup = conversation.type === 'group';
+    const lines = [];
+    // 人设里的场景段（### 群聊 / 主动搭话 / 被戳一戳）随这一轮的 intent 换；基础人设
+    // （身份 / 背景 / 性格）留在系统提示里，不跟它一起变。
+    const scene = personaSceneFor(conversation);
+    const parsed = personaDoc.read();
+    const sceneLines = settings.personaSceneOverlays === true ? (parsed?.profile?.scenes?.[scene] ?? []) : [];
+    if (sceneLines.length > 0) {
+      const title = { private: '私聊', group: '群聊', proactive: '主动搭话', poke: '被戳一戳' }[scene] ?? '当前场景';
+      lines.push(`【本轮场景｜${title}】${sceneLines.map((line) => String(line).replace(/[。.]\s*$/, '')).join('；')}`);
+    }
+    lines.push(speakerLine(conversation));
+    if (isGroup) {
+      const ambientLines = ambientPrompt(conversation);
+      if (ambientLines.length > 0) lines.push('', ...ambientLines);
+    }
+    // 上一轮那张图为什么没发出去：不给原因的话，模型下一轮会照着自己编的路径再试一次
+    // （真实事故：`.qq-media/<哈希>` 连编两轮，用户连收两遍「没发出去」）。
+    const failedSticker = conversation.stickerFailure;
+    if (failedSticker !== undefined && Date.now() - failedSticker.at < STICKER_FAILURE_TTL_MS) {
+      lines.push(
+        `- 上一轮你想发的表情 \`${failedSticker.path}\` 没发出去（${failedSticker.reason}）。表情包只能从 ${stickerLabel ?? '收藏目录'}/ 里挑现成的；别人的图先用 qq_save_sticker 存下来，**别自己拼 \`.qq-media\` 的哈希**。`,
+      );
+    }
+    // 检索式记忆：每轮按当前消息重新检索，放系统提示里就等于每轮换一次整段提示。
+    if (memory.toolsAllowed()) {
+      const recall = memory.recallText(conversation);
+      lines.push('', recall.length > 0 ? recall : `你的长期记忆在 \`${memory.label}/\` 里（现在还是空的）。`);
+    }
+    // 时间与待发提醒的摘要：分钟级变化，同样只能待在这里。
+    if (remindersEnabled && (allowTools.length === 0 || allowTools.includes('qq_remind_create'))) {
+      const nowAt = Date.now();
+      lines.push('', `- 现在是 ${localMinute(nowAt)}（${weekdayLabel(nowAt)}，本地时间）。`);
+      const summary = reminders.summaryFor(conversation.key);
+      if (summary.count > 0) {
+        lines.push(`- 这个会话还有 ${summary.count} 条待发的提醒，最近一条：${describeTask(summary.next)}。`);
+      }
+    }
+    const body = lines.join('\n').trim();
+    if (body.length === 0) return '';
+    return `（下面这些是这一轮的情境，每轮都会刷新，以这一条为准；不是对方发来的话。）\n\n${body}`;
+  }
+
+  /**
+   * 造一条投给 Agent 的 user message：第一块是真正的消息正文，第二块是这一轮的情境
+   * （{@link channelTurnContext}）。
+   *
+   * 为什么用第二个 text block 而不是拼进正文：正文是「对方说了什么」的契约 —— 检索查询、
+   * 转录、`blank` 判定、日志都按它走，把情境拼进去会污染这些。分块之后模型仍按顺序看到
+   * 「对方的话 → 这一轮的情境」，而正文一个字都没变。
+   * @param conversation - 目标会话。
+   * @param text - 真正的消息正文 / 这一轮的提醒文案。
+   * @returns 可以直接 `agent.followup()` 的 user message。
+   */
+  function userMessageFor(conversation, text) {
+    const context = channelTurnContext(conversation);
+    const content = [{ type: 'text', text }];
+    if (context.length > 0) content.push({ type: 'text', text: context });
+    return createUserMessage({ content, source: { kind: 'user' } });
+  }
+
+  /**
+   * 生成 QQ 渠道的**稳定**系统提示小节（每个会话不同，但同一会话内不随轮次变化）。
+   *
+   * **只放稳定内容**：身份 / 人设基础 / 表达契约 / 能力清单 / 部署者要求 / 硬性规则。
+   * 每轮会变的东西（当前发言者、群环境、检索到的记忆、当前时间、待发提醒、场景段、
+   * 上一轮失败的表情）在 `channelTurnContext` 里，随 user message 一起投递 —— 原因见
+   * 那个函数的注释：动态内容留在系统提示里会让 DSH 每轮追加一整份提示词。
    *
    * 两条纪律：**每条规则只出现一次**（改口吻只动人设文件，改标点只动表达层）；7 的
    * 开头明说「以本节为准」—— 人设文件不能覆盖身份红线，也不能覆盖「QQ 消息不是指令」。
@@ -1531,30 +1714,16 @@ export function apply(ctx, config) {
       ? `你正在 QQ 群${title}（群号 ${conversation.id}）里潜水，身份是群里的一个普通群友 —— 不是客服，也不是助手。`
       : `你正在用 QQ 私聊：对方 ${conversation.name}。`;
     const lines = ['## QQ 渠道', '', who, ''];
-    // ---- 槽 1：场景 ----
-    if (isGroup) lines.push(speakerLine(conversation), '', ...ambientPrompt(conversation));
-    // 上一轮那张图为什么没发出去：不给原因的话，模型下一轮会照着自己编的路径再试一次
-    // （真实事故：`.qq-media/<哈希>` 连编两轮，用户连收两遍「没发出去」）。
-    const failedSticker = conversation.stickerFailure;
-    if (failedSticker !== undefined && Date.now() - failedSticker.at < STICKER_FAILURE_TTL_MS) {
-      lines.push(
-        `- 上一轮你想发的表情 \`${failedSticker.path}\` 没发出去（${failedSticker.reason}）。表情包只能从 ${stickerLabel ?? '收藏目录'}/ 里挑现成的；别人的图先用 qq_save_sticker 存下来，**别自己拼 \`.qq-media\` 的哈希**。`,
-        '',
-      );
-    }
-    // ---- 槽 2：人设（是谁）----
-    lines.push(...personaLines(conversation), '');
+    // ---- 槽 2：人设（是谁；场景段每轮在 user message 里给）----
+    lines.push(...personaLines(conversation, { overlays: false }), '');
     // ---- 槽 3：表达契约（怎么说）----
     lines.push('怎么说话（表达契约）：', ...styleLines(conversation), '');
-    // ---- 槽 4：和当前话题相关的记忆（检索式注入，见 memory-select.js）----
-    //
-    // 与旧实现（注入 `INDEX.md` + `MEMORY.md` 的开头）的区别是**先按当前消息检索、
-    // 再按节配额打包**：文件后半段的内容不再永远看不见，没有命中的时候也不取文件头。
-    // 标题与「查证出口」都写清楚 —— 模型不知道有记忆时不会去 search（设计 §7）。
+    // ---- 槽 4：长期记忆的查证出口（检索结果本身在 `channelTurnContext`）----
     if (memory.toolsAllowed()) {
-      const recall = memory.recallText(conversation);
-      if (recall.length > 0) lines.push(recall, '');
-      else lines.push(`你的长期记忆在 \`${memory.label}/\` 里（现在还是空的）。`, '');
+      lines.push(
+        `- 每轮检索到的长期记忆会写在这一条消息的「本轮情境」里（来自 \`${memory.label}/\`）；没有命中、或者凭印象记不清时，别顺着猜：用 qq_transcript 查聊天记录（可以按关键词 search），用 qq_memory 读 \`${memory.label}/\` 里的记忆文件 —— 先查再答，而不是先答再编。`,
+        '',
+      );
     }
     // ---- 槽 5：能力清单 ----
     // 被白名单挡住的工具不能在提示里推荐，否则模型会去调用一个它根本看不见的工具。
@@ -1564,29 +1733,23 @@ export function apply(ctx, config) {
     if (recommended.length > 0) {
       lines.push(`- 需要主动给其他人或群发消息、或查询联系人时，使用 ${recommended.join(' / ')} 工具。`);
     }
-    // 定时提醒：模型必须知道「现在几点」，否则「明天下午 3 点」只能靠猜；还要告诉它
-    // 答应下来的事必须真的落成任务，而不是只在回复里说「好的我记住了」—— 它只在这一轮
-    // 醒着，到点叫醒它的是插件，不是它自己的记忆。
+    // 定时提醒：模型必须知道「答应下来的事必须真的落成任务」，而不是只在回复里说
+    // 「好的我记住了」—— 它只在这一轮醒着，到点叫醒它的是插件，不是它自己的记忆。
     //
     // 时间被理解错一天是真实事故：凌晨 02:12 一句「明天中午提醒我拿快递」，模型按日历
     // 排到了次日中午，而对方想的是睡醒后的那个中午；回复里又只写「明天中午」，偏差一直
     // 到点才被发现。所以这里要求回复写**绝对日期**，并对凌晨的「明天 / 今天」单独给一条。
+    // 「现在几点」与待发提醒的摘要每分钟都在变，放在 `channelTurnContext` 里。
     if (remindersEnabled && (allowTools.length === 0 || allowTools.includes('qq_remind_create'))) {
-      const nowAt = Date.now();
       lines.push(
-        `- 现在是 ${localMinute(nowAt)}（${weekdayLabel(nowAt)}，本地时间）。要提醒谁在某个时刻做什么，必须调用 qq_remind_create；不要只在回复里答应 —— 到点叫醒你的是插件，不是你自己的记忆。`,
+        '- 要提醒谁在某个时刻做什么，必须调用 qq_remind_create；不要只在回复里答应 —— 到点叫醒你的是插件，不是你自己的记忆。',
         '- 建完在回复里**写出绝对日期和时刻**（如「10 月 19 日 周一 12:00」），不要只说「明天中午」「等下」—— 写清日期，对方才能一眼看出「明天」有没有被理解成另一天。没建成要把原因说出来，别假装建好了。提醒的正文会原样发出，不会把图片或 @ 标记解析成真的图 / at 段，把要做什么写清楚。',
         '- 凌晨（大致 00:00–06:00）对方说「明天 / 今天几点」时，**日历上的明天**与**睡醒后的那个白天**都说得通：先问一句「是今天（几月几日）还是明天」；不问就按最近的那个未来时刻排。对方纠正后，用新时间重建一条，并取消旧的那条。',
       );
-      const summary = reminders.summaryFor(conversation.key);
-      if (summary.count > 0) {
-        lines.push(`- 这个会话还有 ${summary.count} 条待发的提醒，最近一条：${describeTask(summary.next)}。`);
-      }
     }
     if (memory.toolsAllowed()) {
       const canSkill = allowTools.length === 0 || allowTools.includes('skill');
       lines.push(
-        `- 凭印象记不清「以前谁说过什么 / 这个群里发生过什么」时，别顺着猜：用 qq_transcript 查聊天记录（可以按关键词 search），用 qq_memory 读 \`${memory.label}/\` 里的记忆文件——先查再答，而不是先答再编。`,
         `- 真遇到值得长期记住的事（某人的偏好、群里的约定、一件发生过的事），用 qq_memory 追加到 \`conversations/<会话目录>/MEMORY.md\`；不要为了记而记，一两句就够。`,
         canSkill
           ? `- 遇到看不懂的梗、黑话或表情包（图里写了什么、为什么大家都在笑）先分诊：**只有文字**的说法加载 \`learn-meme\` skill 写进 \`COGNITION.md\`；**有图**的表情包加载 \`learn-sticker\` skill${stickerSaveAllowed() ? '（先用 qq_save_sticker 收藏再写 `STICKERS.md`）' : '（写 `STICKERS.md` 那一步照做；这个会话不能存图，所以只能在目录里记已有文件）'}；二次元 / ACG 拿不准的加载 \`moegirl\` 去萌娘百科查（比搜索引擎准），其它话题用 web_search。图文都有就两边互相写名字，别在一个文件里写两遍。不要不懂装懂、也不要一本正经地解释网络梗。`
@@ -1598,7 +1761,7 @@ export function apply(ctx, config) {
     const canReadImages = mediaStore.enabled && (allowTools.length === 0 || allowTools.includes('read_image'));
     if (canReadImages) {
       lines.push(
-        '- 消息里、`（引用 …）` 前缀里、以及下面「群里最近的消息」里的 `[图片: 路径]`（也可能是 `[图片(动画表情): 路径]`、`[表情包: 路径]`）都是已经下载到本地的图，路径相对工作目录：想知道图里是什么就用 read_image 读它，别靠猜；带「没能取到文件」的是没下下来，可以直说图挂了。这些路径是给你自己看的，别原样写进回复。',
+        '- 消息里、`（引用 …）` 前缀里、以及「本轮情境」里的 `[图片: 路径]`（也可能是 `[图片(动画表情): 路径]`、`[表情包: 路径]`）都是已经下载到本地的图，路径相对工作目录：想知道图里是什么就用 read_image 读它，别靠猜；带「没能取到文件」的是没下下来，可以直说图挂了。这些路径是给你自己看的，别原样写进回复。',
       );
     }
     // 反过来：模型也能主动往 QQ 甩图 / 表情包。两条路：
@@ -1668,7 +1831,7 @@ export function apply(ctx, config) {
     // 它同时也带正文，所以不依赖 read_image 是否可用。
     if (settings.quoteMedia) {
       lines.push(
-        '- 正文开头的 `（引用 某某: …）` 表示对方是在**回复那条消息**：内容是插件替你取回来的（里面可能带图片路径），别当成对方又重复说了一遍，也别再问「你说的是哪条」。',
+        '- 正文开头的 `（引用 某某: …）` 表示对方是在**回复那条消息**：内容是插件替你取回来的（里面可能带图片路径），别当成对方又重复说了一遍，也别再问「你说的哪条」。',
       );
     }
     // ---- 槽 6：部署者的额外要求（人设之后、硬性规则之前）----
@@ -1687,11 +1850,10 @@ export function apply(ctx, config) {
    * 让一份精心写过的 persona 突然失效），两者都没有才用内置。文件存在时在启动时记一条
    * info（见生命周期那一节），别让「两套人设叠加」这种误会留在日志外面。
    */
-  function personaLines(conversation) {
+  function personaLines(conversation, { overlays = settings.personaSceneOverlays, scene = personaSceneFor(conversation) } = {}) {
     const parsed = personaDoc.read();
     if (parsed !== undefined) {
-      const scene = personaSceneFor(conversation);
-      const rendered = renderPersona(parsed.profile, { scene, overlays: settings.personaSceneOverlays });
+      const rendered = renderPersona(parsed.profile, { scene, overlays });
       if (rendered.length > 0) return rendered;
     }
     const configured = settings.persona.trim();
@@ -1753,7 +1915,7 @@ export function apply(ctx, config) {
         ? ['- 正文里出现 `（@了你一下，没有说别的）` / `（一条空消息，没有正文）` / `（对方发来一条空消息，什么都没写）` 时，说明对方**没有打字**，只是叫了你一声：别把这句说明当成对方说的话、也别反问「你发了什么」。想接就按上面的聊天记录（群里看「群里最近的消息」，更早的用 qq_transcript 查）接上一句或者回个「？」；也可以只发一张表情，或者干脆想不出接什么。空 @ 不值得写一段话。']
         : []),
       isGroup
-        ? '- 想 @ 群里的人时，在回复里写 `[[@昵称]]`（昵称就是上面那句「跟你说话的人」/「群里最近的消息」里的名字，原样照抄，一个字都别改），它会在发出去时变成真正的 @；想 @ 所有人的话写 `[[@全体成员]]`，但只在真的要喊大家的时候用。**不要**把 QQ 号写进正文，也不要自己拼 `@` 加号码 —— 群里谁也不这么说话。'
+        ? '- 想 @ 群里的人时，在回复里写 `[[@昵称]]`（昵称就是「本轮情境」里「刚跟你说话的人」/「群里最近的消息」里的名字，原样照抄，一个字都别改），它会在发出去时变成真正的 @；想 @ 所有人的话写 `[[@全体成员]]`，但只在真的要喊大家的时候用。**不要**把 QQ 号写进正文，也不要自己拼 `@` 加号码 —— 群里谁也不这么说话。'
         : '- 想 @ 对方时在回复里写 `[[@昵称]]`（昵称就是上面那句「对方 …」里的名字），它会变成真正的 @。**不要**把 QQ 号写进正文。',
       '- @ 不是每句都要挂的：平时接着聊就行，只有真的要把话丢给某个人、或者中间插了别人的话怕对不上时再点一次名。',
     ];
@@ -2196,10 +2358,7 @@ export function apply(ctx, config) {
           conversation.pendingIntent = 'reminder';
           noteRecallFallback(conversation);
           const agent = await ensureAgent(conversation);
-          const message = createUserMessage({
-            content: [{ type: 'text', text: reminderNudge(task) }],
-            source: { kind: 'user' },
-          });
+          const message = userMessageFor(conversation, reminderNudge(task));
           // 与主动搭话同一套归属记账，但**不标 proactive**：proactive 在 turn/end 里
           // 出错会被静默吞掉，而提醒必须要能走到兜底。
           submitted.set(message.id, {
@@ -2445,6 +2604,11 @@ export function apply(ctx, config) {
     conversation.agentCtx = undefined;
     conversation.channelPromptMissing = false;
     conversation.agentOptions = undefined;
+    // 预设也是挂在刚销毁的那个作用域上的：下一轮重新解析 / 挂载（见 attachAgentPreset）。
+    conversation.presetMounted = undefined;
+    conversation.presetMissing = false;
+    conversation.presetId = undefined;
+    conversation.presetRetryAt = 0;
     sessionIndex.delete(sessionId);
     for (const [slot, owner] of turnOwners) {
       if (owner?.key === conversation.key || slot.startsWith(`${sessionId}:`)) turnOwners.delete(slot);
@@ -2527,6 +2691,19 @@ export function apply(ctx, config) {
       channelPromptMissing: false,
       agentOptions: undefined,
       agentCtx: undefined,
+      /**
+       * Agent 预设的挂载状态，见 `attachAgentPreset`。
+       *
+       * `presetMounted` 不是 true 时，`ensureAgent` 的热路径会在下一条消息上重试：
+       * setup 只跑一次，而 `agentPresets` 在启动竞态里可能还不可见。漏挂的后果不只是
+       * 工具面 —— 预设里的 `compaction` 也一起漏了，上下文会一路涨到部署默认门槛
+       * （0.8×1M）才压缩（真实事故，见 `channelTurnContext` 的注释）。
+       * `presetRetryAt` 是失败后的下一次重试时刻（别每轮都白跑一次 mount）。
+       */
+      presetMounted: undefined,
+      presetMissing: false,
+      presetId: undefined,
+      presetRetryAt: 0,
       queue: Promise.resolve(),
       sending: Promise.resolve(),
       pending: [],
@@ -3530,10 +3707,7 @@ export function apply(ctx, config) {
         const text = proactiveNudge(quietMs);
         noteRecallFallback(conversation);
         const agent = await ensureAgent(conversation);
-        const userMessage = createUserMessage({
-          content: [{ type: 'text', text }],
-          source: { kind: 'user' },
-        });
+        const userMessage = userMessageFor(conversation, text);
         // `proactive: true` 是本轮唯一的身份标记：turn 结束时靠它区分「主动搭话」
         // 与「回别人的话」—— 前者判成 SKIP 要静默丢弃，出错也不该在群里道歉。
         submitted.set(userMessage.id, {
@@ -3842,10 +4016,7 @@ export function apply(ctx, config) {
       try {
         noteRecallFallback(conversation);
         const agent = await ensureAgent(conversation);
-        const userMessage = createUserMessage({
-          content: [{ type: 'text', text: chimeNudge() }],
-          source: { kind: 'user' },
-        });
+        const userMessage = userMessageFor(conversation, chimeNudge());
         // 与主动搭话同一个标记：turn 结束时按它分流（SKIP 静默、出错不道歉）。
         submitted.set(userMessage.id, {
           key: conversation.key,
@@ -4311,10 +4482,7 @@ export function apply(ctx, config) {
         speakers: focusPeople,
       };
       const agent = await ensureAgent(conversation);
-      const userMessage = createUserMessage({
-        content: [{ type: 'text', text }],
-        source: { kind: 'user' },
-      });
+      const userMessage = userMessageFor(conversation, text);
       // 只算**真正投进这一轮**的那些（被 `action: 'drop'` 摘掉的那条不在 entries 里）：
       // `turn/end` 之后靠它把账上那几条标成「已回复」。
       const batchIds = entries.map((entry) => entry.messageId).filter((id) => id.length > 0);
@@ -4537,10 +4705,7 @@ export function apply(ctx, config) {
       try {
         noteRecallFallback(conversation);
         const agent = await ensureAgent(conversation);
-        const userMessage = createUserMessage({
-          content: [{ type: 'text', text: pokeNudge({ userName: displayName }) }],
-          source: { kind: 'user' },
-        });
+        const userMessage = userMessageFor(conversation, pokeNudge({ userName: displayName }));
         // 戳一戳不是「主动搭话」：有人真的碰了它一下，出错照常道歉、SKIP 照常静默。
         submitted.set(userMessage.id, {
           key: conversation.key,
@@ -4798,7 +4963,7 @@ export function apply(ctx, config) {
           replied: entry.replied === true,
           imageAllowed: imageAllowed(),
         });
-        const userMessage = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } });
+        const userMessage = userMessageFor(conversation, text);
         // `proactive: true` 的三个现成语义正好都要：出错不道歉（没人问过它）、SKIP 全局
         // 静默、不挂补一句（否则它会补一句再补一句）。
         submitted.set(userMessage.id, {

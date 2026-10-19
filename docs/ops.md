@@ -122,6 +122,31 @@ qq-bridge: 表达规则来自 .qq-persona/STYLE.md；气泡：最多 3 个，第
   那条 warn、始终没有补挂成功的 info，说明宿主本身没提供 `systemPrompt` 服务（组合问题），
   那几条规则确实进不去。
 
+### 3.1 越聊越笨 / 上下文越滚越大（群会话）
+
+症状：某个群最近开始答非所问、忘掉刚说过的话、越回越短；日志里没什么错，但会话变得又慢又贵，
+压缩越来越频繁。翻会话记录（`~/.dsh/sessions/<cwd slug>/<session id>/session.v4.jsonl.zstd`，
+`sessionIdFor('group:<群号>', 0)`）能看到**系统提示每轮都在变长**（每次 `system/message` 十几 KB），
+或者 `request/context` 里 `contextWindow` 是 1M、而上下文已经几百 k 还没压缩。
+
+两个成因，2026-10-19 一起修了：
+
+- **动态内容混进系统提示**：当前发言者 / 群环境 / 检索到的记忆 / 当前时间 / 待发提醒 / 人设场景段
+  以前都在 `channelPrompt` 里。DeepSeek 路由声明了 `systemPromptUpdate: 'in-history'`，系统提示
+  一变，DSH 会把**整段新提示**追加成一条新 system 消息（为保住前缀缓存），于是每轮多背 8~9k token。
+  现在这些走 `channelTurnContext`，写在 user message 的第二个 text block 里；系统小节只在人设 /
+  表达 / 表情目录 / 配置真的改了时才变。**别再往 `channelPrompt` 里加 `Date.now()` /
+  `speakerLine` / `ambientPrompt` / `memory.recallText`。**
+- **预设漏挂 → 压缩门槛退回默认**：`agentPresets` 与 `systemPrompt` 一样是 strict 的。重启后
+  第一次 resume 撞上竞态时，旧代码会一直用部署默认预设（`compaction` 也一起漏掉，门槛从
+  0.06×1M 变成 0.8×1M）。现在 `attachAgentPreset` 会在**下一条消息**上补挂；日志里分别有
+  `the agent preset for … is not available yet`（warn）和
+  `attached the agent preset … (retried after the service became available)`（info）。
+
+升级后**已经涨大的旧会话不会自己缩回去**（除非预设补挂成功、60k 的压缩立刻把它压下来）；
+最省事的做法是在那个群发一次 `/reset`（需要 `resetUsers` 里有你）—— 只换会话，**长期记忆
+（`.qq-memory/`）不动**。之后用 `node scripts/ops.mjs logs -n 200` 确认新会话的系统提示稳定。
+
 ### 4. 摘要没跑
 
 - `doctor` 看 `memory` 相关（`memoryDir` 越界会整个停用，日志里有一条 warn）。

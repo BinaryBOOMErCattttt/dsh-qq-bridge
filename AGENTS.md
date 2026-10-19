@@ -745,6 +745,25 @@ workflow**。理由写在 patch 的注释里，其中一个是硬 bug 规避：`
 在**下一条消息**上补挂（含 `{{model}}` / `{{provider}}` 变量）；`/reset` 时清掉。
 **别改回「拿不到就 return」**，也别在注册前不撤旧的那一份（同名注册会抛 duplicate）。
 
+**预设也必须可重试地挂**（`attachAgentPreset`）：`ctx.get('agentPresets')` 同样是 strict 的，
+而 `ensureAgent` 的 `setup` 只跑一次。旧代码服务不可见时静默跳过，那个 Agent 会一直用部署
+默认预设跑到下次重启 —— **预设里的 `compaction` 一起漏掉**，压缩门槛从 `qq` 预设的
+0.06×1M 变成默认的 0.8×1M，上下文一路涨到几百 k 才压（真实事故：群会话 712 轮时 220k，
+每轮还在涨 9k，看起来就是「越聊越笨」）。现在的约定与提示小节一样：setup 失败只记一次
+warn、`presetMounted` 留成 `false`，`ensureAgent` 热路径在下一条消息上补挂（服务没出现时
+不退避；真的 mount 失败才退避 30s）。**别把「预设」只当成工具面** —— 压缩、工具、提示
+都挂在它下面。
+
+**渠道提示小节只能放稳定内容**（`channelPrompt`），每轮会变的东西走
+`channelTurnContext` → user message 的第二个 text block（`userMessageFor`）：当前发言者、
+群环境、检索到的记忆、当前时间、待发提醒、人设的场景段、上一轮没发出去的表情。
+DeepSeek 路由声明 `systemPromptUpdate: 'in-history'`，DSH 为保住前缀缓存会把**变化后的整段
+系统提示**作为新 system 消息追加（不是替换）；动态小节留在系统提示里 = 每轮多一份 8~9k
+token 的人设/表达/硬性规则，十几轮就 220k，然后不间断压缩、失忆。**别把 `Date.now()`、
+`speakerLine`、`ambientPrompt`、`memory.recallText` 放回 `channelPrompt`**；要加新的动态
+信息，加到 `channelTurnContext` 里。系统小节只在人设 / 表达 / 表情目录 / 配置真的改了时
+才变一次 —— 这是 `test/bridge.test.mjs`「the channel system section stays stable」钉住的。
+
 ## 8. 测试与验证
 
 ```bash
@@ -761,7 +780,7 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
 `node scripts/dev-node-modules.mjs --from <DSH checkout>`；DSH 沙箱里 `node --test` 会
 `spawn EPERM`，改用同进程模式 `node --test --experimental-test-isolation=none "test/*.test.mjs"`。
 
-- 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**（基线：`test/` 下 **580** 个用例，
+- 测试是唯一能自动验证的东西：**改完必须跑，且必须全绿**（基线：`test/` 下 **651** 个用例，
   普通终端约 45 秒全过）。0.2.0 删掉 JM 之后**不再有「跳过」**：原先 13 条探针需要真 spawn
   外部进程，沙箱里只能跳过，随 JM 一起删掉了。
 - 已知偶发：**全量同进程连跑**时偶尔红一条、且每次红的那条都不同（见过 `proactive` 节奏、

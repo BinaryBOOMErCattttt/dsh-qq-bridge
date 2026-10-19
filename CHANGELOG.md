@@ -328,6 +328,25 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
 
 ### 修复
 
+- **群会话越聊越笨：动态提示每轮被整段追加（上下文 220k）**：10-19 的群会话翻出来是 712 轮、
+  220k token，最近十几轮**每轮涨 9k**。根因不在模型：`channelPrompt` 这个系统提示小节里混着
+  当前发言者、群环境、检索到的记忆、当前时间、待发提醒与人设场景段 —— 每轮都会变；DeepSeek
+  路由声明了 `systemPromptUpdate: 'in-history'`，DSH 为保住前缀缓存，遇到系统提示变化会把
+  **整段新提示**作为一条新 system 消息追加到会话末尾（不是替换）。于是每一轮都多背一份 8~9k
+  token 的人设 / 表达契约 / 硬性规则，十几轮塞满上下文，接着就是不停的压缩、失忆、答非所问
+  （群里直接说「智力下降了好多」）。现在把提示拆成两半：系统小节只放**稳定内容**（身份 / 人设
+  基础 / 表达契约 / 能力清单 / 部署者要求 / 硬性规则），每轮会变的东西由 `channelTurnContext`
+  写成 user message 的第二个 text block（正文仍是第一块，一个字没变）。系统小节只在人设 /
+  表达 / 表情目录 / 配置真的改了时才变一次；`test/bridge.test.mjs` 用「the channel system
+  section stays stable」钉住这条。
+- **预设漏挂 → 压缩门槛退回默认（上下文一路涨到 800k 才压）**：`ctx.get('agentPresets')` 与
+  `systemPrompt` 一样是 strict 的，而 `ensureAgent` 的 `setup` 只跑一次。重启后第一次 resume
+  若撞上启动竞态，那个 Agent 会一直用部署默认预设跑到下次重启 —— **预设里的 `compaction` 也
+  一起漏了**，压缩门槛从 `qq` 预设的 0.06×1M（60k）变成默认的 0.8×1M（800k），群会话因此涨到
+  220k 还在涨。现在 `attachAgentPreset` 与 `attachChannelPrompt` 同一套路：setup 失败只记一次
+  warn、`presetMounted` 留成 `false`，`ensureAgent` 的热路径在下一条消息上补挂（服务没出现时
+  不退避，真的 mount 失败才退避 30s），补挂成功后重新收窄 `allowTools`。回归用例：
+  「an unavailable agentPresets service is retried on the next message」。
 - **resume 时渠道提示整段丢失（重启后空格断句复发）**：10-18 19:51 已经把「不许拿空格当标点」
   写进内置契约、`STYLE.md` 与硬性规则，19:50 的回复也确实干净了；但 19:48 那次 resume
   之后，Agent 的系统提示从 16KB 掉回 5.7KB 的通用部分 —— `agentCtx.get('systemPrompt')` 是

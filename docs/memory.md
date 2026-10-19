@@ -54,7 +54,7 @@ QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写�
 
 ## 检索式注入：按当前消息挑，不再取文件开头
 
-提示词装配时（`channelPrompt` 的槽 4）不再把 `MEMORY.md` 从第 0 字节截一段，而是：
+每轮投递时（`channelTurnContext`，作为 user message 的「本轮情境」块）不再把 `MEMORY.md` 从第 0 字节截一段，而是：
 
 1. **scope 硬过滤**：候选集里只有 `global` + 这个会话自己的记录。`private:<qq>` 的记录
    对其他会话**连候选资格都没有**（不是降权、不是排后面）。

@@ -165,6 +165,11 @@ function makeHost({
   sessionsRoot,
   presets,
   /**
+   * 让前 N 次 `ctx.get('agentPresets')` 返回 undefined，模拟启动竞态：预设平面还没
+   * active，而第一条 QQ 消息已经到了。见 index.js 的 `attachAgentPreset`。
+   */
+  presetSetupFailures = 0,
+  /**
    * `ctx.get('credentials')` 的桩：API key 轮换用它读写 `$DSH_HOME/.credentials.yaml`
    * （见下面的 `fakeCredentials`）。不传 = 组合里没有凭据服务。
    */
@@ -286,6 +291,8 @@ function makeHost({
   // 这个 Agent 继承得到的工具名：初始是宿主平面的全局工具，join 预设后再并入预设的工具
   // —— 与真实 `tools.view(scope).restrictableNames` 的「宿主编 + 祖先编」语义一致。
   const known = new Set(knownTools);
+  /** `agentPresets` 还剩几次「服务不可见」；见 makeHost 的 presetSetupFailures。 */
+  let presetFailuresLeft = presetSetupFailures;
   const presetService =
     presets === undefined
       ? undefined
@@ -441,7 +448,13 @@ function makeHost({
       // 定时器服务：插件用它排摘要循环（见上面 timeout / interval）。
       if (service === 'timer') return fakeTimer;
       // Agent 预设平面：只有传了 presets 的用例才有（与 headless 组合形成对照）。
-      if (service === 'agentPresets') return presetService;
+      if (service === 'agentPresets') {
+        if (presetFailuresLeft > 0) {
+          presetFailuresLeft -= 1;
+          return undefined;
+        }
+        return presetService;
+      }
       // 会话持久化后端：插件用它的 root 定位要删除的会话目录。
       if (service === 'sessionPersistence' && sessionsRoot !== undefined) return { root: sessionsRoot };
       return undefined;
@@ -533,6 +546,20 @@ function promptText(host, name) {
   const entry = host.list.prompts.find((item) => item.kind === 'section' && item.name === name);
   assert.ok(entry, `prompt section ${name} should be registered`);
   return typeof entry.text === 'function' ? entry.text({}) : entry.text;
+}
+
+/**
+ * 取某条 user message 里的「本轮情境」块。
+ *
+ * 从 2026-10-19 起，每轮会变的东西（当前发言者、群环境、检索到的记忆、当前时间、
+ * 待发提醒、人设的场景段）不再挂在系统提示小节里 —— 动态小节会让 DSH 每轮追加一整份
+ * 系统提示（见 index.js `channelTurnContext` 的注释）。它们现在是 user message 的第二个
+ * text block，第一个 block 仍然是真正的消息正文。
+ */
+function turnContextText(agent) {
+  const message = agent?.inbox?.[agent.inbox.length - 1];
+  const blocks = message?.content ?? [];
+  return blocks.slice(1).map((block) => block.text ?? '').join('\n');
 }
 
 /** 轮询等待直到 `check` 返回真值；超时则测试失败。 */
@@ -990,10 +1017,10 @@ test('mentions that land together become one turn instead of one reply each', as
     // 提示词里说的是「几个人一起在跟你说话」，而不是只报最后一个。
     // 名字**不带 QQ 号**：号码印在提示词里，模型就会照着念出来（那正是不该发生的事），
     // 而它想 @ 谁时写的是 `[[@昵称]]`（见 mention.js / 下面那组用例）。
-    const prompt = promptText(host, 'qq-bridge:channel');
-    assert.ok(prompt.includes('几乎同时在跟你说话的是：kaguya、iroha、mutsumi'), prompt);
-    assert.ok(!prompt.includes('100000003'), prompt);
-    assert.ok(!prompt.includes('4444444444'), prompt);
+    const context = turnContextText(agent);
+    assert.ok(context.includes('几乎同时在跟你说话的是：kaguya、iroha、mutsumi'), context);
+    assert.ok(!context.includes('100000003'), context);
+    assert.ok(!context.includes('4444444444'), context);
 
     completeTurn(host, agent, '都在呢', 1);
     const sent = await until(() => sentTexts(onebot)[0], 'the single reply');
@@ -1112,9 +1139,9 @@ test('mentions that arrive during a long turn become one backlog wave', async ()
     assert.ok(wave.includes('第三句') && wave.includes('第四句'), wave);
     assert.ok(wave.includes('就只写 SKIP'), wave);
     // 场景提示词也得说清「你刚才在忙」，不能再写「几乎同时在跟你说话」。
-    const prompt = promptText(host, 'qq-bridge:channel');
-    assert.ok(prompt.includes('你刚才在忙别的事'), prompt);
-    assert.ok(!prompt.includes('几乎同时在跟你说话'), prompt);
+    const context = turnContextText(agent);
+    assert.ok(context.includes('你刚才在忙别的事'), context);
+    assert.ok(!context.includes('几乎同时在跟你说话'), context);
 
     // 接完这一波：只发裸文本（不引用几分钟前的那一条），整波共用一轮。
     completeTurn(host, agent, '刚在忙，我看看', 2);
@@ -1422,6 +1449,64 @@ test('the QQ agent joins an agent preset, so preset-plane tools exist for the wh
     assert.ok(bare.host.list.warnings.some((line) => line.includes('a whitelist cannot grant tools this Agent does not have')));
   } finally {
     await bare.onebot.close();
+  }
+});
+
+// 用例：启动竞态里预设平面还不可见时，setup 只记一次 warn；**下一条消息**必须补挂
+// 成功。漏挂的后果不只是工具面 —— 预设里的 compaction 也一起漏了，上下文会一路涨到
+// 部署默认门槛（0.8×1M）才压缩，看起来就是「聊得越久越笨」（真实事故，2026-10-19）。
+test('an unavailable agentPresets service is retried on the next message', async () => {
+  const presets = {
+    default: 'standard',
+    compositions: {
+      standard: ['bash', 'read', 'read_image', 'write', 'edit', 'glob', 'grep', 'web_search', 'web_fetch'],
+    },
+  };
+  // 前两次 get 都返回 undefined：一次给 create 前的 resolve，一次给 setup 里的补挂。
+  const { onebot, host } = await boot({ agentPreset: '', allowTools: ['read'] }, { presets, presetSetupFailures: 2 });
+  try {
+    onebot.push(privateMessage('第一句'));
+    const agent = await until(() => host.list.created[0], 'the Agent');
+    // setup 里没挂上：只记一条 warn，回复链路照常。
+    assert.deepEqual(host.list.mountedPresets, []);
+    assert.ok(host.list.warnings.some((line) => line.includes('agent preset') || line.includes('agentPresets')), host.list.warnings.join('|'));
+    assert.equal(agent.inbox.length, 1);
+
+    onebot.push(privateMessage('第二句'));
+    await untilInbox(host, 2, 'the retry to happen on the next message');
+    // 服务出现之后热路径补挂成功，预设里的工具才真正可达。
+    await until(() => host.list.mountedPresets.includes('standard'), 'the preset to be mounted on retry');
+    assert.deepEqual(host.list.mountedPresets, ['standard']);
+    assert.deepEqual(host.list.restrictions.at(-1), { sessionId: agent.id, filter: { allow: ['read'] } });
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：系统提示小节**不含**每轮会变的东西；当前发言者 / 群环境 / 当前时间都在
+// user message 的第二个 text block 里。这是 2026-10-19「越聊越笨」的回归：
+// 动态小节会让 DSH 每轮追加一整份系统提示（约 9k token），十几轮就 220k 上下文。
+test('the channel system section stays stable while per-turn data rides on the user message', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(mention('在吗', { messageId: 11 }));
+    const agent = await untilInbox(host, 1, 'the first turn');
+    const firstSection = promptText(host, 'qq-bridge:channel');
+    const firstContext = turnContextText(agent);
+    assert.ok(firstContext.includes('刚跟你说话的人：kaguya'), firstContext);
+    // 动态数据不能再出现在系统小节里：出现一次，DSH 就会追加一次整段提示。
+    assert.ok(!firstSection.includes('刚跟你说话的人：'), firstSection);
+    assert.ok(!firstSection.includes('现在是 '), firstSection);
+
+    onebot.push(mention('还在吗', { messageId: 12, userId: 333, name: 'iroha', card: 'iroha' }));
+    await untilInbox(host, 2, 'the second turn');
+    const secondSection = promptText(host, 'qq-bridge:channel');
+    const secondContext = turnContextText(agent);
+    assert.equal(secondSection, firstSection, '系统小节必须逐字稳定，否则 DSH 每轮都会追加一份');
+    assert.ok(secondContext.includes('刚跟你说话的人：iroha'), secondContext);
+    assert.notEqual(secondContext, firstContext);
+  } finally {
+    await onebot.close();
   }
 });
 
@@ -1812,11 +1897,11 @@ test('group chatter the bot was not addressed in becomes ambient context', async
 
     onebot.push(mention('你们说呢', { messageId: 13 }));
     const agent = await until(() => host.list.created[0], 'the group Agent');
-    const text = promptText(host, 'qq-bridge:channel');
+    const text = turnContextText(agent);
     // 之前的闲聊按「昵称: 内容」出现，模型因此知道大家在聊什么。
     assert.ok(text.includes('kaguya: 晚上吃啥'), text);
     assert.ok(text.includes('iroha: 随便'), text);
-    // 被 @ 的那条走 user message，不在环境块里重复一遍。
+    // 被 @ 的那条走 user message 的第一块，不在环境块里重复一遍。
     assert.ok(!text.includes('你们说呢'));
   } finally {
     await onebot.close();
@@ -1829,8 +1914,8 @@ test('ambientMessages: 0 disables the group context', async () => {
   try {
     onebot.push(groupMessage([{ type: 'text', data: { text: '晚上吃啥' } }], { messageId: 11 }));
     onebot.push(mention('你们说呢', { messageId: 12 }));
-    await until(() => host.list.created[0], 'the group Agent');
-    const text = promptText(host, 'qq-bridge:channel');
+    const agent = await until(() => host.list.created[0], 'the group Agent');
+    const text = turnContextText(agent);
     assert.ok(!text.includes('晚上吃啥'));
     // 环境块的表头（「群里最近的消息（旧 → 新；…）」）不该出现。注意别只匹配
     // 「群里最近的消息」这几个字 —— 图片那一条静态说明里也会提到它。
@@ -2862,16 +2947,18 @@ test('the channel prompt keeps the group name and always names the latest speake
     const first = promptText(host, 'qq-bridge:channel');
     // 群名来自 get_group_info（入站事件里没有），第一条消息时就该查到。
     assert.ok(first.includes('示例群'), first);
-    assert.ok(first.includes('刚跟你说话的人：kaguya'));
+    const firstContext = turnContextText(agent);
+    assert.ok(firstContext.includes('刚跟你说话的人：kaguya'), firstContext);
 
     onebot.push(mention('还在吗', { messageId: 12, userId: 333, name: 'iroha', card: 'iroha' }));
     await until(() => agent.inbox.length === 2, 'the second message to be delivered');
     const second = await until(() => {
-      const text = promptText(host, 'qq-bridge:channel');
+      const text = turnContextText(agent);
       return text.includes('刚跟你说话的人：iroha') ? text : undefined;
     }, 'the prompt to name the new speaker');
-    // 群名没有被下一条消息冲成空串。
-    assert.ok(second.includes('示例群'), second);
+    // 群名没有被下一条消息冲成空串（系统小节仍然稳定）。
+    const afterSecond = promptText(host, 'qq-bridge:channel');
+    assert.ok(afterSecond.includes('示例群'), afterSecond);
   } finally {
     await onebot.close();
   }
@@ -3117,9 +3204,9 @@ test('images in group chatter are downloaded unless ambientMedia is off', async 
 
     // 随后被 @：上下文里那条已经改写成带路径的版本，模型可以 read_image。
     onebot.push(mention('这啥', { messageId: 22 }));
-    await until(() => host.list.created[0], 'the group Agent');
+    const agent = await until(() => host.list.created[0], 'the group Agent');
     const prompt = await until(
-      () => (/kaguya: \[图片\(动画表情\): (media\/[0-9a-f]{32}\.png)\]/.exec(promptText(host, 'qq-bridge:channel')) ?? undefined),
+      () => (/kaguya: \[图片\(动画表情\): (media\/[0-9a-f]{32}\.png)\]/.exec(turnContextText(agent)) ?? undefined),
       'the ambient line to carry the local path',
     );
     // 落盘的确实是原字节。
@@ -3140,7 +3227,7 @@ test('images in group chatter are downloaded unless ambientMedia is off', async 
     assert.equal(quietImages.hits.length, 0, 'ambient images must not be downloaded when ambientMedia is off');
     quiet.onebot.push(mention('这啥', { messageId: 22 }));
     await until(() => quiet.host.list.created[0], 'the group Agent');
-    const prompt = promptText(quiet.host, 'qq-bridge:channel');
+    const prompt = turnContextText(quiet.host.list.created[0]);
     assert.ok(prompt.includes('[图片(动画表情)]'), prompt);
     // 只断言「没有真的落盘路径」：提示词里作为例子提到 `.qq-media/…` 是另一回事。
     assert.ok(!/media\/[0-9a-f]{32}\./.test(prompt), prompt);
@@ -3809,9 +3896,11 @@ test('a sticker that cannot be sent says so instead of going silent', async () =
   // 一张图都没发出去。
   assert.equal(onebot.calls.some((call) => Array.isArray(call.params.message)), false);
   assert.ok(host.list.warnings.some((line) => line.includes('nope.png')), host.list.warnings.join('|'));
-  // 失败必须回灌进提示词：下一轮模型才看得到「那张没发出去、为什么」，
+  // 失败必须回灌到**下一轮的情境**里：模型才看得到「那张没发出去、为什么」，
   // 否则它会照着自己编的路径再编一个（真实事故：连编两轮 `.qq-media` 哈希）。
-  const prompt = promptText(host, 'qq-bridge:channel');
+  onebot.push(privateMessage('再试一次'));
+  await untilInbox(host, 2, 'the follow-up turn');
+  const prompt = turnContextText(agent);
   assert.match(prompt, /nope\.png/);
   assert.match(prompt, /没发出去/);
 });
@@ -3832,7 +3921,9 @@ test('发表情只认收藏目录：`.qq-media` 里真实存在的图也不能�
   );
   assert.match(sent, /发不出去/);
   assert.equal(onebot.calls.some((call) => Array.isArray(call.params.message)), false, '一张图都不该发出去');
-  const prompt = promptText(host, 'qq-bridge:channel');
+  onebot.push(privateMessage('再试一次'));
+  await untilInbox(host, 2, 'the follow-up turn');
+  const prompt = turnContextText(agent);
   assert.match(prompt, /只能从收藏目录/);
 });
 
@@ -4178,10 +4269,10 @@ test('the channel prompt carries the global INDEX.md once it exists', async () =
   await mkdir(join(cwd, '.qq-memory'), { recursive: true });
   await writeFile(join(cwd, '.qq-memory', 'INDEX.md'), '- kaguya：群主，周六常组织打本', 'utf8');
   onebot.push(privateMessage('在吗'));
-  await until(() => host.list.created[0], 'the first Agent');
   // 索引是异步刷新进缓存的（提示词装配是同步的），所以第一次装配可能还是空的。
+  const agent = await until(() => host.list.created[0], 'the first Agent');
   const text = await until(() => {
-    const current = promptText(host, 'qq-bridge:channel');
+    const current = turnContextText(agent);
     return current.includes('群主，周六常组织打本') ? current : undefined;
   }, 'the memory index to reach the channel prompt');
   assert.match(text, /和当前话题相关的记忆/);
@@ -4206,9 +4297,9 @@ test('a no-date cognition row is recalled when the incoming message uses it', as
     'utf8',
   );
   onebot.push(privateMessage('你懂那个老说法是什么意思吗'));
-  await until(() => host.list.created[0], 'the private Agent');
+  const agent = await until(() => host.list.created[0], 'the private Agent');
   const text = await until(() => {
-    const current = promptText(host, 'qq-bridge:channel');
+    const current = turnContextText(agent);
     return current.includes('老说法 —— 很久以前学的') ? current : undefined;
   }, 'the no-date cognition row to reach the prompt');
   assert.match(text, /老说法 —— 很久以前学的/);
@@ -4547,8 +4638,8 @@ test('proactive: the bot speaks up once a group has gone quiet, on the humanized
   assert.match(nudge, /不是谁发给你的消息/);
   assert.match(nudge, /SKIP/);
   assert.match(nudge, /已经安静了大约 \d+ 分钟/);
-  // 群里刚说过的话在渠道提示里 —— 有上下文才可能接得上话。
-  assert.match(promptText(host, 'qq-bridge:channel'), /今晚吃啥/);
+  // 群里刚说过的话在这一轮的情境里 —— 有上下文才可能接得上话。
+  assert.match(turnContextText(agent), /今晚吃啥/);
 
   // 回复照常按「换行 = 分条」发出去，说明主动搭话用的是拟人通道而不是一条整段。
   completeTurn(host, agent, '随便点个外卖吧\n你吃啥', 2);
@@ -6095,10 +6186,11 @@ test('PERSONA.md 优先于配置 persona，且按场景选段', async () => {
     group.onebot.push(mention('在吗'));
     const agent = await untilInbox(group.host, 1, 'the group Agent');
     const prompt = promptText(group.host, 'qq-bridge:channel');
+    const context = turnContextText(agent);
     assert.match(prompt, /【身份】名字：小栞/);
     assert.match(prompt, /【底色｜始终在场】别人难受时 → 温柔/);
-    assert.match(prompt, /【场景｜群聊】群聊场景标记/);
-    assert.doesNotMatch(prompt, /私聊场景标记/, '群聊轮不该带私聊的场景段');
+    assert.match(context, /【本轮场景｜群聊】群聊场景标记/);
+    assert.doesNotMatch(context, /私聊场景标记/, '群聊轮不该带私聊的场景段');
     assert.doesNotMatch(prompt, /配置里那段人设/, '文件存在时配置 persona 被忽略（不叠加）');
     assert.equal(agent.inbox.length, 1);
     // 表达契约来自 STYLE.md；不认识的节（`## 语气`）内容也要并进「总体」生效。
@@ -6127,8 +6219,9 @@ test('PERSONA.md 优先于配置 persona，且按场景选段', async () => {
     priv.onebot.push(privateMessage('在吗'));
     await untilInbox(priv.host, 1, 'the private Agent');
     const prompt = promptText(priv.host, 'qq-bridge:channel');
-    assert.match(prompt, /【场景｜私聊】私聊场景标记/);
-    assert.doesNotMatch(prompt, /群聊场景标记/);
+    const context = turnContextText(priv.host.list.created[0]);
+    assert.match(context, /【本轮场景｜私聊】私聊场景标记/);
+    assert.doesNotMatch(context, /群聊场景标记/);
   } finally {
     await priv.onebot.close();
   }
@@ -6427,8 +6520,8 @@ test('撤回：ignore 会把群聊环境上下文里那条也摘掉', async () =
     onebot.push(groupRecall({ messageId: 7002, userId: 10001 }));
     onebot.push(mention('刚才说啥了', { messageId: 7000 }));
 
-    await untilInbox(host, 1, 'the addressed turn');
-    const prompt = promptText(host, 'qq-bridge:channel');
+    const agent = await untilInbox(host, 1, 'the addressed turn');
+    const prompt = turnContextText(agent);
     // 「假装没看到」必须连环境上下文也一起删：不然它下次被 @ 时又读到那句。
     assert.doesNotMatch(prompt, /别记我说过这句/);
     assert.match(prompt, /这句留着/, '没被撤回的那条照旧在上下文里');
