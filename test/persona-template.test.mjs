@@ -51,6 +51,16 @@ test('人设模板：零警告、只有一条底色、保留停用示例', () =>
   assert.ok(profile.traits.some((trait) => !trait.enabled), '留一条 [ ] 的点缀当「怎么改」的示例');
   assert.ok(profile.traits.length >= 3, '至少给用户几种可选的点缀');
 
+  // 傲娇的反射方向是「把话打回对方」，不是「自我否认」—— 模板是部署者抄的第一份人设，
+  // 这里写反了会被批量复制成一个「你说什么它都要反驳一句」的人（真实观感投诉）。
+  const tsundere = profile.traits.find((trait) => trait.name === '傲娇');
+  assert.ok(tsundere !== undefined, '模板要留一条傲娇示例');
+  assert.match(tsundere.expression, /顶回去|你才/, '傲娇要写「把话顶回去」，不是「才、才不是」');
+  assert.match(tsundere.taboo, /习惯性|同意/, '傲娇要写清「什么时候别上场」，否则会变成反驳型人格');
+  const gentle = profile.traits.find((trait) => trait.name === '温和');
+  assert.ok(gentle !== undefined, '模板要留一条底色示例');
+  assert.match(gentle.expression, /先接|不列建议/, '温柔要写成能执行的安慰动作，不能只有一句「温柔」');
+
   for (const scene of ['private', 'group', 'proactive', 'poke']) {
     assert.ok(profile.scenes[scene].length > 0, `场景「${scene}」不能空着 —— 四大场景是模板的卖点之一`);
   }
@@ -93,6 +103,23 @@ test('表达模板：零警告、零体检命中、不带会读进提示词的 H
     contract.some((line) => line.includes('才没有，是你没跟上我')),
     '模板要给出改好的那一句，别只给反例',
   );
+  assert.ok(
+    contract.some((line) => line.includes('你才死了呢')),
+    '被冒犯时是把话打回对方（「你才死了呢」），不是自证「才，才没死呢」',
+  );
+  assert.ok(
+    contract.some((line) => line.includes('先接情绪')),
+    '安慰要写成能执行的动作（先接情绪、不列建议），不是一句「温柔」',
+  );
+  assert.ok(
+    contract.some((line) => line.includes('默认 1~3 条')),
+    '默认 1~3 条 —— 固定成两条是另一种模板，一句式又像客服',
+  );
+  assert.ok(
+    contract.some((line) => line.includes('最多 5 条')),
+    '要给出上限（5 条），否则模型会越写越多',
+  );
+  assert.ok(!text.includes('一句话能说完就只发一条'), '模板不能把「只发一条」写成默认');
   assert.ok(text.length <= 2000, '模板不能超过 styleMaxChars 的默认值');
 });
 

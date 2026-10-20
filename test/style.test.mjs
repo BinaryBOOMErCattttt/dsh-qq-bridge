@@ -130,6 +130,27 @@ test('lintStyleDoc：把逗号写成「配额」的规则会被点出来（每�
   );
 });
 
+test('lintStyleDoc：把「只回一条」写成默认会被点出来（一句式回复的根因）', () => {
+  // 真实观感投诉：「每次只回一句」，看着像客服在答工单。根因是契约里的一句
+  // 「一句话能说完就只发一条」—— 它看起来像在讲简洁，实际把条数默认成了 1。
+  for (const line of [
+    '一句话能说完就只发一条',
+    '每次只回一句',
+    '大多数时候只发一条，要补充才发第二条',
+  ]) {
+    const hits = lintStyleDoc({ general: [line] });
+    assert.equal(hits.length > 0, true, `应当报出：${line}`);
+    assert.equal(hits[0].code, 'ONE_LINE');
+    assert.ok(/一句式|工单/.test(hits[0].why), '要说清后果是一句式回复');
+    assert.ok(hits[0].fix.includes('1~3'), '要给出「默认 1~3 条」的替代做法');
+  }
+  // 默认 1~3 条、最多 5 条的写法是对的，不能被报成噪声。
+  assert.deepEqual(
+    lintStyleDoc({ general: ['默认 1~3 条，最多 5 条；只有插话、纯情绪时才单发一条'] }),
+    [],
+  );
+});
+
 test('builtinStyle：标点那条讲频率、不讲「一句最多一个」的配额', () => {
   // 这条不变量是给未来的自己看的：把措辞改回「最多一个」就等于把「每句一个逗号」写回契约。
   const punctuation = builtinStyle().punctuation.join('；');
@@ -209,6 +230,13 @@ test('renderStyleContract：散文 + 机器参数，按场景选段，不能发�
   assert.ok(group.some((line) => line.includes('不超过 40 字')));
   assert.ok(!group.some((line) => line.includes('引用你要接的那句话')), '插话不再强制引用，不该再有这条承诺');
   assert.ok(group.some((line) => line.includes('接不住就不接')), '群聊场景要选群聊那段');
+  // 默认按 humanize 发：换行就是分条。不告诉模型，「回两条」会被写成同一行里的两句话。
+  assert.ok(group.some((line) => line.includes('想分几条发就换行')), '要说清换行 = 分条');
+  const capped = renderStyleContract({ prose, params: { ...params, maxMessages: 1 }, scene: 'group', imageAllowed: false });
+  assert.ok(capped.some((line) => line.includes('最多发 1 条')), '条数上限要跟提示词对齐');
+  const single = renderStyleContract({ prose, params: { ...params, humanize: false }, scene: 'group', imageAllowed: false });
+  assert.ok(single.some((line) => line.includes('作为一条消息直接发')), 'humanize 关掉时说清整轮只有一条');
+  assert.ok(!single.some((line) => line.includes('想分几条发就换行')), 'humanize 关掉时不能说换行会分条');
   // 「行，」「好，」「嗯，」开场是硬性规则（index.js 的 hardRules），**不在**这份可被
   // STYLE.md 覆盖的散文里 —— 放在这里，部署者删掉那一条就等于把它关掉了。
   assert.ok(!group.some((line) => line.includes('这类应答开场')), '应答开场禁令属于硬规则，不能放在可覆盖的散文里');
