@@ -105,11 +105,11 @@ test('免 @ 轮数：0 = 不限，够数就为止', () => {
 function follow(overrides = {}) {
   return {
     enabled: true,
-    windowMs: 60 * 1000,
+    idleMs: 3 * 60 * 1000,
     type: 'group',
     speakerId: 'u1',
     userId: 'u1',
-    activeUntil: NOW + 1000,
+    followUntil: NOW + 1000,
     turnsLeft: true,
     interposeOthers: 8,
     interposeSnapshot: 7, // 当前这条自己已经把序号 +1，所以 8 = 快照 + 1 是「紧跟着」
@@ -123,13 +123,18 @@ test('免 @ 接话：基准入参通过，每条判据单独翻动都会拦住',
   assert.equal(activeFollowAllows(follow()), true, '基准应当通过');
 
   assert.equal(activeFollowAllows(follow({ enabled: false })), false, '1 activeFollow 关着');
-  assert.equal(activeFollowAllows(follow({ windowMs: 0 })), false, '1 窗口关着');
+  assert.equal(activeFollowAllows(follow({ idleMs: 0 })), false, '1 一对一窗口关着');
   assert.equal(activeFollowAllows(follow({ type: 'private' })), false, '2 私聊不需要免 @');
   assert.equal(activeFollowAllows(follow({ speakerId: 'u2' })), false, '3 不是正在跟它聊的那个人');
-  assert.equal(activeFollowAllows(follow({ activeUntil: NOW })), false, '4 窗口过期了');
-  assert.equal(activeFollowAllows(follow({ turnsLeft: false })), false, '5 免 @ 轮数用完');
+  assert.equal(activeFollowAllows(follow({ followUntil: NOW })), false, '4 断聊了（两条之间超时间隔）');
+  assert.equal(activeFollowAllows(follow({ turnsLeft: false })), false, '5 免 @ 条数用完');
   assert.equal(activeFollowAllows(follow({ interposeOthers: 9 })), false, '6 中间有人插过话');
   assert.equal(activeFollowAllows(follow({ mentionsOthers: true })), false, '7 这句 @ 了别人');
+});
+
+test('免 @ 接话：A 路没有概率这个入参（够资格就是回，抽卡只服务多人搭话）', () => {
+  // 判据不看任何概率字段：传进来也不影响结论 —— 这是「一对一不再抽卡」的契约。
+  assert.equal(activeFollowAllows(follow({ chance: 0, roll: 1 })), true);
 });
 
 test('免 @ 接话：「紧跟着的下一条」这个等式是刻意留的容差', () => {

@@ -158,12 +158,13 @@ export const Config = z.object({
   // ---- 活跃对话：聊起来之后保持搭话（见 docs/proactive.md「聊起来之后保持搭话」）----
   // 上面的 proactive* 只在**冷场**时开口；这一组管的是「正聊着」的时候：被叫到之后
   // 接着说的话也算在跟它聊（activeFollow），以及它自己回完隔一会儿再补一句（activeChime*）。
-  activeWindowMs: z.number().default(60 * 1000).description('「活跃对话」窗口（毫秒）：被 @ 到之后这么久之内，同一个人接着说的话算还在跟它聊；「多人搭话」也用它 —— 最近这么久里累计够 activeGroupLines 条、activeGroupSpeakers 个人说过话就进入搭话状态，之后群里谁接话都算数。0 = 整套关闭（既不免 @ 接话，也不补一句、不搭话）'),
-  activeFollow: z.boolean().default(true).description('活跃对话里**免 @ 接话**：被叫到之后的窗口内同一个人接着说的话也当成在跟它聊；群里聊热了（见 activeGroupLines）还会进入**多人搭话** —— 那时候谁接话都算数。够资格不等于就接：每句都按 activeTalkChance 一族的累计概率抽一次卡。默认开，代价是它放松了「群里只在被 @ 时才说话」这条约定（不想让人看见它接闲聊就关掉）；只在群聊生效，私聊本来就不需要 @'),
-  activeMaxTurns: z.number().default(10).description('一次一对一的活跃对话里最多考虑几条免 @ 消息（抽卡没抽中的也算一条）：够这么多条就要重新 @ 它一次；多人搭话不看这个，它的闸门是「够条数、够人数」。0 = 不限'),
-  activeTalkChance: z.number().default(0.05).description('免 @ 搭话的**起始**概率（0~1，抽卡那套）：够资格（一对一窗口里同一个人接着说，或群里进了多人搭话）之后不是每句都接，而是先掷这个概率；每多一条没抽中的消息，下一次的概率就加上 activeTalkChanceStep（「保底」越攒越高），直到 activeTalkChanceMax 封顶。掷中、或者被明确 @ 到（不用抽直接回）之后归零重新攒。0 = 起步为 0（仍会随着没抽中往上攒）'),
-  activeTalkChanceStep: z.number().default(0.1).description('每多一条**没抽中**的免 @ 消息，搭话概率增加多少（0~1）：这就是「越聊越可能接一句」的那一步；实际概率不超过 activeTalkChanceMax'),
-  activeTalkChanceMax: z.number().default(0.8).description('免 @ 搭话概率的上限（0~1）：攒到这么多就不再涨，留一点不确定性，免得在热群里变成每条都回；配得比 activeTalkChance 还小时按起始概率算'),
+  activeWindowMs: z.number().default(60 * 1000).description('「活跃对话」窗口（毫秒）：它管两件事 —— 它回完之后这么久之内可能**补一句**；以及**多人搭话**的热度（最近这么久里累计够 activeGroupLines 条、activeGroupSpeakers 个人说过话就进入搭话状态）。一对一的免 @ 接话不看它，那是 activeFollowIdleMs。0 = 整套关闭（既不免 @ 接话，也不补一句、不搭话）'),
+  activeFollow: z.boolean().default(true).description('活跃对话里**免 @ 接话**：被叫到之后，同一个人接着说的话也当成在跟它聊 —— 这段一对一里他的**每一条都会回**（不抽卡），直到 activeMaxTurns 用完或者断聊（activeFollowIdleMs）；群里聊热了（见 activeGroupLines）还会进入**多人搭话**，那一路才按 activeTalkChance 抽卡。默认开，代价是它放松了「群里只在被 @ 时才说话」这条约定（不想让人看见它接闲聊就关掉）；只在群聊生效，私聊本来就不需要 @'),
+  activeFollowIdleMs: z.number().default(3 * 60 * 1000).description('免 @ 接话的断聊间隔（毫秒）：一对一的对话里，同一个人每接一句就把它往后滑这么久 —— 两条消息之间超过它，这段「你跟我聊」就算结束，要重新 @ 它一次。它只管一对一的免 @ 接话（补一句与多人搭话的热度仍看 activeWindowMs）。0 = 关掉一对一的免 @ 接话（多人搭话不受影响）'),
+  activeMaxTurns: z.number().default(10).description('一次一对一的活跃对话里最多免 @ 回几条：窗口里这个人的每一条都会回，够这么多条就要重新 @ 它一次；多人搭话不看这个，它的闸门是「够条数、够人数」。0 = 不限'),
+  activeTalkChance: z.number().default(0.05).description('**多人搭话**的起始概率（0~1，抽卡那套）：群里进入搭话状态之后不是每句都接，而是先掷这个概率；每多一条没抽中的消息，下一次的概率就加上 activeTalkChanceStep（「保底」越攒越高），直到 activeTalkChanceMax 封顶。掷中、或者被明确 @ 到（不用抽直接回）之后归零重新攒。一对一的免 @ 接话**不抽卡**（每句都回），这一组只影响多人搭话。0 = 起步为 0（仍会随着没抽中往上攒）'),
+  activeTalkChanceStep: z.number().default(0.1).description('多人搭话里，每多一条**没抽中**的消息，搭话概率增加多少（0~1）：这就是「越聊越可能接一句」的那一步；实际概率不超过 activeTalkChanceMax'),
+  activeTalkChanceMax: z.number().default(0.8).description('多人搭话概率的上限（0~1）：攒到这么多就不再涨，留一点不确定性，免得在热群里变成每条都回；配得比 activeTalkChance 还小时按起始概率算'),
   activeGroupLines: z.number().default(6).description('「多人搭话」的进入门槛：最近 activeWindowMs 里群里（除它以外）累计说了这么多条话，就说明大家聊起来了（进入之后仍按 activeTalkChance 抽卡决定接哪句）；0 = 关掉多人搭话（只保留一对一的免 @ 接话）'),
   activeGroupSpeakers: z.number().default(2).description('「多人搭话」还要求最近窗口里至少有这么多**不同的人**说过话：两个人有来有回才算聊起来，一个人自己刷屏不算（与 activeGroupLines 同时满足才进入）'),
   activeGroupBatchScale: z.number().default(2).description('搭话状态里的「倾听时间」倍数：攒批窗口与整批等待上限都乘上它，于是它会多听几句、再合成一轮回复（1 = 不放大，只在群聊的搭话状态里生效）'),

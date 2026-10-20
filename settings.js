@@ -180,6 +180,10 @@ export function createSettings(config, defaultCwd) {
 
   // —— 活跃对话（免 @ 接话 / 补一句 / 多人搭话）——
   const activeWindowMs = msOf(config.activeWindowMs, 60 * 1000);
+  // 一对一免 @ 接话的断聊间隔：刻意与 `activeWindowMs` 分开 —— 那个 60 秒同时量着
+  // 「补一句」与「多人搭话」的热度，把它拉长会让群更容易被判成聊热了；一对一想陪久
+  // 一点只需要动这一项。
+  const activeFollowIdleMs = msOf(config.activeFollowIdleMs, 3 * 60 * 1000);
   const activeMaxTurns = msOf(config.activeMaxTurns, 10);
   // 抽卡概率三项都夹到 0~1；NaN 保持 NaN（与 proactiveChance 同口径）。NaN 进到判据里
   // 会让 `roll < chance` 恒假 = 一句都不接 —— 这是比「按一个莫名其妙的概率乱接」更安全
@@ -318,6 +322,7 @@ export function createSettings(config, defaultCwd) {
     proactiveToHour,
     proactiveChance,
     activeWindowMs,
+    activeFollowIdleMs,
     activeMaxTurns,
     activeTalkChance,
     activeTalkChanceStep,

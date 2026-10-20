@@ -282,6 +282,17 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
 
 ### 行为变化
 
+- **自动复读改成「一串只跟一次」**：原先跟完一次就把链清空，于是四个人连发同一张表情包时，
+  第 1、2 条触发一次、第 3、4 条又凑成新的一对再触发一次 —— 群里看到的是机器人连发两条
+  （2026-10-20 的真实事故）。现在跟过之后链留着并标成 `repeated`，同一串里剩下的相同消息
+  只记账、不再跟，直到中间有人说了别的话（链被换掉）或者隔得超过 `repeatWindowMs`。
+- **免 @ 接话改成「按条数 + 断聊间隔」，而且每一句都真的回**：原先一对一是「1 分钟窗口 + 5% 起步
+  抽卡」，60 秒里对方连发四五句、它大概率一句都不回，窗口就先过期了 —— 「@ 一次之后能接着聊」
+  基本没生效。现在被 @ 到之后，那个人的消息不再需要 @、**每一条都会回**，直到回满 `activeMaxTurns`
+  （默认 10 条）或者两条之间超过 `activeFollowIdleMs`（新配置，默认 3 分钟）算断聊。抽卡
+  （`activeTalkChance` 一族）只留给**多人搭话**：那边人多嘴杂，够资格不等于就接。顺带两处收紧：
+  插话（多人搭话）**不买一对一** —— 被接话的人不会因此白拿一段「每条都回」的窗口；
+  `activeWindowMs` 现在只管「补一句」与多人搭话的热度，把它拉长不再顺带放松一对一。
 - **搭话轮不挂任何指向**：群里没被 @ 的两种轮次 —— 活跃窗口里接上的那句（`continued`）与群里
   聊热后自己凑的一句（`interject`）—— 既不引用那条消息、也不 @ 人，`replyStyle: 'quote'` /
   `'at'` 配得再显式也一样。那一刻它不是在「回某一条」，而是顺着气氛插一句；先引用一句再开口
@@ -378,7 +389,7 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
 
 ### 配置
 
-新增 23 项，全部有中文 `.description()` 并在设置页分了组（「表达（STYLE.md / 气泡 / 标点 / 补一句）」
+新增 24 项，全部有中文 `.description()` 并在设置页分了组（「表达（STYLE.md / 气泡 / 标点 / 补一句）」
 与「感知与互动（链接 / 视频 / 戳一戳）」两张新卡片）：
 
 - 人格与表达：`personaFile` / `personaMaxChars` / `personaSceneOverlays` / `styleFile` /
@@ -388,12 +399,19 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
 - 感知与互动：`linkPreview` / `linkPreviewTimeoutMs` / `linkPreviewMaxBytes` /
   `linkAllowPrivateHosts` / `videoCover` / `videoMaxBytes` / `pokeReply` / `pokeMode` /
   `pokeReplyChance` / `pokeCooldownMs` / `pokeDailyMax`
+- 活跃对话：`activeFollowIdleMs`（免 @ 接话的断聊间隔，默认 3 分钟）
 
 ### 设置页（跟着这次重构一起改）
 
 之前的设置页只是把新字段「塞」进了已有分组：页面结构没动、标签靠描述自动截、人设卡还把
 **已经失效的旧 `persona` 排在第一行**。这次补齐：
 
+- **保存按钮搬到页面顶部（sticky）**：原先整页只有一个保存按钮、在页面最底部，一百多项配置
+  分在 7 个 tab 里，改完根本滚不到那个按钮 —— 真实事故：有人关掉了「自动复读」，但那次改动
+  从来没落盘，bot 第二天照旧复读。现在保存按钮在**页头右侧**、与标题同一行并固定在顶部
+  （页头底色就是内容区的 `bg-layer-2`，不再是一条深色横带），旁边写着「有未保存的修改」/
+  「N 项待修正」/保存失败的提示；按钮灰掉时能看出原因。离开这一页仍会丢弃草稿（与官方
+  `SettingsForm` 一致）。
 - **人设卡改成「文件优先」的顺序**：`personaFile` / `personaMaxChars` / `personaSceneOverlays`
   在前，旧 `persona` 与 `instructions` 在后。实现上顺手修了一个静默的坑：分组字段的顺序原来
   由 schema 决定，`SECTIONS[].fields` 那份声明顺序只用来判归属 —— 现在显式清单说了算（前缀组

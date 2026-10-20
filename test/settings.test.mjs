@@ -37,6 +37,8 @@ test('默认配置原样落到 settings 上', () => {
   assert.equal(s.batchBacklogHoldMs, 120000);
   assert.equal(s.maxReplyChars, 1500);
   assert.equal(s.activeWindowMs, 60 * 1000);
+  assert.equal(s.activeFollowIdleMs, 3 * 60 * 1000);
+  assert.equal(s.activeMaxTurns, 10);
   assert.equal(s.activeGroupLines, 6);
   assert.equal(s.activeGroupSpeakers, 2);
   assert.equal(s.activeGroupBatchScale, 2);
@@ -81,6 +83,10 @@ test('活下来的一批毫秒项：非法退回默认，负数按 0', () => {
   assert.equal(settings({ proactiveIdleMs: -1 }).proactiveIdleMs, 0);
   assert.equal(settings({ activeWindowMs: -1 }).activeWindowMs, 0);
   assert.equal(settings({ activeWindowMs: 1234.7 }).activeWindowMs, 1234);
+  // 断聊间隔与它同一口径：非法退回默认（不是关闭），负数按 0（= 关掉一对一接话）。
+  assert.equal(settings({ activeFollowIdleMs: 'nonsense' }).activeFollowIdleMs, 3 * 60 * 1000);
+  assert.equal(settings({ activeFollowIdleMs: -1 }).activeFollowIdleMs, 0);
+  assert.equal(settings({ activeFollowIdleMs: 1234.7 }).activeFollowIdleMs, 1234);
   assert.equal(settings({ activeChimeMax: 3 }).activeChimeMax, 3);
 });
 

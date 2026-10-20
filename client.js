@@ -18,7 +18,7 @@
  *      把整份配置投影成表单 schema），标签与说明也来自 schema 上的 `.description()`。
  *      于是「加一个配置项」只需要改 `config.js` 一处 —— 设置页自动多出一行。
  *
- * 版式（定稿）：**7 个下划线 tab + 单列扁平区块 +
+ * 版式（定稿）：**sticky 页头（标题 + 保存动作）+ 7 个下划线 tab + 单列扁平区块 +
  * 官方两种字段行**，不再有折叠卡片墙。`TABS` 负责分组（字段 → 分组见 `SECTIONS`），
  * `FIELD_HINTS` 给数字补只读量纲（`= 45 分钟`），`ENUM_LABELS` 给枚举取值配人话。
  * 布尔是 `Switch`（官方开关行），枚举是原生 `<select>`（Input 外观），其余是输入框 /
@@ -81,7 +81,14 @@ window.__ModuleLoader__.load({
     // 表单行 12px 内边距 / 13-500 标签 / 34px 控件 / 12px hint，分隔线 0.5px border-l2。
     const STYLE_TAG = '@qqbot/dsh-plugin-qq/settings.css';
     const STYLES = `
-.qq-page{max-width:720px;display:flex;flex-direction:column;color:var(--dsw-alias-label-primary)}
+.qq-form{display:flex;flex-direction:column;max-width:720px;min-width:0}
+.qq-header{position:sticky;top:0;z-index:4;display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:6px 0 8px;background:var(--dsw-alias-bg-layer-2);border-bottom:.5px solid var(--dsw-alias-border-l2)}
+.qq-header .qq-title{margin:0}
+.qq-headerActions{display:flex;align-items:center;gap:10px;margin-left:auto;flex:none;flex-wrap:wrap;justify-content:flex-end}
+.qq-saveHint{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+.qq-saveFailed{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-state-error-primary)}
+.qq-readOnly{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+.qq-page{max-width:720px;padding-top:10px;display:flex;flex-direction:column;color:var(--dsw-alias-label-primary)}
 .qq-title{margin:0 0 6px;font-size:16px;font-weight:500;line-height:24px}
 .qq-intro{margin:0 0 4px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-tertiary)}
 .qq-notice{margin:0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary)}
@@ -167,7 +174,7 @@ window.__ModuleLoader__.load({
     const zh = {
       navTitle: 'QQ Bridge',
       title: 'QQ Bridge',
-      intro: 'QQ 桥接的全部配置，按用途分页；改完在底部一次保存。',
+      intro: 'QQ 桥接的全部配置，按用途分页；改完点顶部的「保存」一次提交。',
       notice: '保存会写进当前 profile 的 cordis.patch.yml，随后插件重启一次；环境变量（QQBOT_*）的取值会以表达式保留。',
       searchPlaceholder: '搜索配置项…',
       searchEmpty: '没有匹配的配置项。可以搜字段名（如 proactiveChance）或描述里的词。',
@@ -198,6 +205,7 @@ window.__ModuleLoader__.load({
       saveFailed: '本部署没有接受这些值，已保留供你修改。',
       save: '保存',
       saving: '保存中…',
+      unsavedHint: '有未保存的修改',
       remindersTitle: '已记录的定时任务',
       remindersNote:
         '来自提醒任务文件，每 {seconds} 秒自动刷新一次；这一块只读，建任务 / 取消任务都在 QQ 里说一声。',
@@ -228,7 +236,7 @@ window.__ModuleLoader__.load({
     const en = {
       navTitle: 'QQ Bridge',
       title: 'QQ Bridge',
-      intro: 'Every QQ bridge setting, grouped by purpose; save once at the bottom.',
+      intro: 'Every QQ bridge setting, grouped by purpose; hit Save at the top to submit them all.',
       notice: 'Saving writes this profile’s cordis.patch.yml and restarts the plugin once; values that come from QQBOT_* stay as expressions.',
       searchPlaceholder: 'Search settings…',
       searchEmpty: 'No matching settings. Try a field name (e.g. proactiveChance) or a word from its description.',
@@ -259,6 +267,7 @@ window.__ModuleLoader__.load({
       saveFailed: 'The deployment did not accept these values; they were left for you to correct.',
       save: 'Save',
       saving: 'Saving…',
+      unsavedHint: 'Unsaved changes',
       remindersTitle: 'Scheduled reminders',
       remindersNote:
         'Read from the reminder task file and refreshed every {seconds} seconds. This block is read-only; create or cancel tasks by talking to the bot in QQ.',
@@ -728,6 +737,7 @@ window.__ModuleLoader__.load({
       proactiveFreshMs: formatMs,
       proactiveGapMs: formatMs,
       activeWindowMs: formatMs,
+      activeFollowIdleMs: formatMs,
       activeChimeIdleMs: formatMs,
       readDelayMs: formatMs,
       minDelayMs: formatMs,
@@ -1968,6 +1978,47 @@ window.__ModuleLoader__.load({
 
     // ---- 页面 ------------------------------------------------------------------
 
+    /**
+     * 页头右侧的保存动作（与标题同一行，整页只有这一个保存按钮）。
+     *
+     * 原先用的是官方 `SettingsForm`，保存按钮在页面**最底部** —— 这一页有一百多项配置、
+     * 分成 7 个 tab，拨完开关往往根本滚不到那个按钮（真实事故：有人关掉了「自动复读」，
+     * 但那次改动从来没落盘，bot 第二天照旧复读）。现在它跟着标题一起固定在顶部：
+     * 页头用页面自己的底色（`bg-layer-2`，与内容区同一块面板），不再是横贯整页的色带。
+     *
+     * 可用性与官方表单同一套口径：没有改动 / 有字段还非法 / 正在保存 / 本部署只读时
+     * 按钮不可点，并把原因摆出来（非法项计数、保存失败提示）—— 一个灰掉的按钮不说明
+     * 原因，比放错位置的按钮更难查。
+     */
+    const SaveBar = component(function SaveBar(props) {
+      const { t, shell, invalidCount, onSave } = props;
+      const blocked = !shell.writable || !shell.dirty || shell.invalid || shell.saving;
+      const items = [];
+      if (shell.invalid && invalidCount > 0) {
+        items.push(jsx(P.Tag, { tone: 'danger', children: t('invalidCount', { count: invalidCount }) }, 'invalid'));
+      } else if (shell.dirty) {
+        items.push(jsx('span', { className: 'qq-saveHint', children: t('unsavedHint') }, 'hint'));
+      }
+      if (shell.failed === true) {
+        items.push(jsx('p', { className: 'qq-saveFailed', role: 'status', children: t('saveFailed') }, 'failed'));
+      }
+      items.push(
+        jsx(
+          P.Button,
+          {
+            className: 'qq-save',
+            variant: 'primary',
+            size: 'sm',
+            disabled: blocked,
+            onClick: onSave,
+            children: shell.saving ? t('saving') : t('save'),
+          },
+          'save',
+        ),
+      );
+      return jsx('div', { className: 'qq-headerActions', children: items }, 'savebar');
+    });
+
     /** 去重：同一个 tab 里的区块只按 tab 的声明顺序渲染一次。 */
     function flatRows(tabs) {
       return tabs.flatMap((tab) => tab.sections.flatMap((section) => section.rows));
@@ -1983,6 +2034,11 @@ window.__ModuleLoader__.load({
       const [activeId, setActiveId] = useState(tabs.length > 0 ? tabs[0].id : undefined);
       const [query, setQuery] = useState('');
       const [onlyChanged, setOnlyChanged] = useState(false);
+      // 离开这一页就丢掉草稿（官方 `SettingsForm` 也是卸载时 discard）：没保存的改动
+      // 不该在下次打开这一页时突然又冒出来。
+      useEffect(() => () => {
+        if (typeof props.discard === 'function') props.discard();
+      }, []);
 
       const writable = state.shell.writable;
       const rows = flatRows(tabs);
@@ -1997,7 +2053,6 @@ window.__ModuleLoader__.load({
       const searching = query.trim() !== '';
 
       const pageChildren = [
-        jsx('h2', { className: 'qq-title', children: t('title') }, 'title'),
         jsx('p', { className: 'qq-intro', children: t('intro') }, 'intro'),
         jsx('p', { className: 'qq-notice', children: t('notice') }, 'notice'),
         jsx(
@@ -2071,20 +2126,32 @@ window.__ModuleLoader__.load({
         );
       }
 
-      return jsx(
-        P.SettingsForm,
+      // Host 说这一份配置读不到（插件没加载 / 这一行被停用）：只留一句说明，不要画一个
+      // 写不进去的空表单（与官方 `SettingsForm` 的 `available: false` 同义）。
+      if (state.shell.available === false) {
+        return jsx('p', { className: 'qq-empty', role: 'status', children: t('unavailable') }, 'unavailable');
+      }
+      return jsxs(
+        'div',
         {
-          labels: {
-            unavailable: t('unavailable'),
-            readOnly: t('readOnly'),
-            saveFailed: t('saveFailed'),
-            save: t('save'),
-            saving: t('saving'),
-          },
-          state: state.shell,
-          onSave: props.save,
-          onDiscard: props.discard,
-          children: jsx('div', { className: 'qq-page', children: pageChildren }, 'page'),
+          className: 'qq-form',
+          children: [
+            jsxs(
+              'div',
+              {
+                className: 'qq-header',
+                children: [
+                  jsx('h2', { className: 'qq-title', children: t('title') }, 'title'),
+                  jsx(SaveBar, { t, shell: state.shell, invalidCount, onSave: props.save }, 'savebar'),
+                ],
+              },
+              'header',
+            ),
+            state.shell.writable
+              ? null
+              : jsx('p', { className: 'qq-readOnly', role: 'status', children: t('readOnly') }, 'readonly'),
+            jsx('div', { className: 'qq-page', children: pageChildren }, 'page'),
+          ],
         },
         'form',
       );

@@ -85,9 +85,11 @@ export function proactiveSkip(text) {
 }
 
 /**
- * 免 @ 接话的轮数还有余额吗（见 AGENTS.md §4.G 的 A 路）。
+ * 免 @ 接话的条数还有余额吗（见 AGENTS.md §4.F 的 A 路）。
+ *
+ * 一对一的窗口里这个人的每一条都会**真的回**（不抽卡），所以这里数的就是「回了几条」。
  * @param {number} maxTurns - `activeMaxTurns`；`<= 0` 表示不限。
- * @param {number} activeTurns - 这次活跃对话里已经免 @ 接了几轮。
+ * @param {number} activeTurns - 这段一对一里已经免 @ 回了几条。
  * @returns {boolean} 还有余额时为 true。
  */
 export function activeTurnsLeft(maxTurns, activeTurns) {
@@ -100,23 +102,26 @@ export function activeTurnsLeft(maxTurns, activeTurns) {
  *
  * 七条同时成立才算，缺一条都不理它 —— 这一步放松的是「群里只在被 @ 时才说话」这条
  * 默认约定，宁可少接一句也别抢话：
- *   1. `activeFollow` 开着，且活跃窗口开着（`windowMs > 0`）；
+ *   1. `activeFollow` 开着，且一对一窗口开着（`idleMs > 0`）；
  *   2. 是群聊 —— 私聊每条消息本来就都是跟它说的，不需要「免 @」；
  *   3. 说话的就是**正在跟它聊的那个人**（别人插一句不该被它抢答）；
- *   4. 还在窗口内（`now < activeUntil`）；
- *   5. 这次对话里免 @ 接的轮数还没用完；
+ *   4. 还在窗口内（`now < followUntil`，窗口由 `activeFollowIdleMs` 定：消息间隔超过它就断）；
+ *   5. 这段对话里免 @ 回过的条数还没用完（`activeMaxTurns`）；
  *   6. 中间**没有别人说过话**（一对一被插了话就断了，得重新 @ 它 —— 除非那一句把群聊
  *      推过了门槛，那时走的是多人搭话，见 `chatter.isHot`）；
  *   7. 这句没有 @ 别人（`@别人` / `@全体` 明确不是跟它说的）。
  *
+ * 这里**不掷骰子**：够资格就是回。抽卡（`activeTalkChance` 一族）只服务多人搭话 ——
+ * 一对一里对面只有一个人，再叠一层概率只会让「接着聊」名存实亡。
+ *
  * @param {object} input
- * @param {boolean} input.enabled - `activeFollow === true`。
- * @param {number} input.windowMs - `activeWindowMs`。
+ * @param {boolean} input.enabled - `activeFollow === true`（且 `activeWindowMs > 0`）。
+ * @param {number} input.idleMs - `activeFollowIdleMs`；`<= 0` 表示一对一接话关着。
  * @param {string} input.type - 会话类型。
  * @param {string} input.speakerId - 会话记的「正在跟它聊的人」。
  * @param {string} input.userId - 这条消息的发送者。
- * @param {number} input.activeUntil - 这个窗口的截止时刻。
- * @param {boolean} input.turnsLeft - 还有免 @ 轮数（见 `activeTurnsLeft`）。
+ * @param {number} input.followUntil - 这段一对一的截止时刻。
+ * @param {boolean} input.turnsLeft - 还有免 @ 条数（见 `activeTurnsLeft`）。
  * @param {number} input.interposeOthers - 当前插话序号（`chatter.others`）。
  * @param {number} input.interposeSnapshot - 上一次接话时记下的插话序号快照。
  * @param {boolean} input.mentionsOthers - 这条消息 @ 了别人（`mentionsOthers`）。
@@ -125,10 +130,10 @@ export function activeTurnsLeft(maxTurns, activeTurns) {
  */
 export function activeFollowAllows(input) {
   if (input.enabled !== true) return false;
-  if (input.windowMs <= 0) return false;
+  if (input.idleMs <= 0) return false;
   if (input.type !== 'group') return false;
   if (String(input.speakerId ?? '') !== String(input.userId)) return false;
-  if ((Number(input.activeUntil) || 0) <= input.now) return false;
+  if ((Number(input.followUntil) || 0) <= input.now) return false;
   if (input.turnsLeft !== true) return false;
   // 快照停在上一次接话那条上；这里已经比它大 1 以上就说明中间有人插过话
   // （当前这条自己会把序号 +1，所以「紧跟着的下一条」正好是 +1）。
@@ -138,11 +143,14 @@ export function activeFollowAllows(input) {
 }
 
 /**
- * 「免 @ 搭话」的累计概率（抽卡那套保底，见 AGENTS.md §4.G）。
+ * 「多人搭话」的累计概率（抽卡那套，见 AGENTS.md §4.F 的 C 路）。
  *
- * A 路（一对一窗口里同一个人接着说的话）与 C 路（多人搭话）**共用同一条曲线**：够资格
- * 不等于就接 —— 每够资格一次就按这个概率掷一回，没掷中就把「连丢」计数 +1，下一次更接近
- * 上限；掷中、或者被明确 @ 到（那是不用抽的直接回复）之后计数归零，重新从起始概率攒。
+ * C 路（群里聊热了，谁接话都算数）**够资格不等于就接**：每够资格一次就按这个概率掷一回，
+ * 没掷中就把「连丢」计数 +1，下一次更接近上限；掷中、或者被明确 @ 到（那是不用抽的直接
+ * 回复）之后计数归零，重新从起始概率攒。
+ *
+ * 一对一那条路不抽卡（见 `activeFollowAllows`）—— 那里对面只有一个人，而且是它刚回过话
+ * 的人，不存在「人多嘴杂」的问题；抽卡是给「热群里每条都回会刷屏」准备的。
  *
  * 三处刻意的取值：
  *   - `max < base` 时按 `base` 封顶，而不是让配反的上限把起始概率也压掉；
@@ -170,11 +178,11 @@ export function activeTalkChance(base, step, max, misses) {
  * 这一次搭话掷中了吗。
  *
  * 与 `chimeAllows` 的最后一条同构：`chance > 0 && roll < chance`，`roll` 由调用方掷
- * （判据要可重复才测得动边界）。`eligible` 是 A/C 两路是否够资格 —— 不够资格时连概率
+ * （判据要可重复才测得动边界）。`eligible` 是多人搭话够不够资格 —— 不够资格时连概率
  * 都不用算，这里一并挡住。
  *
  * @param {object} input
- * @param {boolean} input.eligible - 够资格（一对一窗口里，或者群聊进了搭话状态）。
+ * @param {boolean} input.eligible - 够资格（群聊进了搭话状态）。
  * @param {number} input.chance - 已算好的概率（见 `activeTalkChance`）。
  * @param {number} input.roll - 已掷好的 0~1 随机数。
  * @returns {boolean} 这一句该接时为 true。

@@ -11,7 +11,7 @@
  * 把页面展开成节点树，断言设置页的那批契约（清单见 `client.js` 顶部注释）：
  *
  *   1. 注册位置与注入面；
- *   2. 147 个字段在 7 个 tab 的合集里恰好各出现一次、不落「其它」；
+ *   2. 148 个字段在 7 个 tab 的合集里恰好各出现一次、不落「其它」；
  *   3. 每个分组恰属一个 tab（`tabOf` 对未知分组返回 undefined）；
  *   4. 控件映射：布尔 → `Switch`、枚举 → `<select>`、数字 / 文本 → `<input>`（官方字段行
  *      几何）、长文本 → `textarea`；工具条里的搜索框才是 primitives 的 `Input`；
@@ -99,7 +99,9 @@ const primitivesStub = {
       return Number.isFinite(parsed) ? { kind: 'set', value: parsed } : undefined;
     },
   }),
-  SettingsForm: 'SettingsForm',
+  Button: function Button(props) {
+    return { type: 'Button', props };
+  },
   SettingsValueField: 'SettingsValueField',
   Switch: function Switch(props) {
     return { type: 'Switch', props };
@@ -346,8 +348,8 @@ function render(session, extra = {}) {
       useQqSettings: (selector) => selector(face.hooks.qqSettings.getSnapshot()),
       edit: extra.edit ?? face.edit,
       resetField: extra.resetField ?? face.resetField,
-      save: face.save,
-      discard: face.discard,
+      save: extra.save ?? face.save,
+      discard: extra.discard ?? face.discard,
     },
   });
 }
@@ -386,7 +388,7 @@ function fieldsIn(tree) {
   return map;
 }
 
-/** 依次点过全部 tab，收集每个字段那一行（用来做「147 个字段各自的控件」这类断言）。 */
+/** 依次点过全部 tab，收集每个字段那一行（用来做「148 个字段各自的控件」这类断言）。 */
 function allFields(session) {
   const found = new Map();
   mountTree(session);
@@ -497,7 +499,7 @@ test('字段覆盖：schema 里每一项都上了页面、都有标签、都不�
   }
 });
 
-test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来是 147', () => {
+test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来是 148', () => {
   const { mod } = mount();
   const fields = mod.describeFields(new z(SCHEMA_JSON()));
 
@@ -528,10 +530,10 @@ test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来
       .length;
   assert.deepEqual(
     Object.fromEntries(mod.TABS.map((tab) => [tab.id, countOf(tab)])),
-    { connect: 12, session: 27, persona: 13, group: 29, reminder: 11, perception: 32, memory: 23 },
+    { connect: 12, session: 27, persona: 13, group: 30, reminder: 11, perception: 32, memory: 23 },
     '字段数按设计 §3.1 分布',
   );
-  assert.equal(fields.length, 147, '合计 147 项');
+  assert.equal(fields.length, 148, '合计 148 项');
 });
 
 test('定时任务：提醒页最上面有一块只读列表，取数路径与 Host 路由一致', () => {
@@ -646,7 +648,7 @@ test('表单投影：7 个 tab 覆盖全部字段，每行带草稿状态与来�
   assert.equal(state.tabs.length, 7);
   assert.equal(state.shell.writable, true);
   const rows = state.tabs.flatMap((tab) => tab.sections.flatMap((section) => section.rows));
-  assert.equal(rows.length, 147, '投影必须覆盖全部字段');
+  assert.equal(rows.length, 148, '投影必须覆盖全部字段');
   for (const tab of state.tabs) {
     for (const section of tab.sections) {
       assert.ok(section.title.length > 0, `${section.id} 的区块标题不能空`);
@@ -665,7 +667,7 @@ test('表单投影：7 个 tab 覆盖全部字段，每行带草稿状态与来�
 test('控件映射：35 个布尔是 Switch、8 个枚举是 select、长文本是 textarea', () => {
   const session = mount();
   const fields = allFields(session);
-  assert.equal(fields.size, 147, '七个 tab 加起来必须刚好是 147 行（每行只渲染一次）');
+  assert.equal(fields.size, 148, '七个 tab 加起来必须刚好是 148 行（每行只渲染一次）');
 
   const kinds = new Map();
   for (const [key, field] of fields) {
@@ -687,7 +689,7 @@ test('控件映射：35 个布尔是 Switch、8 个枚举是 select、长文本�
 
   const tally = {};
   for (const kind of kinds.values()) tally[kind] = (tally[kind] ?? 0) + 1;
-  assert.deepEqual(tally, { boolean: 35, choice: 8, long: 2, input: 102 }, '按 schema 的类型分布');
+  assert.deepEqual(tally, { boolean: 35, choice: 8, long: 2, input: 103 }, '按 schema 的类型分布');
 
   // 数字框带 `inputMode="numeric"`；列表行在输入框下面给 Pill 预览。
   assert.equal(controlIn(fields.get('proactiveChance'), isInput).props.inputMode, 'numeric');
@@ -859,12 +861,17 @@ test('重构新增的字段在设置页上有像样的短标签（不截成半�
   }
 });
 
-test('页面骨架：标题 / 简介 / 通知 / 工具条 / 7 个 tab / 只渲染当前 tab 的区块', () => {
+test('页面骨架：页头（标题 + 保存）/ 简介 / 通知 / 工具条 / 7 个 tab / 只渲染当前 tab 的区块', () => {
   const session = mount();
   const tree = mountTree(session);
 
-  assert.equal(tree.type, 'SettingsForm', '根节点必须是 primitives 的 SettingsForm（它带保存按钮与只读提示）');
-  assert.equal(textOf(nodes(tree, (node) => node.props?.className === 'qq-title')[0]), 'QQ Bridge');
+  assert.equal(tree.type, 'div');
+  assert.equal(tree.props.className, 'qq-form', '根节点是这一页自己的表单壳（保存动作在页头，不再用官方 SettingsForm 的底栏）');
+  const header = nodes(tree, (node) => node.props?.className === 'qq-header')[0];
+  assert.ok(header, '必须有一个 sticky 页头');
+  assert.equal(tree.props.children[0], header, '页头必须是第一个子节点 —— 保存按钮就在这一行里');
+  assert.equal(textOf(nodes(header, (node) => node.props?.className === 'qq-title')[0]), 'QQ Bridge');
+  assert.equal(textOf(nodes(header, (node) => node.props?.className === 'qq-save')[0]), '保存');
   assert.match(textOf(nodes(tree, (node) => node.props?.className === 'qq-intro')[0]), /按用途分页/);
   assert.match(textOf(nodes(tree, (node) => node.props?.className === 'qq-notice')[0]), /cordis\.patch\.yml/);
 
@@ -900,6 +907,35 @@ test('页面骨架：标题 / 简介 / 通知 / 工具条 / 7 个 tab / 只渲�
   assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[0].props['aria-selected'], true);
   nodes(rerender(session), (node) => node.props?.role === 'tab')[0].props.onKeyDown(key('ArrowLeft'));
   assert.equal(nodes(rerender(session), (node) => node.props?.role === 'tab')[6].props['aria-selected'], true, '← 从第一个绕回最后一个');
+});
+
+test('页头保存动作：没改时不可点、改过可点且点下去真的保存、只读时不可点', () => {
+  const session = mount();
+  const face = session.page.options.inject();
+  const barOf = (tree) => nodes(tree, (node) => node.props?.className === 'qq-headerActions')[0];
+  const buttonOf = (tree) => nodes(barOf(tree), (node) => node.props?.className === 'qq-save')[0];
+
+  // 1. 什么都没有改：按钮在，但不可点（与官方表单同一套口径）。
+  const clean = mountTree(session);
+  assert.equal(buttonOf(clean).props.disabled, true, '没有改动时不能保存');
+  assert.equal(textOf(buttonOf(clean)), '保存');
+
+  // 2. 拨一个开关（草稿就是「已改」）：按钮变可用，旁边提示还有未保存的修改。
+  face.edit('repeat', 'false');
+  const dirty = rerender(session);
+  assert.equal(buttonOf(dirty).props.disabled, false, '有改动就该能保存');
+  assert.equal(textOf(nodes(barOf(dirty), (node) => node.props?.className === 'qq-saveHint')[0]), '有未保存的修改');
+
+  // 3. 点下去走的是注入的 save —— 不是只画了个按钮。
+  let saved = 0;
+  const spy = mountTree(session, { save: () => { saved += 1; } });
+  buttonOf(spy).props.onClick();
+  assert.equal(saved, 1, '页头上的按钮必须接到 props.save');
+
+  // 4. 只读部署：按钮同样不可点，并且页面上有一句说明。
+  const readOnly = mountTree(mount({ writable: false }), {});
+  assert.equal(buttonOf(readOnly).props.disabled, true, '只读时不能保存');
+  assert.equal(textOf(nodes(readOnly, (node) => node.props?.className === 'qq-readOnly')[0]), '本部署的设置为只读。');
 });
 
 test('人格页：文件参数在上、旧 persona 折进「兼容」、额外要求在正文', () => {
@@ -1206,7 +1242,7 @@ test('非法值：输入框 aria-invalid、提示走错误色，文案来自字�
 test('summary 视图：导航项问它时只回一行简介', () => {
   const session = mount();
   resetHooks();
-  assert.equal(render(session, { view: 'summary' }), 'QQ 桥接的全部配置，按用途分页；改完在底部一次保存。');
+  assert.equal(render(session, { view: 'summary' }), 'QQ 桥接的全部配置，按用途分页；改完点顶部的「保存」一次提交。');
 });
 
 test('旧版的卡片 chrome 与折叠状态都删干净了（源码里搜不到它们的名字）', () => {

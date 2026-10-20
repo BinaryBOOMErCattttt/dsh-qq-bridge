@@ -2093,21 +2093,30 @@ test('images that cannot be downloaded are never repeated', async () => {
   }
 });
 
-// 用例：跟过一句就断链 —— 群里一直刷同一个字时，它不会一句不落地跟着刷。
-test('the bot repeats once and then waits for a fresh pair', async () => {
+// 用例：一串相同消息里只跟一次 —— 跟完之后链留着（标成 `repeated`），后面再来同样的
+// 消息只记账、不再跟，直到有人说了别的话把链打断，下一串才重新攒人数。
+test('the bot repeats once per run, and only starts over after the chain breaks', async () => {
   const { onebot } = await boot();
   try {
     onebot.push(groupText('6', { messageId: 90 }));
     onebot.push(groupText('6', { userId: 3333333333, card: 'iroha', messageId: 91 }));
     assert.equal(await until(() => sentTexts(onebot)[0], 'the repeat'), '6');
 
-    // 第三条相同的消息不该立刻再跟一次（链已经断了）。
+    // 第 3、4、5 条相同的消息都不该再跟一次：这一串已经跟过了。
     onebot.push(groupText('6', { userId: 4444444444, card: 'mutsumi', messageId: 92 }));
-    await settle();
-    assert.deepEqual(sentTexts(onebot), ['6']);
-
-    // 再来一条相同的消息才又攒够一对。
     onebot.push(groupText('6', { userId: 5555555555, name: 'anon', card: 'anon', messageId: 93 }));
+    onebot.push(groupText('6', { userId: 6666666666, name: 'soyo', card: 'soyo', messageId: 94 }));
+    await settle();
+    assert.deepEqual(sentTexts(onebot), ['6'], '一串只跟一次，不该连发第二条');
+
+    // 有人说了别的：链被打断，下一串要重新攒（两条相同的才又跟一次）。
+    onebot.push(groupText('7', { userId: 7777777777, name: 'taki', card: 'taki', messageId: 95 }));
+    await settle();
+    onebot.push(groupText('6', { userId: 8888888888, name: 'tomori', card: 'tomori', messageId: 96 }));
+    await settle();
+    assert.deepEqual(sentTexts(onebot), ['6'], '单独一条不算「连着」');
+
+    onebot.push(groupText('6', { userId: 9999999999, name: 'rikki', card: 'rikki', messageId: 97 }));
     await until(() => sentTexts(onebot).length === 2, 'the second repeat');
     assert.deepEqual(sentTexts(onebot), ['6', '6']);
   } finally {
@@ -2256,6 +2265,9 @@ test('two identical stickers in a row get echoed', async () => {
 // 而带 `emoji_id` 的商城表情（NapCat 把它折成 image 段，没有 sub_type）要按表情发回去。
 test('a repeated picture keeps its kind: sticker stays a sticker, photo stays a photo', async () => {
   const images = await startImageServer(TINY_PNG);
+  // 第二段用**另一张图**：同一张图在第一段已经跟过一次了，而「一串只跟一次」之后
+  // 再来同一张不会再跟（这里验的是「表情按表情发」，不是复读的触发条件）。
+  const market = await startImageServer(OTHER_PNG);
   const mediaRoot = await mkdtemp(join(tmpdir(), 'qq-media-'));
   const { onebot } = await boot({ cwd: mediaRoot, mediaDir: 'media' });
   const groupSends = () => onebot.calls.filter((call) => call.action === 'send_group_msg' && Array.isArray(call.params.message));
@@ -2268,7 +2280,7 @@ test('a repeated picture keeps its kind: sticker stays a sticker, photo stays a 
 
     // 商城表情：NapCat 折成 `image` + `emoji_id`（没有 sub_type）。复读按表情发。
     const marketFace = (messageId, userId, card) => groupMessage(
-      [{ type: 'image', data: { summary: '猫猫', file: 'A.gif', url: images.url(), emoji_id: '42' } }],
+      [{ type: 'image', data: { summary: '猫猫', file: 'A.gif', url: market.url(), emoji_id: '42' } }],
       { messageId, userId, card },
     );
     onebot.push(marketFace(144, 100000003, 'kaguya'));
@@ -2278,6 +2290,7 @@ test('a repeated picture keeps its kind: sticker stays a sticker, photo stays a 
   } finally {
     await onebot.close();
     await images.close();
+    await market.close();
     await rm(mediaRoot, { recursive: true, force: true });
   }
 });
@@ -5083,10 +5096,10 @@ test('activeFollow: activeMaxTurns limits how long it keeps following', async ()
   assert.equal(agent.inbox.length, 2, 'the cap should force a fresh mention');
 });
 
-/** A：窗口过期之后又得重新 @ 它。 */
-test('activeFollow: the window expires', async () => {
-  // 窗口 1 毫秒：下一条消息到的时候必然已经过期 —— 不依赖用例跑多久。
-  const { onebot, host } = await bootActive({ activeWindowMs: 1 });
+/** A：两条消息之间隔太久，这段一对一的「还聊着」就断了，得重新 @ 它。 */
+test('activeFollow: the one-to-one window expires when the person goes quiet', async () => {
+  // 断聊间隔 1 毫秒：下一条消息到的时候必然已经过期 —— 不依赖用例跑多久。
+  const { onebot, host } = await bootActive({ activeFollowIdleMs: 1 });
   onebot.push(mention('在吗'));
   const agent = await until(() => host.list.created[0], 'the Agent');
   await until(() => agent.inbox.length >= 1, 'the mention');
@@ -5371,11 +5384,18 @@ test('group talk defaults: a 1-minute window, 6 lines from 2 speakers, listening
 });
 
 /**
- * 一对一的免 @ 窗口只有 `activeWindowMs`（默认 1 分钟）那么长：被 @ 一次买的是这一小段，
- * 不是「这一天它都归你了」。
+ * 一对一的免 @ 接话用**自己**的断聊间隔（`activeFollowIdleMs`，默认 3 分钟），不是
+ * `activeWindowMs` 那 1 分钟 —— 后者现在只管「补一句」与多人搭话的热度。两个窗口分开是
+ * 刻意的：把 60 秒拉长到 3 分钟会让群更容易被判成聊热（更多插话），而一对一需要的只是
+ * 「两条消息之间别太远」。
  */
-test('the one-to-one window is the short activeWindowMs, not a long leash', async () => {
-  const { onebot, host } = await bootActive({ activeWindowMs: 1 });
+test('the one-to-one window is activeFollowIdleMs, not the chime/heat window', async () => {
+  // 默认 3 分钟：@ 一次买的是这一段，不是「这一整天它都归你了」。
+  assert.equal(liveConfig(Config({})).activeFollowIdleMs, 3 * 60 * 1000);
+  assert.equal(liveConfig(Config({})).activeWindowMs, 60 * 1000);
+
+  // 把断聊间隔压到 1 毫秒：下一条必然已经出窗，@ 要求就回来了。
+  const { onebot, host } = await bootActive({ activeFollowIdleMs: 1 });
   onebot.push(mention('在吗'));
   const agent = await until(() => host.list.created[0], 'the Agent');
   await until(() => agent.inbox.length >= 1, 'the mention');
@@ -5525,7 +5545,8 @@ function talkRollConfig(overrides = {}) {
   return { activeTalkChance: 0, activeTalkChanceStep: 1, activeTalkChanceMax: 1, ...overrides };
 }
 
-test('搭话抽卡：够资格也未必接，连丢一条之后概率才涨上来', async () => {
+test('A 路不抽卡：抽卡参数全设成 0 也照回（一对一里那个人的每条都回）', async () => {
+  // `activeTalkChance: 0` + step 1：如果 A 路还抽卡，第一句就必然不接。
   const { onebot, host } = await bootActive(talkRollConfig());
   onebot.push(mention('在吗'));
   const agent = await until(() => host.list.created[0], 'the group Agent to be created');
@@ -5533,57 +5554,65 @@ test('搭话抽卡：够资格也未必接，连丢一条之后概率才涨上�
   completeTurn(host, agent, '在的', 1);
   await until(() => sentTexts(onebot).length === 1, 'the reply to go out');
 
-  // 同一个人接着说：一对一窗口里够资格，但起始概率是 0 —— 这一条不该进 Agent。
-  onebot.push(groupText('那你说呢', { messageId: 7601 }));
-  await settle(100);
-  assert.equal(agent.inbox.length, 1, '概率 0 时够资格也不接');
-
-  // 连丢了一条，概率涨到 1：这一条必中。
-  onebot.push(groupText('到底行不行', { messageId: 7602 }));
-  await until(() => agent.inbox.length >= 2, 'the second follow-up to hit the roll');
-  assert.equal(agent.inbox[1].content[0].text, '到底行不行');
+  // 同一个人接着说的三句：一句都不能少（这就是「@ 一次之后能连着聊」）。
+  for (const [index, text] of ['那你说呢', '到底行不行', '还有吗'].entries()) {
+    onebot.push(groupText(text, { messageId: 7601 + index }));
+    await until(() => agent.inbox.length >= index + 2, `follow-up #${index + 1} to be admitted`);
+    assert.equal(agent.inbox[index + 1].content[0].text, text);
+    completeTurn(host, agent, `回 ${index + 1}`, index + 2);
+    await until(() => sentTexts(onebot).length >= index + 2, `reply #${index + 1} to go out`);
+  }
 });
 
-test('搭话抽卡：抽中之后归零，下一句又要重新攒', async () => {
-  const { onebot, host } = await bootActive(talkRollConfig());
+test('A 路：插话（多人搭话）不顺手买一段一对一 —— 被接话的人不会接着白拿免 @', async () => {
+  const { onebot, host } = await bootActive(talkRollConfig({ activeGroupLines: 3, activeGroupSpeakers: 2 }));
   onebot.push(mention('在吗'));
   const agent = await until(() => host.list.created[0], 'the Agent');
   await until(() => agent.inbox.length >= 1, 'the mention');
   completeTurn(host, agent, '在的', 1);
   await until(() => sentTexts(onebot).length === 1, 'the first reply');
 
-  onebot.push(groupText('第一句', { messageId: 7611 }));
+  // 甲让热度到 2（还不够），乙踩到门槛（3 条）→ 够资格但概率 0，不接。
+  onebot.push(groupText('甲', { messageId: 7631, userId: 10001, card: 'soyo' }));
+  onebot.push(groupText('乙', { messageId: 7632, userId: 10002, card: 'rana' }));
   await settle(100);
-  onebot.push(groupText('第二句', { messageId: 7612 }));
-  await until(() => agent.inbox.length >= 2, 'the follow-up that hits');
-  completeTurn(host, agent, '好', 2);
-  await until(() => sentTexts(onebot).length === 2, 'the second reply');
+  assert.equal(agent.inbox.length, 1, '搭话状态里概率 0 也不接');
 
-  // 抽中那一下把累计清零：再来一条又是 0 概率，不接。
-  onebot.push(groupText('第三句', { messageId: 7613 }));
+  // 连丢一条之后概率涨到 1：丙这一句被接住（C 路插话）。
+  onebot.push(groupText('丙', { messageId: 7633, userId: 10001, card: 'soyo' }));
+  await until(() => agent.inbox.length >= 2, 'the next group-talk message to hit the roll');
+  assert.match(agent.inbox[1].content[0].text, /soyo 说：丙/);
+  completeTurn(host, agent, '嗯', 2);
+  await until(() => sentTexts(onebot).length === 2, 'the interjection to go out');
+
+  // 插话不买一对一：soyo 再说话仍然要走 C 路，而概率已经归零 → 不接。
+  onebot.push(groupText('丁', { messageId: 7634, userId: 10001, card: 'soyo' }));
   await settle(100);
-  assert.equal(agent.inbox.length, 2, '抽中之后累计归零');
+  assert.equal(agent.inbox.length, 2, '插话之后不留下一个一对一窗口');
 });
 
-test('搭话抽卡：被明确 @ 到就直接回，并把连丢的累计清零', async () => {
-  const { onebot, host } = await bootActive(talkRollConfig());
+test('多人搭话：被明确 @ 到就直接回，并把连丢的累计清零', async () => {
+  const { onebot, host } = await bootActive(talkRollConfig({ activeGroupLines: 3, activeGroupSpeakers: 2 }));
   onebot.push(mention('在吗'));
   const agent = await until(() => host.list.created[0], 'the Agent');
   await until(() => agent.inbox.length >= 1, 'the mention');
   completeTurn(host, agent, '在的', 1);
   await until(() => sentTexts(onebot).length === 1, 'the first reply');
 
-  onebot.push(groupText('跟一句', { messageId: 7621 }));
+  // 甲让热度到 2，乙踩到门槛（3 条）→ 够资格但概率 0，先连丢一条。
+  onebot.push(groupText('甲', { messageId: 7621, userId: 10001, card: 'soyo' }));
+  onebot.push(groupText('乙', { messageId: 7622, userId: 10002, card: 'rana' }));
   await settle(100);
   assert.equal(agent.inbox.length, 1, '先连丢一条');
 
   // 被 @ 到：不抽卡，直接回；累计也该清零（它刚说过话）。
-  onebot.push(mention('那这个呢', { messageId: 7622 }));
+  onebot.push(mention('那这个呢', { messageId: 7623 }));
   await until(() => agent.inbox.length >= 2, 'the explicit mention to be admitted');
   completeTurn(host, agent, '这个啊', 2);
   await until(() => sentTexts(onebot).length === 2, 'the second reply');
 
-  onebot.push(groupText('再跟一句', { messageId: 7623 }));
+  // 群里还热着，但第三次够资格的概率必须回到起始的 0（若保底留着，这里会是 1 = 必中）。
+  onebot.push(groupText('丙', { messageId: 7624, userId: 10002, card: 'rana' }));
   await settle(100);
   assert.equal(agent.inbox.length, 2, '被 @ 到之后累计清零：这一条又回到起始概率 0');
 });

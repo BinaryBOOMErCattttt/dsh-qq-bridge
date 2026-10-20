@@ -6,9 +6,10 @@
  * （或者把 `intent` 换掉）：
  *
  *   - 被叫到永远不用抽卡；
+ *   - A 路（一对一窗口里的那个人接着说）也**不抽卡**：够资格就 `continued`；
  *   - 空消息 / 没有会话记录永远不接；
  *   - C 路（插话）的**四条排除**一条都不能少 —— 尤其是「@ 了别人」；
- *   - 抽卡没中时 `eligible` 仍为 true（调用方要据此 +1 连丢）。
+ *   - C 路抽卡没中时 `eligible` 仍为 true（调用方要据此 +1 连丢）。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -39,8 +40,9 @@ test('被明确叫到时不需要抽卡：intent = addressed', () => {
   assert.equal(decision.reason, 'explicit');
 });
 
-test('A 路（一对一窗口里）优先于 C 路：intent = continued', () => {
-  const decision = decideGroupTurn({ ...HOT, followAllowed: true });
+test('A 路（一对一窗口里）优先于 C 路：intent = continued，且不抽卡', () => {
+  // 概率 0、掷骰必不中都不影响结论：一对一的免 @ 接话**够资格就回**。
+  const decision = decideGroupTurn({ ...HOT, followAllowed: true, chance: 0, roll: 1 });
   assert.equal(decision.intent, 'continued');
   assert.equal(decision.reason, 'follow');
 });

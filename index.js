@@ -355,9 +355,10 @@ export function apply(ctx, config) {
   /**
    * 群号 → 复读状态 `{ chain, queue }`（见 `maybeRepeat`）。
    *
-   * - `chain` 是「最近一条还值得跟的东西」：`{ kind, key, count, senders, at, … }`，
+   * - `chain` 是「最近一条还值得跟的东西」：`{ kind, key, count, senders, at, repeated }`，
    *   三种 kind 各自带自己的载荷（文字原文 / 表情包本地路径 / 系统表情 id）。
-   *   跟过一句、或者中间有人说了别的，这条链就没了 —— 不按群累积历史。
+   *   中间有人说了别的，这条链就被换掉；跟过一次之后链留着但标成 `repeated`（不再跟），
+   *   直到被换掉或超出 `repeatWindowMs` —— 不按群累积历史。
    * - `queue` 是这个群自己的串行链：判断表情包要先把图下载下来（异步），同一个群里
    *   两条消息谁先回来并不确定，不排队的话链上的顺序就跟群里说话的顺序对不上了。
    */
@@ -2636,6 +2637,7 @@ export function apply(ctx, config) {
     // 活跃对话（私聊也有）：新开一轮就该把「还聊着」这件事也忘掉，并撤掉挂着的补一句。
     cancelChime(conversation);
     conversation.activeUntil = 0;
+    conversation.followUntil = 0;
     conversation.activeSpeakerId = '';
     conversation.activeInterposeSeq = 0;
     conversation.activeTurns = 0;
@@ -2776,17 +2778,20 @@ export function apply(ctx, config) {
       /**
        * 「活跃对话」状态：这个会话是不是正跟人聊着（见 docs/proactive.md「聊起来之后保持搭话」）。
        *
-       * `activeUntil` 是这次聊天的截止时刻（每接一句就往后滑），`activeSpeakerId` 是正在
-       * 跟它聊的那个人 —— 群里只有这个人接着说的话才可能免 @ 算进来（别人插话就另说了）。
-       * `activeInterposeSeq` 是那条消息那一刻的插话序号，用来判断「中间有没有别人说过话」；
-       * `activeTurns` 是这次活跃对话里已经考虑了几条免 @ 消息（受 activeMaxTurns 约束，
-       * 抽卡没抽中的也算 —— 那是安全上限，不随概率放松）。
+       * `activeUntil` 是「补一句」与多人搭话热度的截止时刻（`activeWindowMs`，每接一句就往后滑）；
+       * `followUntil` 是**一对一免 @ 接话**的截止时刻（`activeFollowIdleMs`，比上面那个宽得多）。
+       * `activeSpeakerId` 是正在跟它聊的那个人 —— 群里只有这个人接着说的话才可能免 @ 算进来
+       * （别人插话就另说了）。`activeInterposeSeq` 是那条消息那一刻的插话序号，用来判断
+       * 「中间有没有别人说过话」；`activeTurns` 是这段一对一里已经免 @ 回了几条（受
+       * `activeMaxTurns` 约束 —— 那是安全上限，不随概率放松）。
        *
-       * `talkMisses` 是抽卡那套「保底」：这段对话里连着几条够资格却没抽中。每连丢一条，
+       * `talkMisses` 是多人搭话那套「保底」：这段对话里连着几条够资格却没抽中。每连丢一条，
        * 下一次的搭话概率就高一点（见 `activeTalkChance`）；抽中、被明确 @ 到、或者这段
-       * 对话凉了（既不在一对一窗口里、群也没聊热）都会归零。
+       * 对话凉了（既不在一对一窗口里、群也没聊热）都会归零。一对一的免 @ 接话不看它 ——
+       * 那条路不抽卡。
        */
       activeUntil: 0,
+      followUntil: 0,
       activeSpeakerId: '',
       activeInterposeSeq: 0,
       activeTurns: 0,
@@ -3013,21 +3018,22 @@ export function apply(ctx, config) {
         const who = describeConversation(existing);
         if (intent === 'continued' || intent === 'interject') {
           existing.talkMisses = 0;
-          report('info', `${who} ${decision.reason === 'follow' ? '免 @ 搭话抽中' : '插话抽中'}（概率 ${Math.round(decision.chance * 100)}%）：${intent}`);
+          report(
+            'info',
+            decision.reason === 'follow'
+              ? `${who} 免 @ 接话（一对一窗口里，直接回）：continued`
+              : `${who} 插话抽中（概率 ${Math.round(decision.chance * 100)}%）：interject`,
+          );
         } else if (decision.eligible) {
+          // 走到 `eligible` 的只剩多人搭话：抽卡没抽中，把「连丢」+1（下一次概率更高）。
+          // 一对一的免 @ 接话不抽卡（见 speaking-rules.js 的 `activeFollowAllows`），
+          // 所以这里没有「A 路没抽中也要窗口照滑、条数照扣」那一段了。
           existing.talkMisses = (Number(existing.talkMisses) || 0) + 1;
-          // A 路没抽中也算「人还在跟它说话」：窗口照滑、免 @ 轮数照扣。不然 60 秒的窗口
-          // 会在概率攒够之前先过期，或者把「这次没接」当成「这段断了」。
-          // （C 路不扣轮数 —— 它的闸门本来就是「够条数、够人数」。）
-          if (followed) noteActiveMessage(existing, userId, true);
           report('info', `${who} 搭话没抽中（概率 ${Math.round(decision.chance * 100)}%，已连丢 ${existing.talkMisses} 条，原因 ${decision.reason}）：这一句不接`);
         } else if (decision.reason === 'not-eligible' && existing.talkMisses) {
           // 既不在一对一窗口里、群也没聊热：这段对话凉了，累计清零，下次重新从起始概率攒
           // —— 不然半小时前攒下的「保底」会在一段全新的聊天开头突然炸出来。
           existing.talkMisses = 0;
-        }
-        if (decision.reason === 'not-eligible' || decision.reason === 'roll') {
-          // 被排除的那几条（@ 别人 / 命令 / 纯媒体）也不该悄悄「接」，这里统一在下面返回。
         }
       }
       if (intent === 'none' && !explicit) return undefined;
@@ -3045,7 +3051,9 @@ export function apply(ctx, config) {
       // 被明确叫到（@ / 前缀 / groupTrigger: all）就直接回，不抽卡；它刚说过话，累计的
       // 「连丢」也该清零 —— 否则抽卡那点保底会攒到它刚回完的下一句上。
       if (explicit) conversation.talkMisses = 0;
-      noteActiveMessage(conversation, userId, continued);
+      // 这对一的窗口怎么滑，按 `intent` 分三种口径（见 `noteActiveMessage`）：
+      // 被叫到 = 开一段新的，接着聊 = 往后滑一条，插话 = 不买一对一（只顺手记补一句的账）。
+      noteActiveMessage(conversation, userId, intent);
       return {
         conversation,
         message,
@@ -3089,7 +3097,7 @@ export function apply(ctx, config) {
     });
     // 私聊的每条消息本来就都是「跟它说的」，所以活跃对话在私聊里不需要额外判定 ——
     // 只要把这个窗口往后滑，它回完之后才可能自己补一句（见 scheduleChime）。
-    noteActiveMessage(conversation, userId, false);
+    noteActiveMessage(conversation, userId, 'addressed');
     return {
       conversation,
       message,
@@ -3313,7 +3321,10 @@ export function apply(ctx, config) {
    *     前后两条就不再是「连着」的）；
    *   - 间隔超过 `repeatWindowMs` 也不续链；默认还要至少两个不同的人说过
    *     （一个人自己连发两遍是手滑，不是复读）；文字太长（`repeatMaxChars`）不跟。
-   * 跟过一次之后链就断掉：否则群里一直刷同一个字时，它会一句不落地跟着刷。
+   * **一串只跟一次**：跟过之后链留着并标成 `repeated`，后面再来同样的消息只记账、
+   * 不再跟 —— 直到中间有人说了别的话（链被换掉）或者隔得超过 `repeatWindowMs`。
+   * 否则群里连着刷同一个字时，它会每隔两条就跟着刷一次（真实事故：四个人连发同一张
+   * 表情包，它跟了两次）。
    *
    * 判定要下载表情包才知道是不是同一张（异步），所以整个判定挂在每个群自己的串行链
    * `state.queue` 上按到达顺序跑 —— 见 `repeatStates`。
@@ -3393,8 +3404,13 @@ export function apply(ctx, config) {
     // `sub_type: 0`，群里看到的又是照片样式的图。反过来不成立：链里从没出现过表情的
     // 截图/照片仍是普通图片（标成表情会被 QQ 裁小），所以这里只做 OR，不按「像不像」猜。
     const sticker = candidate.sticker === true || (chained && previous?.sticker === true);
-    const entry = { ...candidate, sticker, count, senders, at: arrivedAt };
-    if (!canAct || count < threshold || !distinct) {
+    // 「这一串已经跟过了」也记在链上：跟过一次之后，同一串里剩下的相同消息只记账、
+    // 不再跟 —— 直到被别的话打断（链被换掉）或超出 `repeatWindowMs`（重新攒）。
+    // 之前是「跟完就把链清空」，于是 4 条相同的消息会跟 2 次（第 3、4 条又凑成一对），
+    // 群里看到的就是连着发两条（2026-10-20 的真实事故）。
+    const repeated = chained && previous?.repeated === true;
+    const entry = { ...candidate, sticker, count, senders, at: arrivedAt, repeated };
+    if (repeated || !canAct || count < threshold || !distinct) {
       state.chain = entry;
       return;
     }
@@ -3404,8 +3420,8 @@ export function apply(ctx, config) {
       state.chain = entry;
       return;
     }
-    // 跟过就断链，免得群里刷屏时它一句不落地跟着刷。
-    state.chain = undefined;
+    // 跟过之后链**留着**、标记成 `repeated`：这一串到此为止，下一串要重新攒人数。
+    state.chain = { ...entry, repeated: true };
     const conversation = targetConversation('group', groupId);
     report('info', `→ ${describeConversation(conversation)}: ${describeRepeat(entry)}（复读）`);
     sendRepeat(conversation, entry);
@@ -3762,28 +3778,29 @@ export function apply(ctx, config) {
   //
   // 上面那块 `proactive` 管的是**冷场**（群里安静 45 分钟之后自己开个话头）；这一块管
   // 「正聊着」的时候。真人不会让对方每句都叫一遍自己的名字，也不会在对方安静十秒之后
-  // 就把话题掐掉。三件事共用一个「活跃对话」窗口（`activeUntil`）：
+  // 就把话题掐掉。三件事各有各的窗口：
   //
-  //   A. 免 @ 接话（`activeFollow`）：被叫到之后的窗口内、正在跟它聊的那个人接着说的话
-  //      也算在跟它聊（window 默认 1 分钟 —— 一个人 @ 一次只买这一小段）；
+  //   A. 免 @ 接话（`activeFollow` / `activeFollowIdleMs`）：被叫到之后，正在跟它聊的那个人
+  //      接着说的话也算在跟它聊。窗口（默认 3 分钟，两条之间的间隔）与条数（`activeMaxTurns`）
+  //      一起封住这件事 —— **够资格就是回**，不掷骰子：对面只有一个人，而且刚跟它说完话。
   //   B. 自己补一句（`activeChime*`）：它回完之后对方安静了一小会儿，它可能再追一句；
-  //   C. **多人搭话**（`activeGroup*`）：群里几个人自己聊了起来（最近窗口里够条数、够人数），
-  //      它就进入搭话状态 —— 那之后谁接话都算数，而且「倾听时间」变长（攒批更久），
-  //      多听几句才合成一轮回复。
+  //      看的是 `activeUntil`（`activeWindowMs`，默认 1 分钟）。
+  //   C. **多人搭话**（`activeGroup*`）：群里几个人自己聊了起来（最近 `activeWindowMs` 里
+  //      够条数、够人数），它就进入搭话状态 —— 那之后谁接话都算数，而且「倾听时间」变长
+  //      （攒批更久），多听几句才合成一轮回复。
   //
-  // A 与 C 都只是「够资格」：够资格之后还要按 `activeTalkChance` 一族**抽一次卡**
-  // （见 speaking-rules.js 的 `activeTalkChance`）—— 这是刻意的，人多嘴杂的群里
-  // 「够热就每条都回」会变成刷屏；抽卡让它在热群里也保持一份不确定（连丢越多越容易接上，
-  // 抽中或被打断之后归零）。
+  // A 与 C 的区别正是「要不要抽卡」：C 路够热不等于就接，还要按 `activeTalkChance` 一族
+  // 掷一次会自己涨的概率（见 speaking-rules.js）—— 人多嘴杂的群里「够热就每条都回」会变成
+  // 刷屏。A 路不抽：那一段里只有一个人，抽卡只会让「接着聊」名存实亡。
   //
-  // 窗口只靠**别人发来的消息**往后滑（机器人自己说的话不算，否则它自己就能给窗口续命）；
+  // 两个窗口都只靠**别人发来的消息**往后滑（机器人自己说的话不算，否则它自己就能给窗口续命）；
   // 一对一窗口里有人插话，这次「你跟我聊」就算断了，要重新叫它一次 —— 但插话本身会记进
   // 热度窗口，大家一起说的话够多、够热闹时，走的就是 C 而不是 A 了（这就是
   // 「有人插话就考虑进入多人搭话」的落点）。
 
 
 
-  /** 免 @ 接话的轮数还有余额吗（`activeMaxTurns` 为 0 表示不限）。 */
+  /** 免 @ 接话的条数还有余额吗（`activeMaxTurns` 为 0 表示不限）。 */
   function activeTurnsLeft(conversation) {
     return activeTurnsLeftRule(settings.activeMaxTurns, conversation.activeTurns);
   }
@@ -3818,34 +3835,53 @@ export function apply(ctx, config) {
   /**
    * 记一次「这个会话正聊着」，把活跃窗口往后滑。
    *
-   * 由 `admit` 在两条路上调用：**被叫到**（`continued === false`，会重置免 @ 接话的轮数）
-   * 与**窗口内接上话**（`continued === true`，轮数 +1）。私聊的每条消息都算「被叫到」，
-   * 所以私聊不需要 `activeFollow` 也能有「补一句」——窗口照样在滑。
+   * 由 `admit` 在三条路上调用，口径**刻意不同**（`mode`）：
+   *   - `'addressed'`：被叫到（@ / 前缀 / `groupTrigger: all`）或私聊的一条消息 —— 开一段
+   *     新的一对一（说话人换成他、条数归零）；
+   *   - `'continued'`：一对一窗口里他接着说的那句 —— 往后滑一条、条数 +1；
+   *   - `'interject'`：多人搭话里它顺手接了一句 —— **不买一对一**。那一句只是顺着群里的
+   *     气氛接的，说话人并没有「正在跟它聊」这层关系；给他开一段三分钟的免 @ 窗口会让热群里
+   *     每个被接话的人都白拿一段「每条都回」。
+   *
+   * `activeUntil` 与 `followUntil` 是两个窗口，别合并：前者（`activeWindowMs`）管「补一句」
+   * 与多人搭话的热度，后者（`activeFollowIdleMs`）只管一对一的免 @ 接话 —— 那个要宽得多
+   * （默认 3 分钟，60 秒里对方回一句就过期了）。
    *
    * `activeInterposeSeq` 记的是这条消息那一刻的**插话序号**：用来判断「这条之后有没有别人说过话」，
    * 见 `activeFollowAllows` 与 `runChime`。
    *
    * @param conversation - 这条消息所属的会话。
    * @param userId - 发消息的人（群里只有他接着说的话才可能免 @ 算进来）。
-   * @param continued - 这条是不是「窗口内接上的」（而不是被叫到）。
+   * @param mode - `'addressed'` / `'continued'` / `'interject'`（见上）。
    */
-  function noteActiveMessage(conversation, userId, continued) {
-    conversation.activeUntil = Date.now() + settings.activeWindowMs;
-    conversation.activeSpeakerId = userId;
-    conversation.activeTurns = continued ? (conversation.activeTurns ?? 0) + 1 : 0;
-    if (conversation.type === 'group') conversation.activeInterposeSeq = chatter.others(conversation.id);
+  function noteActiveMessage(conversation, userId, mode) {
+    const now = Date.now();
+    conversation.activeUntil = now + settings.activeWindowMs;
     // 对方又说话了：这一句对应的「补一句」额度重新算，旧的那个定时器也就作废了。
     conversation.chimeCount = 0;
     cancelChime(conversation);
+    if (mode === 'interject') {
+      // 插话之后没有人处在「一对一」里：既不给被接话的人免 @，也不把此刻的群进度当成
+      // 一对一的快照（那会让一个本该断掉的一对一在后面又「对上」）。
+      conversation.activeSpeakerId = '';
+      conversation.followUntil = 0;
+      conversation.activeTurns = 0;
+      conversation.activeInterposeSeq = chatter.others(conversation.id);
+      return;
+    }
+    conversation.followUntil = now + settings.activeFollowIdleMs;
+    conversation.activeSpeakerId = userId;
+    conversation.activeTurns = mode === 'continued' ? (conversation.activeTurns ?? 0) + 1 : 0;
+    if (conversation.type === 'group') conversation.activeInterposeSeq = chatter.others(conversation.id);
   }
 
   /**
-   * 这条**没被叫到**的群消息能不能算「接着聊」（见 AGENTS.md §4.G 的 A 路）。
+   * 这条**没被叫到**的群消息能不能算「接着聊」（见 AGENTS.md §4.F 的 A 路）。
    *
    * 七条判据在 `speaking-rules.js` 的 `activeFollowAllows` 里（那里逐条写着为什么）；
    * 这里只把会话状态、插话序号与配置凑成那份入参。这一步放松的是「群里只在被 @ 时
-   * 才说话」这条默认约定，宁可少接一句也别抢话 —— 通过之后也不一定接，还要过 `admit`
-   * 里那一抽（`activeTalkChance`）。
+   * 才说话」这条默认约定，宁可少接一句也别抢话 —— 但够资格就是**真的回**（A 路不抽卡，
+   * 每句都回，条数由 `activeMaxTurns` 封顶）。
    * @param conversation - 已有的会话记录。
    * @param userId - 发消息的人。
    * @param message - OneBot 的 `message` 字段。
@@ -3855,11 +3891,13 @@ export function apply(ctx, config) {
   function activeFollowAllows(conversation, userId, message, selfId) {
     return activeFollowAllowsRule({
       enabled: settings.activeFollow === true,
-      windowMs: settings.activeWindowMs,
+      // `activeWindowMs` 仍然是整套活跃对话的总开关（0 = 免 @ 接话 / 补一句 / 多人搭话全关）；
+      // 它自己的 60 秒只留给补一句与多人搭话的热度，一对一用更宽的 `activeFollowIdleMs`。
+      idleMs: settings.activeWindowMs > 0 ? settings.activeFollowIdleMs : 0,
       type: conversation.type,
       speakerId: conversation.activeSpeakerId,
       userId,
-      activeUntil: conversation.activeUntil,
+      followUntil: conversation.followUntil,
       turnsLeft: activeTurnsLeft(conversation),
       interposeOthers: chatter.others(conversation.id),
       interposeSnapshot: conversation.activeInterposeSeq,
@@ -5471,9 +5509,10 @@ export function apply(ctx, config) {
     report(
       'info',
       `active conversation — activeFollow on: a group follow-up from the person it is talking to needs no @ ` +
-        `(window ${Math.round(settings.activeWindowMs / 60000)} min, at most ${settings.activeMaxTurns || '不限'} turns); ` +
+        `(it answers every one of them until ${settings.activeMaxTurns || '不限'} turns, ` +
+        `stopped by ${Math.round(settings.activeFollowIdleMs / 60000)} min of silence); ` +
         `group talk after ${settings.activeGroupLines || '关闭'} lines from ${settings.activeGroupSpeakers} speakers ` +
-        `(listen x${settings.activeGroupBatchScale}); either way one is only admitted by a roll — ` +
+        `(listen x${settings.activeGroupBatchScale}) is admitted by a roll — ` +
         `start ${Math.round(settings.activeTalkChance * 100)}%, +${Math.round(settings.activeTalkChanceStep * 100)}% per miss, ` +
         `up to ${Math.round(settings.activeTalkChanceMax * 100)}%`,
     );

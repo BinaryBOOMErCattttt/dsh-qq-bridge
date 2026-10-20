@@ -13,13 +13,16 @@
   设 `proactive: false`；想留但怕越界，就收紧 `allowGroups`、`proactiveFromHour` /
   `proactiveToHour` 与 `proactiveDailyMax`。
 - **`activeFollow` 默认开**：它会让它在群里回应**没有 @ 它**的消息：既包括「正在跟它聊的
-  那个人、且中间没人插话、且没 @ 别人」的一对一接话，也包括**多人搭话** —— 群里一段时间里
-  够条数、够人数地聊起来之后，谁接话都算数（直到大家停下来）。这一步放松了「群里只在被叫到
-  才说话」这条约定，所以**不放心就设 `false`**；想留也可以把 `activeMaxTurns` 调小、
+  那个人、且中间没人插话、且没 @ 别人」的一对一接话（默认 3 分钟内一条接一条地问，最多
+  `activeMaxTurns` 条，而且**每条都会真的回**），也包括**多人搭话** —— 群里一段时间里够条数、
+  够人数地聊起来之后，谁接话都算数（直到大家停下来）。这一步放松了「群里只在被叫到才说话」
+  这条约定，所以**不放心就设 `false`**；想留也可以把 `activeMaxTurns` 调小、
+  把 `activeFollowIdleMs` 调短（想彻底收掉一对一就设成 `0`）、
   把 `activeGroupLines` 调高或设成 `0` 关掉多人搭话。
-  另外，这些「免 @ 搭话」还要过 `activeTalkChance` 一族的**抽卡**才会真的开口（默认 5% 起、
+  多人搭话那一路还要过 `activeTalkChance` 一族的**抽卡**才会真的开口（默认 5% 起、
   每条没抽中 +10%、上限 80%）—— 它是让频率更像真人的那一层，不是安全边界：真想收紧就照上
   面那样关掉资格，或者把 `activeTalkChance` / `activeTalkChanceStep` 都设成 `0`。
+  **一对一的免 @ 接话不抽卡**（够资格就回），它的上限就是「条数 + 断聊间隔」这两项。
 - **API key 轮换（`apiKeyRotate`）会改写全局凭据文件** `$DSH_HOME/.credentials.yaml`：
   它默认开着，但只在 `apiKeyFile` 里存在「另一个探测通过的 key」时才会真的写。也就是说
   **谁能在 `cwd` 里放这个文件，谁就能决定 bot 用哪把 key** —— 池子文件别放在别人写得到

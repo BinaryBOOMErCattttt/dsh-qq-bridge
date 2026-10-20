@@ -1,10 +1,10 @@
 /**
- * 「这次为什么轮到它说话」的**纯判据**：把准入、A/C 抽卡、插话准入收成一个函数。
+ * 「这次为什么轮到它说话」的**纯判据**：把准入、抽卡、插话准入收成一个函数。
  *
  * 它回答的是一句话：这一条群消息该不该进 Agent，以及进去的话是哪种 `intent`：
  *
  *   - `addressed`  —— 被叫到（@ / 前缀 / `groupTrigger: all`）；
- *   - `continued`  —— A 路：一对一窗口里，正在跟它聊的那个人接着说；
+ *   - `continued`  —— A 路：一对一窗口里，正在跟它聊的那个人接着说（**不抽卡**，直接回）；
  *   - `interject`  —— C 路：群里聊热了，抽中插话（这一轮回的是哪条见 `index.js` 的 quoteHead）；
  *   - `none`       —— 不接（只在内部用，调用方据此丢弃这条）。
  *
@@ -52,9 +52,11 @@ export function interjectExclusion(input) {
  *   1. 被明确叫到 → 直接 `addressed`，不抽卡（这是唯一不需要理由的开口）；
  *   2. 空消息 → `none`（空 @ 的替身由调用方处理，不消耗抽卡计数）；
  *   3. 这个群还没有会话记录 → `none`（闲聊不该凭空把群变成「处理过」的会话）；
- *   4. 够资格（A 路窗口里，或 C 路群够热）→ **抽一次卡**（A/C 共用，见 `activeTalkChance`）：
- *      掷中就 `continued` / `interject`，没掷中就 `none` 并把「连丢」交给调用方 +1；
- *   5. 不够资格 → `none`（调用方据此把「连丢」清零：这段对话凉了）。
+ *   4. A 路够资格（一对一窗口里、正在跟它聊的那个人）→ 直接 `continued`，**不抽卡**：
+ *      对面只有一个人，而且刚跟它说完话，再叠一层概率只会让「接着聊」名存实亡；
+ *   5. C 路够资格（群聊热了）→ 先过四条排除，再**抽一次卡**：掷中就 `interject`，
+ *      没掷中就 `none` 并把「连丢」交给调用方 +1（人多嘴杂的群里「够热就每条都回」会刷屏）；
+ *   6. 不够资格 → `none`（调用方据此把「连丢」清零：这段对话凉了）。
  *
  * @param {object} input
  * @param {boolean} input.explicit - 被叫到（@ / 前缀 / groupTrigger: all）。
@@ -78,17 +80,16 @@ export function decideGroupTurn(input) {
   if (input.existing !== true) return { intent: 'none', reason: 'no-conversation', eligible: false, chance: 0 };
   const follow = input.followAllowed === true;
   const hot = input.groupHot === true;
-  if (!follow && !hot) return { intent: 'none', reason: 'not-eligible', eligible: false, chance: 0 };
-  // C 路（只有热度、没有一对一窗口）先过四条排除：别人在跟别人说话时别抢。
-  if (!follow) {
-    const excluded = interjectExclusion(input);
-    if (excluded !== undefined) return { intent: 'none', reason: excluded, eligible: false, chance: 0 };
-  }
+  // A 路优先，且**不掷骰子**：它已经在跟具体某个人聊，那一句就是冲它来的。
+  if (follow) return { intent: 'continued', reason: 'follow', eligible: true, chance: 1 };
+  if (!hot) return { intent: 'none', reason: 'not-eligible', eligible: false, chance: 0 };
+  // C 路（只靠群里的热度）：先过四条排除 —— 别人在跟别人说话时别抢。
+  const excluded = interjectExclusion(input);
+  if (excluded !== undefined) return { intent: 'none', reason: excluded, eligible: false, chance: 0 };
   const chance = activeTalkChance(input.chance, input.chanceStep, input.chanceMax, input.misses);
   const hit = activeTalkAllows({ eligible: true, chance, roll: input.roll });
   if (!hit) return { intent: 'none', reason: 'roll', eligible: true, chance };
-  // 一对一窗口优先：那说明它在跟具体某个人聊，而不是在热群里随便接一句。
-  return { intent: follow ? 'continued' : 'interject', reason: follow ? 'follow' : 'hot', eligible: true, chance };
+  return { intent: 'interject', reason: 'hot', eligible: true, chance };
 }
 
 /**

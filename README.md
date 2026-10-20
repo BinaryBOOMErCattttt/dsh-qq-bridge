@@ -93,7 +93,7 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | `agentPreset` | `qq` | QQ 会话挂的 Agent 预设（自带的最小预设，没有 shell） |
 | `allowTools` | 17 个工具 | QQ 会话的工具白名单；默认没有 write / edit / bash |
 | `proactive` | `true` | 允许它在群里主动开口（私聊不会） |
-| `activeFollow` | `true` | 群里聊起来之后免 @ 接话（刻意放松「只在被 @ 时说话」） |
+| `activeFollow` | `true` | 群里聊起来之后免 @ 接话：@ 一次之后那个人的下一条不用再 @，最多连着回 10 条、间隔超过 3 分钟算断聊（刻意放松「只在被 @ 时说话」） |
 | `memory` | `true` | 长期记忆：转录 + 每日摘要 + 认知库 + 人物表 + 检索式注入 + 两个记忆工具 |
 | `recallMode` | `ignore` | 被撤回的消息：清引用永远做，调侃要显式开 `tease` |
 | `reminder` | `true` | 定时提醒；默认只能提醒自己，@ 别人 / @全体默认关 |
