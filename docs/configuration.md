@@ -101,6 +101,7 @@
 | `allowTools` | 18 个工具名 | QQ 会话可用的工具白名单：默认 `read` / `read_image` / `glob` / `grep` / `web_search` / `web_fetch` / `skill` + 十一个 `qq_*` —— **没有 write / edit / bash**。空 = 不限制（全给它继承到的工具）；写错的名字会被丢掉并记 warn，见[限制 QQ 会话的工具](tools.md#限制-qq-会话的工具allowtools) |
 | `resetCommand` | `/reset` | 新开一轮会话（旧会话留在磁盘上当存档）的指令；空 = 禁用 |
 | `resetUsers` | `[]` | 允许用 `resetCommand` 的 QQ 号；**留空 = 谁都不能重置**（与 `allowUsers` 反过来，见[新开一轮会话](sessions.md#新开一轮会话reset)）。本仓库的 `cordis.patch.yml` 把这一项接在 `QQBOT_RESET_USERS` 环境变量上（写进 `<启动 cwd>/.env`，逗号分隔）—— 免得把自己的号提交进仓库 |
+| `idleResetHours` | `0` | 会话**静默**超过这么多小时之后，下一条消息自动开新一轮（与 `/reset` 同一套机制，长期记忆不动）；`0` = 关。不需要 `resetUsers` 权限；「静默」按这个会话最后一条别人的消息算（含没 @ 机器人的闲聊），见[静默太久自动换一轮](sessions.md#静默太久自动换一轮idleresethours) |
 | `maxReplyChars` | `1500` | 单条 QQ 消息最大字符数（协议上限），超出自动分段 |
 | `mediaDownload` | `true` | 是否把消息里的图片/表情包下载到本地（模型只能读本地文件，不下载就只看到占位符） |
 | `mediaDir` | `.qq-media` | 媒体缓存目录，相对 `cwd`；必须落在 `cwd` 内，否则自动停用下载 |

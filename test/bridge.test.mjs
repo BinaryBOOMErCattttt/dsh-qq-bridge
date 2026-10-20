@@ -1510,6 +1510,36 @@ test('the channel system section stays stable while per-turn data rides on the u
   }
 });
 
+// 用例：宿主那几段「编码代理 / Web GUI / 文件卡片」的小节，在 QQ 会话的作用域里
+// 必须被**同名**覆盖掉（`HOST_PROMPT_SHADOWS`）—— 它们压在系统提示的首尾，比渠道小节
+// 更像「我是谁」。断言的是注册的小节名字与文本，而不是拼装后的整段提示（拼装是宿主的事）。
+test('the channel prompt shadows the host sections that frame a coding agent', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(privateMessage('在吗'));
+    await untilInbox(host, 1, 'the first turn');
+    const byName = new Map(host.list.prompts.filter((entry) => entry.kind === 'section').map((entry) => [entry.name, entry]));
+    for (const name of [
+      'harness:identity',
+      'deployment:persona-prefix',
+      'ui:deliverable-file-references',
+      'harness:source',
+      'app:web-surface',
+      'deployment:persona-suffix',
+    ]) {
+      assert.ok(byName.has(name), `the scenario section "${name}" must be shadowed in the agent scope`);
+    }
+    // 空文本 = 装配时整段丢掉；persona 前缀换成 QQ 会话自己的身份，不再自称编码代理。
+    assert.equal(byName.get('app:web-surface').text, '');
+    assert.equal(byName.get('deployment:persona-prefix').text, '你是一个在 QQ 群里跟人聊天的人，不是助手，也不是编程代理。');
+    assert.ok(!byName.get('deployment:persona-prefix').text.includes('coding agent'));
+    // 渠道小节本身还在（别把覆盖写成了替换）。
+    assert.ok(byName.has('qq-bridge:channel'));
+  } finally {
+    await onebot.close();
+  }
+});
+
 // 用例十三：agentPreset 的两种显式取值 —— 指定名字、以及 none（不挂预设）。
 test('agentPreset selects the mount explicitly and none skips it', async () => {
   const presets = {
@@ -1862,6 +1892,54 @@ test('an empty resetCommand disables the reset handling', async () => {
     assert.equal(onebot.calls.some((call) => call.action === 'send_private_msg'), false);
   } finally {
     await onebot.close();
+  }
+});
+
+// 用例：静默太久（idleResetHours）之后的第一条消息自动开新一轮 —— 不需要任何人
+// 发 `/reset`。这里取一个很小的小时数（0.00002 ≈ 72ms），等够它再发第二条。
+test('idleResetHours opens a new round after a long silence', async () => {
+  const { onebot, host } = await boot({ idleResetHours: 0.00002 });
+  try {
+    onebot.push(privateMessage('第一句'));
+    const first = await untilInbox(host, 1, 'the first Agent');
+    completeTurn(host, first, '嗯');
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    onebot.push(privateMessage('第二句'));
+    const second = await until(() => host.list.created[1], 'a fresh Agent after the idle gap');
+    assert.notEqual(second.id, first.id, '静默超过 idleResetHours 之后必须换一个 Session id');
+    assert.ok(host.list.disposed.includes(first.id), '旧 Agent 必须销毁，不能让两个同时挂在同一个会话上');
+    assert.equal(second.inbox[0].content[0].text, '第二句', '触发换轮的那条消息本身不能被丢掉');
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：没静默够就不换轮；idleResetHours: 0（默认）等于关闭。
+test('a short pause and the default setting both keep the same round', async () => {
+  const { onebot, host } = await boot({ idleResetHours: 12 });
+  try {
+    onebot.push(privateMessage('第一句'));
+    const first = await untilInbox(host, 1, 'the first Agent');
+    completeTurn(host, first, '嗯');
+    onebot.push(privateMessage('第二句'));
+    await until(() => first.inbox.length >= 2, 'the second message to reach the same Agent');
+    assert.equal(host.list.created.length, 1, '12 小时的静默门槛没到，不该换轮');
+    assert.equal(first.id, host.list.created[0].id);
+  } finally {
+    await onebot.close();
+  }
+
+  const off = await boot();
+  try {
+    off.onebot.push(privateMessage('第一句'));
+    const agent = await untilInbox(off.host, 1, 'the first Agent');
+    completeTurn(off.host, agent, '嗯');
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    off.onebot.push(privateMessage('第二句'));
+    await until(() => agent.inbox.length >= 2, 'the second message to reach the same Agent');
+    assert.equal(off.host.list.created.length, 1, 'idleResetHours 默认 0 = 关闭，永远不自动换轮');
+  } finally {
+    await off.onebot.close();
   }
 });
 

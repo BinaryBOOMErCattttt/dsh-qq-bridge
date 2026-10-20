@@ -339,6 +339,21 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
 
 ### 修复
 
+- **QQ 会话的自我认知是「编码代理 + 网页界面」**：宿主的系统提示把部署 persona 配成
+  「You are a coding agent powered by the {{model}} model.」，末尾还有 `app:web-surface`
+  （「你在 DeepSeek Harness Web GUI 里跟用户对话」）、`harness:source`（实现仓库路径）与
+  `ui:deliverable-file-references`（用 Markdown 链接 / `present` 展示结果）。QQ 会话原样继承，
+  人设小节被夹在中间 —— 开头一句「你是编码代理」、结尾一句「你在网页里」，比人设更像身份。
+  现在 `attachChannelPrompt` 在每个 QQ 会话自己的作用域里按**同名小节**覆盖掉这六段
+  （`HOST_PROMPT_SHADOWS`；`systemPrompt` 的合并规则本来就是「Agent 作用域遮蔽全局」），
+  Web UI 的会话不受影响。
+- **压缩空转：每 3 轮重写一遍摘要（这才是「越聊越人机」）**：`qq` 预设把 `thresholdRatio`
+  压到 0.06（60k），本意是省钱；但系统提示 + 工具 schema 本身就占 ~10k、每轮 +4k，于是
+  每 3 轮撞一次线，压缩几乎每回一次话就重写一遍摘要，而摘要是英文技术备忘录（`## Primary
+  Request and Intent` / `## Key Technical Concepts`），旧摘要还会被并进新摘要（3.4KB → 7.6KB）。
+  10-20 的群会话 97 轮压了 27 次，模型对聊天的「记忆」只剩一份助理备忘 + 最近 3~4 轮原话。
+  预设改成 `thresholdRatio: 0.15` / `retainRatio: 0.06`：150k 触发、逐字保留约 45k，压缩降到
+  约 25 轮一次，原话留得住（总花费基本持平，95% 的上下文是 cacheRead）。
 - **群会话越聊越笨：动态提示每轮被整段追加（上下文 220k）**：10-19 的群会话翻出来是 712 轮、
   220k token，最近十几轮**每轮涨 9k**。根因不在模型：`channelPrompt` 这个系统提示小节里混着
   当前发言者、群环境、检索到的记忆、当前时间、待发提醒与人设场景段 —— 每轮都会变；DeepSeek
@@ -400,6 +415,8 @@ profile 的 `cordis.patch.yml` 里写过这些字段，自己的值仍然优先�
   `linkAllowPrivateHosts` / `videoCover` / `videoMaxBytes` / `pokeReply` / `pokeMode` /
   `pokeReplyChance` / `pokeCooldownMs` / `pokeDailyMax`
 - 活跃对话：`activeFollowIdleMs`（免 @ 接话的断聊间隔，默认 3 分钟）
+- 会话生命周期：`idleResetHours`（静默超过多少小时后，下一条消息自动开新一轮；`0` = 关，
+  本仓库的 patch 置成 `12`；详见[会话与轮次](docs/sessions.md#静默太久自动换一轮idleresethours)）
 
 ### 设置页（跟着这次重构一起改）
 

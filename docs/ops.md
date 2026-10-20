@@ -129,7 +129,7 @@ qq-bridge: 表达规则来自 .qq-persona/STYLE.md；气泡：最多 3 个，第
 `sessionIdFor('group:<群号>', 0)`）能看到**系统提示每轮都在变长**（每次 `system/message` 十几 KB），
 或者 `request/context` 里 `contextWindow` 是 1M、而上下文已经几百 k 还没压缩。
 
-两个成因，2026-10-19 一起修了：
+三个成因：前两个 2026-10-19 修的，第三个是 2026-10-20 从会话日志里查出来的：
 
 - **动态内容混进系统提示**：当前发言者 / 群环境 / 检索到的记忆 / 当前时间 / 待发提醒 / 人设场景段
   以前都在 `channelPrompt` 里。DeepSeek 路由声明了 `systemPromptUpdate: 'in-history'`，系统提示
@@ -142,10 +142,20 @@ qq-bridge: 表达规则来自 .qq-persona/STYLE.md；气泡：最多 3 个，第
   0.06×1M 变成 0.8×1M）。现在 `attachAgentPreset` 会在**下一条消息**上补挂；日志里分别有
   `the agent preset for … is not available yet`（warn）和
   `attached the agent preset … (retried after the service became available)`（info）。
+- **压缩门槛压得太低 → 每 3 轮重写一遍摘要**（0.06 = 60k 门槛那版）：系统提示 + 工具 schema
+  本身约 10k、每轮 +4k，60k 门槛意味着压缩几乎每回一次话就重写一遍摘要，而摘要是一条英文技术
+  备忘录（`## Primary Request and Intent` / `## Key Technical Concepts`），旧摘要还会被并进
+  新摘要。10-20 那个群 97 轮压了 27 次，模型对聊天的「记忆」只剩备忘 + 最近 3~4 轮原话 ——
+  群里看到的就是「越聊越人机」。现在预设改成 `thresholdRatio: 0.15` / `retainRatio: 0.06`
+  （150k 触发、逐字保留约 45k）。查自己部署的门槛：`grep thresholdRatio cordis.patch.yml`；
+  查实际压了几次：把 `session.v4.jsonl.zstd` 解压后数 `compaction/start` 的条数
+  （`node -e 'console.log(require("node:zlib").zstdDecompressSync(require("node:fs").readFileSync(process.argv[1])).toString())' <文件>`）。
 
-升级后**已经涨大的旧会话不会自己缩回去**（除非预设补挂成功、60k 的压缩立刻把它压下来）；
+升级后**已经涨大的旧会话不会自己缩回去**（新门槛下它可能一直不压缩，直到长到 150k）；
 最省事的做法是在那个群发一次 `/reset`（需要 `resetUsers` 里有你）—— 只换会话，**长期记忆
 （`.qq-memory/`）不动**。之后用 `node scripts/ops.mjs logs -n 200` 确认新会话的系统提示稳定。
+如果只是想让它「每天翻篇」，把 `idleResetHours` 配成 12：静默超过 12 小时后的第一条消息自动
+开新一轮，不用记着去发指令（见[会话与轮次](sessions.md#静默太久自动换一轮idleresethours)）。
 
 ### 4. 摘要没跑
 

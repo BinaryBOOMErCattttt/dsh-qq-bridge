@@ -45,3 +45,35 @@
 - 长期记忆（`.qq-memory/`）**不受影响**：转录、`MEMORY.md` 是按会话 key 落的，
   与轮次无关 —— 「上一轮聊过什么」仍然记得，只是不再占着上下文。
 - 把 `resetCommand` 设为空串即可禁用该指令。
+
+## 静默太久自动换一轮（`idleResetHours`）
+
+`/reset` 要有人手动发，长期跑下来没人按；而会话越老，模型手里的「记忆」越可能只剩压缩摘要。
+`idleResetHours` 把「每天翻篇」做成自动的：
+
+- 会话**静默**超过这么多小时（默认 `0` = 关，本仓库的 `cordis.patch.yml` 置成 `12`）之后，
+  下一条消息先开**新一轮**（机制与 `/reset` 完全一样：代次 +1、旧会话留档、长期记忆不动），
+  再照常回这条消息。
+- 「静默」按**这个会话最后一条别人的消息**算 —— 群里一直在说话（哪怕没 @ 它）就不算静默；
+  戳一戳也算活动。机器人自己说的话不算。重启后内存里的时刻是空的，所以进程刚起的那条消息
+  不会触发（保守：宁可少换一次，也不要在刚重启时把上下文砍断）。
+- 它不需要 `resetUsers` 权限：这不是谁发的指令，是按时间自动发生的。`/reset` 自己不会触发
+  两次换代（那条消息走的是指令分支）。
+- 为什么是「静默」而不是「每天 04:00 定时」：定时会打断深夜的聊天，也会在群正活跃时把上下文
+  砍断；按静默时长判，效果等价于「每天第一次开口换一轮」。
+- 换代只清会话上下文：`.qq-memory/` 里的转录、`MEMORY.md`、认知库都不动，所以「昨天聊过
+  什么」仍然查得到，只是不再占着模型的上下文。
+
+## 系统提示里宿主的那几段（QQ 会话会覆盖掉）
+
+宿主（`dsh-web-app` 的 patch）把部署 persona 配成「You are a coding agent powered by the
+model.」，还在系统提示末尾注册「You are interacting with the user through the DeepSeek Harness
+Web GUI at …」「The DeepSeek Harness implementation checkout is at …」，`dsh-client-ui-deliverables`
+再补一段「用 Markdown 链接 / `present` 展示结果」。这些对 Web UI 是对的，对 QQ 会话是错的：
+它们分别压在系统提示的开头和结尾，比夹在中间的 `qq-bridge:channel` 更像「我是谁」。
+
+插件在**每个 QQ 会话自己的作用域**里按同名小节把它们覆盖掉（`harness:identity` /
+`deployment:persona-prefix` / `ui:deliverable-file-references` / `harness:source` /
+`app:web-surface` / `deployment:persona-suffix`），Web UI 的会话不受影响。以后升级 DSH 时
+如果发现 QQ 会话又开始自称「编码代理 / 在网页里」，先看 `index.js` 的 `HOST_PROMPT_SHADOWS`
+是不是漏了新加的小节。

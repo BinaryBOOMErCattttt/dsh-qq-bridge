@@ -73,6 +73,9 @@ export function createSettings(config, defaultCwd) {
   const allowTools = deduped(config.allowTools);
   const resetUsers = deduped(config.resetUsers);
   const resetCommand = trimmed(config.resetCommand).toLowerCase();
+  // 静默换代的小时数：小数也认（测试与「半天」这种取值都靠它）；0 与非法值都是关闭。
+  const idleResetHoursRaw = Number(config.idleResetHours);
+  const idleResetHours = Number.isFinite(idleResetHoursRaw) && idleResetHoursRaw > 0 ? idleResetHoursRaw : 0;
   const persona = trimmed(config.persona);
   const instructions = trimmed(config.instructions);
 
@@ -262,6 +265,7 @@ export function createSettings(config, defaultCwd) {
     allowTools,
     resetUsers,
     resetCommand,
+    idleResetHours,
     persona,
     instructions,
     stickerDir,

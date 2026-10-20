@@ -108,6 +108,39 @@ export const inject = ['tools', 'agents', 'timer'];
 const CHANNEL_SECTION_ORDER = 8950;
 
 /**
+ * 宿主的系统提示里，与 QQ 会话无关的几段 —— 在 Agent 作用域里按**同名小节**覆盖掉。
+ *
+ * 为什么需要它：`dsh-web-app` 把部署 persona 配成「You are a coding agent powered by
+ * the {{model}} model.」，又在系统提示末尾注册 `app:web-surface`（「You are interacting
+ * with the user through the DeepSeek Harness Web GUI at http://…」）与 `harness:source`
+ * （「实现仓库在…，别用它推断工作目录」）；`dsh-client-ui-deliverables` 还注册了一段
+ * 「用 Markdown 链接 / `present` 展示结果」。这些对 Web UI 是对的，但 QQ 会话是**在群里
+ * 聊天的人**，不是编码代理、也不在浏览器里 —— 而它们分别压在系统提示的开头和结尾，
+ * 比夹在中间的 `qq-bridge:channel` 更容易被模型当成身份（久了就「变人机」）。
+ *
+ * 机制：`systemPrompt` 的小节按名字合并，**Agent 作用域的同名小节遮蔽全局小节**
+ * （`dsh-system-prompt` 的 `PERSONA_PREFIX_SECTION` 注释写明这个槽位就是给预设/会话覆盖
+ * 用的）。所以在 `attachChannelPrompt` 里按同名注册一份即可，只影响这个 QQ 会话，
+ * Web UI 的会话原样不动。空字符串的小节在装配时会被丢掉（`renderPrompt` 过滤空段）。
+ */
+const HOST_PROMPT_SHADOWS = [
+  // 「You are an AI agent powered by DeepSeek Harness.」—— 身份由渠道小节自己交代。
+  { name: 'harness:identity', order: -1000, text: '' },
+  // 「You are a coding agent powered by the deepseek-flash model.」—— 最伤的一段：
+  // 它是系统提示的第二句，模型会拿它当自我认知。
+  { name: 'deployment:persona-prefix', order: 0, text: '你是一个在 QQ 群里跟人聊天的人，不是助手，也不是编程代理。' },
+  // 「Prefer showing the primary results … Use ![Description](path) … present …」——
+  // Web 文件卡片的写法，QQ 不渲染 Markdown（见硬性要求）。
+  { name: 'ui:deliverable-file-references', order: 9000, text: '' },
+  // 「The DeepSeek Harness implementation checkout is at …」—— 与聊天无关。
+  { name: 'harness:source', order: 10000, text: '' },
+  // 「You are interacting with the user through the DeepSeek Harness Web GUI at …」。
+  { name: 'app:web-surface', order: 10100, text: '' },
+  // 「Your working directory is …」—— 路径相对工作目录这件事渠道小节已经说过。
+  { name: 'deployment:persona-suffix', order: 10200, text: '' },
+];
+
+/**
  * `agentPreset` 配置的哨兵值：不挂载任何预设。
  * 用于明确要求「QQ 会话只用宿主平面的工具」（例如自建部署里预设平面不存在，
  * 或使用者故意不给它任何文件/联网能力）。
@@ -926,6 +959,10 @@ export function apply(ctx, config) {
         // 群聊里换了发言者 / 群里又聊了几句都能立刻反映到提示词里。
         text: () => channelPrompt(conversation),
       }));
+      // 再把宿主那几段「编码代理 / Web GUI / 文件卡片」按同名小节遮蔽掉（见
+      // `HOST_PROMPT_SHADOWS`）：只在这个 Agent 的作用域里生效，Web UI 的会话不受影响。
+      // 空字符串的小节在装配时会被丢掉，所以这里能写成「覆盖成空」。
+      for (const shadow of HOST_PROMPT_SHADOWS) effects.push(prompt.section({ ...shadow }));
       conversation.channelPromptEffects = effects;
     } catch (error) {
       for (const effect of effects) {
@@ -2662,6 +2699,38 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 静默太久（`idleResetHours`）之后的第一条消息：先给它换一轮会话。
+   *
+   * 为什么不是「每天 04:00 定时重置」：定时重置会打断深夜的聊天，也在群正活跃时把上下文
+   * 砍断；按**静默时长**判等价于「每天第一次开口换一轮」，但只在真的冷下来之后发生。
+   * 换轮的机制与 `/reset` 完全一样（见 `resetConversation`）：代次 +1 并落盘、旧会话留档、
+   * 长期记忆不动。区别只在于它不需要 `resetUsers` 权限（它是按时间自动发生的，不是谁发的指令）。
+   *
+   * 排进 `conversation.queue` 而不是就地 `await`：`handleEvent` 是同步的，而这条消息马上要
+   * 走攒批 → `submitBatch`，那条路也排在同一个队列上 —— 于是换代一定先跑完，消息投进的
+   * 是新一轮的 Agent（顺序由队列保证，不靠定时器）。
+   *
+   * 销毁失败就保持旧会话（`resetConversation` 返回 false）：宁可这一轮还记得上一段，
+   * 也不能让新旧两个 Agent 同时挂在同一个会话上。
+   * @param conversation - 刚刚收到消息的会话。
+   */
+  function maybeIdleReset(conversation) {
+    const hours = settings.idleResetHours;
+    if (!(hours > 0)) return;
+    const idle = Number(conversation.idleMs) || 0;
+    if (idle < hours * 60 * 60 * 1000) return;
+    // 只触发一次：下一条消息的 `idleMs` 由 `noteConversationActivity` 重新算过。
+    conversation.idleMs = 0;
+    const who = describeConversation(conversation);
+    const quiet = Math.round(idle / 60000);
+    enqueue(conversation, async () => {
+      const started = await resetConversation(conversation);
+      if (started) report('info', `${who} 静默了 ${quiet} 分钟（idleResetHours=${hours}），自动开始新一轮会话`);
+      else report('warn', `${who} 静默了 ${quiet} 分钟，但没能开始新一轮（旧会话还活着，见上一条 warn）`);
+    });
+  }
+
+  /**
    * 一条会话记录的初始形状（入站会话与出站用的临时壳共用，免得两边字段漂移）。
    *
    * - `queue` 是入站串行链：同一个会话的消息按到达顺序依次处理（媒体落盘、投递），避免并发 turn。
@@ -2762,6 +2831,14 @@ export function apply(ctx, config) {
        * 正在聊的时候插嘴是最不像人的地方。机器人自己的消息不算（见 `touchActivity`）。
        */
       lastActiveAt: 0,
+      /**
+       * 这一条消息到达之前，这个会话已经安静了多久（毫秒）。
+       *
+       * `lastActiveAt` 在 `touchActivity` 里一到就把「刚才有多安静」盖掉了，而静默换代
+       * （`idleResetHours`）要用**更新前**的值，所以在覆盖之前先记在这里。每条别人发来的
+       * 消息都会重算一次；机器人自己说话不算（与 `lastActiveAt` 同一套口径）。
+       */
+      idleMs: 0,
       /**
        * 机器人自己最后一次在这个会话里说话的时刻。
        *
@@ -2874,6 +2951,11 @@ export function apply(ctx, config) {
       // 磁盘上说这个会话已经 reset 过几次，就从那一轮开始 —— 重启不该把
       // reset 之前那段会话 resume 回来。
       refreshSessionGeneration(conversation);
+      // 建记录时就把「有人活动」记上：`touchActivity` 在 `admit` **之前**跑（那时这条
+      // 记录还不存在），不补这一下，下一条消息算出来的静默时长永远是 0，`idleResetHours`
+      // 就永远不会触发。从外面（`qq_send_message`）建出来的壳也照记 —— 它同样说明
+      // 这个会话刚才有动静。
+      conversation.lastActiveAt = Date.now();
       conversations.set(key, conversation);
     }
     if (type === 'group') {
@@ -3173,7 +3255,21 @@ export function apply(ctx, config) {
     const id = type === 'group' ? String(event.group_id ?? '') : String(event.user_id ?? '');
     const conversation = conversations.get(`${type}:${id}`);
     if (conversation === undefined) return;
-    conversation.lastActiveAt = Date.now();
+    noteConversationActivity(conversation);
+  }
+
+  /**
+   * 记一次「这个会话有人活动」：先算刚才安静了多久，再刷新时刻。
+   *
+   * 顺序不能反 —— 静默换代（`idleResetHours`）读的是 `idleMs`，它必须在 `lastActiveAt`
+   * 被覆盖之前算出来（见 `maybeIdleReset`）。
+   * @param conversation - 目标会话。
+   * @param now - 当前时刻（测试/调用点省一次 Date.now）。
+   */
+  function noteConversationActivity(conversation, now = Date.now()) {
+    const previous = Number(conversation.lastActiveAt) || 0;
+    conversation.idleMs = previous > 0 ? Math.max(0, now - previous) : 0;
+    conversation.lastActiveAt = now;
   }
 
   /**
@@ -4711,8 +4807,9 @@ export function apply(ctx, config) {
       name: displayName,
     });
     // 戳一戳也算「这个会话有人活动」：主动说话据此判断群是否安静下来了。
-    conversation.lastActiveAt = Date.now();
+    // 走同一个记账口 —— 顺便把「刚才安静了多久」记下来（静默换代要用更新前的值）。
     const now = Date.now();
+    noteConversationActivity(conversation, now);
     const decision = pokeAction({
       selfId,
       targetId: notice.targetId,
@@ -5059,10 +5156,15 @@ export function apply(ctx, config) {
     const who = describeConversation(conversation);
     // 兜底清理归属表，避免「消息入队了但 turn 始终没被 claim」导致无限增长。
     if (submitted.size > 512) submitted.clear();
+    // 「这条消息恰好是指令」—— 静默换代要让开它（下面那一轮换代由它自己来）。
+    const isResetCommand = commanded && resetCommand.length > 0 && preview.toLowerCase() === resetCommand;
+    // 静默太久之后的第一条消息：先换一轮会话，再照常攒批（见 `maybeIdleReset`）。
+    // 放在 `/reset` 判定之前、但跳过 `/reset` 自己 —— 否则一次指令会连换两轮。
+    if (!isResetCommand) maybeIdleReset(conversation);
     // 会话重置指令：整条消息恰好等于指令才触发，且只对「发指令的这个会话」生效。
     // 它开的是**新一轮**会话（旧会话留在磁盘上当存档），而不是把记录删掉。
     // 攒着的那批是在重置之前收到的，必须先投出去，否则那几句话会被一起忘掉。
-    if (commanded && resetCommand.length > 0 && preview.toLowerCase() === resetCommand) {
+    if (isResetCommand) {
       // 权限：只有 resetUsers 里的人能用（默认空白名单 = 谁都不能）。没权限的**静默忽略**，
       // 既不重置也不回「你没有权限」—— 回一句等于告诉全群这里有这么个指令、还激人去试；
       // 这一条仍然照常记进转录（rememberTranscript 在前面已经跑过），留痕在记忆里。

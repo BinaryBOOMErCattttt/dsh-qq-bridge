@@ -496,6 +496,11 @@ QQ 里发 /reset ─▶ handleEvent 的旁路（先 flushBatch）─▶ resetCon
    ③ 清记账：sessionIndex / turnOwners / submitted / transcripts / ambient / repeatStates /
       主动说话计数 / 活跃对话窗口与 chime
    ④ 下一句消息算出**新的** id → resume 不到 → create 一个空会话（第 N 轮）
+
+静默太久（idleResetHours > 0）：
+noteConversationActivity（touchActivity / 戳一戳）先记下 `idleMs`（**更新前的** `lastActiveAt`）
+   ─▶ handleEvent 里 admitted 之后、`/reset` 判定之前 ─▶ maybeIdleReset
+        idleMs ≥ idleResetHours → enqueue(resetConversation)（它排在 submitBatch 前面）
 ```
 
 不能踩的：
@@ -508,6 +513,15 @@ QQ 里发 /reset ─▶ handleEvent 的旁路（先 flushBatch）─▶ resetCon
 - **重置要过权限**（`canReset` / `Config.resetUsers`）：全项目唯一一个「白名单为空 = 谁都不能」
   的配置项（与 `allowUsers` 相反），别顺手统一。判断点在 `handleEvent` 的 `/reset` 分支里、
   `flushBatch` **之前**（否则没权限的人也能让攒着的消息提前投出去），没权限时静默 return。
+- **静默换代的 `idleMs` 只能在 `lastActiveAt` 被覆盖之前算**（`noteConversationActivity`）：
+  `touchActivity` 在 `admit` 之前跑，一到就把「刚才有多安静」盖掉了；而新建会话记录时
+  `conversationFor` 必须补一次 `lastActiveAt`，否则第二条消息算出来的静默永远是 0。
+- **`maybeIdleReset` 要跳过 `/reset` 自己**（否则一次指令连换两轮），并且**排进
+  `conversation.queue`** 而不是就地 await：`handleEvent` 是同步的，而这条消息马上要经
+  攒批 → `submitBatch`（也排在同一队列上），队列顺序是「先换轮、再投递」的唯一保证。
+- **销毁失败就不换**（`resetConversation` 返回 false）：宁可这一轮还带着上一段，也不能让新旧
+  两个 Agent 同时挂在同一个会话上。
+
 
 ### H. 每天轮换模型凭据（`apiKeyRotate`，默认开）
 

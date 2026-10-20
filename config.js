@@ -80,6 +80,7 @@ export const Config = z.object({
     ),
   resetCommand: z.string().default('/reset').description('新开一轮会话的指令：在 QQ 里单独发送该指令即生效（旧的会话留在磁盘上当存档，新的一轮从零开始）；留空表示禁用'),
   resetUsers: z.array(z.string()).default([]).description('允许使用 resetCommand 的 QQ 号白名单；留空表示**谁都不能**重置（群里任何一个人都能把会话记忆重置掉显然不合适，所以这一项默认就是关的）'),
+  idleResetHours: z.number().default(0).description('会话静默超过这么多小时之后，下一条消息自动开新一轮（与 resetCommand 同一套机制：换代次、旧会话留档、长期记忆不动；0 = 关闭，默认关）。它按时间自动发生，不需要 resetUsers 权限；「静默」按这个会话最后一条别人的消息算（含没 @ 机器人的闲聊）'),
   maxReplyChars: z.number().default(1500).description('单条 QQ 消息的最大字符数（协议上限），超出自动分段'),
   // ---- 图片/表情包：下载到本地，让 Agent 能用 read_image 真的看见 ----
   mediaDownload: z.boolean().default(true).description('是否把 QQ 消息里的图片/表情包下载到本地（模型只能读本地文件，不下载就只看到一句占位符）'),

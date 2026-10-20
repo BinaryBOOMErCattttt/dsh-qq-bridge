@@ -231,6 +231,18 @@ test('字符串项去空白，空白串按「没写」算', () => {
   assert.equal(settings({ persona: '   ' }).persona, '');
 });
 
+test('idleResetHours：正数（含小数）照用，0 / 负数 / 非数字都算关闭', () => {
+  assert.equal(settings().idleResetHours, 0);
+  assert.equal(settings({ idleResetHours: 12 }).idleResetHours, 12);
+  assert.equal(settings({ idleResetHours: 0.5 }).idleResetHours, 0.5);
+  // 「关」必须是一个确定的值，不能是 NaN —— 否则 `idle < hours * 3600e3` 永远是 false，
+  // 行为看起来一样但日志与设置页会露馅。
+  assert.equal(settings({ idleResetHours: 0 }).idleResetHours, 0);
+  assert.equal(settings({ idleResetHours: -3 }).idleResetHours, 0);
+  assert.equal(settings({ idleResetHours: Number.NaN }).idleResetHours, 0);
+  assert.equal(settings({ idleResetHours: 'abc' }).idleResetHours, 0);
+});
+
 test('未再加工的字段原样透传（schema 已经保证类型与默认值）', () => {
   const s = settings({ groupTrigger: 'prefix', replyStyle: 'quote', humanize: false, stickerMaxFiles: 3 });
   assert.equal(s.groupTrigger, 'prefix');
