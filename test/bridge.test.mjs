@@ -6437,6 +6437,12 @@ test('PERSONA.md 优先于配置 persona，且按场景选段', async () => {
       prompt.indexOf('别自己音译') > hardRulesAt,
       '专名不自己音译的禁令属于硬性规则，STYLE.md 删不掉',
     );
+    // 「金句」也是人机感地板：真实投诉里那四种句式（这事我认 / 是 X 也是真 X / 不过说实话 /
+    // 打分 + 编数字）必须写在硬性规则里，部署者删掉 STYLE.md 里那一条也还留在这里。
+    assert.ok(
+      prompt.indexOf('别把回话收成') > hardRulesAt,
+      '「不要把回话收成金句」的禁令属于硬性规则，STYLE.md 删不掉',
+    );
   } finally {
     await group.onebot.close();
   }

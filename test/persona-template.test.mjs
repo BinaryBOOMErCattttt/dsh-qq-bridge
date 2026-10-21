@@ -20,7 +20,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { parsePersonaDoc, renderPersona } from '../persona.js';
-import { lintStyleDoc, parseStyleDoc, renderStyleContract } from '../style.js';
+import { lintStyleDoc, parseStyleDoc, renderStyleContract, styleStructure } from '../style.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const PERSONA_TEMPLATE = 'deploy/persona/PERSONA.template.md';
@@ -126,6 +126,12 @@ test('表达模板：零警告、零体检命中、不带会读进提示词的 H
   );
   assert.ok(!text.includes('一句话能说完就只发一条'), '模板不能把「只发一条」写成默认');
   assert.ok(text.length <= 2000, '模板不能超过 styleMaxChars 的默认值');
+
+  // 模板自己得示范「否定、正向与替代」那套写法：含禁令的条目不超过三分之一。
+  // 判据见 docs/persona-style.md 的「三个能数的数」—— 过半是在做减法，模型没有正向目标。
+  const structure = styleStructure(prose);
+  assert.ok(structure.ratio <= 1 / 3, `模板里含禁令的条目 ${structure.negative}/${structure.bullets}：应当 ≤ 1/3`);
+  assert.ok(structure.bullets <= 18, `模板 ${structure.bullets} 条：每条都在稀释其它条，别再往上加`);
 });
 
 test('提示词：18 道题都在，且给出了落盘与自检的硬要求', () => {
@@ -172,6 +178,9 @@ test('自检脚本：模板本身退出码 0，且 JSON 里没有 error', () => 
   assert.equal(result.findings.filter((item) => item.level === 'error').length, 0);
   assert.equal(result.persona.counts.base, 1);
   assert.deepEqual(result.style.lint, []);
+  // JSON 里要带结构三个数：agent / CI 靠它判断「这份契约是在做减法还是在描述做法」。
+  assert.equal(typeof result.style.structure.ratio, 'number');
+  assert.ok(result.style.structure.bullets > 0);
 });
 
 test('自检脚本：写歪的文件退出码 1，并点名具体问题', () => {

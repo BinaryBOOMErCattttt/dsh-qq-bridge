@@ -27,7 +27,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { parsePersonaDoc, renderPersona } from '../persona.js';
-import { lintStyleDoc, parseStyleDoc, renderStyleContract } from '../style.js';
+import { lintStyleDoc, parseStyleDoc, renderStyleContract, styleStructure } from '../style.js';
 
 /**
  * 两个文件的上限，抄的是 `config.js` 里 `personaMaxChars` / `styleMaxChars` 的默认值。
@@ -36,6 +36,18 @@ import { lintStyleDoc, parseStyleDoc, renderStyleContract } from '../style.js';
  */
 const PERSONA_MAX_CHARS = 4000;
 const STYLE_MAX_CHARS = 2000;
+
+/**
+ * 含禁令条目的占比阈值（判据见 `style.js` 的 `styleStructure`）。
+ *
+ * 1/3 是「建议」线，1/2 是「明显偏多」线：表达契约里过半条目在说「别做什么」时，
+ * 模型删掉了坏选项却没有替代目标，只能退回训练分布里最安全的语域 —— 助手腔。
+ */
+const BAN_RATIO_HINT = 1 / 3;
+const BAN_RATIO_WARN = 0.5;
+
+/** 字数余量低于这个数就提醒：再补几行就会被 `styleMaxChars` 静默截断。 */
+const CHARS_HEADROOM_HINT = 200;
 
 /** 预览用的表达参数：按配置默认值来，文件里写的是「散文」，参数只影响预览。 */
 const PREVIEW_PARAMS = { stripShortPeriod: true, shortPeriodMaxChars: 40, humanize: true };
@@ -185,6 +197,17 @@ function checkStyle(file, strict) {
   if (!empty && missing.length > 0) findings.push(finding('info', 'style', `没有这几节（会跳过，不报错）：${missing.join('、')}`));
 
   if (file.chars > STYLE_MAX_CHARS) findings.push(finding('warn', 'style', `文件 ${file.chars} 字，超过 styleMaxChars 默认值 ${STYLE_MAX_CHARS}：超出的部分会被截断`));
+  else if (STYLE_MAX_CHARS - file.chars < CHARS_HEADROOM_HINT) findings.push(finding('info', 'style', `离 styleMaxChars（默认 ${STYLE_MAX_CHARS}）只剩 ${STYLE_MAX_CHARS - file.chars} 字：再补几行就会被截断，而且只记一条 warn`));
+
+  // 结构提示：只报数、不判对错。单条「别写括号旁白」是具体的坏习惯，写得对；
+  // 问题出在整份文件的配比 —— 一条条都在做减法时，模型没有可执行的正向目标。
+  const structure = styleStructure(prose);
+  const percent = Math.round(structure.ratio * 100);
+  if (structure.bullets >= 8 && structure.ratio > BAN_RATIO_WARN) {
+    findings.push(finding('warn', 'style', `含禁令的条目 ${structure.negative}/${structure.bullets}（${percent}%）：半数以上在说「别做什么」。模型知道不该说什么之后会去猜该说什么，猜出来的就是最安全的助手腔 —— 把每条改成「别 X → 改成 Y」，并删掉与硬性规则重复的那些；见 docs/persona-style.md 的「否定、正向与替代」`));
+  } else if (structure.bullets >= 8 && structure.ratio > BAN_RATIO_HINT) {
+    findings.push(finding('info', 'style', `含禁令的条目 ${structure.negative}/${structure.bullets}（${percent}%）：建议不超过三分之一，其余写成「该怎么做」而不是「别怎么做」`));
+  }
 
   const preview = renderStyleContract({ prose, params: PREVIEW_PARAMS, scene: 'group', imageAllowed: true });
   const report = {
@@ -194,6 +217,7 @@ function checkStyle(file, strict) {
     chars: file.chars,
     warnings,
     counts,
+    structure,
     lint: lint.map((hit) => ({ section: hit.section, sectionLabel: hit.sectionLabel, line: hit.line, code: hit.code })),
     preview,
   };
@@ -221,6 +245,8 @@ function printHuman(say, result) {
       for (const line of report.preview) say(`    ${line}`);
     } else {
       say(`  总体 ${report.counts.general} / 标点 ${report.counts.punctuation} / 表情包 ${report.counts.sticker} / 私聊 ${report.counts.privateChat} / 群聊 ${report.counts.group}`);
+      const { structure } = report;
+      say(`  结构 ${structure.bullets} 条 · 含禁令 ${structure.negative}（${Math.round(structure.ratio * 100)}%）· 距 styleMaxChars 上限 ${Math.max(0, STYLE_MAX_CHARS - report.chars)} 字`);
       say('  提示词预览（群聊，按默认参数；实际以配置为准）：');
       for (const line of report.preview) say(`    ${line}`);
     }

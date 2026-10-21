@@ -22,6 +22,7 @@ import {
   parseStyleDoc,
   renderStyleContract,
   sanitizeBubble,
+  styleStructure,
 } from '../style.js';
 
 test('parseStyleDoc：五个节各归各位，段落说明也收进去', () => {
@@ -298,4 +299,36 @@ test('sanitizeBubble：绝不删逗号（那会改变断句与语义）', () => 
   assert.equal(sanitizeBubble('我说，你听。', { shortPeriodMaxChars: 40 }), '我说，你听');
   // 英文逗号同理。
   assert.equal(sanitizeBubble('wait, what？'), 'wait, what？');
+});
+
+test('styleStructure：数得出每节「多少条在说别做什么」', () => {
+  const structure = styleStructure({
+    general: ['他在接话：说什么就接什么', '别用「行，」开场：要答应就直接说', ''],
+    punctuation: ['多数句子不带逗号'],
+    sticker: [],
+    privateChat: ['不写序号、列表'],
+    group: ['接不住就安静', '别人说的荤话接意思就行'],
+  });
+  assert.equal(structure.bullets, 6, '空行不算条目');
+  assert.equal(structure.negative, 2);
+  assert.equal(structure.ratio, 2 / 6);
+  assert.deepEqual(structure.sections.general, { bullets: 2, negative: 1 });
+  assert.deepEqual(structure.sections.sticker, { bullets: 0, negative: 0 });
+});
+
+test('styleStructure：不把「别人」「要不要」「不是」算成禁令（否则好文件会被报成坏文件）', () => {
+  // 这三类是真实假阳性：「别人」在群聊规则里到处都是；「要不要我去看看」是提议；
+  // 「你在接话，不是写答复」是定义。把它们算进占比，会让一份干净的契约凭空过半。
+  const structure = styleStructure({
+    general: ['你在接话，不是写答复：他说什么你就接什么'],
+    privateChat: ['答完可以带一个短追问（「你呢」「要不要我去看看」）'],
+    group: ['别人说的荤话接意思就行', '别人聊到一半的话题也能插一句'],
+  });
+  assert.equal(structure.negative, 0);
+  assert.equal(structure.ratio, 0);
+});
+
+test('styleStructure：一个字都没有时 ratio 是 0，不是 NaN', () => {
+  assert.deepEqual(styleStructure({}), { bullets: 0, negative: 0, ratio: 0, sections: {} });
+  assert.equal(styleStructure(undefined).ratio, 0);
 });

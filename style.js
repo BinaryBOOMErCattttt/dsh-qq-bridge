@@ -249,6 +249,52 @@ export function lintStyleDoc(prose) {
   return hits;
 }
 
+/**
+ * 数「多少条规则在告诉模型**别做什么**」用的词表。
+ *
+ * 只认**指令性**的否定词，并且刻意排掉三个高频假阳性：
+ *
+ *   - 「别人」（`别(?!人)`）—— 群聊规则里到处都是「别人说的…」，不是禁令；
+ *   - 「特别」（`(?<!特)`）；
+ *   - 「要不要」（`(?<![要])不要`）—— 「要不要我去看看」是提议，不是禁止。
+ *
+ * 也不含「不是」「不带」「没有」：那三个在正确的写法里出现在定义与频率句里
+ * （「你在接话，不是写答复」「多数句子不带逗号」），算成禁令会让占比虚高。
+ */
+const BAN_WORDS = /(?<!特)别(?!人)|(?<![要])不要|不用|不许|不准|禁止|避免|勿|不写|不加|不拿|不列|不套|不接/;
+
+/**
+ * 表达规则的**结构**：不判断文笔，只数三个数。
+ *
+ * 来由是一个可重复的现象：把 `STYLE.md` 一条条改下去，人机感反而更难去掉。数出来才看清
+ * —— 里面九成条目在说「别做什么」，告诉模型「那该做什么」的只有个位数。否定是减法：
+ * 删掉坏选项之后模型只能退回训练分布里最安全的语域，而那个语域就是助手腔。所以
+ * 「要写多少条正向」不是一个文风偏好，是两个能测的量：
+ *
+ *   - `ratio`：含禁令词的行 / 总行数。经验阈值 1/3；超过一半基本就是在一路做减法。
+ *   - `bullets`：条目数。每条都在稀释其它条，12~16 条之后边际收益接近零。
+ *
+ * **它只报数，不判对错**：一条「别写括号旁白」是具体坏习惯，写得很对；占比才是问题所在。
+ * `persona-check` 拿这三个数做提示，`lintStyleDoc` 仍然只管措辞。
+ *
+ * @param {object} prose - {@link parseStyleDoc} 的 `prose`。
+ * @returns {{bullets: number, negative: number, ratio: number,
+ *   sections: Record<string, {bullets: number, negative: number}>}} 。
+ */
+export function styleStructure(prose) {
+  const sections = {};
+  let bullets = 0;
+  let negative = 0;
+  for (const [section, lines] of Object.entries(prose ?? {})) {
+    const list = (lines ?? []).map((line) => String(line ?? '').trim()).filter((line) => line.length > 0);
+    const banned = list.filter((line) => BAN_WORDS.test(line)).length;
+    sections[section] = { bullets: list.length, negative: banned };
+    bullets += list.length;
+    negative += banned;
+  }
+  return { bullets, negative, ratio: bullets > 0 ? negative / bullets : 0, sections };
+}
+
 /** 内置契约的副本（每次给新对象，调用方随便改不会污染模块级常量）。 */
 export function builtinStyle() {
   return {
