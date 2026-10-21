@@ -24,6 +24,11 @@
   的余量」（判据是 `style.js` 的 `styleStructure`，只数指令性否定词，不认「别人」「要不要」
   「不是」）。`deploy/persona/STYLE.template.md` 按这套写法重写（17 条、含禁令 1/3 以下、
   删掉与 `hardRules` 重复的地板），本仓库的 `.qq-persona/STYLE.md` 同步改（30 条 → 16 条）。
+- **修掉一条静默失效的记忆注入**：`archiveMonthsOf` 用了 `readdirSync` 却没 import，ReferenceError
+  被裸 `catch {}` 当成「归档目录还没建」，于是「更早的记忆：archive/ 下 N 个文件」那行从来没出现过
+  —— 归档文件确实在、`qq_memory search` 也搜得到，只是提示词里从不提它，模型因此不知道还有冷层。
+  补上 import，并新增 `test/memory.test.mjs` 按目录行为钉住这条接线（纯函数测试抓不到这种洞）。
+  见[长期记忆](docs/memory.md)。
 
 ## 0.2.0 — 2026-10-18
 

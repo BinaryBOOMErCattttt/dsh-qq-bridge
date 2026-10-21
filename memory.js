@@ -36,7 +36,7 @@
  * @module @qqbot/dsh-plugin-qq/memory
  */
 import { appendFile, mkdir, unlink } from 'node:fs/promises';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { errorText, localDate, localStamp, memoryOneLine, memoryRelativePath, memorySlug, msUntilDailyHour, sessionIdFor } from './util.js';
