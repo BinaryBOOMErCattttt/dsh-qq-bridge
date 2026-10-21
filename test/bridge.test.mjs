@@ -6316,6 +6316,11 @@ test('PERSONA.md 优先于配置 persona，且按场景选段', async () => {
       prompt.indexOf('不许拿空格当标点') > hardRulesAt,
       '空格不是标点的禁令属于硬性规则，STYLE.md 删不掉',
     );
+    // 专名不自己音译同样是硬性规则：快模型会用英文原名现翻一个「听起来像」的中文。
+    assert.ok(
+      prompt.indexOf('别自己音译') > hardRulesAt,
+      '专名不自己音译的禁令属于硬性规则，STYLE.md 删不掉',
+    );
   } finally {
     await group.onebot.close();
   }
