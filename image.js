@@ -17,9 +17,11 @@
  * @module qq-bridge/image
  */
 import { readFile, stat } from 'node:fs/promises';
+import { lookup } from 'node:dns/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fetchBytes, sniffImageExtension } from './media.js';
+import { checkUrl, hostReason } from './links.js';
 import { pathInside } from './util.js';
 
 /** 出站图片的默认字节上限（配置里可改）。 */
@@ -59,6 +61,47 @@ function displayPath(root, target) {
 }
 
 /**
+ * 出站图片的 URL 安全检查：先查字面量，再把 DNS 解析出的每个地址查一遍。
+ *
+ * 为什么不能只靠 `checkUrl`：它是同步纯函数，只看得到 hostname 字面量；
+ * `http://127.0.0.1.nip.io/`、`http://nas.lan/`、以及任何解析到内网 IP 的公网域名
+ * 都能骗过它。出站图片的 URL 直接来自模型（群里的人可以让它发任意链接），所以
+ * 这一层必须补上。
+ *
+ * 已知边界（与 links.js 相同）：解析与真正连接之间仍可能被 DNS rebinding 换掉地址。
+ * 要彻底堵住得在连接层固定解析后的 IP（undici dispatcher），这里先做到「解析结果
+ * 里有内网地址就拒绝」；重定向由 `fetchBytes` 的 `validateUrl` 逐跳复用本函数。
+ *
+ * @param raw - 待校验的 URL。
+ * @param options.allowPrivateHosts - 只给测试 / 自建图床用；生产调用不传。
+ * @returns 归一化后的 URL。
+ * @throws 协议/字面量/DNS 任一关不通过时抛错。
+ */
+async function assertPublicImageUrl(raw, { allowPrivateHosts = false } = {}) {
+  const checked = checkUrl(raw, { allowPrivateHosts });
+  if (!checked.ok) throw new Error(`image URL rejected (${checked.reason}): ${raw}`);
+  if (allowPrivateHosts) return checked.url;
+  let addresses;
+  try {
+    addresses = await lookup(checked.host, { all: true });
+  } catch {
+    throw new Error(`could not resolve image host ${checked.host}`);
+  }
+  if (!Array.isArray(addresses) || addresses.length === 0) {
+    throw new Error(`could not resolve image host ${checked.host}`);
+  }
+  for (const entry of addresses) {
+    const address = String(entry?.address ?? '');
+    // `hostReason` 只认带方括号的 IPv6 字面量；解析结果给的是裸地址。
+    const reason = hostReason(entry?.family === 6 ? `[${address}]` : address);
+    if (reason !== undefined) {
+      throw new Error(`image URL resolves to a private address (${reason}): ${checked.host}`);
+    }
+  }
+  return checked.url;
+}
+
+/**
  * 把模型给的图片来源变成字节。
  *
  * 接受三种写法（都是模型真会写出来的）：
@@ -75,6 +118,7 @@ function displayPath(root, target) {
  * @param options.maxBytes - 字节上限；超出直接失败，不做静默压缩。
  * @param options.timeoutMs - URL 下载超时。
  * @param options.fetchImpl - 下载实现，测试可注入。
+ * @param options.allowPrivateHosts - 只给测试 / 自建图床用：跳过内网地址判定（生产调用不传）。
  * @returns `{ bytes, format, source, label }`：字节、格式、原样的来源、给人看的来源摘要。
  * @throws 输入为空 / 越界 / 不是文件 / 太大 / 不是图片 / 下载失败时抛错（message 已说人话）。
  */
@@ -84,6 +128,7 @@ export async function loadOutgoingImage({
   maxBytes = DEFAULT_IMAGE_MAX_BYTES,
   timeoutMs = DEFAULT_IMAGE_TIMEOUT_MS,
   fetchImpl = globalThis.fetch,
+  allowPrivateHosts = false,
 } = {}) {
   const root = resolve(cwd ?? process.cwd());
   const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : DEFAULT_IMAGE_MAX_BYTES;
@@ -95,7 +140,14 @@ export async function loadOutgoingImage({
   let label;
   if (/^https?:\/\//i.test(raw)) {
     try {
-      bytes = await fetchBytes(raw, { maxBytes: limit, timeoutMs: timeout, fetchImpl });
+      const safeUrl = await assertPublicImageUrl(raw, { allowPrivateHosts });
+      bytes = await fetchBytes(safeUrl, {
+        maxBytes: limit,
+        timeoutMs: timeout,
+        fetchImpl,
+        // 每一跳重定向都重新查：公网地址跳内网是 SSRF 最直接的绕过。
+        validateUrl: (next) => assertPublicImageUrl(next, { allowPrivateHosts }),
+      });
     } catch (error) {
       throw new Error(`could not download ${raw}: ${reasonOf(error)}`);
     }

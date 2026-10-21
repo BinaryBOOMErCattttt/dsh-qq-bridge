@@ -43,7 +43,7 @@ import { errorText, localDate, localStamp, memoryOneLine, memoryRelativePath, me
 import { readJsonl, readTextOrUndefined, readdirOrEmpty, writeJsonAtomic, writeTextAtomic } from './filestore.js';
 import { collectMedia, messageToText } from './onebot.js';
 import { insideDirectory } from './image.js';
-import { appendStickerRow, hotCognitionLines, normalizeCognitionDoc, normalizeStickerDoc, parseCognition, parseStickerCatalog, removeCognitionRow, removeStickerRow, renameStickerRow, stickerCatalogLines, upsertCognitionRow, upsertStickerRow } from './cognition.js';
+import { appendStickerRow, normalizeCognitionDoc, normalizeStickerDoc, parseCognition, parseStickerCatalog, removeCognitionRow, removeStickerRow, renameStickerRow, stickerCatalogLines, upsertCognitionRow, upsertStickerRow } from './cognition.js';
 import {
   archivePlan,
   parseMemoryDoc,
@@ -55,6 +55,7 @@ import {
   renderMemoryBlock,
   upsertMemoryRow,
   upsertPersonRow,
+  vocabularyOf,
 } from './memory-select.js';
 
 /** 认知库、表情包目录与全局人物表的文件名（都在 memoryDir 根下，与 INDEX.md 同级）。 */
@@ -68,10 +69,7 @@ const STATS_FILE = 'memory.index.json';
 const ARCHIVE_DIR = 'archive';
 /** 表情包目录注入提示词的上限：与旧 STICKER_PROMPT_MAX 一致，别让目录把提示词撑爆。 */
 const STICKER_CATALOG_MAX = 40;
-/** 热梗段的上限：15 条 / 1200 字（见 cognition.js 的 hotCognitionLines）。 */
-const HOT_COGNITION_LIMIT = 15;
-const HOT_COGNITION_MAX_CHARS = 1200;
-/** 这两个文件每轮都要读：用 mtime+size 判定缓存，避免每次装配提示词都读两遍盘。 */
+/** 表情包目录每轮都要读：用 mtime+size 判定缓存，避免每次装配提示词都读盘。 */
 const CATALOG_CACHE_MS = 5000;
 
 /** 每个记忆文件在 `.history/` 里最多留几份旧版本（写坏时人工翻回去用）。 */
@@ -225,6 +223,19 @@ export function createMemory(deps) {
   const conversationRecordsCache = new Map();
   /** `archive/` 月份清单的缓存：会话 key → `{ at, months }`。 */
   const archiveMonthsCache = new Map();
+  /**
+   * 每个会话「已经给过哪些记忆」的账：会话 key → `{ generation, seeded, baselined, seen, vocabKey, archiveKey }`。
+   *
+   * 为什么要有它：记忆块每轮都跟着 user message 投递、并且**一直留在历史里**。人物表 +
+   * 索引 + 全部梗的写法就有 4~6k 字，每轮重发一遍，35 轮就把上下文顶到 150k；随后宿主的
+   * 压缩把整段聊天改写成一份英文技术备忘录，群里看到的就是「越聊越人机」。
+   *
+   * 契约：**同一条记录在一个会话轮次里只给一次**。换代（`/reset`、静默换轮）清账；
+   * 新人物、新学的梗、新归档月份、改过标题的条目照常补一次。模型要看没给过的，
+   * 用 `qq_memory search` / `qq_transcript search` —— 块里的提示语就是这么写的。
+   * 只在内存里：重启后每样再给一次（一次 6k，换进程重启的频率可以接受）。
+   */
+  const recallLedger = new Map();
 
   /** 摘要 Agent 的会话 id（确定性派生，重启后 resume，摘要历史不会断）。 */
   const digestSessionId = sessionIdFor('bridge:digest');
@@ -744,30 +755,68 @@ export function createMemory(deps) {
   }
 
   /**
+   * 取这个会话的「已经给过什么」的账；换代（`sessionGeneration` 变了）时重开一本。
+   *
+   * 用会话记录上的代次而不是自己数轮次：`/reset` 与静默换轮都会 +1，换代之后人物表、
+   * 索引这些「给一次就够」的东西应该重新给一遍。
+   * @param conversation - 目标会话。
+   */
+  function recallLedgerFor(conversation) {
+    const key = String(conversation?.key ?? '');
+    const generation = Number(conversation?.sessionGeneration) || 0;
+    const current = recallLedger.get(key);
+    if (current !== undefined && current.generation === generation) return current;
+    const fresh = { generation, seeded: false, baselined: false, seen: new Set(), vocabKey: '', archiveKey: '' };
+    recallLedger.set(key, fresh);
+    return fresh;
+  }
+
+  /**
    * 记忆注入的总入口（设计 §5 / §7）：检索 + 按节配额打包 + 出处 + 词汇表 + 归档聚合行。
    *
    * 与旧的 `memoryIndexText` 的区别不是「读得更多」，而是**先按 scope 硬过滤、再按当前
    * 消息打分**：文件开头的几条无关内容不再永远占着预算，写在后半段的条目也不会永远
    * 看不见。没有命中时按 pinned / salience / 最近兜底，**绝不取文件头**。
+   *
+   * 另外按 `recallLedger` 做「只给一次」：同一条记录、同一份索引 / 词汇表 / 归档行，
+   * 在一个会话轮次里只进一次历史。这是上下文增长的主要来源 —— 每轮 6k 字的重发会在
+   * 三十几轮后触发宿主的压缩，把它改写成一英文技术备忘录。
    * @param conversation - 目标会话。
-   * @returns 可直接拼进提示词的整段；没有任何内容时为空串。
+   * @returns 可直接拼进提示词的整段；这一轮没有新东西（或记忆是空的）时为空串。
    */
   function recallText(conversation) {
     if (!memoryEnabled) return '';
+    const ledger = recallLedgerFor(conversation);
     const index = readSyncText(memoryIndexFile);
-    const indexText = index.text.trim().slice(0, INDEX_PROMPT_MAX_CHARS);
+    // 索引是「你记得哪些会话」的目录，换代给一次就够；INDEX.md 改过也不重给（改的是
+    // 目录本身，模型照旧可以 qq_memory read）。这一条能省下每轮 ~1k 字。
+    const indexText = ledger.seeded ? '' : index.text.trim().slice(0, INDEX_PROMPT_MAX_CHARS);
     const now = Date.now();
     const query = recallQueryFor(conversation);
     const own = conversationRecords(conversation.key);
     const global = globalRecords();
+    const records = [...global.records, ...own.records];
+    // 给过的记录直接不进候选：引用、打分、配额都只在「还没给过」的里面挑。
+    const fresh = records.filter((record) => !ledger.seen.has(record.id));
     const archiveMonths = archiveMonthsOf(conversation.key);
+    const archiveKey = archiveMonths.join(',');
+    const archiveDue = archiveMonths.length > 0 && ledger.archiveKey !== archiveKey;
+    // 词汇表同理：只有真的学了新梗（写法集合变了）才重发那一大串。
+    const vocab = settings.memoryVocabHint === false ? [] : vocabularyOf(records, conversation.key);
+    const vocabKey = vocab.join('\u0000');
+    const vocabDue = vocab.length > 0 && ledger.vocabKey !== vocabKey;
     const block = renderMemoryBlock({
-      records: [...global.records, ...own.records],
+      records: fresh,
       query: query.text,
       scope: conversation.key,
       focus: query.focus,
       indexText,
-      archiveMonths,
+      archiveMonths: archiveDue ? archiveMonths : [],
+      vocabList: vocabDue ? vocab : [],
+      // 第一轮给一份「底色」（人物表 + pinned / 最近的几条，见 renderMemoryBlock 的兜底）；
+      // 之后只让真正命中当前消息的进来 —— 否则每轮都会用兜底捞出几条没问到的记忆，
+      // 历史照样一路变长（实测：只做「去掉给过的」还不够，六轮仍会多出 9k 字）。
+      fallback: ledger.baselined !== true,
       stats: memoryStats,
       config: {
         promptChars: settings.memoryPromptChars,
@@ -777,8 +826,13 @@ export function createMemory(deps) {
       },
       now,
     });
-    // 一条都没有、连索引也没写：让 index.js 说「记忆还是空的」，而不是给一个空标题。
-    if (block.picked.length === 0 && indexText.length === 0 && archiveMonths.length === 0) return '';
+    // 这一轮没有新东西：一个字都不发（不是「记忆是空的」—— 空记忆在系统提示里已经说清）。
+    if (block.picked.length === 0 && indexText.length === 0 && !archiveDue && !vocabDue) return '';
+    for (const record of block.picked) ledger.seen.add(record.id);
+    if (block.picked.length > 0) ledger.baselined = true;
+    if (indexText.length > 0) ledger.seeded = true;
+    if (archiveDue) ledger.archiveKey = archiveKey;
+    if (vocabDue) ledger.vocabKey = vocabKey;
     bumpStats(block.picked);
     return block.text;
   }
@@ -786,42 +840,41 @@ export function createMemory(deps) {
   /**
    * 认知库与表情包目录的同步读数（提示词装配用）。
    *
-   * 为什么是**同步**：`SystemPrompt.section()` 的 text provider 每次装配都要重新求值，
-   * 没法 await（与表情包目录用同步 `readdir`、记忆索引用后台缓存是同一个理由）。两个
-   * 文件都有 `memoryFileMaxBytes` 兜底（默认 32KB），一次 `stat` + 命中缓存时零读取，
-   * 代价远小于为它再引入一套异步刷新与失效。
+   * 为什么是**同步**：提示词的每次装配都要重新求值（表情包目录现在走 `channelTurnContext`，
+   * 同样是同步求值），没法 await；与记忆索引用后台缓存是同一个理由。文件有
+   * `memoryFileMaxBytes` 兜底（默认 32KB），一次 `stat` + 命中缓存时零读取。
    *
-   * 缓存键是两份文件的 `size:mtime`：摘要 Agent 刚写完新条目时，下一次装配就能看见，
+   * 缓存键是文件的 `size:mtime`：`qq_save_sticker` / 改名刚写完目录时，下一次装配就能看见，
    * 不用等固定 TTL 过期。
    *
-   * @returns `{ stickers: string[], hot: string[], catalog: boolean }`：
+   * 只读 `STICKERS.md`：热梗段（`COGNITION.md`）不再进提示词（认知条目现在由
+   * `memory.recallText` 按相关度注入），别再顺手把它读一遍 —— 那是每轮一次白读。
+   *
+   * @returns `{ stickers: string[], catalog: boolean }`：
    *   `stickers` 是「名字（含义）」行（没有目录文件时为空数组，调用方退回裸文件名），
-   *   `hot` 是热梗段，`catalog` 表示表情包目录文件到底有没有解析出条目。
+   *   `catalog` 表示表情包目录文件到底有没有解析出条目。
    */
   function catalogState() {
-    if (!memoryEnabled) return { stickers: [], hot: [], catalog: false };
+    if (!memoryEnabled) return { stickers: [], catalog: false };
     const read = (name) => {
       const absolute = join(memoryBase, name);
       try {
         const info = statSync(absolute);
-        // 解析失败与空文件同义（下面两个纯函数对空串返回空结果），这里不额外抛。
+        // 解析失败与空文件同义（纯函数对空串返回空结果），这里不额外抛。
         if (info.size === 0) return { text: '', key: `${info.size}:${info.mtimeMs}` };
         return { text: readFileSync(absolute, 'utf8'), key: `${info.size}:${info.mtimeMs}` };
       } catch {
         return { text: '', key: 'missing' };
       }
     };
-    const cognition = read(COGNITION_FILE);
     const stickers = read(STICKERS_FILE);
-    const key = `${cognition.key}|${stickers.key}`;
+    const key = stickers.key;
     if (key === catalogCache.key && Date.now() - catalogCache.at < CATALOG_CACHE_MS) return catalogCache.text;
     const parsedStickers = parseStickerCatalog(stickers.text);
-    const parsedCognition = parseCognition(cognition.text);
     // 一份文件写坏不能让提示词装配失败：坏条目在这里被丢掉，只留一条 warn 供排查。
-    for (const warning of [...parsedStickers.warnings, ...parsedCognition.warnings].slice(0, 3)) report('warn', warning);
+    for (const warning of parsedStickers.warnings.slice(0, 3)) report('warn', warning);
     const text = {
       stickers: stickerCatalogLines(parsedStickers.collected, { max: STICKER_CATALOG_MAX }),
-      hot: hotCognitionLines(parsedCognition.entries, { limit: HOT_COGNITION_LIMIT, maxChars: HOT_COGNITION_MAX_CHARS }),
       catalog: parsedStickers.collected.length > 0,
     };
     catalogCache = { at: Date.now(), key, text };
@@ -829,7 +882,7 @@ export function createMemory(deps) {
   }
 
   /** 上面那份同步读数的缓存（`{ at, key, text }`）。 */
-  let catalogCache = { at: 0, key: '', text: { stickers: [], hot: [], catalog: false } };
+  let catalogCache = { at: 0, key: '', text: { stickers: [], catalog: false } };
 
   /**
    * 给表情包目录追加一行（`qq_save_sticker` 存完图之后调）。
@@ -877,6 +930,7 @@ export function createMemory(deps) {
       if (relative === undefined) {
         throw new Error(`${tool}: path "${raw}" is not inside the memory directory ${memoryLabel}/ (no absolute paths, no "..")`);
       }
+      assertPathVisible(relative, exec, tool);
       return relative;
     }
     const fromAgent = exec?.agent?.id !== undefined ? conversations.get(sessionIndex.get(exec.agent.id)) : undefined;
@@ -888,13 +942,23 @@ export function createMemory(deps) {
     return 'INDEX.md';
   }
 
-  /** 记忆目录下已存在的文件（相对路径），按名称排序；没有时是空数组。 */
-  async function listMemoryFiles() {
+  /**
+   * 记忆目录下已存在的文件（相对路径），按名称排序；没有时是空数组。
+   *
+   * `exec` 是工具调用上下文：QQ 会话只看得到全局文件与自己那个会话目录，摘要 Agent /
+   * 宿主平面（`qqCallerKey` 为 undefined）照旧看全部。
+   * @param exec - 工具执行上下文（可省略）。
+   */
+  async function listMemoryFiles(exec) {
+    const caller = qqCallerKey(exec);
+    const ownSlug = caller === undefined ? undefined : memorySlugFor(caller);
     const out = [];
     for (const top of ['INDEX.md', COGNITION_FILE, STICKERS_FILE, PEOPLE_FILE, STATS_FILE, 'digest.json']) {
+      if (ownSlug !== undefined && !SHARED_MEMORY_FILES.has(top)) continue;
       if ((await readTextOrUndefined(join(memoryBase, top))) !== undefined) out.push(`${memoryLabel}/${top}`);
     }
     for (const slug of await readdirOrEmpty(join(memoryBase, 'conversations'))) {
+      if (ownSlug !== undefined && slug !== ownSlug) continue;
       for (const name of await readdirOrEmpty(join(memoryBase, 'conversations', slug))) {
         if (name.endsWith('.md') || name.endsWith('.json')) out.push(memoryRelativeConvPath(slug, name));
       }
@@ -1019,6 +1083,59 @@ export function createMemory(deps) {
     if (key !== undefined) return key;
     if (agentId === digestSessionId) return digestTarget;
     return undefined;
+  }
+
+  /**
+   * 调用者如果是**某个 QQ 会话**的 Agent，返回那个会话的 key。
+   *
+   * 摘要 Agent（`digestSessionId`）与宿主平面的 Web 主会话都不在 `sessionIndex` 里，
+   * 这里返回 undefined —— 它们需要跨会话读（摘要按任务读目标会话，宿主是部署者）。
+   * 这个区分就是「QQ 会话只能碰自己」的判据，**别用 `writeScopeOf` 代替**：那个函数
+   * 对摘要会话返回 `digestTarget`，会把「摘要目标」误当成「调用者自己的会话」。
+   */
+  function qqCallerKey(exec) {
+    const agentId = exec?.agent?.id;
+    if (agentId === undefined) return undefined;
+    return sessionIndex.get(agentId);
+  }
+
+  /** 记忆目录顶层、所有会话共享的文件：QQ 会话可以读（写仍由 `assertGlobalWrite` 管）。 */
+  const SHARED_MEMORY_FILES = new Set(['INDEX.md', COGNITION_FILE, STICKERS_FILE, PEOPLE_FILE]);
+
+  /**
+   * QQ 会话的读取边界：`qq_transcript` / `qq_memory` 只能碰自己的会话。
+   *
+   * 为什么必须在这里挡：scope 过滤只作用于**注入**（`renderMemoryBlock`），而这两个
+   * 工具拿的是原始路径与会话 key；不挡的话，群里任何人只要让模型调一次
+   * `qq_transcript conversation:"private:<号>"`，私聊记录就会原样回到群里。
+   * 摘要 Agent / 宿主平面不受限（`qqCallerKey` 为 undefined）。
+   */
+  function assertOwnConversation(key, exec, tool) {
+    const caller = qqCallerKey(exec);
+    if (caller === undefined || key === caller) return;
+    throw new Error(
+      `${tool}: a QQ conversation can only access its own records (${caller}); ` +
+        `leave "conversation" empty instead of passing "${key}"`,
+    );
+  }
+
+  /**
+   * `qq_memory` 的路径边界：显式 `path` 同样不能指向别的会话。
+   *
+   * 放行三类：全局记忆文件（INDEX / COGNITION / STICKERS / PEOPLE）、本会话目录
+   * `conversations/<自己的 slug>/` 下的任何文件，其余一律拒绝。`memoryRelativePath`
+   * 已经挡掉了绝对路径与 `..`，这里只判「是不是自己的」。
+   */
+  function assertPathVisible(relative, exec, tool) {
+    const caller = qqCallerKey(exec);
+    if (caller === undefined) return;
+    if (SHARED_MEMORY_FILES.has(relative)) return;
+    const ownPrefix = `conversations/${memorySlugFor(caller)}/`;
+    if (relative.startsWith(ownPrefix)) return;
+    throw new Error(
+      `${tool}: a QQ conversation can only access its own memory (${memoryLabel}/${ownPrefix}); ` +
+        `"${relative}" belongs to another conversation`,
+    );
   }
 
   /**
@@ -1417,10 +1534,17 @@ export function createMemory(deps) {
   }
 
   /** `qq_transcript list`：磁盘上有记录的会话、条数与最后一条消息。 */
-  async function listTranscripts() {
+  /**
+   * 列出有转录的会话；QQ 会话只列得到自己的那一个。
+   * @param exec - 工具执行上下文（可省略）。
+   */
+  async function listTranscripts(exec) {
+    const caller = qqCallerKey(exec);
+    const ownSlug = caller === undefined ? undefined : memorySlugFor(caller);
     const lines = [];
     const root = join(memoryBase, 'conversations');
     for (const slug of await readdirOrEmpty(root)) {
+      if (ownSlug !== undefined && slug !== ownSlug) continue;
       const dir = join(root, slug);
       const files = (await readdirOrEmpty(join(dir, 'log'))).filter((name) => name.endsWith('.jsonl')).sort();
       if (files.length === 0) continue;
@@ -1578,6 +1702,8 @@ export function createMemory(deps) {
     if (key.length === 0) {
       throw new Error(`${tool}: cannot tell which conversation this is about; pass conversation: "group:<群号>" or "private:<QQ号>"`);
     }
+    // QQ 会话只能解析到自己：显式传别的 key（哪怕是 `private:<号>` 这种合法形态）一律拒绝。
+    assertOwnConversation(key, exec, tool);
     const paths = memoryPaths(key);
     const label = conversation !== undefined
       ? `${conversation.type === 'group' ? '群' : '私聊'} ${conversation.name || conversation.id}`

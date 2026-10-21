@@ -5,6 +5,83 @@
 
 ## 未发布
 
+- **`index.js` 再拆两块：`routes.js` 与 `key-rotation.js`**：设置页的两条 Host 路由
+  （会话列表 / 重置、定时任务看板）搬到 [`routes.js`](routes.js)，会话动作仍是
+  `webSessionSnapshots` / `resetConversationFromWeb`（由 deps 传入）；凭据轮换
+  （池子 / 探测 / 写回 / 每日定时器 / 启动自述）搬到 [`key-rotation.js`](key-rotation.js)，
+  `index.js` 只 `createKeyRotation()` 与 `start()`。两个新模块都不 import `index.js`，
+  路由的 `ctx.inject(['connection'])` 语义原样保留。
+- **清理 `index.js` 的拆分残留**：删掉搬到 `send.js` / `batch.js` 之后没人用的四个常量与
+  未使用的 `chunkText` 导入；主动说话 / 补一句 / 戳一戳 / 撤回四处「跨天归零」的计数器
+  收成一个 `dailyCount`；补上 Agent 装配 / 准入 / 复读 / 媒体 / 戳一戳 / 撤回等分节符，
+  并修正 `blankConversation` 里错位的「补一句」注释。行为不变（全量测试全绿）。
+  顺带同步 `docs/media.md` / `docs/reminders.md` / `docs/agents/data-flows.md` 里
+  已经搬走的实现位置。
+- **`index.js` 再拆两块：`reminder-runtime.js` 与 `batch.js`**：
+  `scheduleTimer` / `deliverReminderText` / `deliverReminderModel` / `reminderNudge` /
+  `settleReminderTurn` / `runReminderTurn` 搬到 [`reminder-runtime.js`](reminder-runtime.js)；
+  `enqueue` / `holdForBatch` / `flushBatch` / `flushIfIdle` / `backlogBusy` /
+  `backlogShouldHold` / `submitBatch` / `renderBatch` 搬到 [`batch.js`](batch.js)。
+  `index.js` 只装配 `createReminderRuntime(deps)` / `createBatcher(deps)` 并解构同名函数，
+  调用点（`handleEvent` / `turn/end` / `/reset` / 提醒 / 主动说话）一个都没改；
+  两个新模块都不 import `index.js`。
+- **表情包目录从 `index.js` 拆到 [`sticker.js`](sticker.js)**：列文件 / 裸名字补全 /
+  `qq_save_sticker` / `qq_rename_sticker` / 张数上限 / 改名回滚 / 三个白名单口径整体搬出，
+  `index.js` 只装配 `createStickerStore(deps)` 并解构同名函数，调用点与测试入口都没变。
+  `sticker.js` 不 import `index.js`；`memory` 只作为 deps 传入（记忆关掉时存图仍可用）。
+- **表情包目录也挪出系统提示（存一张表情不再追加一整份人设）**：目录会随
+  `qq_save_sticker` / `qq_rename_sticker` / 删图变化，而它原来写在渠道提示里 —— 每存一张，
+  下一次装配的系统提示就差几个字，DSH 又追加一份 7.5k 字的人设 + 表达契约 + 硬性规则
+  （与群名同一个机制，只是频率是「每次存图」）。现在目录走「本轮情境」的
+  `stickerCatalogLines`：本会话第一次给一次、目录变了补一次、其余轮次一个字不发；
+  系统提示里只留**怎么用标记 / 别滥用 / 存一下叫什么**这些稳定规则。顺带删掉了
+  `memory.catalog().hot`（`index.js` 取了从来没用过，`catalogState` 白读一遍 COGNITION.md）。
+  见 `test/bridge.test.mjs` 的「the sticker catalogue rides on the turn context」。
+- **记忆块每个会话轮次只给一次（上下文不再每轮重发 6k 字）**：检索式注入每轮都把
+  人物表 + `INDEX.md` + 词汇表 + 归档行塞进 user message，而这些消息一直留在历史里 ——
+  35 轮就把上下文顶到 152k，触发宿主压缩；压缩把它改写成一份英文技术备忘录
+  （「## Primary Request and Intent」/「roleplay session」），群里看到的就是「越聊越人机」。
+  现在 `memory.js` 有一本 `recallLedger`：同一条记录、同一份索引 / 词汇表 / 归档行，
+  在一个会话轮次（`sessionGeneration`）里只进一次历史；换代（`/reset`、静默换轮）清账，
+  新人物、新学的梗、新归档月份照常补一次，这一轮没有新东西时整块不出现。第一轮还会给
+  一份「底色」（人物表 + pinned / 最近的几条），之后**只让真正命中当前消息的记录进来** ——
+  只去掉「给过的」不够：兜底每轮都会捞出几条没问到的，实测六轮仍多出 9k 字。改完用真实
+  记忆实测六轮：~33k 字 → ~6.4k 字（其中 5.5k 是第一轮那份底色）。
+  要看没给过的，块里的提示语让模型自己 `qq_memory search` / `qq_transcript search`。
+  见[长期记忆](docs/memory.md#检索式注入按当前消息挑不再取文件开头)。
+- **群名挪出系统提示（重启后整份人设不再被追加一遍）**：群名来自 `get_group_info` 的一次
+  查询，重启后第一次可能查不到、群里也会改名；而渠道提示词一旦少几个字，DSH 的
+  `systemPromptUpdate: 'in-history'` 就会把 7.5k 字的人设 + 表达契约 + 硬性规则**再追加一份**
+  到历史里 —— 模型看到两份规则，回复立刻变得又短又像在照章办事（2026-10-21 21:58 的真实
+  事故）。现在群名 / 对方名字走「本轮情境」，系统小节一个字都不随它变；群名查询也挪到
+  `ensureAgent` 最前面（重启后 `resume` 那条路也会补查），查不到就不提。见
+  `test/bridge.test.mjs` 的「the channel section does not depend on the group name lookup」。
+- **发送链路从 `index.js` 拆到 [`send.js`](send.js)**：`enqueueSend` / `sendToConversation` /
+  `replyPieces` / `sendParts` / `sendPieces` / `sendOne` / `quoteHead` / 私聊输入状态整体搬出；
+  `index.js` 只装配依赖并解构同名函数，调用点与测试入口都没变。`send.js` 不 import `index.js`，
+  依赖表写在文件头；`AGENTS.md` 的模块地图与依赖方向已同步。
+- **修掉记忆工具的跨会话越权**：`qq_transcript` / `qq_memory` 以前接受任意 `conversation`
+  与 `path` —— 群里的提示注入可以列出所有会话、读私聊转录与别的群的 `MEMORY.md`，甚至改写
+  它们，而 `docs/memory.md` 的 scope 隔离只挡了提示词注入这一层。现在 QQ 会话的调用被强制
+  锁到自己的 key（全局文件仍可读，写仍由 `assertGlobalWrite` 管）；摘要 Agent 与宿主平面
+  不受限。见[长期记忆](docs/memory.md#scope私聊内容永不升级)与[安全提醒](docs/security.md)。
+- **重启后 agent 提醒的模型回复不再被丢**：提醒走 `targetConversation` 造的一次性壳，
+  `conversations` 里没有它；`turn/end` 以前先按 key 查会话、查不到就 return，根本走不到
+  提醒分支，模型白跑一轮、120 秒后只剩兜底文案。现在 reminder 分支排在那次查询之前。
+- **归属表兜底（`turnOwners` / `submitted`）**：`turnOwners` 以前没有任何超时，收不到
+  `turn/end` 的轮次会让会话永久 `busyWithTurn`（主动说话 / 补一句 / agent 提醒全部失效）；
+  `submitted.size > 512` 的整表 `clear()` 还会把在飞消息的归属一起抹掉、静默丢回复。
+  现在两条都按 1 小时 TTL 清扫，超上限只淘汰最旧的。
+- **出站图片 URL 的 SSRF 校验**：`qq_send_image` / `qq_save_sticker` 接受 http(s) URL，
+  以前直接 `fetch` 且跟随重定向。现在先过 `checkUrl`，再解析 DNS 并检查每个 A/AAAA 是否为
+  内网/保留地址；重定向改为自己跟、逐跳复用同一套校验。`linkPreview` 的字面量判定保持不变
+  （见 `links.js` 的「已知边界」）。
+- **工程门禁**：`package.json` 补 `check` / `test` / `verify` 脚本；新增
+  `scripts/check.mjs`（AGENTS.md 65536 字节预算、`config.js` ↔ `docs/configuration.md`
+  字段一致性、全仓库 `node --check`）；新增 `.github/workflows/checks.yml`（Linux + Windows
+  的静态检查；测试在装有宿主 peer 依赖时才跑）。`AGENTS.md` 的 §4 完整正文拆到
+  [`docs/agents/data-flows.md`](docs/agents/data-flows.md)，主文件回到注入预算内。
+
 - **私聊「对方正在输入」**（`privateTyping`，默认开）：从模型开始想怎么回（`agent/inbox/claimed`）
   到消息真正发出去，插件每 4 秒向协议端续一次输入状态，对方的 QQ 上会显示「正在输入」；
   群聊不显示。走 NapCat 的 `set_input_status` 扩展，协议端不支持时只记一条 warn 并停用，

@@ -581,7 +581,7 @@ function qqTranscript(deps) {
       },
     },
     async execute(args, exec) {
-      if (args.action === 'list') return memory.listTranscripts();
+      if (args.action === 'list') return memory.listTranscripts(exec);
       const target = memory.resolveConversation(args, exec, 'qq_transcript');
       if (args.action === 'search') {
         if (typeof args.query !== 'string' || args.query.trim().length === 0) throw new Error('qq_transcript: "query" is required for action "search"');
@@ -732,7 +732,7 @@ function qqMemory(deps) {
       },
     },
     async execute(args, exec) {
-      if (args.action === 'list') return memory.listFiles();
+      if (args.action === 'list') return memory.listFiles(exec);
       const path = memory.resolvePath(args, 'qq_memory', exec);
       if (args.action === 'read') return memory.readFile(path);
       if (args.action === 'search') {

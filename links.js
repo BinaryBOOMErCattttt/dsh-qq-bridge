@@ -422,10 +422,13 @@ function readXmlTag(raw, name) {
 
 /**
  * 判定一个主机名是否指向内网/保留地址。
- * @param {string} hostname - URL 解析出来的 hostname（IPv6 带方括号）。
+ *
+ * 除了 `checkUrl` 自己用，也导出给 `image.js`：出站图片的 URL 抓取要先解析 DNS，
+ * 再把每个解析结果交给这里判一次（字面量判定拦不住 `127.0.0.1.nip.io` 这种）。
+ * @param {string} hostname - URL 解析出来的 hostname（IPv6 带方括号），或一个裸 IP。
  * @returns {'localhost' | 'internal-host' | 'private-ip' | 'bad-url' | undefined}
  */
-function hostReason(hostname) {
+export function hostReason(hostname) {
   if (hostname.startsWith('[')) {
     const bytes = ipv6Bytes(hostname);
     if (!bytes) return 'bad-url';

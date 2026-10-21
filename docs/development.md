@@ -38,8 +38,8 @@ node --test test\
 > 在 DSH 自己的沙箱里跑测试时，`node --test` 会派生子进程并捕获输出，而沙箱不允许管道
 > （`spawn EPERM`）。同一个套件用同进程模式跑即可：`node --test --experimental-test-isolation=none "test/*.test.mjs"`。
 >
-> 基线是 **647 条全过、0 跳过**（0.2.0 删掉 JM 之后，原先那 13 条「沙箱里跳过」的探针也随
-> 之消失）。唯一的例外是 `test/persona-template.test.mjs` 里那 3 条：它们要真 `spawn` 一次
+> 基线是**全过、0 跳过**（数量以 `node --test test/` 的输出为准，不写死）。0.2.0 删掉 JM 之后，原先那 13 条「沙箱里跳过」的探针也随
+> 之消失。唯一的例外是 `test/persona-template.test.mjs` 里那 3 条：它们要真 `spawn` 一次
 > `scripts/persona-check.mjs`（钉住「干净 = 0 / 要改 = 1 / `--strict` 才升级」），而沙箱封了
 > 进程间管道（`spawn EPERM`，`status` 是 null）—— **那是环境的限制**，在沙箱外跑仍应全绿；
 > 沙箱里看到 `✖ 自检脚本：…` 时先用完整权限重跑这三条再判断。原有的偶发规律仍在：全量同进程
@@ -79,6 +79,11 @@ dsh --profile qqbot --port 3081 --no-open
 node --test test/
 ```
 
+也可以走 npm 脚本：`npm test`（同上）、`npm run check`（文档一致性 + 全仓库 `node --check`，
+不 import 插件模块，所以不依赖宿主 peer 包）、`npm run verify`（先 check 再 test）。
+CI 只跑 `check` 与静态检查；`@deepseek-ai/*` 是宿主注入的 peer，CI 上没有，测试那一步会
+显式跳过并告警 —— **发布前必须在装有 DSH 的机器上 `npm test` 全绿**。
+
 （Windows 上先跑一次 `node scripts\dev-node-modules.mjs --from <DSH checkout>` 铺好
 `node_modules`；在 DSH 沙箱里跑要加 `--experimental-test-isolation=none`，见
 [本机开发](#本机开发)。）
@@ -95,8 +100,9 @@ node --test test/
 `humanize: false` 回到单条、群聊引用/@ 指向（含 `auto` 的两面：紧挨着回不引用，
 中间又出现了消息 —— 别人说的、或者机器人自己刚发的 —— 才引用；搭话轮 —— 免 @ 接上的那句与
 多人插话 —— **既不引用也不 @**，`replyStyle: 'quote'` / `'at'` 也一样）、
-群名与「当前发言者」不再过期、**系统提示小节逐字稳定**（每轮会变的发言者 / 群环境 / 记忆 /
-时间都在 user message 的「本轮情境」块里，不回到系统提示）、**预设服务晚到时下一条消息补挂**
+群名与「当前发言者」不再过期、**系统提示小节逐字稳定**（每轮会变的发言者 / 群环境 / 群名 /
+记忆 / 时间都在 user message 的「本轮情境」块里，不回到系统提示；群名查不到时整段提示词
+一个字都不变，见「群名查不到也不能改写人设」那条用例）、**预设服务晚到时下一条消息补挂**
 （含补挂后重新收窄 `allowTools`），外加 `splitBurst` / `typingDelayMs` 两个纯函数的边界用例。
 
 还有「@ 人」那一组：正文写 `[[@昵称]]` 真的变成 `at` 段且位置照原文、整条回复只有一个标记时
@@ -153,8 +159,9 @@ OneBot 按真实形状回 `image` 段，另外起一个 HTTP 服务假装腾讯�
 还有「发表情包」那一组：发出去的确实是一个 `image` 段且 `base64://` 解出来就是原字节、
 从 QQ 会话里调用默认发回当前会话（群里也能显式指定群号）、把会话里刚收到的那张图
 （正文给了 `.qq-media/…` 路径）原样发回去、非图片 / 超过 `imageMaxBytes` / `cwd` 之外的
-路径一律在发消息之前就失败、`imageSend: false` 直接报错、渠道提示里列出 `.qq-stickers/`
-的文件名（被 `allowTools` 挡掉或目录在 `cwd` 外时一个字都不提），外加
+路径一律在发消息之前就失败、`imageSend: false` 直接报错、下一轮的「本轮情境」里列出
+`.qq-stickers/` 的文件名（被 `allowTools` 挡掉或目录在 `cwd` 外时一个字都不提）、目录变了
+**不改系统提示**而只在下一轮的情境里补一次，外加
 `loadOutgoingImage` / `imageSegment` 的纯函数用例（本地路径、`file://`、URL、大小与格式校验）。
 
 以及「存表情包」那一组：把会话里刚收到的那张图存进 `.qq-stickers/` 且落盘的是**原字节**、

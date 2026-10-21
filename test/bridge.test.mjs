@@ -90,8 +90,9 @@ async function startImageServer(body = TINY_PNG, { status = 200, contentType = '
  * @param options.getImage - `get_image` 的桩响应（不传则像多数实现一样报「不支持」）。
  * @param options.getMsg - `get_msg` 的桩响应：`(params) => 消息对象`（不传则报「不支持」）。
  * @param options.uploadFails - 给出时，`upload_*_file` 一律失败（用来验证「文件发不出去」的降级）。
+ * @param options.groupInfoFails - 给出时，`get_group_info` 一律失败（模拟重启后 NapCat 还没就绪）。
  */
-async function startFakeOneBot({ getImage, getMsg, uploadFails } = {}) {
+async function startFakeOneBot({ getImage, getMsg, uploadFails, groupInfoFails } = {}) {
   const calls = [];
   // 端口 0 = 让系统分配空闲端口，避免与真实 NapCat（3001）或并行测试冲突。
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
@@ -120,7 +121,10 @@ async function startFakeOneBot({ getImage, getMsg, uploadFails } = {}) {
 
   async function dataFor(frame) {
     if (frame.action === 'get_login_info') return { user_id: SELF_ID, nickname: '小助手' };
-    if (frame.action === 'get_group_info') return { group_id: frame.params.group_id, group_name: '示例群' };
+    if (frame.action === 'get_group_info') {
+      if (groupInfoFails) throw new Error('get_group_info is unavailable');
+      return { group_id: frame.params.group_id, group_name: '示例群' };
+    }
     if (frame.action === 'get_group_list') return [{ group_id: 100000001, group_name: '示例群' }];
     if (frame.action === 'get_friend_list') return [{ user_id: 100000002, nickname: 'iroha' }];
     if (frame.action === 'get_image') {
@@ -3205,16 +3209,23 @@ test('qq_send_message resolves [[@nickname]] against the conversation it is send
 
 // 用例十八：修两个「不像真人」的旧毛病 —— 群名从第二条消息起不再丢失，
 // 提示词里的「刚跟你说话的人」也永远是当前这位，而不是建 Agent 时的第一位。
-test('the channel prompt keeps the group name and always names the latest speaker', async () => {
+//
+// 群名现在走「本轮情境」（系统小节里**一个字都不能变**）：系统提示一旦因为群名这种
+// 查得到查不到的东西改一个字，DSH 就会把整份人设 + 硬性规则再追加一遍（见下面
+// 「群名查不到」那个用例）。
+test('the turn context keeps the group name and always names the latest speaker', async () => {
   const { onebot, host } = await boot();
   try {
     onebot.push(mention('在吗', { messageId: 11 }));
     const agent = await until(() => host.list.created[0], 'the group Agent');
     const first = promptText(host, 'qq-bridge:channel');
-    // 群名来自 get_group_info（入站事件里没有），第一条消息时就该查到。
-    assert.ok(first.includes('示例群'), first);
-    const firstContext = turnContextText(agent);
-    assert.ok(firstContext.includes('刚跟你说话的人：kaguya'), firstContext);
+    // 群名来自 get_group_info（入站事件里没有），第一条消息时就该查到 —— 但只进情境。
+    assert.ok(first.includes('100000001'), first);
+    assert.ok(!first.includes('示例群'), '群名不进系统提示');
+    const firstContext = await until(() => {
+      const text = turnContextText(agent);
+      return text.includes('示例群') && text.includes('刚跟你说话的人：kaguya') ? text : undefined;
+    }, 'the group name and the speaker in the turn context');
 
     onebot.push(mention('还在吗', { messageId: 12, userId: 333, name: 'iroha', card: 'iroha' }));
     await until(() => agent.inbox.length === 2, 'the second message to be delivered');
@@ -3222,11 +3233,41 @@ test('the channel prompt keeps the group name and always names the latest speake
       const text = turnContextText(agent);
       return text.includes('刚跟你说话的人：iroha') ? text : undefined;
     }, 'the prompt to name the new speaker');
-    // 群名没有被下一条消息冲成空串（系统小节仍然稳定）。
+    assert.ok(second.includes('这个群叫「示例群」'), second);
+    // 系统小节逐字不变：这是「重启后整份提示词被追加一遍」的防线。
     const afterSecond = promptText(host, 'qq-bridge:channel');
-    assert.ok(afterSecond.includes('示例群'), afterSecond);
+    assert.equal(afterSecond, first);
   } finally {
     await onebot.close();
+  }
+});
+
+// 用例十八·二：群名查询失败（重启后 NapCat 还没就绪、或群里改了名）不能让系统提示变一个字。
+// 一次网络抖动就重写 7.5k 字的人设，模型会看到两份硬性规则 —— 真实事故里那几轮回复
+// 立刻变成一句式的照章办事。
+test('the channel section does not depend on the group name lookup', async () => {
+  const withName = await boot();
+  const withoutName = await boot({}, {}, { groupInfoFails: true });
+  try {
+    withName.onebot.push(mention('在吗', { messageId: 21 }));
+    withoutName.onebot.push(mention('在吗', { messageId: 21 }));
+    const [a, b] = await until(
+      () => withName.host.list.created[0] && withoutName.host.list.created[0]
+        ? [withName.host.list.created[0], withoutName.host.list.created[0]]
+        : undefined,
+      'both group Agents',
+    );
+    assert.equal(
+      promptText(withoutName.host, 'qq-bridge:channel'),
+      promptText(withName.host, 'qq-bridge:channel'),
+      '群名查不到 / 查得到，系统小节必须逐字一致',
+    );
+    // 查得到时有这一行；查不到时连空壳都不写（免得模型以为这个群没有名字）。
+    assert.ok(turnContextText(a).includes('这个群叫「示例群」'), turnContextText(a));
+    assert.ok(!turnContextText(b).includes('这个群叫'), turnContextText(b));
+  } finally {
+    await withName.onebot.close();
+    await withoutName.onebot.close();
   }
 });
 
@@ -3719,7 +3760,14 @@ test('loadOutgoingImage reads paths inside cwd and URLs, and refuses everything 
 
     // URL：插件自己先下下来（顺便校验格式），而不是把链接原样丢给 NapCat。
     const url = images.url('/meme.png');
-    const remote = await loadOutgoingImage({ source: url, cwd });
+    // 生产调用不传 allowPrivateHosts：127.0.0.1 必须先被 SSRF 判定拦下，不能真去连。
+    await assert.rejects(
+      () => loadOutgoingImage({ source: url, cwd }),
+      /could not download.*(rejected|private|localhost)/,
+    );
+    assert.equal(images.hits.length, 0, '私网地址在发请求之前就被拒了');
+    // 测试自己起的是本机服务，显式放开内网地址才能验下载链路。
+    const remote = await loadOutgoingImage({ source: url, cwd, allowPrivateHosts: true });
     assert.equal(remote.format, 'png');
     assert.deepEqual(remote.bytes, TINY_PNG);
     assert.equal(remote.label, url);
@@ -3731,7 +3779,10 @@ test('loadOutgoingImage reads paths inside cwd and URLs, and refuses everything 
     await assert.rejects(() => loadOutgoingImage({ source: '../outside.png', cwd }), /inside the working directory/);
     await assert.rejects(() => loadOutgoingImage({ source: pathToFileURL('/etc/hostname').href, cwd }), /inside the working directory/);
     await assert.rejects(() => loadOutgoingImage({ source: 'ftp://example.com/a.png', cwd }), /unsupported image source/);
-    await assert.rejects(() => loadOutgoingImage({ source: 'http://127.0.0.1:1/x.png', cwd, timeoutMs: 800 }), /could not download/);
+    await assert.rejects(
+      () => loadOutgoingImage({ source: 'http://127.0.0.1:1/x.png', cwd, timeoutMs: 800 }),
+      /could not download.*(rejected|private|localhost)/,
+    );
     await assert.rejects(() => loadOutgoingImage({ source: '.qq-stickers/笑死.png', cwd, maxBytes: 10 }), /larger than 10 bytes/);
 
     // 段形状：base64 放在 file 里（NapCat 的发送侧按 [url, file, path] 取第一个有值的字段）。
@@ -3857,15 +3908,51 @@ test('qq_save_sticker keeps a picture the conversation posted and it shows up in
     assert.equal(value.bytes, TINY_PNG.length);
     // 落盘的必须是原字节：这张图以后要原样发回去，转码过就不是同一张表情了。
     assert.deepEqual(await readFile(join(cwd, '.qq-stickers', '委屈.png')), TINY_PNG);
-    // 提示词每次装配都重新读目录，所以不用重启就该列出来。条目必须带上**完整路径**：
-    // 只给名字的话模型会自己猜扩展名（真实事故：敲盆.gif 被写成敲盆.jpg，发送侧找不到）。
-    assert.match(promptText(host, 'qq-bridge:channel'), /委屈（委屈、求安慰） → \.qq-stickers\/委屈\.png/);
+    // 目录变了之后**下一轮的情境**里就能挑到它（不放进系统提示：存一张表情不该让整份
+    // 人设 + 硬规则再追加一遍，见下面「表情包目录变了不改系统提示」那条）。
+    // 条目必须带上**完整路径**：只给名字的话模型会自己猜扩展名
+    //（真实事故：敲盆.gif 被写成敲盆.jpg，发送侧找不到）。
+    const channel = promptText(host, 'qq-bridge:channel');
+    onebot.push(privateMessage('刚存的那张以后能用上吧'));
+    await untilInbox(host, 2, 'the next turn after saving');
+    assert.match(turnContextText(agent), /委屈（委屈、求安慰） → \.qq-stickers\/委屈\.png/);
+    assert.equal(promptText(host, 'qq-bridge:channel'), channel, '系统提示一个字都不能变');
     // 存下来的唯一用途就是发出去：裸文件名（不带扩展名）也该认得出来。
     const sent = await host.tools.get('qq_send_image').execute({ image: '委屈' }, { agent });
     assert.equal(sent.source, '.qq-stickers/委屈.png');
   } finally {
     await onebot.close();
     await images.close();
+  }
+});
+
+/**
+ * 表情包目录是系统提示里最后一块**会变**的内容：存一张图 / 改个名，提示词就差几个字，
+ * 而 DSH 会把整段 7.5k 字的人设 + 表达契约 + 硬性规则当新的 system 消息再追加一份
+ *（2026-10-21 群名那 6 个字的真实事故）。所以它跟着「本轮情境」走：本会话第一次给一次、
+ * 目录变了补一次、其余轮次一个字不发。
+ */
+test('the sticker catalogue rides on the turn context and never rewrites the system prompt', async () => {
+  const { onebot, host, cwd } = await bootImages();
+  try {
+    onebot.push(privateMessage('在吗'));
+    const agent = await untilInbox(host, 1, 'the first turn');
+    const first = promptText(host, 'qq-bridge:channel');
+    assert.ok(turnContextText(agent).includes('.qq-stickers/笑死.png'), '第一次要把目录给一次');
+    assert.ok(!first.includes('.qq-stickers/笑死.png'), '目录内容不进系统提示');
+
+    // 存一张新表情：`stickerNames()` 读到它就算「目录变了」，与 qq_save_sticker 写完等价。
+    await writeFile(join(cwd, '.qq-stickers', '委屈.png'), TINY_PNG);
+    onebot.push(privateMessage('还在吗'));
+    await untilInbox(host, 2, 'the second turn');
+    assert.equal(promptText(host, 'qq-bridge:channel'), first, '系统小节必须逐字不变');
+    assert.ok(turnContextText(agent).includes('.qq-stickers/委屈.png'), '新表情在下一轮补一次');
+
+    onebot.push(privateMessage('第三句'));
+    await untilInbox(host, 3, 'the third turn');
+    assert.ok(!turnContextText(agent).includes('.qq-stickers/'), '目录没变就不再重复');
+  } finally {
+    await onebot.close();
   }
 });
 
@@ -3954,9 +4041,13 @@ test('qq_rename_sticker moves the file and its catalogue row together', async ()
     assert.deepEqual((await readdir(join(cwd, '.qq-stickers'))).sort(), ['笑死.png', '难过.png']);
     assert.deepEqual(await readFile(join(cwd, '.qq-stickers', '难过.png')), TINY_PNG, '改的是名字，不是字节');
     // 目录那一条跟着搬：含义 / 场景 / 路径都在新名字下，旧名字一条不剩。
-    const prompt = promptText(host, 'qq-bridge:channel');
-    assert.match(prompt, /难过（委屈、求安慰） → \.qq-stickers\/难过\.png/);
-    assert.doesNotMatch(prompt, /委屈（/);
+    // 看的是**下一轮的情境**（目录变了才补一次，系统提示不动）。
+    onebot.push(privateMessage('改名之后能用了吧'));
+    await untilInbox(host, 2, 'the next turn after renaming');
+    const catalog = turnContextText(agent);
+    assert.match(catalog, /难过（委屈、求安慰） → \.qq-stickers\/难过\.png/);
+    assert.doesNotMatch(catalog, /委屈（/);
+    assert.doesNotMatch(promptText(host, 'qq-bridge:channel'), /难过（委屈/);
     // 发图那条路认得新名字（旧名字的裸名字解析已经不指向任何文件）。
     const sent = await host.tools.get('qq_send_image').execute({ image: '难过' }, { agent });
     assert.equal(sent.source, '.qq-stickers/难过.png');
@@ -3985,7 +4076,10 @@ test('qq_rename_sticker refuses taken names and unusable names', async () => {
     await assert.rejects(() => rename().execute({ from: '不存在的表情', to: '新名字' }, { agent }), /没有「不存在的表情」/);
     // 一次都没动过目录。
     assert.deepEqual((await readdir(join(cwd, '.qq-stickers'))).sort(), ['委屈.png', '笑死.png']);
-    assert.match(promptText(host, 'qq-bridge:channel'), /委屈（委屈、求安慰） → \.qq-stickers\/委屈\.png/);
+    // 存进去的那一条在下一轮的情境里（系统提示不动，见「表情包目录变了」那条）。
+    onebot.push(privateMessage('再看一眼目录'));
+    await untilInbox(host, 2, 'the next turn');
+    assert.match(turnContextText(agent), /委屈（委屈、求安慰） → \.qq-stickers\/委屈\.png/);
   } finally {
     await onebot.close();
   }
@@ -4017,15 +4111,17 @@ test('qq_rename_sticker is not registered without the sticker directory or its w
   }
 });
 
-test('the channel prompt offers qq_send_image and lists the sticker pack', async () => {
+test('the channel prompt offers qq_send_image and the sticker rules, and the pack rides on the turn context', async () => {
   const on = await bootImages();
   on.onebot.push(privateMessage('在吗'));
-  await until(() => on.host.list.created[0], 'the first Agent');
+  const agent = await untilInbox(on.host, 1, 'the first Agent');
   const prompt = promptText(on.host, 'qq-bridge:channel');
   assert.match(prompt, /qq_send_image/);
-  assert.match(prompt, /\.qq-stickers\/笑死\.png/);
   // 「存一下这个」是群里最常出现的一句，提示词必须把那条窄通道说清楚。
   assert.match(prompt, /qq_save_sticker/);
+  // 目录**内容**不在系统提示里（它每存一张就变，会让整份人设再追加一遍），在「本轮情境」。
+  assert.doesNotMatch(prompt, /\.qq-stickers\/笑死\.png/);
+  assert.match(turnContextText(agent), /\.qq-stickers\/笑死\.png/);
 
   // 白名单挡掉这个工具时，提示词里一个字都不能再提它。
   const off = await bootImages(
@@ -4543,6 +4639,31 @@ test('the channel prompt carries the global INDEX.md once it exists', async () =
   }, 'the memory index to reach the channel prompt');
   assert.match(text, /和当前话题相关的记忆/);
   assert.match(text, /### 全局索引（INDEX.md）/);
+});
+
+/**
+ * 「只给一次」的端到端回归：同一个会话的第二条消息不再重发同一段记忆。
+ *
+ * 记忆块每轮都跟着 user message 投递、并且一直留在历史里 —— 人物表 + 索引 + 词汇表
+ * 每轮重发一遍，三十几轮就把上下文顶到宿主的压缩门槛，压缩会把整段聊天改写成一份
+ * 英文技术备忘录（群里看到的就是「越聊越人机」）。账本在 `memory.js` 的 `recallLedger`。
+ */
+test('the memory block is delivered once per session round, not on every turn', async () => {
+  const { onebot, host, cwd } = await bootMemory();
+  await mkdir(join(cwd, '.qq-memory'), { recursive: true });
+  await writeFile(join(cwd, '.qq-memory', 'INDEX.md'), '- kaguya：群主，周六常组织打本', 'utf8');
+  onebot.push(privateMessage('在吗'));
+  const agent = await untilInbox(host, 1);
+  await until(
+    () => turnContextText(agent).includes('群主，周六常组织打本'),
+    'the memory index on the first turn',
+  );
+
+  onebot.push(privateMessage('还在吗'));
+  await untilInbox(host, 2);
+  const second = turnContextText(agent);
+  assert.doesNotMatch(second, /和当前话题相关的记忆/, '第二条消息不该再发一整段记忆');
+  assert.doesNotMatch(second, /群主，周六常组织打本/, '给过的索引不再重复');
 });
 
 /**
@@ -7004,6 +7125,39 @@ test('提醒：agent 模式让模型说，@ 由插件注入', async () => {
       'the model reply',
     );
     assert.deepEqual(sent.params.message[0], { type: 'at', data: { qq: '100000003' } }, '@ 挂在第一条文字气泡前');
+  } finally {
+    await onebot.close();
+  }
+});
+
+test('提醒：重启后没有会话记录时，agent 轮的模型回复仍然发得出去', async () => {
+  // 模拟重启后的内存态：`conversations` 是空的，但磁盘上有一条到点的提醒。
+  // `runReminderTurn` 会为它造一次性壳（不写进会话表）；turn/end 若先按 key 查会话
+  // 再处理提醒，模型这一轮就白丢了，只剩 120 秒后的兜底文案（真实回归）。
+  const { onebot, host } = await boot({ proactive: false, activeFollow: false, repeat: false });
+  try {
+    await host.tools.get('qq_remind_create').execute(
+      { target_type: 'group', target_id: '100000001', text: '交作业', in_minutes: 1, mode: 'agent' },
+      {},
+    );
+    fireSchedulerAfter(host, 61_000);
+    const agent = await until(() => host.list.created[0], 'the reminder Agent');
+    await until(() => agent.inbox.length >= 1, 'the reminder nudge');
+    completeTurn(host, agent, '该交作业了', 1);
+
+    // 操作员建的提醒没有默认 @，正文以纯字符串发出；这里只钉「模型回复没有被丢」。
+    const sent = await until(
+      () => onebot.calls.find((call) => {
+        if (call.action !== 'send_group_msg') return false;
+        const message = call.params.message;
+        const text = typeof message === 'string'
+          ? message
+          : (Array.isArray(message) ? message.filter((segment) => segment.type === 'text').map((segment) => segment.data.text).join('') : '');
+        return text === '该交作业了';
+      }),
+      'the model reply from a restart reminder',
+    );
+    assert.ok(sent);
   } finally {
     await onebot.close();
   }

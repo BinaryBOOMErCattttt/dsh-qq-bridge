@@ -30,6 +30,11 @@
   指定的那一个引用，不会动凭据文件里的其它记录（浏览器会话等由凭据层自己维护）。
   不想要这个行为就把 `apiKeyRotate` 设成 `false`。
 - Agent 跑在 `cwd` 指定的目录里，受沙箱策略约束。
+- **Agent 的 `read` / `glob` / `grep` 能读整个 `cwd`**：`.qq-memory` 的转录、`data/api-keys.txt`、
+  启动 cwd 的 `.env` 都在里面。`qq_memory` / `qq_transcript` 现在已经按会话锁住归属
+  （见[长期记忆](memory.md#scope私聊内容永不升级)），但 `read` 是通用文件工具，挡不住提示注入。
+  部署时把凭据池 / `.env` 放在 cwd 外，或从 `allowTools` 里去掉 `read` / `glob` / `grep`
+  （发表情与看图走 `read_image` / `qq_send_image`，不依赖它们）。
 - **私聊补一句（`privateAfterthought`，默认开）是对「主动消息只有一个总开关」的一次语义例外**：
   群聊的主动消息归 `proactive`，而私聊的补一句是「刚聊完再看有没有想补充的」，有自己的开关、
   概率与每日上限。它仍然是「主动给真人发消息」，所以五道闸门一条不少（只在正常回复后、对方

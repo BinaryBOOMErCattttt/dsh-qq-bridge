@@ -67,9 +67,25 @@ QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写�
    **消息里原样出现的梗**是必进的，不看日期。每条都带出处（`MEMORY.md#L23`），
    模型要细节自己 `qq_memory read`。
 4. **兜底**：没有任何命中时按 pinned / salience / 最近取，**绝不取文件头**。
+5. **只给一次**：同一个会话轮次（`sessionGeneration`）里，已经给过的记录、`INDEX.md` 的
+   全局索引、词汇表、归档聚合行**不再重复**。账本在 `memory.js` 的 `recallLedger`：
+   换代（`/reset`、静默换轮）清账，新人物、新学的梗、新归档月份照常补一次；这一轮什么
+   新东西都没有时，整块不出现（也不再补一句「记忆还是空的」）。
+
+   第一轮还会给一份「底色」（人物表 + pinned / 最近的几条，即第 4 条的兜底），之后
+   **只让真正命中当前消息的记录进来**（实体命中 / 词汇命中，加上必进的说话人）——
+   只去掉「给过的」还不够：兜底每轮都会捞出几条没问到的记忆，六轮实测仍会多出 9k 字。
+
+   为什么要有第 5 条：这块每轮都跟着 user message 投递，而且**一直留在历史里**。人物表 +
+   索引 + 词汇表每轮 4~6k 字，三十几轮就顶到 `cordis.patch.yml` 里的压缩门槛；宿主压缩
+   会把整段聊天改写成一份英文技术备忘录（「## Primary Request and Intent」），群里看到
+   的就是「越聊越人机」。只给一次 + 只给命中的之后，六轮实测从 ~33k 字降到 ~6k 字
+   （其中 5.5k 是第一轮那份底色）。要看没给过的，块里的提示语让模型自己
+   `qq_memory search` / `qq_transcript search`。
 
 另外附一行「词汇表」：全部梗的写法（含变体，`memoryVocabHint`），只让模型知道这些写法
-存在，听不懂时能主动去 search —— 这是最便宜的一道保险。
+存在，听不懂时能主动去 search —— 这是最便宜的一道保险。它同样只在新学、改名时才重发
+（写法集合变了才重发；没变就不占篇幅）。
 
 检索查询来自 `conversation.recallQuery`：`submitBatch` 在投递前写入这一批的正文与说话人；
 主动说话 / 补一句 / 提醒这些没有「来消息」的轮次退回到群环境（`ambient` 的最后几条）。
@@ -84,6 +100,7 @@ QQ 消息 ─▶ 转录(.qq-memory/…/log/YYYY-MM-DD.jsonl)         插件写�
 | 存储层 | 文件就是 scope 的边界：`COGNITION.md` / `PEOPLE.md` 只收 `global`；`MEMORY.md` 的 scope 由那个会话决定 |
 | 写入闸门 | 私聊会话对 `COGNITION.md` / `PEOPLE.md` 的任何写请求（write / append / upsert / remove）**直接拒绝**，提示写进本会话的 `MEMORY.md`。摘要 Agent 在私聊的摘要轮里走同一条闸门（它拿不到那两个写通道） |
 | 检索层 | `private:<qq>` / `group:<id>` 的记录在打分**之前**被过滤掉，只对同一个会话可见 |
+| 工具层 | `qq_transcript` / `qq_memory` 的 `conversation` / `path` 对 QQ 会话**强制锁到本会话**；摘要 Agent 与宿主平面（不在 `sessionIndex` 里）不受限。`read` / `grep` 仍能直接读文件，见[安全提醒](security.md) |
 
 宿主平面的 Web 主会话不受此限：那是部署者在操作，不是 QQ 消息。
 历史遗留的 `COGNITION.md` 条目无从判定来源，按 `global` 处理。

@@ -145,7 +145,7 @@ QQ 会话里不接受裸 QQ 号作为 @ 目标：名字只在**这个会话**的
 
 - **任务与调度在 `reminders.js`**：纯函数（时间推算 / 校验 / 模式决策）与
   `createReminders`（持久化、单定时器、重试）分开，前者可以不起 Harness 直接单测。
-- **发送在 `index.js`**：`deliverReminderText` 走「原样、不分气泡、不加打字延迟」；
+- **发送在 `reminder-runtime.js`**：`deliverReminderText` 走「原样、不分气泡、不加打字延迟」；
   `deliverReminderModel` 走正常拟人发送链路，但 @ 由任务注入（`sendParts` 的 `at`）。
 - **agent/prompt 那一轮**：`runReminderTurn` 伪造一条 user message，`submitted` 上写
   `reminderId`（**不写 `proactive`**），`turn/end` 里 reminder 分支必须排在

@@ -1,0 +1,40 @@
+name: checks
+
+# 为什么测试这一步是「有条件跑」：插件的测试要 import 宿主注入的
+# `@deepseek-ai/schemastery` / `dsh-tools` / `dsh-llm`，它们不在 npm 上，
+# 也不该被 vendored 进仓库。CI 上只保证「文档不漂移 + 所有 JS 语法正常」；
+# 测试在装有 DSH 的机器（本地 / 发布机）上仍然是必须全绿的那条基线。
+on:
+  push:
+  pull_request:
+
+jobs:
+  static:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 文档一致性 + 语法
+        run: node scripts/check.mjs
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 测试（需要宿主 peer 依赖）
+        shell: bash
+        run: |
+          if node -e "import('@deepseek-ai/schemastery').then(() => {}, () => process.exit(1))"; then
+            node --test test/
+          else
+            echo "::warning::缺少 @deepseek-ai/* peer 依赖，跳过测试。发布前请在装有 DSH 的机器上跑 npm test，基线必须全绿。"
+          fi

@@ -106,12 +106,28 @@ function reasonOf(error) {
  *
  * 入站落盘（`createMediaStore`）与出站发图（`image.js`）共用这一份 ——
  * 「怎么把一个 URL 变成有上限的字节」只该有一种答案，两边的上限语义才不会有出入。
+ *
+ * 重定向一律自己跟（`redirect: 'manual'`）：这样每一跳都能先过 `validateUrl`。
+ * 出站图片会把 `checkUrl` + DNS 解析的结果传进来；入站不带校验器，行为与以前一样
+ * （最多 3 跳），因为 NapCat 给的图片地址有时就是本机地址。
+ *
  * @param url - http / https 链接。
- * @param options - `{ maxBytes, timeoutMs, fetchImpl }`；缺省即模块默认。
+ * @param options - `{ maxBytes, timeoutMs, fetchImpl, validateUrl, maxRedirects }`；缺省即模块默认。
+ * @param options.validateUrl - 可选的异步校验器：每一跳（含初始 URL）先调它，返回字符串时
+ *   作为归一化后的下一跳地址；抛错即中止。
  * @returns 完整字节。
- * @throws 非法 URL、非 http(s)、HTTP 错误、空响应体、超时或超限时抛错。
+ * @throws 非法 URL、非 http(s)、重定向异常、HTTP 错误、空响应体、超时或超限时抛错。
  */
-export async function fetchBytes(url, { maxBytes = DEFAULTS.maxBytes, timeoutMs = DEFAULTS.timeoutMs, fetchImpl = globalThis.fetch } = {}) {
+export async function fetchBytes(
+  url,
+  {
+    maxBytes = DEFAULTS.maxBytes,
+    timeoutMs = DEFAULTS.timeoutMs,
+    fetchImpl = globalThis.fetch,
+    validateUrl,
+    maxRedirects = 3,
+  } = {},
+) {
   const byteCap = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : DEFAULTS.maxBytes;
   const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) : DEFAULTS.timeoutMs;
   let parsed;
@@ -126,24 +142,55 @@ export async function fetchBytes(url, { maxBytes = DEFAULTS.maxBytes, timeoutMs 
   const timer = setTimeout(() => controller.abort(new Error(`timed out after ${timeout}ms`)), timeout);
   timer.unref?.();
   try {
-    const response = await fetchImpl(parsed.href, { redirect: 'follow', signal: controller.signal });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const declared = Number(response.headers?.get?.('content-length'));
-    if (Number.isFinite(declared) && declared > byteCap) throw new Error(`too large (${declared} bytes)`);
-    if (response.body === null || response.body === undefined) throw new Error('empty response body');
-    const chunks = [];
-    let total = 0;
-    for await (const chunk of response.body) {
-      const bytes = Buffer.from(chunk);
-      total += bytes.length;
-      if (total > byteCap) {
-        controller.abort(new Error('too large'));
-        throw new Error(`larger than ${byteCap} bytes`);
+    let current = parsed;
+    for (let hop = 0; hop <= maxRedirects; hop += 1) {
+      if (typeof validateUrl === 'function') {
+        const checked = await validateUrl(current.href);
+        if (typeof checked === 'string' && checked.length > 0) current = new URL(checked);
       }
-      chunks.push(bytes);
+      const response = await fetchImpl(current.href, { redirect: 'manual', signal: controller.signal });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers?.get?.('location');
+        try {
+          await response.body?.cancel?.();
+        } catch {
+          // 3xx 的响应体没有用；取不取消不影响判定。
+        }
+        if (typeof location !== 'string' || location.trim().length === 0) {
+          throw new Error(`redirect ${response.status} without a location`);
+        }
+        if (hop === maxRedirects) throw new Error(`too many redirects (${maxRedirects})`);
+        let next;
+        try {
+          next = new URL(location.trim(), current.href);
+        } catch {
+          throw new Error('invalid redirect location');
+        }
+        if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+          throw new Error(`unsupported redirect scheme ${next.protocol}`);
+        }
+        current = next;
+        continue;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const declared = Number(response.headers?.get?.('content-length'));
+      if (Number.isFinite(declared) && declared > byteCap) throw new Error(`too large (${declared} bytes)`);
+      if (response.body === null || response.body === undefined) throw new Error('empty response body');
+      const chunks = [];
+      let total = 0;
+      for await (const chunk of response.body) {
+        const bytes = Buffer.from(chunk);
+        total += bytes.length;
+        if (total > byteCap) {
+          controller.abort(new Error('too large'));
+          throw new Error(`larger than ${byteCap} bytes`);
+        }
+        chunks.push(bytes);
+      }
+      if (total === 0) throw new Error('empty response body');
+      return Buffer.concat(chunks);
     }
-    if (total === 0) throw new Error('empty response body');
-    return Buffer.concat(chunks);
+    throw new Error(`too many redirects (${maxRedirects})`);
   } finally {
     clearTimeout(timer);
   }

@@ -4,6 +4,17 @@
   "private": true,
   "type": "module",
   "description": "Bidirectional QQ (OneBot v11) bridge: QQ messages drive Harness agents, and any agent can send QQ messages, images and stickers back into a chat.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flyinstar/dsh-qq-bridge.git"
+  },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test": "node --test test/",
+    "test:coverage": "node --test --experimental-test-coverage test/",
+    "verify": "npm run check && npm test"
+  },
   "engines": {
     "node": ">=22"
   },
@@ -36,6 +47,8 @@
     "onebot.js",
     "media.js",
     "image.js",
+    "send.js",
+    "sticker.js",
     "mention.js",
     "napcat.js",
     "desktop.js",
@@ -57,9 +70,14 @@
     ".dsh/skills/*/SKILL.md",
     "README.md",
     "docs/*.md",
+    "docs/agents/*.md",
     "scripts/*",
     "test/*.mjs",
-    "deploy/*"
+    "deploy/*",
+    "batch.js",
+    "reminder-runtime.js",
+    "routes.js",
+    "key-rotation.js"
   ],
   "dsh": {
     "bundle": {

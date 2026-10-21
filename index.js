@@ -21,7 +21,7 @@
  * **出站**（本地文件 / URL → QQ 的 image 段）在 `image.js`。这里只负责路由、
  * 提示词与工具装配：什么时候该发、发给谁。
  *
- * 六个宿主平面工具的**声明**在 `tools.js`（依赖由这里显式传进去，那边不持有状态）；
+ * 十一个宿主平面工具的**声明**在 `tools.js`（依赖由这里显式传进去，那边不持有状态）；
  * 本文件留的是它们的**能力来源**——收件人解析、发送队列这些真正有状态的东西。
  * 长期记忆整个子系统（转录 / 记忆文件 / 摘要循环）在 `memory.js`，同样由这里显式递依赖。
  *
@@ -29,25 +29,28 @@
  */
 import { readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdir, readFile, rename, stat } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { OneBotClient, atMentions, blankMessageLabel, chunkText, collectMedia, findReply, isEmojiOnlyMessage, isStickerSegment, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs, userDisplayName } from './onebot.js';
+import { OneBotClient, atMentions, blankMessageLabel, collectMedia, findReply, isEmojiOnlyMessage, isStickerSegment, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, userDisplayName } from './onebot.js';
 import { createMediaStore } from './media.js';
 import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
 import { endpointTarget, findNapcatDir, repairNapcat } from './napcat.js';
 import { registerQqTools } from './tools.js';
-import { createSettings, MAX_TIMER_MS } from './settings.js';
+import { createSettings } from './settings.js';
 import { createChatter } from './chatter.js';
-import { buildMentionResolver, hasMentionMarker, isAllMention, mentionSegments } from './mention.js';
+import { buildMentionResolver, isAllMention } from './mention.js';
+import { createSender } from './send.js';
+import { createStickerStore } from './sticker.js';
+import { createReminderRuntime } from './reminder-runtime.js';
+import { createBatcher } from './batch.js';
+import { registerRoutes } from './routes.js';
+import { createKeyRotation } from './key-rotation.js';
 import {
   activeFollowAllows as activeFollowAllowsRule,
   activeTurnsLeft as activeTurnsLeftRule,
-  batchCap as batchCapRule,
-  batchScale as batchScaleRule,
-  batchWindow as batchWindowRule,
   chimeAllows,
   chimeDelay as chimeDelayRule,
   privateAfterthoughtAllows,
@@ -55,33 +58,26 @@ import {
   proactiveSkip,
 } from './speaking-rules.js';
 import { createMemory } from './memory.js';
-import { renderBacklog } from './backlog.js';
-import { createReminders, describeTask, REMINDER_ROUTE_PATH } from './reminders.js';
-import { builtinStyle, classifyReply, createStyle, renderStyleContract, sanitizeBubble } from './style.js';
+import { createReminders, describeTask } from './reminders.js';
+import { builtinStyle, createStyle, renderStyleContract } from './style.js';
 import { createPersona, renderPersona } from './persona.js';
 import { observationOf, renderObservation } from './modalities.js';
 import { pokeAction, pokeActionType, pokeNudge, pokeNotice } from './interactions.js';
-import { recallAction, recallLine, recallNudge, recallNotice } from './recall.js';
-import { fetchPageTitle, previewLine } from './links.js';
-import { decideGroupTurn, interjectBatchPrompt, interjectLine } from './speech-policy.js';
+import { recallAction, recallNudge, recallNotice } from './recall.js';
+import { decideGroupTurn } from './speech-policy.js';
 import {
-  apiKeyFingerprint,
   errorText,
   hourLabel,
   liveConfig,
   localDate,
   localMinute,
   memorySlug,
-  msUntilDailyHour,
-  parseApiKeyPool,
   sessionIdFor,
-  SESSION_ROUTE_PATH,
-  stickerFileName,
   visibleText,
   weekdayLabel,
   withinActiveHours,
 } from './util.js';
-import { readTextOrUndefined, writeBytesAtomic, writeJsonAtomic } from './filestore.js';
+import { writeJsonAtomic } from './filestore.js';
 
 // 这几个的契约由 test/bridge.test.mjs 直接从插件入口验，所以在这里再导出一次
 // （Loader 也只认 index.js 这个入口，搬走的东西必须在入口处仍然拿得到）。
@@ -167,15 +163,6 @@ const QUOTE_TEXT_CHARS = 200;
 const QUOTE_FETCH_TIMEOUT_MS = 5000;
 
 /**
- * 渠道提示里最多列几个表情包文件名。
- *
- * 列出来是为了让模型**知道有什么**（名字通常就是意思，比如 `笑死.gif`），省掉一次
- * `glob`；但目录是使用者随手往里丢的，可能一下就几百张 —— 提示词不该被它撑爆，
- * 超出的部分模型仍然可以用 glob 自己看。
- */
-const STICKER_PROMPT_MAX = 40;
-
-/**
  * 「上一轮那张表情没发出去」这条提醒在提示词里保留多久（毫秒）。
  *
  * 失败的原因（路径不存在 / 不在收藏目录）模型必须知道，否则它会照着自己编的路径
@@ -183,40 +170,6 @@ const STICKER_PROMPT_MAX = 40;
  * 但这条提醒是短时效的：十轮之后还在说「上一轮」，模型会以为那是一句没做完的指令。
  */
 const STICKER_FAILURE_TTL_MS = 10 * 60 * 1000;
-
-/**
- * 长任务期间那波「迟到的消息」隔多久看一眼「它忙完了没有」（毫秒）。
- *
- * timers 只在**会话还忙**的时候存在：醒来一次，忙就再等一个短周期，不忙就把整波投出去
- * （见 `flushBatch` / `backlogShouldHold`）。一秒一次是刻意选的：投递延迟的上限就是它，
- * 而每次醒来只做一次 Map 查询；两分钟的任务也才 120 次，比给每个会话挂一堆状态便宜。
- */
-const BACKLOG_POLL_MS = 1000;
-
-/**
- * 私聊「对方正在输入」的刷新间隔（毫秒）。
- *
- * QQ 的输入状态只亮几秒，协议端不会替我们续：不补发就会在思考到一半时自己熄灭。
- * 4 秒是密度与成本的折中 —— 一次二三十秒的思考也才七八次调用；太密只是白花 API。
- */
-const TYPING_REFRESH_MS = 4000;
-
-/**
- * `set_input_status` 的超时（毫秒）。
- *
- * 故意比普通 OneBot 调用短得多：它只是一条「锦上添花」的状态，不值得在协议端不认这个
- * action 时让挂起的调用撑十几秒；失败也绝不影响后面的消息本身。
- */
-const TYPING_CALL_TIMEOUT_MS = 3000;
-
-/**
- * 一次「正在输入」最多亮多久（毫秒）。
- *
- * 正常一轮回复不会超过这个量级；它是**卡死时的保险** —— turn/end 因为任何原因没来
- * （协议断开、插件被卡住），刷新循环也不能一直每 4 秒发一次调用。到点后自己熄灭，
- * 后面真发出消息时 `sendParts` 会重新点亮。
- */
-const TYPING_MAX_MS = 2 * 60 * 1000;
 
 /**
  * 一个会话最多记住多少个「可以被 @ 的人」。
@@ -242,6 +195,20 @@ const RECENT_MAX = 30;
  * 一个刷屏的长消息在内存里留一整段（QQ 消息是不可信输入，能不长期留就不留）。
  */
 const RECENT_TEXT_MAX = 80;
+
+/**
+ * 归属表（`submitted` / `turnOwners`）的兜底超时：一条消息投出去之后，如果永远等不到
+ * `agent/inbox/claimed` 或 `turn/end`（模型端挂死、宿主在别处 dispose 了这个 Agent），
+ * 那个条目不能永久占着会话 —— `busyWithTurn` 会一直为 true，主动说话 / 补一句 /
+ * agent 提醒全部静默失效。一小时足够覆盖任何正常的一轮，也短到不会让人等到忘记。
+ */
+const OWNER_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * `submitted` 的软上限。超过时按投递时间淘汰最旧的，**不能整表 `clear()`**：
+ * 那会把正在飞的消息归属一起抹掉，之后 `turn/end` 找不到 owner，模型回复被静默丢弃。
+ */
+const SUBMITTED_MAX = 512;
 
 /**
  * 默认的「群友口吻」，注入系统提示的 QQ 渠道小节（人设槽的兜底）。
@@ -331,6 +298,8 @@ export function apply(ctx, config) {
   // 失败，turn 在消息被 claim 之前就死掉。下面的 route 记录当前生效的选择，
   // 也通过 qq_list_conversations 暴露出来便于排查。
   const route = { provider: '', model: '', reasoningEffort: undefined, source: 'none', error: '' };
+
+  // ---- 模型路由：配置优先，否则继承部署默认 ---------------------------------------------------
 
   /**
    * 解析 QQ 会话应当使用的 provider/model。
@@ -483,10 +452,6 @@ export function apply(ctx, config) {
   const imageMaxBytes = Number.isFinite(settings.imageMaxBytes) && settings.imageMaxBytes > 0
     ? Math.floor(settings.imageMaxBytes)
     : DEFAULT_IMAGE_MAX_BYTES;
-  // 表情包目录的张数上限（0 = 不限制）。归零/夹紧的口径在 settings.js，这里只读结果。
-  const stickerMaxFiles = settings.stickerMaxFiles;
-  const stickerRoot = settings.stickerDir.trim().length > 0 ? resolve(cwd, settings.stickerDir.trim()) : undefined;
-  const stickerInside = stickerRoot !== undefined && insideDirectory(resolve(cwd), stickerRoot);
   /**
    * 表情包复读里「算同一张画面」的位差上限（0 = 只认字节完全相同）。
    *
@@ -494,11 +459,6 @@ export function apply(ctx, config) {
    * 功能 —— 真想要那种效果该关掉复读的图（`repeatMedia: false`），而不是让它乱跟。
    */
   const repeatImageTolerance = Math.min(0.3, Math.max(0, Number(settings.repeatImageTolerance) || 0));
-  if (stickerRoot !== undefined && !stickerInside) {
-    report('warn', `stickerDir "${settings.stickerDir.trim()}" resolves outside cwd (${cwd}); the sticker pack will not be advertised`);
-  }
-  /** 表情包目录的展示路径（相对 cwd、正斜杠），就是模型该写进 qq_send_image 的那种写法。 */
-  const stickerLabel = stickerInside ? relative(resolve(cwd), stickerRoot).split(sep).join('/') : undefined;
 
   // ---- 人格与表达：两个热读文件 + 一组机器参数（见 docs/persona-style.md「人格与表达」）----
   //
@@ -559,6 +519,98 @@ export function apply(ctx, config) {
     channelSectionOrder: CHANNEL_SECTION_ORDER,
   });
 
+  // 表情包目录的读写边界搬去了 sticker.js；这里只装配，并把字段解构成同名函数，
+  // 调用点（channelTurnContext / send / tools / 目录创建）一个都没改。
+  const stickers = createStickerStore({
+    settings,
+    cwd,
+    report,
+    memory,
+    imageMaxBytes,
+    imageAllowed,
+    allowTools,
+    canReadImages,
+  });
+  const {
+    root: stickerRoot,
+    inside: stickerInside,
+    label: stickerLabel,
+    catalogLines: stickerCatalogLines,
+    resolveSource: resolveStickerSource,
+    sendSource: stickerSendSource,
+    isFile: isStickerFile,
+    noteFailure: noteStickerFailure,
+    save: saveSticker,
+    rename: renameSticker,
+    saveAllowed: stickerSaveAllowed,
+    renameAllowed: stickerRenameAllowed,
+  } = stickers;
+
+  // 发送链路（拆条 / 引用 / 输入状态 / 串行队列）搬去了 send.js；这里只装配依赖。
+  //
+  // 依赖里的 `conversationMentions` / `describeConversation` / `noteOwnMessage`
+  // 仍然是本闭包里的函数声明（函数提升，位置在下面不影响装配）。
+  const sender = createSender({
+    client,
+    settings,
+    report,
+    cwd,
+    imageMaxBytes,
+    styleParams,
+    chatMaxChars,
+    conversations,
+    chatter,
+    imageAllowed,
+    stickerSendSource,
+    noteStickerFailure,
+    conversationMentions,
+    describeConversation,
+    noteOwnMessage,
+  });
+  const {
+    enqueueSend,
+    sendToConversation,
+    sendLiteral,
+    replyPieces,
+    sendOne,
+    startTyping,
+    stopTyping,
+    stopAllTyping,
+  } = sender;
+
+  // 攒批（窗口 / 积压 / 提交）搬去了 batch.js；这里只装配并解构同名别名。
+  const batcher = createBatcher({
+    settings,
+    client,
+    report,
+    memory,
+    submitted,
+    sendToConversation,
+    groupTalkActive,
+    busyWithTurn,
+    findRecent,
+    mediaFor,
+    resolveQuote,
+    imageAllowed,
+    dropPrefix,
+    quotePrefix,
+    registerParticipant,
+    ensureAgent,
+    userMessageFor,
+    describeConversation,
+  });
+  const {
+    enqueue,
+    holdForBatch,
+    backlogBusy,
+    backlogShouldHold,
+    flushBatch,
+    flushIfIdle,
+    batchScale,
+    batchWindow,
+    batchCap,
+  } = batcher;
+
   // ---- 定时提醒（见 reminders.js 与 docs/reminders.md）--------------------------
   //
   // 任务文件放在 cwd 内（与 mediaDir / memoryDir 同一套越界校验）：它是唯一一份
@@ -575,6 +627,32 @@ export function apply(ctx, config) {
   } else if (settings.reminder && !reminderInside) {
     report('warn', `reminderFile "${settings.reminderFile}" resolves outside cwd (${cwd}); scheduled reminders are disabled`);
   }
+  // 定时提醒的运行时（发送 / Agent 轮 / 守卫）搬去了 reminder-runtime.js；这里只装配。
+  const reminderRuntime = createReminderRuntime({
+    ctx,
+    client,
+    settings,
+    report,
+    enqueueSend,
+    sendOne,
+    sendToConversation,
+    enqueue,
+    targetConversation,
+    ensureAgent,
+    userMessageFor,
+    submitted,
+    noteRecallFallback,
+    pendingReminderTurns,
+  });
+  const {
+    scheduleTimer,
+    deliverText: deliverReminderText,
+    deliverModel: deliverReminderModel,
+    nudge: reminderNudge,
+    settle: settleReminderTurn,
+    run: runReminderTurn,
+  } = reminderRuntime;
+
   const reminders = reminderInside
     ? createReminders({
         file: reminderRoot,
@@ -608,270 +686,21 @@ export function apply(ctx, config) {
     }, 'qq-bridge:reminders');
   }
 
-  // 设置页那一块「已记录的定时任务」要读的是**运行中的任务文件**，它不是配置项，
-  // schema 里没有、也不能为了它加一个假的配置字段。于是这里挂一条只读的 Host 路由：
-  // Connection 的 `/api` 自带 Host/Origin 栅栏与浏览器认证，页面（同源 fetch）拿到的
-  // 就是操作员视角；数据本身走 `reminders.overview()`，只含展示字段。
-  //
-  // 没有 Connection 服务（headless / 没开 Web）时静默不挂 —— 那边也没有设置页。
-  //
-  // 必须用 `ctx.inject`（可选依赖）、**不能**在这里 `ctx.get('connection')` 一次：
-  // 本插件的 `apply()` 跑在 `dsh-client-connection` 之前（实测启动日志：插件在
-  // T+0s 打完整套配置，`dsh web: http://…` 在 T+2s 才出现），那一刻
-  // `ctx.get('connection')` 是 undefined —— 于是路由**永远**挂不上，设置页那一块
-  // 只会拿到 404（真实事故：任务确实建好了，页面上却什么都没有）。
-  // `ctx.inject(['connection'], …)` 等的是「服务出现」这个事件：有了才跑回调，
-  // 全程没有 Web 半侧的组合（headless）里回调压根不跑，也不影响插件激活。
-  // 路由的注销由 `registerFetchRoute` 自己挂的 effect 负责（它绑在回调拿到的那个
-  // 子上下文上），插件卸载时一起收掉。
-  ctx.inject(['connection'], (connectionCtx) => {
-    const connection = connectionCtx.get('connection');
-    if (connection === undefined || typeof connection.fetch?.register !== 'function') return;
-    connection.fetch.register({
-      path: REMINDER_ROUTE_PATH,
-      methods: ['GET'],
-      requestBody: 'buffered',
-      fetch: async () => {
-        const at = Date.now();
-        const body = reminders === undefined
-          ? { ok: true, enabled: false, now: at, pending: 0, total: 0, tasks: [] }
-          : { ok: true, enabled: true, ...(await reminders.overview(at)) };
-        return new Response(JSON.stringify(body), {
-          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
-        });
-      },
-    });
-  });
-
-  // 设置页「重置对话」：与 QQ 里的 `/reset` 调同一个 `resetConversation`，只是入口换成
-  // Web UI。为什么不复用 `resetUsers`：那是「群消息里谁能发这个指令」的白名单，而这条
-  // 路由只在 Connection 的认证栅栏内、且只交给 owner principal（别的 principal 一律 403）
-  // —— 能打开设置页的人本来就能改这份配置、重启进程，重置一个会话比那轻得多。
-  //
-  // 列表只读**这次进程**的 `conversations`：会话记录是内存态，重启后要等对方再发一条
-  // 消息才会重新出现。这一点写在 docs/sessions.md，别让页面暗示「磁盘上所有会话」。
-  ctx.inject(['connection'], (connectionCtx) => {
-    const connection = connectionCtx.get('connection');
-    if (connection === undefined || typeof connection.fetch?.register !== 'function') return;
-    connection.fetch.register({
-      path: SESSION_ROUTE_PATH,
-      methods: ['GET', 'POST'],
-      requestBody: 'buffered',
-      fetch: async (request) => {
-        if (request.method === 'GET') {
-          return jsonResponse({ ok: true, now: Date.now(), conversations: webSessionSnapshots() });
-        }
-        let body;
-        try {
-          body = await request.json();
-        } catch {
-          return jsonResponse({ ok: false, error: 'invalid-json' }, 400);
-        }
-        // `{ all: true }`：设置页的「全部重置」。逐个排进各自的串行链，一个失败不拦其余。
-        if (body?.all === true) {
-          const reset = [];
-          const failed = [];
-          for (const conversation of [...conversations.values()]) {
-            const key = conversation.key;
-            if (await resetConversationFromWeb(conversation)) {
-              reset.push({
-                key,
-                round: conversation.sessionGeneration ?? 0,
-                sessionId: sessionIdFor(key, conversation.sessionGeneration ?? 0),
-              });
-            } else {
-              failed.push({ key, reason: 'dispose-failed' });
-            }
-          }
-          // 全部重置是一次批处理：请求本身成功（200），逐项结果放在 `failed` 里，
-          // 页面据此显示「重置了几个、失败几个」。单条重置的失败才用 4xx/5xx。
-          return jsonResponse({ ok: true, reset, failed, conversations: webSessionSnapshots() });
-        }
-        const key = typeof body?.key === 'string' ? body.key.trim() : '';
-        if (key.length === 0) return jsonResponse({ ok: false, error: 'missing-key' }, 400);
-        const conversation = conversations.get(key);
-        if (conversation === undefined) {
-          return jsonResponse(
-            { ok: false, error: 'unknown-conversation', reset: [], failed: [{ key, reason: 'unknown-conversation' }] },
-            404,
-          );
-        }
-        if (!(await resetConversationFromWeb(conversation))) {
-          return jsonResponse(
-            { ok: false, error: 'dispose-failed', reset: [], failed: [{ key, reason: 'dispose-failed' }] },
-            409,
-          );
-        }
-        return jsonResponse({
-          ok: true,
-          reset: [{
-            key,
-            round: conversation.sessionGeneration ?? 0,
-            sessionId: sessionIdFor(key, conversation.sessionGeneration ?? 0),
-          }],
-          failed: [],
-          conversations: webSessionSnapshots(),
-        });
-      },
-    });
+  // 设置页的两条 Host 路由（会话列表 / 重置、定时任务看板）搬去了 routes.js；
+  // 这里只装配：路由只做 HTTP 形状，会话动作仍是本文件的 webSessionSnapshots /
+  // resetConversationFromWeb（它们要碰会话队列与 resetConversation）。
+  registerRoutes(ctx, {
+    reminders,
+    conversations,
+    snapshots: webSessionSnapshots,
+    resetFromWeb: resetConversationFromWeb,
   });
 
   // ---- 模型凭据：每天尝试轮换（见 docs/ops.md「每天轮换 API key」）------------------
   //
-  // 为什么这件事能在这里做成：Harness 的模型调用是**每次请求**去解析凭据的
-  // （llm-deepseek 的 resolveApiKey → ctx.credentials.resolve），而本地凭据层监听
-  // `$DSH_HOME/.credentials.yaml`、写完就地更新内存 —— 所以把新 key 交给 credentials
-  // 服务就等于当场生效，不用重启 Harness。反过来，自己去改那个 YAML 文件是不行的：
-  // 里面还有浏览器会话等 records，手写一份很容易把它们弄丢，也绕过了凭据层自己的文件锁。
-  //
-  // 池子是 cwd 里的一个纯文本文件，而不是配置项：配置会显示在 Web UI 上、也会被复制粘贴
-  // 到别处，key 不该走那条路。它同时也必须在 cwd 内（与该目录的其它约定一致）。
-  const apiKeyRotateOn = settings.apiKeyRotate !== false;
-  const apiKeyRefName = typeof settings.apiKeyRef === 'string' ? settings.apiKeyRef.trim() : '';
-  // 凭据引用名与凭据层自身的语法一致（也是 POSIX 环境变量名）：不合法就整个停用，
-  // 而不是每天写一个语法都不对的 ref 进去。
-  const apiKeyRefValid = /^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyRefName);
-  const apiKeyPoolCfg = typeof settings.apiKeyFile === 'string' ? settings.apiKeyFile.trim() : '';
-  const apiKeyPoolPath = apiKeyPoolCfg.length > 0 ? resolve(cwd, apiKeyPoolCfg) : undefined;
-  const apiKeyPoolInside = apiKeyPoolPath !== undefined && insideDirectory(resolve(cwd), apiKeyPoolPath);
-  /** 池子的展示路径（相对 cwd、正斜杠），日志与「怎么配」的提示里都用它。 */
-  const apiKeyPoolLabel = apiKeyPoolInside ? relative(resolve(cwd), apiKeyPoolPath).split(sep).join('/') : apiKeyPoolCfg;
-  const apiKeyRotateEnabled = apiKeyRotateOn && apiKeyRefValid && apiKeyPoolInside;
-  if (apiKeyRotateOn && !apiKeyRefValid) {
-    report('warn', `apiKeyRef "${apiKeyRefName}" is not a credential name (A-Za-z_ followed by A-Za-z0-9_); api key rotation is disabled`);
-  } else if (apiKeyRotateOn && !apiKeyPoolInside) {
-    report('warn', `apiKeyFile "${apiKeyPoolCfg}" resolves outside cwd (${cwd}); api key rotation is disabled`);
-  }
-
-
-
-
-  /**
-   * 探测一个候选 key 现在能不能用。
-   *
-   * 用 GET 而不是发一次真的对话：「换 key」最怕的是从一个没额度的 key 换到另一个同样
-   * 没额度的 key，所以探测必须**便宜且不消耗 token**。DeepSeek 的 OpenAI 兼容面
-   * （`/models`）认 `Authorization: Bearer`，Anthropic 面认 `x-api-key` —— 两个头一起
-   * 带上，同一套配置就能探两种协议（多出来的那个头会被服务端忽略）。
-   *
-   * 判定：2xx = 可用；429 = key 本身有效但被限流/额度用尽，对「找一个现在能用的」来说
-   * 同样算不可用，但日志里要区分出来 —— 那说明池子里这个 key 该换了，而不是写错了。
-   * @param key - 候选 key。
-   * @returns `{ ok, detail }`：detail 是可以直接写进日志的一句话。
-   */
-  async function probeApiKey(key) {
-    const url = settings.apiKeyProbeUrl;
-    if (url.length === 0) return { ok: true, detail: 'probe disabled' };
-    try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: { authorization: `Bearer ${key}`, 'x-api-key': key },
-        signal: AbortSignal.timeout(settings.apiKeyProbeTimeoutMs),
-      });
-      // 响应体一律不要（`/models` 的列表又长又没用），但也不能让连接挂着不给个交代。
-      if (response.body !== null) {
-        try {
-          await response.body.cancel();
-        } catch {
-          // 取不取消都不影响判定：状态码已经拿到了。
-        }
-      }
-      if (response.ok) return { ok: true, detail: `HTTP ${response.status}` };
-      return { ok: false, detail: response.status === 429 ? 'HTTP 429 (额度用尽或被限流)' : `HTTP ${response.status}` };
-    } catch (error) {
-      return { ok: false, detail: `probe failed: ${errorText(error)}` };
-    }
-  }
-
-  /**
-   * 每天到点尝试把当前凭据换成池子里的下一个 key。
-   *
-   * 「尝试」的含义就在这两个循环里：从**当前生效的 key 之后**开始，逐个探测池子里的候选，
-   * 第一个探测通过的才写进去；全都不通过就保留原来的、只记一条 warn。这样池子里混进一个
-   * 失效的 key 不会把 bot 直接换成不可用的状态，也不会因为一行坏 key 就每天卡在同一个位置。
-   *
-   * 状态是**算出来的**，不落盘：当前用的是哪个 key 直接问凭据层要，下一个是谁由它在池子里的
-   * 位置决定。于是重启、手工改过 key、池子刚调整过顺序都不会让轮换跑偏（当前 key 不在池子里
-   * 时从池首开始）。
-   * @param reason - 写进日志的触发原因（例如 `daily at 04:00`）。
-   */
-  async function rotateApiKey(reason) {
-    if (!apiKeyRotateEnabled) return;
-    const text = await readTextOrUndefined(apiKeyPoolPath);
-    // 「文件还没有 / 还没填 key」是**没配置**而不是故障：记 info，把「该怎么办」说清楚，
-    // 别让使用者每天在 journal 里看到一条红黄的 warn 却不知道要做什么。
-    if (text === undefined) {
-      report('info', `api key rotation (${reason}): no key pool at ${apiKeyPoolLabel}; put one key per line there to start rotating`);
-      return;
-    }
-    const pool = parseApiKeyPool(text);
-    if (pool.length === 0) {
-      report('info', `api key rotation (${reason}): key pool ${apiKeyPoolLabel} has no key yet (comments and blank lines do not count)`);
-      return;
-    }
-    const credentials = ctx.get('credentials');
-    if (credentials === undefined || typeof credentials.set !== 'function' || typeof credentials.resolve !== 'function') {
-      report('warn', `api key rotation: the credentials service is not visible from this plugin, cannot switch ${apiKeyRefName}`);
-      return;
-    }
-    // describe() 能直接回答「写进去会不会被启动环境压住」：环境变量里的 DEEPSEEK_API_KEY
-    // 优先级高于凭据文件，那种部署下写文件等于白写 —— 提前说清楚，而不是每天静默地
-    // 「成功」换了一个根本不生效的 key。
-    if (typeof credentials.describe === 'function') {
-      try {
-        const info = await credentials.describe(apiKeyRefName);
-        if (info?.writable === false) {
-          report('warn', `api key rotation: ${apiKeyRefName} is supplied read-only by the launching environment (source ${info.source ?? 'env'}); rotating the stored value would have no effect`);
-          return;
-        }
-      } catch (error) {
-        report('warn', `api key rotation: could not inspect ${apiKeyRefName}: ${errorText(error)}`);
-        return;
-      }
-    }
-    let current = '';
-    try {
-      current = (await credentials.resolve(apiKeyRefName))?.value ?? '';
-    } catch (error) {
-      report('warn', `api key rotation: could not read the current ${apiKeyRefName}: ${errorText(error)}`);
-      return;
-    }
-    const currentLabel = current.length > 0 ? apiKeyFingerprint(current) : '(未设置)';
-    // 候选顺序：当前 key 的下一个开始，绕回池首。当前 key 不在池子里（手工填的、或者
-    // 池子刚换过）时从第一个开始 —— 池子里的顺序就是轮换顺序。
-    const start = current.length > 0 && pool.includes(current) ? (pool.indexOf(current) + 1) % pool.length : 0;
-    const order = [];
-    for (let step = 0; step < pool.length; step += 1) {
-      const candidate = pool[(start + step) % pool.length];
-      if (candidate !== current) order.push(candidate);
-    }
-    if (order.length === 0) {
-      report('info', `api key rotation: ${apiKeyPoolLabel} holds no key other than the one in use (${currentLabel}); nothing to rotate`);
-      return;
-    }
-    for (const candidate of order) {
-      const probe = await probeApiKey(candidate);
-      if (!probe.ok) {
-        report('warn', `api key rotation: candidate ${apiKeyFingerprint(candidate)} rejected (${probe.detail}); trying the next one`);
-        continue;
-      }
-      try {
-        await credentials.set(apiKeyRefName, candidate);
-      } catch (error) {
-        report('warn', `api key rotation: could not store ${apiKeyRefName}: ${errorText(error)}`);
-        return;
-      }
-      // 写回之后回读一次：凭据层的写入是异步的（落盘 + 通知），确认真的换过去了才算成功。
-      const after = await credentials.resolve(apiKeyRefName).catch(() => undefined);
-      if (after?.value !== candidate) {
-        report('warn', `api key rotation: ${apiKeyRefName} still reads back as the old value after a write; the credentials store did not take it`);
-        return;
-      }
-      report('info', `api key rotation: switched ${apiKeyRefName} from ${currentLabel} to ${apiKeyFingerprint(candidate)} (${probe.detail})`);
-      return;
-    }
-    report('warn', `api key rotation: none of the ${order.length} other key(s) in ${apiKeyPoolLabel} passed the probe; keeping ${currentLabel}`);
-  }
+  // 整个轮换器（池子 / 探测 / 写回 / 每日定时器）搬去了 key-rotation.js；这里只装配。
+  // `start()` 在下面的「生命周期」里调用 —— 它要挂定时器并写启动自述。
+  const keyRotation = createKeyRotation({ ctx, settings, cwd, report });
 
   // ---- 会话代次（`/reset` 开新一轮会话的记账）------------------------------------
   //
@@ -972,6 +801,7 @@ export function apply(ctx, config) {
     conversationResetDirty = true;
   }
 
+  // ---- Agent 装配：渠道提示、预设、工具白名单 -----------------------------------------------
 
   /**
    * 撤掉上一次挂上的提示变量与 QQ 渠道小节。
@@ -1092,6 +922,17 @@ export function apply(ctx, config) {
    * @returns 存活的 Agent。
    */
   async function ensureAgent(conversation) {
+    // 群名只影响日志、会话列表与「本轮情境」的可读性，查询失败绝不能挡住回复链路。
+    // 放在最前面：重启后会话记录是空的，`resume` 那条路是**每一条消息**都会走的，
+    // 只在建 Agent 时查一次的话，程序重启一次群名就永久丢了（见 `channelTurnContext`）。
+    // 只试一次（进程内）：查询失败就空着，别每条消息都打一次 API。
+    if (conversation.type === 'group' && conversation.name.length === 0 && conversation.nameLookup !== true) {
+      conversation.nameLookup = true;
+      conversation.name = await client
+        .call('get_group_info', { group_id: Number(conversation.id) })
+        .then((info) => String(info?.group_name ?? ''))
+        .catch(() => '');
+    }
     const sessionId = sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0);
     const live = ctx.agents.get(sessionId);
     if (live !== undefined) {
@@ -1114,13 +955,6 @@ export function apply(ctx, config) {
         await attachChannelPrompt(conversation, live.ctx ?? conversation.agentCtx, conversation.agentOptions ?? live.options);
       }
       return live;
-    }
-    // 群名只影响提示词和会话列表的可读性，查询失败绝不能挡住回复链路。
-    if (conversation.type === 'group' && conversation.name.length === 0) {
-      conversation.name = await client
-        .call('get_group_info', { group_id: Number(conversation.id) })
-        .then((info) => String(info?.group_name ?? ''))
-        .catch(() => '');
     }
     // 组装 agentOptions：只带上真正有值的字段，避免把空串当成显式选择。
     const chosen = resolveRoute();
@@ -1375,6 +1209,8 @@ export function apply(ctx, config) {
     }
   }
 
+  // ---- 每轮上下文：环境、发言者、记忆、时间 ---------------------------------------------------
+
   /**
    * 渲染「群里最近在聊什么」小段。
    * 每次提示词装配时现算，因此拿到的一定是最新的群聊，而不是建 Agent 那一刻的快照。
@@ -1465,298 +1301,6 @@ export function apply(ctx, config) {
     return `刚跟你说话的人：${conversation.senderName}。`;
   }
 
-  /**
-   * 表情包目录里认得出来的图片文件名（**不带**目录前缀）；目录不存在/不可用时为空。
-   *
-   * 用同步 readdir 而不是 async：`SystemPrompt.section()` 的 text provider 是**同步**
-   * 求值的（每次装配提示词都要重新算，群聊上下文正是靠这个才不过期），而这里读的是一个
-   * 一层、几十个文件的小目录 —— 一次 readdir 的代价远小于为它引入缓存与失效逻辑。
-   * 只认 PNG/JPEG/WebP/GIF（发送侧也只认这四种，列个 README.md 出来只会让模型去撞一次错）。
-   */
-  function stickerFiles() {
-    if (stickerRoot === undefined || !stickerInside) return [];
-    try {
-      return readdirSync(stickerRoot, { withFileTypes: true })
-        .filter((entry) => entry.isFile() && !entry.name.startsWith('.') && /\.(png|jpe?g|gif|webp)$/i.test(entry.name))
-        .map((entry) => entry.name);
-    } catch {
-      return []; // 还没建 / 被删了 / 没权限：当作「没有表情包」，不影响其余提示词。
-    }
-  }
-
-  /**
-   * 表情包目录里认得出来的图片路径（相对 cwd，带目录前缀），供渠道提示列候选。
-   * @returns 形如 `['.qq-stickers/笑死.gif', …]` 的数组，最多 `STICKER_PROMPT_MAX` 个。
-   */
-  function stickerNames() {
-    if (stickerLabel === undefined) return [];
-    return stickerFiles()
-      .sort()
-      .slice(0, STICKER_PROMPT_MAX)
-      .map((name) => `${stickerLabel}/${name}`);
-  }
-
-  /**
-   * 把「一个表情包文件名」补成真路径（裸名字、以及写错扩展名的目录路径）。
-   *
-   * 模型很可能不写全 `.qq-stickers/笑死.png` 而只写 `笑死` / `笑死.png`，也可能把扩展名
-   * 猜错（目录里 .jpg 比 .gif 多，真实事故：`敲盆.gif` 被写成 `敲盆.jpg`）。这两种都会让
-   * `loadOutgoingImage` 按 cwd 相对路径去找时落空、只能回一句「表情包没发出去」。所以：
-   * 裸文件名先在表情包目录里找（精确 → 忽略扩展名）；带 `stickerLabel/` 前缀的路径如果是
-   * 已知文件名写错了扩展名，也换回真实的那一个。
-   *
-   * 只碰**收藏目录里的文件名**：`.qq-media/xxx.jpg`、URL 之类的写法原样交出去，绝不改写。
-   *
-   * @param source - 标记或工具参数里给的来源。
-   * @returns 能认出来就是相对 cwd 的路径，否则原样返回。
-   */
-  function resolveStickerSource(source) {
-    const raw = String(source ?? '').trim();
-    if (raw.length === 0 || stickerLabel === undefined) return raw;
-    if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return raw;
-    if (raw.startsWith(`${stickerLabel}/`)) {
-      const name = raw.slice(stickerLabel.length + 1);
-      // 收藏目录只有一层：带子目录的写法不猜，交给发送侧照常报错。
-      if (name.length === 0 || /[/\\]/.test(name)) return raw;
-      const repaired = findStickerByName(name);
-      return repaired === undefined ? raw : `${stickerLabel}/${repaired}`;
-    }
-    if (/[/\\]/.test(raw)) return raw;
-    const repaired = findStickerByName(raw);
-    return repaired === undefined ? raw : `${stickerLabel}/${repaired}`;
-  }
-
-  /**
-   * 在表情包目录里按名字找文件：先精确匹配，再忽略扩展名匹配。
-   *
-   * 同名不同扩展名的文件可能同时存在（`.gif` 和 `.jpg`），排序后取第一个，保证同样的输入
-   * 永远得到同一个结果 —— 别让「发哪张」随 readdir 的顺序漂移。
-   *
-   * @param name - 文件名（可带扩展名，也可只有名字）。
-   * @returns 目录里真实存在的文件名；认不出来时 undefined。
-   */
-  function findStickerByName(name) {
-    const files = stickerFiles().sort();
-    const exact = files.find((file) => file === name);
-    if (exact !== undefined) return exact;
-    const stem = name.replace(/\.[^.]+$/, '');
-    return files.find((file) => file.replace(/\.[^.]+$/, '') === stem);
-  }
-
-  /**
-   * 发表情时**只认收藏目录里的文件**（`[[图片: …]]` 这一条路）。
-   *
-   * 三条理由，都对应真实事故或明确的设计边界：
-   *   1. `.qq-media/<内容哈希>` 是入站图的 LRU 缓存（默认 200 张），迟早被淘汰。模型把
-   *      它写进正文时，**当时看着像真的**、发的时候早没了，用户收到的是一句「没发出去」
-   *      —— 它还会接着编下一个哈希（真发生过）。
-   *   2. 任意 cwd 路径（`README.md`、别人的截图、`/etc/...`）不该借「发表情」发出去：
-   *      QQ 消息是不可信输入，模型可能被群里的人指使去发本地文件。
-   *   3. 想发「别人刚发的那张」有正当入口：先 `qq_save_sticker` 收藏（带名字与含义），
-   *      它才进得了这个目录 —— 这同时也让那张图以后还能再被选中。
-   *
-   * 裸文件名先按 `resolveStickerSource` 补全（模型常写 `笑死` 而不是全路径）。
-   * @param source - 标记里给的来源。
-   * @returns 收藏目录内的绝对路径。
-   * @throws 目录不可用 / 不在收藏目录 / 文件不存在时抛错（message 是给人看的一句话）。
-   */
-  function stickerSendSource(source) {
-    const raw = resolveStickerSource(source);
-    if (stickerRoot === undefined || !stickerInside || stickerLabel === undefined) {
-      throw new Error(`stickerDir is not usable (${settings.stickerDir.trim() || '(empty)'}): it must be a directory inside ${cwd}`);
-    }
-    const target = resolve(cwd, raw);
-    if (!insideDirectory(stickerRoot, target)) {
-      throw new Error(`${stickerLabel}/ 里没有「${raw}」：表情包只能从收藏目录里发（别人刚发的图要先 qq_save_sticker 存下来）`);
-    }
-    return target;
-  }
-
-  /**
-   * 这个来源是不是收藏目录里的表情包 —— 决定出站 image 段带不带 `sub_type: 1`
-   * （见 `imageSegment` 的注释）。
-   *
-   * 只认「能确定落在 stickerRoot 里的本地路径」，宁可不标也不乱标：
-   *   - URL / `file://` 一律按普通图片发（远端是什么无从判断）；
-   *   - `.qq-media/<哈希>` 这类缓存图照旧发成普通图片（它可能是截图或照片）；
-   *   - 裸文件名先按 `resolveStickerSource` 补成 `.qq-stickers/笑死.gif` 再判。
-   *
-   * @param source - 标记或工具参数里的来源。
-   * @returns 确认是收藏目录里的文件时 true。
-   */
-  function isStickerFile(source) {
-    if (stickerRoot === undefined || !stickerInside) return false;
-    const raw = resolveStickerSource(source);
-    // 只挡「带协议的来源」。别写成 `/^[a-z][a-z0-9+.-]*:/`：那会把 Windows 的 `C:\…`
-    // 当成协议名（收藏目录就在 C 盘时，绝对路径的表情会被误判成普通图片）。
-    if (raw.length === 0 || /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) || /^file:/i.test(raw)) return false;
-    return insideDirectory(stickerRoot, resolve(cwd, raw));
-  }
-
-  /** 记下「这一轮想发的图没发出去」，给下一轮提示词用（见 `channelPrompt`）。 */
-  function noteStickerFailure(conversation, source, reason) {
-    conversation.stickerFailure = { path: String(source ?? '').slice(0, 120), reason: String(reason ?? '').slice(0, 160), at: Date.now() };
-  }
-
-  /**
-   * 把「一张图」固化进表情包目录：`qq_save_sticker` 的全部实现。
-   *
-   * 为什么需要它（实测缺口）：QQ 会话按设计没有 write / edit / bash —— 那三样在不可信
-   * 输入面上太危险 —— 于是群里那句最自然的「存一下这个表情」模型**永远做不到**。真实
-   * 发生过的样子是：它 `read_image` 看完、`glob .qq-stickers/**` 发现是空的，只能把含义
-   * 追加进 `COGNITION.md`，key 还是 `.qq-media/<内容哈希>` 这个 LRU 缓存路径，然后回一句
-   * 「存好了」。那条记忆迟早指向一个被淘汰掉的文件，群里收到的就是「（表情包没发出去）」。
-   *
-   * 所以这里开一条**窄**通道，把边界全部收在函数里：
-   *   - 只写 `stickerRoot` 之内，文件名由纯函数 `stickerFileName` 洗成单层名字；
-   *   - 字节先过 `loadOutgoingImage`（魔数判格式 + 大小上限 + 必须在 cwd 内），
-   *     所以「`.txt` 改名成 `.png`」和越界路径都进不来；
-   *   - 张数到 `stickerMaxFiles` 就拒绝 —— 群里谁都能让它一直存，磁盘不该被这么撑大；
-   *   - 同名**不覆盖**：覆盖等于让群里任何一个人用一句「存一下」把现有表情换掉。
-   *
-   * 存完之后还会往 `STICKERS.md` 补一行「名字｜画面｜含义｜场景｜路径｜日期｜置信」：
-   * 不写这一行的话，下一次提示词里它又只是一串文件名，模型还得 `read_image` 猜含义。
-   * 目录写失败**不回滚图片**（图已经落盘，缺一行目录比丢图好）—— 只记一条 warn。
-   *
-   * @param options.source - 图片来源（`.qq-media/…` 相对路径 / cwd 内绝对路径 / http(s) 链接）。
-   * @param options.name - 模型起的中文名（可带扩展名，最终以真实格式为准）。
-   * @param options.meaning - 一句话含义（可空；空则写进「未收藏」待办区）。
-   * @param options.scene - 适用场景（可空）。
-   * @returns `{ path, bytes, format, source, catalog? }`：`catalog` 是目录那一行的结果说明。
-   */
-  async function saveSticker({ source, name, meaning, scene } = {}) {
-    if (stickerRoot === undefined || !stickerInside || stickerLabel === undefined) {
-      throw new Error(`the sticker directory is not usable (${settings.stickerDir.trim() || '(empty)'}): it must be a directory inside ${cwd}`);
-    }
-    const existing = stickerFiles();
-    if (stickerMaxFiles > 0 && existing.length >= stickerMaxFiles) {
-      throw new Error(`the sticker directory already holds ${existing.length} images (stickerMaxFiles: ${stickerMaxFiles}); ask the operator to clean it up or raise the limit`);
-    }
-    // 先取字节、先校验，再动目录：失败时不会在表情包目录里留下半个文件。
-    const image = await loadOutgoingImage({ source, cwd, maxBytes: imageMaxBytes });
-    const fileName = stickerFileName(name, image.format);
-    if (fileName === undefined) {
-      throw new Error(`"${String(name ?? '').slice(0, 40)}" is not a usable sticker name: pass a short file name such as "委屈" (the extension comes from the image itself)`);
-    }
-    // `existing` 只列认得出来的图片；再多一次 stat 是为了挡住「同名但扩展名不同 / 是个目录」
-    // 这类列不出来的占位，免得 rename 覆盖掉用户自己放的东西。
-    const target = join(stickerRoot, fileName);
-    const occupied = existing.includes(fileName) || (await stat(target).catch(() => undefined)) !== undefined;
-    if (occupied) {
-      throw new Error(`${stickerLabel}/${fileName} already exists: pick another name (or read that sticker first and ask the operator if it should be replaced)`);
-    }
-    await mkdir(stickerRoot, { recursive: true });
-    await writeBytesAtomic(target, image.bytes);
-    const path = `${stickerLabel}/${fileName}`;
-    report('info', `sticker saved: ${path} (${image.bytes.length} bytes, from ${image.label})`);
-    // 目录那一步是**尽力而为**：图片已经存好了，不能让一次目录写入失败把「存表情」变成失败。
-    let catalog;
-    if (memory.enabled) {
-      try {
-        const written = await memory.appendSticker({
-          name: fileName.replace(/\.[^.]+$/, ''),
-          meaning: String(meaning ?? '').trim(),
-          scene: String(scene ?? '').trim(),
-          path,
-          date: localDate(),
-        });
-        if (written.ok) {
-          catalog = `added to ${memory.label}/STICKERS.md (${written.section})`;
-        } else {
-          catalog = `not written to STICKERS.md: ${written.reason}`;
-          report('warn', `could not add ${path} to the sticker catalogue: ${written.reason}`);
-        }
-      } catch (error) {
-        catalog = `not written to STICKERS.md: ${errorText(error)}`;
-        report('warn', `could not add ${path} to the sticker catalogue: ${errorText(error)}`);
-      }
-    }
-    return { path, bytes: image.bytes.length, format: image.format, source: image.label, catalog };
-  }
-
-  /**
-   * 给一张已收藏的表情**改名**：`qq_rename_sticker` 的全部实现。
-   *
-   * 为什么需要它（真实事故，就是它促成了这个工具）：模型想改一张表情的名字 / 含义时，
-   * 手上只有「用新名字再存一遍」这一条路 —— 于是 `.qq-stickers/` 里多出一张**同画面、
-   * 不同名**的图，`STICKERS.md` 里旧名字那条还留着，以后两张都会被挑中，删除又做不到。
-   * 改名必须是「同一个文件换个名字，目录里那一条跟着搬」，不是「再存一张」。
-   *
-   * 边界（与 `saveSticker` 同一套路，只是方向反过来）：
-   *   - 只认 `stickerRoot` 里**已经存在**的那张（`findStickerByName` 的解析规则与发表情一致：
-   *     裸名字、写错扩展名都找得回来）；
-   *   - 新名字走同一个纯函数 `stickerFileName` 清洗，扩展名**沿用旧文件的真格式**（不重新嗅：
-   *     这里没有新字节，换扩展名只会让「名字写着 .png、里面是 GIF」）；
-   *   - 目标名已被占用就拒绝 —— 与「同名不覆盖」同一条理由，别让群里任何一个人一句
-   *     「改个名」把别人的表情挤掉；
-   *   - 目录那一步失败时**把文件改回去**：改名的价值就在于「文件与目录一致」，只改一半
-   *     比不改更糟（目录指着一个不存在的路径，发出去就是「表情包没发出去」）。
-   *
-   * @param options.from - 现在的名字（文件名，可带扩展名）。
-   * @param options.to - 想改成的新名字（扩展名由旧文件决定）。
-   * @param options.meaning - 可选：顺手改含义（不给就沿用目录里原来的）。
-   * @param options.scene - 可选：顺手改适用场景。
-   * @param options.look - 可选：顺手改画面描述。
-   * @returns `{ path, previous, bytes, renamed, catalog? }`：`catalog` 是目录那一步的结果说明。
-   */
-  async function renameSticker({ from, to, meaning, scene, look } = {}) {
-    if (stickerRoot === undefined || !stickerInside || stickerLabel === undefined) {
-      throw new Error(`the sticker directory is not usable (${settings.stickerDir.trim() || '(empty)'}): it must be a directory inside ${cwd}`);
-    }
-    const wanted = String(from ?? '').trim();
-    const found = findStickerByName(wanted);
-    if (found === undefined) {
-      const names = stickerFiles().sort().slice(0, 20);
-      throw new Error(
-        `${stickerLabel}/ 里没有「${wanted}」：只能给已经收藏的表情改名${names.length > 0 ? `（现有：${names.join('、')}）` : '（目录是空的，先 qq_save_sticker 收藏）'}`,
-      );
-    }
-    const extension = found.replace(/^.*\./, '').toLowerCase();
-    const target = stickerFileName(to, extension);
-    if (target === undefined) {
-      throw new Error(`"${String(to ?? '').slice(0, 40)}" is not a usable sticker name: pass a short file name such as "委屈" (the extension stays "${extension}")`);
-    }
-    const previous = `${stickerLabel}/${found}`;
-    const path = `${stickerLabel}/${target}`;
-    if (target === found) {
-      // 名字没变：不算错，也不搬文件（只把现有大小回显出来）。
-      const size = (await stat(join(stickerRoot, found)).catch(() => undefined))?.size;
-      return { path, previous, bytes: size, renamed: false };
-    }
-    // 先查占用再改名：`existing` 只列认得出来的图片，多一次 stat 挡住隐藏文件 / 目录。
-    const targetPath = join(stickerRoot, target);
-    const sourcePath = join(stickerRoot, found);
-    if ((await stat(targetPath).catch(() => undefined)) !== undefined) {
-      throw new Error(`${path} already exists: pick another name`);
-    }
-    const size = (await stat(sourcePath)).size;
-    await rename(sourcePath, targetPath);
-    let catalog;
-    if (memory.enabled) {
-      let written;
-      try {
-        written = await memory.renameSticker({
-          from: found.replace(/\.[^.]+$/, ''),
-          to: target.replace(/\.[^.]+$/, ''),
-          path,
-          meaning: String(meaning ?? '').trim() || undefined,
-          scene: String(scene ?? '').trim() || undefined,
-          look: String(look ?? '').trim() || undefined,
-        });
-      } catch (error) {
-        // 目录写失败就把文件改回去：只改一半的改名，比不改更糟（见函数头）。
-        await rename(targetPath, sourcePath).catch(() => {});
-        throw error instanceof Error ? error : new Error(errorText(error));
-      }
-      if (!written.ok) {
-        await rename(targetPath, sourcePath).catch(() => {});
-        throw new Error(`could not update STICKERS.md: ${written.reason}`);
-      }
-      catalog = `updated ${memory.label}/STICKERS.md (${written.section})`;
-    }
-    report('info', `sticker renamed: ${previous} → ${path} (${size} bytes)`);
-    return { path, previous, bytes: size, renamed: true, catalog };
-  }
 
   /**
    * 「这一轮」的动态情境：每轮都会变，所以**不能**放进系统提示。
@@ -1768,7 +1312,8 @@ export function apply(ctx, config) {
    * system 消息追加到会话里，而不是替换旧的。于是每一轮上下文都多出整整一份人设 / 表达
    * 契约 / 硬性规则（约 9k token），十几轮就把上下文塞到 220k，紧接着是不间断的压缩、
    * 失忆和「变笨」。把动态部分挂到 user message 的第二个 text block 上，每轮只追加这一
-   * 小节，系统提示保持稳定（只在人设 / 表达 / 表情目录 / 配置真的改了时才变一次）。
+   * 小节，系统提示保持稳定（只在人设 / 表达 / 配置真的改了时才变一次；表情包目录也搬到了
+   * 这里，见 `stickerCatalogLines`）。
    *
    * @param conversation - 目标会话。
    * @returns 动态情境正文；没有可写的内容时返回空串。
@@ -1786,6 +1331,12 @@ export function apply(ctx, config) {
       lines.push(`【本轮场景｜${title}】${sceneLines.map((line) => String(line).replace(/[。.]\s*$/, '')).join('；')}`);
     }
     lines.push(speakerLine(conversation));
+    // 群名 / 对方名字放在这里（而不是系统提示里）：它来自 `get_group_info` 的一次查询，
+    // 重启后可能暂时查不到，群里也可能改名 —— 系统提示跟着变一次，DSH 就会把整份人设
+    // 再追加一遍（见 `channelPrompt`）。每轮现给，查到就有、查不到就不提。
+    if (conversation.name.length > 0) {
+      lines.push(isGroup ? `- 这个群叫「${conversation.name}」（群号 ${conversation.id}）。` : `- 这个私聊窗口是跟 ${conversation.name} 的。`);
+    }
     if (isGroup) {
       const ambientLines = ambientPrompt(conversation);
       if (ambientLines.length > 0) lines.push('', ...ambientLines);
@@ -1798,10 +1349,18 @@ export function apply(ctx, config) {
         `- 上一轮你想发的表情 \`${failedSticker.path}\` 没发出去（${failedSticker.reason}）。表情包只能从 ${stickerLabel ?? '收藏目录'}/ 里挑现成的；别人的图先用 qq_save_sticker 存下来，**别自己拼 \`.qq-media\` 的哈希**。`,
       );
     }
+    // 表情包目录：存图 / 改名之后它就得让模型看见，但它也是会变的 —— 放系统提示里等于
+    // 每存一张就追加一整份人设 + 硬规则（见 `stickerCatalogLines`）。这里只在本会话第一次
+    // 或目录变了时给一次。
+    const catalogLines = stickerCatalogLines(conversation);
+    if (catalogLines.length > 0) lines.push('', ...catalogLines);
     // 检索式记忆：每轮按当前消息重新检索，放系统提示里就等于每轮换一次整段提示。
+    // 「同一条只给一次」的账在 memory.js（`recallLedger`）：这一轮没有新东西时一个字都不加，
+    // 也不再补一句「记忆还是空的」—— 系统提示里已经说清它去哪儿查，而这块每轮都会留在
+    // 历史里，重复一次就是一次额外的上下文。
     if (memory.toolsAllowed()) {
       const recall = memory.recallText(conversation);
-      lines.push('', recall.length > 0 ? recall : `你的长期记忆在 \`${memory.label}/\` 里（现在还是空的）。`);
+      if (recall.length > 0) lines.push('', recall);
     }
     // 时间与待发提醒的摘要：分钟级变化，同样只能待在这里。
     if (remindersEnabled && (allowTools.length === 0 || allowTools.includes('qq_remind_create'))) {
@@ -1835,6 +1394,8 @@ export function apply(ctx, config) {
     return createUserMessage({ content, source: { kind: 'user' } });
   }
 
+  // ---- 系统提示：人设 / 表达契约 / 硬性规则 ------------------------------------------------
+
   /**
    * 生成 QQ 渠道的**稳定**系统提示小节（每个会话不同，但同一会话内不随轮次变化）。
    *
@@ -1848,10 +1409,14 @@ export function apply(ctx, config) {
    */
   function channelPrompt(conversation) {
     const isGroup = conversation.type === 'group';
-    const title = conversation.name.length > 0 ? `「${conversation.name}」` : '';
+    // 群名 / 对方名字**不进系统提示**：群名来自 `get_group_info`（重启后第一次查询可能失败，
+    // 群里也可能改名），而 `systemPromptUpdate: 'in-history'` 一旦发现整段文本变了，就会把
+    // 7.5k 字的人设 + 表达 + 硬性规则**再追加一份**到历史里（真实事故：2026-10-21 21:58
+    // 重启后群名查空了 6 个字，整份提示词就多了一份，回复立刻变得又短又像在照章办事）。
+    // 名字每一轮在 `channelTurnContext` 里现给（见本函数上面那条「只放稳定内容」）。
     const who = isGroup
-      ? `你正在 QQ 群${title}（群号 ${conversation.id}）里潜水，身份是群里的一个普通群友 —— 不是客服，也不是助手。`
-      : `你正在用 QQ 私聊：对方 ${conversation.name}。`;
+      ? `你正在 QQ 群（群号 ${conversation.id}）里潜水，身份是群里的一个普通群友 —— 不是客服，也不是助手。`
+      : '你正在用 QQ 私聊。';
     const lines = ['## QQ 渠道', '', who, ''];
     // ---- 槽 2：人设（是谁；场景段每轮在 user message 里给）----
     lines.push(...personaLines(conversation, { overlays: false }), '');
@@ -1897,8 +1462,7 @@ export function apply(ctx, config) {
     }
     // 图片/表情包只有落盘之后才「看得见」：把路径告诉模型，还得告诉它该用哪个工具读。
     // 没有 read_image 就别提这件事，否则模型会去调用一个它根本看不见的工具。
-    const canReadImages = mediaStore.enabled && (allowTools.length === 0 || allowTools.includes('read_image'));
-    if (canReadImages) {
+    if (canReadImages()) {
       lines.push(
         '- 消息里、`（引用 …）` 前缀里、以及「本轮情境」里的 `[图片: 路径]`（也可能是 `[图片(动画表情): 路径]`、`[表情包: 路径]`）都是已经下载到本地的图，路径相对工作目录：想知道图里是什么就用 read_image 读它，别靠猜；带「没能取到文件」的是没下下来，可以直说图挂了。这些路径是给你自己看的，别原样写进回复。',
       );
@@ -1911,36 +1475,23 @@ export function apply(ctx, config) {
     // 标记不是工具，但**跟着同一个开关走**：`allowTools` 把 qq_send_image 挡在外面时，
     // 回复里也不该还能发图 —— 否则白名单就漏了一层（operator 明确说了「只给 read」）。
     if (imageAllowed()) {
-      // 目录优先用 STICKERS.md 的「名字（含义）→ 路径」：模型看含义就能判断该不该发，
-      // 看裸文件名只能猜或者先 read_image。没有目录（旧部署 / 记忆关掉）时退回文件名，行为不变。
-      const catalog = memory.enabled ? memory.catalog() : { stickers: [], hot: [], catalog: false };
-      const names = stickerNames();
       // 标记只认**收藏目录**里的现成表情：以前这里举的是 `.qq-media/ab12….jpg`，模型有样
       // 学样去拼哈希，而那是 LRU 缓存，发的时候大概率已经没了（真实事故，见
       // `stickerSendSource`）。目录不可用时整条标记建议都不给 —— 那条路本来就走不通。
+      //
+      // 目录**内容**（有哪些、完整路径）不写在这里：它会随存图 / 改名 / 删图变化，而系统
+      // 提示只要变一个字，DSH 就会把整段人设 + 表达契约 + 硬性规则再追加一份（2026-10-21
+      // 群名那 6 个字的真实事故）。那一份跟着「本轮情境」走，见 `stickerCatalogLines`。
       if (stickerLabel !== undefined) {
-        // 例子用目录里真实存在的第一张：写死 `笑死.gif` 会在改名 / 删图之后变成一句
-        // 「教模型去发一张不存在的图」，而它真的会照着抄。
-        const example = names[0] ?? `${stickerLabel}/笑死.gif`;
         lines.push(
-          `- 想发表情包时，在回复正文里写 \`[[图片: 路径]]\`，路径**只能**是收藏目录里的现成表情（例如 \`[[图片: ${example}]]\`；扩展名照抄目录里那个，别自己改）。\`.qq-media/…\` 这类临时缓存路径会被直接拒绝 —— 别自己拼哈希，目录里没有就是没有。这个标记会作为**一张图**发出去，位置就在它出现的地方；**想只发一张表情、一个字都不说，整条回复就只写这一行** —— 别配「给你发张表情包」这种话。`,
+          `- 想发表情包时，在回复正文里写 \`[[图片: 路径]]\`，路径**只能**是 ${stickerLabel}/ 里的现成表情（有哪些、名字与完整路径见「本轮情境」里的表情包目录；目录变了会再给一次）。扩展名照抄目录里那个，别自己改；\`.qq-media/…\` 这类临时缓存路径会被直接拒绝 —— 别自己拼哈希，目录里没有就是没有。这个标记会作为**一张图**发出去，位置就在它出现的地方；**想只发一张表情、一个字都不说，整条回复就只写这一行** —— 别配「给你发张表情包」这种话。${canReadImages() ? '拿不准某张是什么，先 read_image 看一眼再发。' : ''}`,
+          '- 表情包别滥用 —— 一次最多一张，也别每句都配一张。纯情绪（笑、无语、委屈、拒绝、赞成、撒娇、接梗）可以只发一张不说话；**有信息要说、是/否题、承诺、道歉、需要解释的时候不许拿表情代替回答**。',
         );
       }
       lines.push(
         '- 要给**别的**群 / 好友发图、或者就是「把这张图发过去」这种明确动作，用 qq_send_image 工具（它也接受 http(s) 图片链接；它是立刻发出去的，不跟在正文的行序里）。',
       );
       if (stickerLabel !== undefined) {
-        if (catalog.stickers.length > 0) {
-          lines.push(
-            `- 你自己的表情包（名字（含义）→ 完整路径；想发哪张就把箭头后面的路径**原样**抄进标记里，别自己拼或改扩展名）${canReadImages ? '，目录里没有的再 read_image 看一眼' : ''}：${catalog.stickers.join('、')}。表情包别滥用 —— 一次最多一张，也别每句都配一张。纯情绪（笑、无语、委屈、拒绝、赞成、撒娇、接梗）可以只发一张不说话；**有信息要说、是/否题、承诺、道歉、需要解释的时候不许拿表情代替回答**。`,
-          );
-        } else {
-          lines.push(
-            names.length > 0
-              ? `- 你自己的表情包在 ${stickerLabel}/ 里：${names.join('、')}。文件名通常就是它的意思${canReadImages ? '，拿不准的先 read_image 看一眼' : ''}；想发哪张就把它的路径写进标记里。表情包别滥用 —— 一次最多一张，也别每句都配一张。`
-              : `- 你自己的表情包目录 ${stickerLabel}/ 目前是空的，没有现成的表情包可挑（别人刚发的图要先 qq_save_sticker 存下来才能发）。`,
-          );
-        }
         // 「把这张存下来」是群里最常见的一句话，而模型自己没有写文件的能力（QQ 会话没有
         // write / edit / bash），不给它这条通道时它会假装存好了，然后只往 COGNITION.md 里
         // 记一个迟早被淘汰的 `.qq-media/<哈希>` 路径 —— 见 `saveSticker` 的注释。
@@ -2071,6 +1622,8 @@ export function apply(ctx, config) {
     ];
   }
 
+  // ---- 能力判定与工具依赖：图片、提醒、目标解析 -------------------------------------------------
+
   /**
    * 这个 Agent 能不能往 QQ 发图。
    *
@@ -2083,552 +1636,15 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 这个 Agent 能不能把图**存**进表情包目录（`qq_save_sticker`）。
+   * 这个 Agent 能不能用 `read_image` 看图。
    *
-   * 三层：发图总开关开着（存下来的唯一用途就是以后发出去，所以它不该在一个发不了图的
-   * 会话里冒出来）、表情包目录可用（没配 / 配到 cwd 外时只能记 warn 并停用）、
-   * `qq_save_sticker` 自己那一格白名单。
+   * 提示词里「拿不准的先 read_image 看一眼」这句话只在真能用的时候才该出现 —— 否则
+   * 模型会去调用一个它看不见的工具。`channelPrompt` 与表情包目录那段共用这一处判断。
    */
-  function stickerSaveAllowed() {
-    return imageAllowed()
-      && stickerRoot !== undefined && stickerInside
-      && (allowTools.length === 0 || allowTools.includes('qq_save_sticker'));
+  function canReadImages() {
+    return mediaStore.enabled && (allowTools.length === 0 || allowTools.includes('read_image'));
   }
 
-  /**
-   * 这个 Agent 能不能给已收藏的表情改名（`qq_rename_sticker`）。
-   *
-   * 与 `stickerSaveAllowed` 同一套路，只是白名单那一格换成它自己的名字：改名动的是
-   * 目录里**已有的**文件（不引入新字节），所以它能单独放开 —— 只读部署里「模型存不了
-   * 新图、但能整理已有名字」是合理的。
-   */
-  function stickerRenameAllowed() {
-    return imageAllowed()
-      && stickerRoot !== undefined && stickerInside
-      && (allowTools.length === 0 || allowTools.includes('qq_rename_sticker'));
-  }
-
-  /**
-   * 一轮回复最多发几条（`burstMaxMessages`；非正数 / 非法值 = 不限）。
-   *
-   * 提示词与拆条都要读它：提示词在「一次只发一条」时不能再说「想连说几句就换行」，
-   * 否则模型会照着一条它做不到的规则写。
-   */
-
-  /**
-   * 「日常闲聊并成一条」的字数门槛（`burstSingleMaxChars`；非正数 = 关掉）。
-   *
-   * 按去掉空白后的字数算：换行、缩进这些排版字符不该把一条闲聊顶过门槛。
-   */
-
-  /**
-   * 把一段回复拆成「像真人连着发的」几条消息（**只拆条，不丢内容**）。
-   *
-   * 不开启 `humanize` 时就是旧行为（只在超过协议上限时分段）。开启后先把换行拆成
-   * 一条条独立消息（换行 = 分条，不再是同一条里的排版），再对每一行按标点/长度拆成
-   * 短句（受 `burstMaxChars` / `burstMaxParts` 约束），最后每段都接受一次协议上限的
-   * 硬校验 —— 模型偶尔写超长时，最后一段仍可能被 `chunkText` 再切开。
-   *
-   * 「聊天型 / 信息型」只影响**发送途中被打断**时停不停（见 `sendParts`），不影响条数：
-   * 模型写几行就发几行，插件**不设气泡数上限、也不把多出来的并进最后一条**。
-   * `burstMaxMessages` 是唯一可选的总条数上限（默认 0 = 不限，显式设了才并条）。
-   *
-   * @param text - 模型给出的完整回复。
-   * @returns 按发送顺序排列的分段。
-   */
-  function burstParts(text) {
-    const limit = settings.maxReplyChars;
-    if (!settings.humanize) return chunkText(text, limit);
-    const burst = Number.isSafeInteger(settings.burstMaxChars) && settings.burstMaxChars > 0
-      ? Math.min(settings.burstMaxChars, limit)
-      : limit;
-    const maxParts = Number.isFinite(settings.burstMaxParts) ? Math.max(1, Math.floor(settings.burstMaxParts)) : 3;
-    return splitBurst(text, burst, maxParts, settings.burstMaxMessages).flatMap((part) => chunkText(part, limit));
-  }
-
-  /** 发送前等待（`ms <= 0` 时立即返回）；unref 让待发的延迟不拖住进程退出。 */
-  function sleep(ms) {
-    if (!(ms > 0)) return Promise.resolve();
-    return new Promise((resolve) => {
-      const timer = setTimeout(resolve, ms);
-      timer.unref?.();
-    });
-  }
-
-  /**
-   * 把一次发送挂到会话的串行链上。
-   *
-   * 同一个会话的发送挂在 `conversation.sending` 上串行执行：拟人延迟会让一次回复
-   * 持续好几秒，若不排队，下一轮回复（或一句复读）会插进来，群里看到的就是两条
-   * 消息交错。前一次失败也要继续排下一次，所以两个分支都接上 `run`。
-   *
-   * @param conversation - 目标会话。
-   * @param run - 真正的发送步骤（调用方保证自己不会 reject）。
-   * @returns 本次发送完成时兑现的 Promise，绝不 reject。
-   */
-  function enqueueSend(conversation, run) {
-    const chained = (conversation.sending ?? Promise.resolve()).then(run, run);
-    conversation.sending = chained.then(
-      () => {},
-      () => {},
-    );
-    return chained;
-  }
-
-  /**
-   * 把一条回复发到 QQ：拆段、按真人打字节奏加延迟，任一段失败即停止。
-   *
-   * 正文里的 `[[图片: 路径]]` 标记会变成一张真的图（见 `replyPieces`）——「只发表情、
-   * 一个字都不说」就是整条正文只有那一处标记。
-   *
-   * @param conversation - 目标会话。
-   * @param text - 要发送的正文（可含表情包标记）。
-   * @param options - `human`：拆短句 + 打字延迟（自动回复用）；`quote`：本轮的回复指向
-   *   `{ messageId, userId, seq, emoji }`，仅群聊生效，且只挂在第一个**文字**气泡上
-   *   （规则见 `quoteHead`）；`at`：要挂到第一个文字气泡前的 `{ id, name }[]`
-   *   （定时提醒用，模型自己不写 @）；`intent`：这一轮为什么轮到它（`addressed` /
-   *   `continued` / `interject`），决定挂不挂指向（搭话轮不挂，见 `quoteHead`）。
-   * @returns 本次发送（含延迟）完成时兑现的 Promise：至少发出一条为 true，否则 false。
-   *   绝不 reject。
-   */
-  function sendToConversation(conversation, text, { human = false, quote, at, intent } = {}) {
-    return enqueueSend(conversation, () => sendParts(conversation, text, human, quote ?? { messageId: '', userId: '', seq: 0 }, at, intent));
-  }
-
-  /**
-   * 把一段正文**原样**发给会话：不认 `[[图片: …]]` 标记、不拆短句、不加打字延迟。
-   *
-   * 复读专用 —— 群里有人把 `[[图片: .qq-media/…]]` 这种字样打两遍时，那是两句**文字**，
-   * 不是让机器人发文件的指令：标记只解析模型写的回复（`replyPieces`）。复读机的正文
-   * 全部来自不可信的群消息，所以这里一步都不多做，只按协议上限分段。
-   *
-   * @param conversation - 目标会话。
-   * @param text - 要原样发出的正文。
-   * @returns 本次发送完成时兑现的 Promise，绝不 reject。
-   */
-  function sendLiteral(conversation, text) {
-    return enqueueSend(conversation, async () => {
-      for (const part of chunkText(text, settings.maxReplyChars)) {
-        if (!(await sendOne(conversation, part))) return;
-      }
-    });
-  }
-
-  /**
-   * 把一条回复拆成「要一条条发出去的东西」：文字段与表情包段，顺序照原文。
-   *
-   * 三段流水线，顺序不能反：
-   *   1. `splitStickerLines` 把 `[[图片: …]]` 拆成图段；
-   *   2. `burstParts` 拆条 —— 换行/标点/长度；
-   *   3. `sanitizeBubble` 清洗标点（剥句末「。」、并连续句号与空格）。
-   *
-   * **发几条由模型自己写**：这里没有骰子、没有概率，也**没有气泡数上限 / 并条** ——
-   * 模型写几行就发几行（协议上限由 `chunkText` 兜底）。
-   *
-   * 文字段里的 `[[@昵称]]` 标记在这里只**标记出来**（`mention: true`），真正的段解析放在
-   * `sendParts` 里做 —— 那里才拿得到会话记录（「谁可以被 @」的名单挂在会话上）。
-   * 没有标记的文字段仍然以纯字符串发出，与旧行为逐字节一致。
-   *
-   * @param text - 模型给出的完整回复。
-   * @param human - 是否按拟人节奏拆短句（自动回复用；工具与复读走 human=false）。
-   * @returns `{ kind: 'text', text, mention? }` 或 `{ kind: 'image', source, raw }` 的数组。
-   */
-  function replyPieces(text, human) {
-    const asText = (value) =>
-      (human ? burstParts(value) : chunkText(value, settings.maxReplyChars)).map((part) =>
-        hasMentionMarker(part) ? { kind: 'text', text: part, mention: true } : { kind: 'text', text: part });
-    const pieces = splitStickerLines(text).flatMap((piece) => {
-      if (piece.kind === 'text') return asText(piece.text);
-      if (!imageAllowed()) return asText(piece.raw); // 没允许发图时标记只是普通文字
-      return [piece];
-    });
-    if (!human) return pieces;
-    // 标点清洗只对文字气泡：剥句末「。」、并连续句号与空格。剥完什么都不剩的气泡丢掉。
-    return pieces
-      .map((piece) => (piece.kind !== 'text' ? piece : { ...piece, text: sanitizeBubble(piece.text, styleParams) }))
-      .filter((piece) => piece.kind !== 'text' || (typeof piece.text === 'string' && piece.text.length > 0));
-  }
-
-  /**
-   * 发一条已经组装好的 `message`。
-   * @returns 成功为 true；失败只记一条 warn（调用方决定是否继续发后面的）。
-   */
-  async function sendOne(conversation, message) {
-    // 群聊与私聊走不同的 OneBot action，参数名也不同。
-    const action = conversation.type === 'group' ? 'send_group_msg' : 'send_private_msg';
-    const idKey = conversation.type === 'group' ? 'group_id' : 'user_id';
-    try {
-      await client.call(action, { [idKey]: conversation.id, message });
-      // 记下「我最后在这里说话是什么时候」：主动说话靠它避免对着没人的群自说自话
-      // （见 proactiveEligible）。所有真正发出去的消息都走这个函数，所以自动回复、
-      // 复读、主动搭话都会被记上；出站工具那条路自己发，不计也无关紧要。
-      conversation.lastBotSpeakAt = Date.now();
-      // 我自己的话也算「把被回复的那条挤远了」：回复指向的进度表在这一刻进账
-      // （NapCat 不回灌自己的消息，等不到事件，见 `noteOwnMessage`）。
-      noteOwnMessage(conversation.type, conversation.id);
-      return true;
-    } catch (error) {
-      report('warn', `could not send to ${conversation.key}: ${error?.message ?? error}`);
-      return false;
-    }
-  }
-
-  // ---- 私聊「对方正在输入」-----------------------------------------------------
-  //
-  // 真人回消息时，对方先看到「正在输入」，过一会儿才收到字。QQ 的输入状态不是常亮的：
-  // 协议端只在收到 `set_input_status` 之后替我们亮几秒，所以这里每 `TYPING_REFRESH_MS`
-  // 补一次，直到这条回复真的发出去（发消息本身也会清掉它）。
-  //
-  // 只在**私聊**里做：群里亮「正在输入」的收益远小于人多时的噪音与调用量；也只在
-  // **自动回复**（`human: true`）上做 —— 工具发消息、复读、`/reset` 的回执都不是
-  // 「我在打字」。`agent/inbox/claimed` 把它的起点提前到「模型开始想怎么回」，
-  // 因此沉默的那几秒（通常才是最长的）也不会让对方以为机器人没看见。
-  //
-  // 状态按会话 key 记，`stopTyping` 幂等：`turn/end`（任何分支）、发送结束、`/reset`
-  // 与插件卸下都会清掉它。协议端不支持这个扩展时只记一条 warn，然后这个进程里不再试。
-  const typingStates = new Map();
-  let typingUnsupported = false;
-  let typingWarned = false;
-
-  /** 这个会话该不该显示「正在输入」。 */
-  function typingEnabledFor(conversation) {
-    return settings.privateTyping === true
-      && conversation.type === 'private'
-      && typingUnsupported !== true
-      && client.connected === true;
-  }
-
-  /** 发一次输入状态（`event_type`：1 = 正在输入，0 = 停下）。失败绝不影响消息本身。 */
-  function pingTyping(conversation, typing) {
-    client.call('set_input_status', { user_id: conversation.id, event_type: typing ? 1 : 0 }, TYPING_CALL_TIMEOUT_MS)
-      .catch((error) => {
-        const detail = errorText(error);
-        // 「协议端没有这个 action」与一次网络抖动要分开：前者这个进程里再也别试，
-        // 后者只告警一次（每 4 秒一行 warn 会把日志刷满），下一次刷新还会照常发。
-        if (/not found|unknown action|unsupported|not supported|不支持/i.test(detail)) {
-          typingUnsupported = true;
-          stopAllTyping();
-          report('warn', `私聊「正在输入」已停用：协议端不支持 set_input_status（${detail}）`);
-          return;
-        }
-        if (typingWarned) return;
-        typingWarned = true;
-        report('warn', `私聊「正在输入」发送失败（不影响消息本身）：${detail}`);
-      });
-  }
-
-  /** 开始/续上这个会话的「正在输入」；重复调用无副作用。 */
-  function startTyping(conversation) {
-    if (!typingEnabledFor(conversation)) return;
-    if (typingStates.has(conversation.key)) return;
-    const state = { timer: undefined, deadline: Date.now() + TYPING_MAX_MS };
-    typingStates.set(conversation.key, state);
-    pingTyping(conversation, true);
-    const tick = () => {
-      // 已经停了、连接断了、开关被关掉（热更新前）都就地收手：别让定时器一直空转。
-      if (!typingStates.has(conversation.key)) return;
-      if (!typingEnabledFor(conversation) || Date.now() >= state.deadline) {
-        stopTyping(conversation);
-        return;
-      }
-      pingTyping(conversation, true);
-      state.timer = setTimeout(tick, TYPING_REFRESH_MS);
-      state.timer.unref?.();
-    };
-    state.timer = setTimeout(tick, TYPING_REFRESH_MS);
-    state.timer.unref?.();
-  }
-
-  /** 停掉刷新；`cancel` 时再发一条「没在输入」（发消息本身也会清掉它）。 */
-  function stopTyping(conversation, { cancel = true } = {}) {
-    const state = typingStates.get(conversation.key);
-    if (state === undefined) return;
-    typingStates.delete(conversation.key);
-    if (state.timer !== undefined) clearTimeout(state.timer);
-    if (cancel && typingEnabledFor(conversation)) pingTyping(conversation, false);
-  }
-
-  /** 进程里所有会话都停下（插件卸下 / 协议端不支持时）。 */
-  function stopAllTyping({ cancel = false } = {}) {
-    for (const [key, state] of typingStates) {
-      if (state.timer !== undefined) clearTimeout(state.timer);
-      if (!cancel) continue;
-      const conversation = conversations.get(key);
-      if (conversation !== undefined && typingEnabledFor(conversation)) pingTyping(conversation, false);
-    }
-    typingStates.clear();
-  }
-
-  /**
-   * 发一条回复（`sendToConversation` 的发送步骤）。
-   *
-   * `human` 的那一次回复在开始前点亮「正在输入」，无论成功、失败还是中途停下都在
-   * `finally` 里熄灭 —— `stopTyping` 幂等，`turn/end` 提前停过也没关系。
-   */
-  async function sendParts(conversation, text, human, quote, at, intent) {
-    if (!human) return sendPieces(conversation, text, human, quote, at, intent);
-    startTyping(conversation);
-    let sent = false;
-    try {
-      sent = await sendPieces(conversation, text, human, quote, at, intent);
-      return sent;
-    } finally {
-      // 真发出去的消息本身就会清掉输入状态；一个字都没发出去时才需要显式取消。
-      stopTyping(conversation, { cancel: !sent });
-    }
-  }
-
-  /** `sendParts` 的实际发送步骤（调用方已保证同一会话串行）。 */
-  async function sendPieces(conversation, text, human, quote, at, intent) {
-    const pieces = replyPieces(text, human);
-    // 「昵称 → QQ 号」的名单在一次发送里只造一遍：几个分段共用同一份，也保证同一次回复里
-    // 同名的解析结果一致。
-    const mentionsFor = conversationMentions(conversation);
-    // 定时提醒的 @ 名单由任务提供（创建时就解析成了 QQ 号），只挂到**第一个文字气泡**：
-    // 模型自己不写 `[[@…]]`，重试/重启之后也不依赖会话上那份会过期的 participants。
-    const atSegments = Array.isArray(at)
-      ? at
-          .filter((entry) => entry !== undefined && String(entry.id ?? '').trim().length > 0)
-          .map((entry) => ({ type: 'at', data: { qq: String(entry.id).trim() } }))
-      : [];
-    const mode = human ? classifyReply(text, { chatMaxChars }) : 'informational';
-    // 「发送中被打断就停」的快照：聊天型的后续气泡在真正发出前比一比，这期间对方又说话了
-    // 就不再发剩下的（已经发的第一条留着）。真人也是这么停的；信息型该讲完还得讲完。
-    const activitySnapshot = conversation.lastActiveAt;
-    let firstTextSeen = false;
-    // 至少发出一条就是 true：定时提醒靠它判断「要不要走兜底」。
-    let sentAny = false;
-    // @ 只挂到**第一条真正发出去的文字**上：第一条文字如果被标记解析吃空，
-    // 它不该把 @ 也一起带走。
-    let atPending = atSegments.length > 0;
-    for (const [index, piece] of pieces.entries()) {
-      // 聊天型：对方已经接话了，就别接着说。
-      if (human && mode === 'chat' && index > 0 && piece.kind === 'text' && conversation.lastActiveAt !== activitySnapshot) {
-        report('info', `${describeConversation(conversation)}: 对方已经接话，剩下的 ${pieces.length - index} 个气泡不发了`);
-        return sentAny;
-      }
-      if (human) {
-        // 第一条前多等一个「读消息」的时间；后续每条只算打字时间。
-        // 表情包没有字数可算，等一个下限就够（第一张仍然算「读消息」那一段时间）。
-        // 字段逐个显式传：`delayJitter` 与纯函数的 `jitter` 不同名，整包展开会静默丢掉抖动。
-        await sleep(typingDelayMs(piece.kind === 'text' ? piece.text.length : 0, {
-          charsPerSecond: settings.charsPerSecond,
-          minDelayMs: settings.minDelayMs,
-          maxDelayMs: settings.maxDelayMs,
-          jitter: settings.delayJitter,
-          baseMs: index === 0 ? settings.readDelayMs : 0,
-        }));
-      }
-      // 引用只挂第一个**文字**气泡：图段永远不挂（§6.6），整轮只有图时引用自然被丢弃。
-      // 被回复的那条本身只有表情时也不引用，搭话轮整个不挂（见 `quoteHead`）。
-      const head = piece.kind === 'text' && !firstTextSeen
-        ? quoteHead(conversation, { quote, intent })
-        : undefined;
-      const atHere = piece.kind === 'text' && atPending ? atSegments : [];
-      if (piece.kind === 'text') firstTextSeen = true;
-      if (piece.kind === 'text') {
-        // 没有 @ 标记、没有指向、也没有任务给的 @ 时仍然发纯字符串：与旧版发送格式完全一致。
-        if (piece.mention !== true && head === undefined && atHere.length === 0) {
-          if (!(await sendOne(conversation, piece.text))) return sentAny;
-          sentAny = true;
-          atPending = false;
-          continue;
-        }
-        const segments = piece.mention === true
-          ? mentionSegments(piece.text, mentionsFor)
-          : [{ type: 'text', data: { text: piece.text } }];
-        // 标记解析完什么都不剩（只写了一个认不出来的名字）时，这一条就没有内容可发了。
-        if (segments.length === 0) continue;
-        const message = [...(head === undefined ? [] : [head]), ...atHere, ...segments];
-        if (await sendOne(conversation, message)) {
-          sentAny = true;
-          atPending = false;
-          continue;
-        }
-        // 引用发不出去就算了：没有任何轮次是「必须有锚点」的（插话也一样，见 `quoteHead`）。
-        return sentAny;
-      }
-      let bytes;
-      try {
-        bytes = (await loadOutgoingImage({ source: stickerSendSource(piece.source), cwd, maxBytes: imageMaxBytes })).bytes;
-      } catch (error) {
-        // 表情包发不出去**不能静默**：整条回复只有这一行时，静默就等于「机器人没理人」。
-        // 同时把失败记进会话（`stickerFailure`）：模型下一轮看得到「那张没发出去、为什么」，
-        // 否则它会照着自己编的路径再编一个（真实事故：`.qq-media/<哈希>` 连编两轮）。
-        report('warn', `sticker ${piece.source} could not be sent: ${errorText(error)}`);
-        noteStickerFailure(conversation, piece.source, errorText(error));
-        const notice = '（那张表情我这儿没有，发不出去）';
-        if (!(await sendOne(conversation, notice))) return sentAny;
-        sentAny = true;
-        continue;
-      }
-      // 图不挂引用、也没有可算的打字时间（延迟只留 index 0 的那个「读消息」）。
-      // `imageSegment` 返回的是**一个段**，`message` 要的是段数组（旧写法就是 [segment]）。
-      // `sticker: true` 带上 QQ 的「大表情」标记 —— 这条路只发收藏目录里的表情包。
-      if (!(await sendOne(conversation, [imageSegment(bytes, { sticker: true })]))) return sentAny;
-      sentAny = true;
-      // 发出去了就把上一条失败记录清掉：再留着会变成一句没做完的指令。
-      conversation.stickerFailure = undefined;
-    }
-    return sentAny;
-  }
-
-  // ---- 定时提醒：发送、Agent 轮与守卫 -----------------------------------------
-  //
-  // 这一块只做「怎么把提醒发出去」与「agent 那一轮怎么等」；任务的生命周期
-  // （到点没到点、失败怎么退、重启怎么补）在 reminders.js 里。
-
-  /** 排一个一次性定时器；有 timer 服务就用它（插件卸载自动清），否则退回裸 setTimeout。 */
-  function scheduleTimer(callback, ms) {
-    if (typeof ctx.timeout === 'function') {
-      const dispose = ctx.timeout(callback, ms);
-      return typeof dispose === 'function' ? dispose : () => {};
-    }
-    const handle = setTimeout(callback, ms);
-    handle.unref?.();
-    return () => clearTimeout(handle);
-  }
-
-  /** 任务里的 @ 名单 → OneBot at 段；私聊不发 @（没有意义，也容易显示成怪东西）。 */
-  function reminderAtSegments(task) {
-    if (task?.type !== 'group') return [];
-    return (Array.isArray(task.mentions) ? task.mentions : [])
-      .filter((entry) => String(entry?.id ?? '').trim().length > 0)
-      .map((entry) => ({ type: 'at', data: { qq: String(entry.id).trim() } }));
-  }
-
-  /**
-   * 发提醒的固定文案：原样、不分气泡、不清标点、不加打字延迟。
-   *
-   * 为什么不复用 `sendToConversation(..., { human: true })`：提醒是「到点必须说出口」的
-   * 承诺，气泡并条与标点清洗都可能改变它，拟人延迟还会让它晚几秒。文本走
-   * `chunkText` 只按协议上限分段；@ 只挂在第一段。
-   *
-   * @returns `{ ok, retryable, reason }`：断线可重试，其余按失败处理。
-   */
-  async function deliverReminderText(task, text) {
-    if (!client.connected) return { ok: false, retryable: true, reason: 'QQ bridge is not connected' };
-    const conversation = targetConversation(task.type, task.targetId);
-    const head = reminderAtSegments(task);
-    const parts = chunkText(String(text ?? ''), settings.maxReplyChars);
-    if (parts.length === 0) return { ok: true };
-    let sent = false;
-    await enqueueSend(conversation, async () => {
-      for (const [index, part] of parts.entries()) {
-        const message = index === 0 && head.length > 0 ? [...head, { type: 'text', data: { text: part } }] : part;
-        if (!(await sendOne(conversation, message))) return;
-        sent = true;
-      }
-    });
-    return sent ? { ok: true } : { ok: false, retryable: true, reason: 'send failed' };
-  }
-
-  /**
-   * 发 agent 写出来的正文：走正常拟人通道（拆句/打字延迟），但 @ 由任务注入。
-   *
-   * 不把 @ 交给模型自己写：重启后 participants 名单是空的、模型也可能忘；
-   * `sendParts` 的 `at` 选项会把 at 段挂到第一个文字气泡前，且只挂一次。
-   */
-  async function deliverReminderModel(task, text) {
-    if (!client.connected) return { ok: false, retryable: true, reason: 'QQ bridge is not connected' };
-    const conversation = targetConversation(task.type, task.targetId);
-    const ok = await sendToConversation(conversation, text, {
-      human: true,
-      at: task.mentions,
-    });
-    return ok === false ? { ok: false, retryable: true, reason: 'send failed' } : { ok: true };
-  }
-
-  /**
-   * 到点提醒那一轮「伪造的 user message」。
-   *
-   * 与 `proactiveNudge` 的三条纪律相同：说清这不是谁发来的、给出 SKIP 出口（仅 prompt
-   * 模式允许跳过）、别暴露机制。agent 模式**不给** SKIP 出口 —— 提醒不能因为模型
-   * 「不想说」就消失，真不想说也得把事说出来。
-   */
-  function reminderNudge(task) {
-    const at = localMinute(Number(task.scheduledAt) || Number(task.dueAt) || Date.now());
-    const who = (Array.isArray(task.mentions) ? task.mentions : []).map((entry) => entry.name).join('、');
-    const subject = who.length > 0 ? `提醒 ${who}` : '提醒这个会话';
-    const lines = [
-      `（这条不是谁发给你的消息，是插件在提醒你：你之前答应过在 ${at} ${subject}「${task.text}」，现在到点了。）`,
-      '',
-    ];
-    if (task.mode === 'prompt') {
-      lines.push(`要做的事：${task.prompt}`);
-    } else {
-      lines.push(`用你平时的语气把这件事说出来：${task.text}`);
-    }
-    lines.push(
-      '',
-      '注意：',
-      '- 别提前面这条提醒，也别说「这是定时任务」；就当自己到点想起来了。',
-      '- @ 由插件加，你不用自己写 @；一条就够，别刷屏。',
-    );
-    if (task.mode === 'prompt' && task.allowSkip === true) {
-      lines.push('- 如果确实没事可报、或者做不成，就整条回复只写 `SKIP` —— 那样一个字都不会发出去。');
-    } else {
-      lines.push('- 这条不能跳过：至少要把这件事说出来。');
-    }
-    return lines.join('\n');
-  }
-
-  /** 结束（或丢弃）一条等待中的 agent 提醒；返回是否真的结算了。 */
-  function settleReminderTurn(taskId, outcome) {
-    const entry = pendingReminderTurns.get(taskId);
-    if (entry === undefined) return false;
-    pendingReminderTurns.delete(taskId);
-    if (entry.guard !== undefined) {
-      entry.guard();
-      entry.guard = undefined;
-    }
-    entry.resolve(outcome);
-    return true;
-  }
-
-  /**
-   * 跑一轮 agent/prompt 提醒，兑现 `{ kind: 'reply'|'skip'|'failure'|'timeout', ... }`。
-   *
-   * 守卫按**任务**存而不是按会话存：`/reset` 会清掉这个会话的 turnOwners，那一轮的
-   * `turn/end` 永远不会来 —— 只有这个守卫能把兜底文案发出去。超时之后迟到的
-   * `turn/end` 会找不到 entry，按「已结算」静默丢弃。
-   */
-  function runReminderTurn(task) {
-    return new Promise((resolve) => {
-      const entry = { resolve, guard: undefined };
-      pendingReminderTurns.set(task.id, entry);
-      entry.guard = scheduleTimer(() => {
-        pendingReminderTurns.delete(task.id);
-        report('warn', `reminder ${task.id}: agent turn timed out after ${settings.reminderAgentTimeoutMs}ms; falling back`);
-        resolve({ kind: 'timeout' });
-      }, settings.reminderAgentTimeoutMs);
-
-      const conversation = targetConversation(task.type, task.targetId);
-      enqueue(conversation, async () => {
-        try {
-          if (!client.connected) {
-            settleReminderTurn(task.id, { kind: 'failure', reason: 'QQ bridge is not connected' });
-            return;
-          }
-          conversation.pendingIntent = 'reminder';
-          noteRecallFallback(conversation);
-          const agent = await ensureAgent(conversation);
-          const message = userMessageFor(conversation, reminderNudge(task));
-          // 与主动搭话同一套归属记账，但**不标 proactive**：proactive 在 turn/end 里
-          // 出错会被静默吞掉，而提醒必须要能走到兜底。
-          submitted.set(message.id, {
-            key: conversation.key,
-            quote: { messageId: '', userId: '', seq: 0 },
-            intent: 'reminder',
-            reminderId: task.id,
-          });
-          agent.followup(message);
-        } catch (error) {
-          settleReminderTurn(task.id, { kind: 'failure', reason: errorText(error) });
-        }
-      });
-    });
-  }
 
   /** 「谁在调这个工具」：当前这一轮最后一位发言人；Web 主会话没有会话记录。 */
   function conversationSpeaker(conversation) {
@@ -2732,45 +1748,6 @@ export function apply(ctx, config) {
     };
   }
 
-  /**
-   * 本轮回复第一个**文字**气泡上的「指向」段（引用 / @）。
-   *
-   * 规则按顺序：
-   *   0. **搭话轮不挂任何指向**（`intent === 'continued'` / `'interject'`）：这两种轮次不是
-   *      「有人在问它、它回那一条」，而是它自己顺着群里的气氛凑一句。真人凑话时不会先引用
-   *      一句再开口（也不会先 @ 一下再开口）—— 那正是「人机感」最重的那个动作；群里本来就
-   *      看得出它在接谁的话（`replyStyle` 再显式也不改变这一点，「搭话」不是「回答」）；
-   *   1. **被回复的那条只有表情时不引用**（`quote.emoji`）：引用块会把那张表情再贴一遍，
-   *      看着像在郑重地回复一张图；`replyStyle: 'at'` 不受影响（它只认 `userId`）；
-   *   2. `replyStyle: quote` / `at` 照旧；
-   *   3. `auto` 只在「我回的那条后面又出现了消息」时才引用 —— **包括我自己刚发出去的话**
-   *      （上一轮的回复、复读、主动搭话）：紧挨着回时引用是纯噪音，一轮问答本来就看得出来
-   *      在回谁；被后来的话挤远了才需要点名，不然看的人对不上话头。
-   *
-   * @param conversation - 目标会话。
-   * @param options.quote - 被回复消息的 `{ messageId, userId, seq, emoji }`。
-   * @param options.intent - 这一轮为什么轮到它（`addressed` / `continued` / `interject`）。
-   * @returns 要挂在前面的段；不需要指向时 undefined。
-   */
-  function quoteHead(conversation, { quote, intent } = {}) {
-    const target = quote ?? { messageId: '', userId: '', seq: 0 };
-    if (conversation.type !== 'group') return undefined;
-    // 搭话（免 @ 接话 / 多人插话）不点名也不引用：见上面第 0 条。
-    if (intent === 'continued' || intent === 'interject') return undefined;
-    // 积压的一波同样不挂：那一批里每一条都是几分钟前的，指谁都是错的。
-    if (intent === 'backlog') return undefined;
-    // 引用一张表情没有意义（见第 1 条）；@ 不在此列。
-    const quotable = target.emoji !== true;
-    const style = settings.replyStyle;
-    if (style === 'auto') {
-      const drifted = typeof target.seq === 'number' && chatter.anchor(conversation.id) > target.seq;
-      if (!quotable || !drifted || target.messageId.length === 0) return undefined;
-      return { type: 'reply', data: { id: target.messageId } };
-    }
-    if (style === 'quote' && quotable && target.messageId.length > 0) return { type: 'reply', data: { id: target.messageId } };
-    if (style === 'at' && target.userId.length > 0) return { type: 'at', data: { qq: target.userId } };
-    return undefined;
-  }
 
   /**
    * 取一个可用的发送目标：已经有会话记录就复用（发送串行链也一起复用），
@@ -2809,6 +1786,8 @@ export function apply(ctx, config) {
       : targetConversation(type, id);
     return { conversation, type, id };
   }
+
+  // ---- 会话生命周期：/reset、设置页重置、静默换代 ---------------------------------------------
 
   /**
    * 让一个 QQ 会话**新开一轮**：`/reset` 的实际动作。
@@ -2966,14 +1945,6 @@ export function apply(ctx, config) {
     return started;
   }
 
-  /** 路由用的 JSON 响应：设置页是同源 fetch，一律不缓存。 */
-  function jsonResponse(body, status = 200) {
-    return new Response(JSON.stringify(body), {
-      status,
-      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
-    });
-  }
-
   /**
    * 静默太久（`idleResetHours`）之后的第一条消息：先给它换一轮会话。
    *
@@ -3006,6 +1977,8 @@ export function apply(ctx, config) {
     });
   }
 
+  // ---- 会话记录：字段、参与者、群名 -------------------------------------------------------
+
   /**
    * 一条会话记录的初始形状（入站会话与出站用的临时壳共用，免得两边字段漂移）。
    *
@@ -3023,6 +1996,17 @@ export function apply(ctx, config) {
       type,
       id: String(id),
       name: '',
+      /**
+       * 群名只在进程内查一次（`get_group_info`）：重启后会话记录是空的，而 `ensureAgent`
+       * 的 `resume` 路径每条消息都会走 —— 不补查的话群名会一直空到下一次换代。
+       * 标记写在记录上（不是模块变量），换代之后会自然地再查一次。
+       */
+      nameLookup: false,
+      /**
+       * 表情包目录「上次给过哪一份」的账（`{ generation, key }`），见 `stickerCatalogLines`。
+       * `undefined` = 本会话还没给过，下一轮会补一次。
+       */
+      stickerCatalog: undefined,
       senderId: '',
       senderName: '',
       agent: undefined,
@@ -3150,14 +2134,6 @@ export function apply(ctx, config) {
       activeTurns: 0,
       talkMisses: 0,
       /**
-       * 「自己补一句」的定时器与记账（见 scheduleChime）。
-       *
-       * `chimeSeq` 是「现在这条消息对应的补一句」的编号：新消息一来就 +1，旧定时器醒来
-       * 发现编号对不上就什么都不做 —— 比到处记得 clearTimeout 更不容易漏。
-       * `chimeCount` 是对方这一句之后已经补了几句（受 activeChimeMax 约束，收到新消息归零）；
-       * `chimeDay` / `chimeToday` 是当天的补一句计数（受 activeChimeDailyMax 约束）。
-       */
-      /**
        * 戳一戳的记账（见 `handlePoke`）：`pokeAt` 是上次回应它的时刻（冷却用），
        * `pokeDay` / `pokeToday` 是当天的回应次数（跨天就地归零，与主动说话同一套路）。
        * 冷却与上限都只在内存里：重启归零是可接受的，而且重启后第一下就回一次反而正常。
@@ -3175,6 +2151,14 @@ export function apply(ctx, config) {
       recallAt: 0,
       recallDay: '',
       recallToday: 0,
+      /**
+       * 「自己补一句」的定时器与记账（见 scheduleChime）。
+       *
+       * `chimeSeq` 是「现在这条消息对应的补一句」的编号：新消息一来就 +1，旧定时器醒来
+       * 发现编号对不上就什么都不做 —— 比到处记得 clearTimeout 更不容易漏。
+       * `chimeCount` 是对方这一句之后已经补了几句（受 activeChimeMax 约束，收到新消息归零）；
+       * `chimeDay` / `chimeToday` 是当天的补一句计数（受 activeChimeDailyMax 约束）。
+       */
       chimeTimer: undefined,
       chimeSeq: 0,
       chimeCount: 0,
@@ -3276,6 +2260,8 @@ export function apply(ctx, config) {
   function dropPrefix(text) {
     return settings.groupTrigger === 'prefix' ? text.slice(settings.prefix.length).trim() : text;
   }
+
+  // ---- 准入：这条消息该不该进 Agent、以什么身份进 ---------------------------------------------
 
   /**
    * 准入判断：这条入站消息该不该送到它的 Agent。
@@ -3474,6 +2460,8 @@ export function apply(ctx, config) {
     };
   }
 
+  // ---- 群聊记账：谁在说话、会话活跃度 ------------------------------------------------------
+
   /**
    * 记一次「群里又有人说话了」，返回该群当前**别人**说话的插话序号。
    *
@@ -3547,6 +2535,8 @@ export function apply(ctx, config) {
     conversation.idleMs = previous > 0 ? Math.max(0, now - previous) : 0;
     conversation.lastActiveAt = now;
   }
+
+  // ---- 撤回的账：最近看见过什么（环境与撤回共用） ------------------------------------------------
 
   /**
    * 记一条「它看见过这个会话里的这句话」—— 撤回时唯一能回答「撤的是哪句」的账。
@@ -3675,6 +2665,8 @@ export function apply(ctx, config) {
     // 先按占位符入缓冲（提示词立刻可用），下载完成后再就地改写成带路径的版本。
     if (settings.ambientMedia) void hydrateAmbientMedia(raw, entry, lineChars);
   }
+
+  // ---- 自动复读：文字 / 图片 / 表情 ----------------------------------------------------
 
   /**
    * 自动复读：群里**连着**出现同一条消息时，跟着复读一句（或把那张表情包发回去）。
@@ -3970,24 +2962,55 @@ export function apply(ctx, config) {
   const proactiveEnabled = settings.proactive === true;
 
 
-
+  /**
+   * 读一个「今天用了多少次」的计数；跨天就地归零。
+   *
+   * 主动说话 / 补一句 / 戳一戳 / 撤回调侃四处共用这一套，字段名不同只是因为它们
+   * 在 `blankConversation` 里按功能成组出现：`dayKey` 存日期、`countKey` 存次数。
+   * 计数刻意放在**内存**里：重启后归零可以接受（重启本身很稀有），换成落盘状态
+   * 得多维护一个文件，与 `ambient` / 复读链这些运行时状态的口径也一致。
+   *
+   * @param conversation - 目标会话。
+   * @param dayKey - 会话记录上存「上次计数是哪天」的字段名。
+   * @param countKey - 会话记录上存次数的字段名。
+   * @returns 今天已经用掉的次数。
+   */
+  function dailyCount(conversation, dayKey, countKey) {
+    const today = localDate();
+    if (conversation[dayKey] !== today) {
+      conversation[dayKey] = today;
+      conversation[countKey] = 0;
+    }
+    return conversation[countKey] ?? 0;
+  }
 
   /**
-   * 这个会话的「今天」计数（跨天就地归零），返回今天已经主动说过几次。
+   * 清理归属表里已经超时的条目。
    *
-   * 计数刻意放在**内存**里：重启后归零是可以接受的（重启本身很稀有，而且重启后
-   * 至少要等 `proactiveIdleMs` 才可能开口），换成落盘状态得多维护一个文件，
-   * 与 `ambient` / 复读链这些运行时状态的口径也一致。
-   * @param conversation - 目标会话。
-   * @returns 今天已主动说话的次数。
+   * 正常路径由 `agent/inbox/claimed` / `turn/end` 删除；这里是兜底：模型端挂死、
+   * 宿主在别处 dispose 了这个 Agent、或者 `agent.followup()` 异步失败，都可能让
+   * 条目永远留着。`busyWithTurn` 一旦看到它，这个会话的主动说话 / 补一句 / 提醒
+   * 就永久失效 —— 比丢一轮回复更隐蔽。
+   *
+   * 顺带把 `submitted` 压回上限：超过 `SUBMITTED_MAX` 时淘汰最旧的，而不是整表 clear。
+   * @param now - 当前时刻（测试可注入）。
    */
-  function proactiveTodayCount(conversation) {
-    const today = localDate();
-    if (conversation.proactiveDay !== today) {
-      conversation.proactiveDay = today;
-      conversation.proactiveCount = 0;
+  function sweepOwnership(now = Date.now()) {
+    for (const [slot, owner] of turnOwners) {
+      if (now - (Number(owner?.at) || 0) < OWNER_TTL_MS) continue;
+      turnOwners.delete(slot);
+      transcripts.delete(slot);
+      report('warn', `turn ${slot} 超过 ${Math.round(OWNER_TTL_MS / 60000)} 分钟没有结束，已从归属表移除`);
     }
-    return conversation.proactiveCount ?? 0;
+    for (const [id, owner] of submitted) {
+      if (now - (Number(owner?.at) || 0) < OWNER_TTL_MS) continue;
+      submitted.delete(id);
+      report('warn', `message ${id} 超过 ${Math.round(OWNER_TTL_MS / 60000)} 分钟没有被 claim，已从投递表移除`);
+    }
+    if (submitted.size > SUBMITTED_MAX) {
+      const oldest = [...submitted.entries()].sort((a, b) => (Number(a[1]?.at) || 0) - (Number(b[1]?.at) || 0));
+      for (const [id] of oldest.slice(0, submitted.size - SUBMITTED_MAX)) submitted.delete(id);
+    }
   }
 
   /**
@@ -4000,6 +3023,7 @@ export function apply(ctx, config) {
    * @returns 有在飞的 turn 时为 true。
    */
   function busyWithTurn(conversation) {
+    sweepOwnership();
     const prefix = `${sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0)}:`;
     for (const slot of turnOwners.keys()) {
       if (slot.startsWith(prefix)) return true;
@@ -4029,7 +3053,7 @@ export function apply(ctx, config) {
       lastProactiveAt: conversation.lastProactiveAt,
       // 这个读数带「跨天就地归零」的副作用，所以只有走到这里才取 —— 判据本身是纯的，
       // 取数这一步不是。
-      todayCount: proactiveTodayCount(conversation),
+      todayCount: dailyCount(conversation, 'proactiveDay', 'proactiveCount'),
       now,
       idleMs: settings.proactiveIdleMs,
       freshMs: settings.proactiveFreshMs,
@@ -4084,7 +3108,7 @@ export function apply(ctx, config) {
    * @param now - 判定通过的时刻（毫秒）。
    */
   function proactiveSpeak(conversation, now) {
-    conversation.proactiveCount = proactiveTodayCount(conversation) + 1;
+    conversation.proactiveCount = dailyCount(conversation, 'proactiveDay', 'proactiveCount') + 1;
     conversation.lastProactiveAt = now;
     // 人设的「主动搭话」场景段读它（`personaSceneFor`）；turn/end 会清掉。
     conversation.pendingIntent = 'proactive';
@@ -4103,6 +3127,7 @@ export function apply(ctx, config) {
           quote: { messageId: '', userId: '', seq: 0 },
           proactive: true,
           intent: 'proactive',
+          at: Date.now(),
         });
         agent.followup(userMessage);
       } catch (error) {
@@ -4171,13 +3196,10 @@ export function apply(ctx, config) {
   // 「有人插话就考虑进入多人搭话」的落点）。
 
 
-
   /** 免 @ 接话的条数还有余额吗（`activeMaxTurns` 为 0 表示不限）。 */
   function activeTurnsLeft(conversation) {
     return activeTurnsLeftRule(settings.activeMaxTurns, conversation.activeTurns);
   }
-
-
 
 
   /**
@@ -4200,8 +3222,6 @@ export function apply(ctx, config) {
     if (settings.activeFollow !== true) return false;
     return chatter.isHot(groupId, settings.activeWindowMs, settings.activeGroupLines, settings.activeGroupSpeakers);
   }
-
-
 
 
   /**
@@ -4343,16 +3363,6 @@ export function apply(ctx, config) {
     conversation.chimeTimer = timer;
   }
 
-  /** 这个会话今天已经自己补了几句（跨天就地归零）。 */
-  function chimeTodayUsed(conversation) {
-    const today = localDate();
-    if (conversation.chimeDay !== today) {
-      conversation.chimeDay = today;
-      conversation.chimeToday = 0;
-    }
-    return conversation.chimeToday ?? 0;
-  }
-
   /**
    * 「补一句」的正题（定时器醒来时再判一遍 —— 这一小会儿里什么都可能变了）。
    *
@@ -4373,7 +3383,7 @@ export function apply(ctx, config) {
         hasQueuedBatch: conversation.pending.length > 0 || conversation.batchTimer !== undefined,
         busy: busyWithTurn(conversation),
         chimeCount: conversation.chimeCount,
-        chimeToday: chimeTodayUsed(conversation),
+        chimeToday: dailyCount(conversation, 'chimeDay', 'chimeToday'),
         dailyMax: settings.privateAfterthoughtDailyMax,
         lastBotSpeakAt: conversation.lastBotSpeakAt,
         lastActiveAt: conversation.lastActiveAt,
@@ -4393,7 +3403,7 @@ export function apply(ctx, config) {
       chimeCount: conversation.chimeCount,
       chimeMax: settings.activeChimeMax,
       // 同 proactiveEligible 的 todayCount：这个读数带跨天归零的副作用，走到这里才取。
-      chimeToday: chimeTodayUsed(conversation),
+      chimeToday: dailyCount(conversation, 'chimeDay', 'chimeToday'),
       chimeDailyMax: settings.activeChimeDailyMax,
       lastBotSpeakAt: conversation.lastBotSpeakAt,
       lastActiveAt: conversation.lastActiveAt,
@@ -4418,7 +3428,7 @@ export function apply(ctx, config) {
    */
   function chimeSpeak(conversation, now) {
     conversation.chimeCount = (conversation.chimeCount ?? 0) + 1;
-    conversation.chimeToday = chimeTodayUsed(conversation) + 1;
+    conversation.chimeToday = dailyCount(conversation, 'chimeDay', 'chimeToday') + 1;
     conversation.pendingIntent = 'chime';
     const silenceSec = Math.max(1, Math.round((now - (Number(conversation.lastActiveAt) || now)) / 1000));
     report('info', `${describeConversation(conversation)} 对话还热着（对方安静了约 ${silenceSec} 秒），主动补一句`);
@@ -4433,6 +3443,7 @@ export function apply(ctx, config) {
           quote: { messageId: '', userId: '', seq: 0 },
           proactive: true,
           intent: 'proactive',
+          at: Date.now(),
         });
         agent.followup(userMessage);
       } catch (error) {
@@ -4464,6 +3475,8 @@ export function apply(ctx, config) {
       '- 对方没接话，别追问太紧：没什么想说的就 SKIP，这很正常。',
     ].join('\n');
   }
+
+  // ---- 媒体：入站图片与引用的落盘 --------------------------------------------------------
 
   /**
    * 把一条消息里的图片/表情包落到本地，并给出「段下标 → 替身文本」的映射。
@@ -4615,415 +3628,7 @@ export function apply(ctx, config) {
     }
   }
 
-  // ---- 攒批：几个人同时 @ 时只回一轮 -----------------------------------------
-
-  /**
-   * 这个会话现在的「倾听时间」倍数。
-   *
-   * 只有**多人搭话**的群会放大：大家正聊着的时候它该多听几句再开口，而不是每两秒截一句
-   * 就回一轮。一对一的窗口不放大 —— 那边是「它正在跟你说话」，等太久反而像掉线。
-   * @param conversation - 目标会话。
-   * @returns 倍数（≥1）。
-   */
-  function batchScale(conversation) {
-    // 私聊一律不放大（那边是「它正在跟你说话」，等太久像掉线）；先判类型再查热度，
-    // 私聊连那次热度查询都省掉。
-    if (conversation?.type !== 'group') return 1;
-    return batchScaleRule('group', groupTalkActive(conversation.id), settings.activeGroupBatchScale);
-  }
-
-  /** 攒批窗口（毫秒）；配置非法或为 0 时返回 0，表示关闭攒批、来一条回一条。 */
-  function batchWindow(scale) {
-    return batchWindowRule(settings.batchWindowMs, scale);
-  }
-
-  /** 一批最多等多久（毫秒）。配置比窗口还小时没有意义，按下限（= 窗口）算；与窗口同倍放大。 */
-  function batchCap(window, scale) {
-    return batchCapRule(settings.batchMaxWaitMs, window, scale);
-  }
-
-  /**
-   * 把一件「按到达顺序处理」的事挂到会话队列尾。
-   *
-   * 队列是每个会话一条的串行链：媒体落盘、确保 Agent 就绪、投递消息都在这条链上，
-   * 处理顺序因此与消息到达顺序一致（否则「先发图、再说那句话」会被下载耗时颠倒）。
-   * 失败时把原因回给发消息的人 —— 静默会被群里当成「机器人不理人」。
-   * @returns 这条排进来的任务所在的队列承诺（`submitBatch` 用它在收尾时清 `submitting`）。
-   */
-  function enqueue(conversation, job) {
-    conversation.queue = conversation.queue
-      .then(job)
-      .catch((error) => {
-        const detail = error?.message ?? String(error);
-        report('warn', `could not queue for ${conversation.key}: ${detail}`);
-        void sendToConversation(conversation, `（我这边出错了：${detail}）`);
-      });
-    return conversation.queue;
-  }
-
-  /**
-   * 收下一条要回的消息，先压着不投给 Agent：等一个窗口，看还有没有人接着说。
-   *
-   * 这是「几个人同时 @ 时不要分开回复」的关键。Harness 的 inbox 每次只从 next-turn
-   * 里认领**一条**消息，也就是「一条消息 = 一轮 = 一条回复」；前后脚到的消息若逐条投递，
-   * 群里看到的必然是机器人一条一条地分别答复每个人。攒成一条，才有一轮里把几个人
-   * 一起接住的机会。
-   *
-   * 窗口从**最后一条**往后算（还有人接着说就再等一个窗口），但整批的等待以第一条
-   * 到达时刻为起点卡一个上限（`batchMaxWaitMs`）—— 否则群里你一句我一句地 @ 下去，
-   * 机器人会永远不吭声。多人搭话时这两个值一起按 `activeGroupBatchScale` 放大，
-   * 于是它会多听几句再合成一轮（见 `batchScale`）。
-   *
-   * 它**正在忙**（上一轮还没跑完）时，这条消息不按「2 秒窗口」算，而是进一波迟到的
-   * 消息（`entry.held`）：窗口到了也不投，等它闲下来合成一轮接（见 `flushBatch` /
-   * `backlogBusy`）。不这么做的话，十分钟的长任务会攒出上百个 turn、上百条回复，
-   * 每条都在回答几分钟前的问题。
-   *
-   * @param conversation - 目标会话。
-   * @param entry - 已准入的这条消息 `{ message, name, userId, quote, at }`。
-   */
-  function holdForBatch(conversation, entry) {
-    const scale = batchScale(conversation);
-    const window = batchWindow(scale);
-    if (window <= 0) {
-      submitBatch(conversation, [entry]);
-      return;
-    }
-    // 忙的时候到的消息都属于「一波迟到的对话」：多憋一会儿、回头一起接。
-    // `batchBacklogHoldMs: 0` 是「不憋」—— 那样它就和关掉这一项一样，回到逐批排队。
-    if (settings.batchBacklog === true && settings.batchBacklogHoldMs > 0 && backlogBusy(conversation)) entry.held = true;
-    conversation.pending.push(entry);
-    const cap = batchCap(window, scale);
-    const since = conversation.pending[0].at;
-    const wait = Math.max(0, Math.min(window, since + cap - Date.now(), MAX_TIMER_MS));
-    if (conversation.batchTimer !== undefined) clearTimeout(conversation.batchTimer);
-    conversation.batchTimer = setTimeout(() => flushBatch(conversation), wait);
-    // 等待中的批次不该拖着进程不让退出（与 sleep 一致）。
-    conversation.batchTimer.unref?.();
-  }
-
-  /**
-   * 这个会话现在算不算「忙着」—— 攒批这边用的口径。
-   *
-   * 比 `busyWithTurn` 多算一件事：`submitBatch` 已经排上、但还没跑到 `followup` 的那段
-   * 窗口。那段时间里 `submitted` 还是空的，只看它会把这个会话当成空闲，于是新到的消息
-   * 可能被算进另一批、和正在投的那批分成两轮。
-   * @param conversation - 目标会话。
-   * @returns 忙时为 true。
-   */
-  function backlogBusy(conversation) {
-    if (busyWithTurn(conversation)) return true;
-    return (conversation.submitting ?? 0) > 0;
-  }
-
-  /**
-   * 这一波还要不要继续憋着。
-   *
-   * 四个条件缺一不可：开关开着 · 这一波里确实有「忙的时候到的」条目 · 它现在还忙 ·
-   * 还没憋到 `batchBacklogHoldMs` 的上限。上限是为了兜住「它卡住了」：卡着的 turn
-   * 不会结束，没有上限的话这些消息就再也不会被投出去（比晚回糟得多）。
-   * @param conversation - 目标会话。
-   * @returns 需要继续等时为 true。
-   */
-  function backlogShouldHold(conversation) {
-    if (settings.batchBacklog !== true) return false;
-    if (!(settings.batchBacklogHoldMs > 0)) return false;
-    if (!conversation.pending.some((item) => item.held === true)) return false;
-    if (!backlogBusy(conversation)) return false;
-    const since = Number(conversation.pending[0]?.at) || 0;
-    return since > 0 && Date.now() - since < settings.batchBacklogHoldMs;
-  }
-
-  /**
-   * 结束等待，把攒下的消息作为**一条** user message 投进会话队列。
-   *
-   * 忙的时候就别投：先重新挂一个短定时器（`BACKLOG_POLL_MS`），等它闲下来再投 ——
-   * 那一整段会被 `submitBatch` 当成一波迟到的消息交给模型（见 `renderBacklog`）。
-   * `force` 只有一个调用点：`/reset`。那批话是重置前说的，必须照旧先投出去。
-   *
-   * @param conversation - 目标会话。
-   * @param options.force - 跳过「还忙着」的等待（`/reset` 用）。
-   */
-  function flushBatch(conversation, { force = false } = {}) {
-    if (conversation.batchTimer !== undefined) {
-      clearTimeout(conversation.batchTimer);
-      conversation.batchTimer = undefined;
-    }
-    if (conversation.pending.length === 0) return;
-    if (!force && backlogShouldHold(conversation)) {
-      const since = Number(conversation.pending[0]?.at) || 0;
-      const left = settings.batchBacklogHoldMs - (Date.now() - since);
-      const wait = Math.max(50, Math.min(left, BACKLOG_POLL_MS));
-      const timer = setTimeout(() => flushBatch(conversation), wait);
-      timer.unref?.();
-      conversation.batchTimer = timer;
-      return;
-    }
-    const batch = conversation.pending.splice(0);
-    submitBatch(conversation, batch);
-  }
-
-  /**
-   * 一轮结束后看一眼：是不是有一波迟到的消息可以投了。
-   *
-   * 挂在 `turn/end` 上（而不是只靠定时器），是因为「忙完」这件事只有那里知道得最准：
-   * 定时器最多晚一个 `BACKLOG_POLL_MS`，而这里能让积压的那一轮紧接着开始。只处理
-   * `held` 的批次 —— 普通的 2 秒窗口有它自己的定时器，不该被提前截断。
-   * @param conversation - 目标会话。
-   */
-  function flushIfIdle(conversation) {
-    if (conversation === undefined) return;
-    if (conversation.pending.length === 0) return;
-    if (!conversation.pending.some((item) => item.held === true)) return;
-    if (backlogBusy(conversation)) return;
-    flushBatch(conversation);
-  }
-
-  /**
-   * 把一批消息渲染成一条 user message 交给会话的 Agent。
-   *
-   * 媒体在这里才落盘（在队列上串行），一条里的图和话都按原样呈现给模型。
-   * 只带 @、没有正文的消息在这里也**不丢**：正文换成一句「他 @ 了你一下，没说什么」
-   * —— 模型得知道轮到自己说话了，才能决定回一句「？」、发张表情，还是接上一句
-   * （见 `blankReply`）。只有在引用也没取到、整批确实什么都没有时才什么都不发。
-   *
-   * 一批里只要有一条是「忙的时候到的」（`held`），整批就按**一波迟到的消息**渲染
-   * （见 `backlog.js` / `renderBacklog`）：它们不是几乎同时到的，而是它在忙别的事的
-   * 那段时间里陆续到的 —— 这个事实必须交给模型，它才知道可以挑着接、或者 SKIP。
-   */
-  function submitBatch(conversation, batch) {
-    // 排上队就算「忙」：到 `followup` 之前 `submitted` 还是空的（见 `backlogBusy`）。
-    conversation.submitting = (conversation.submitting ?? 0) + 1;
-    enqueue(conversation, async () => {
-      const selfId = client.selfId;
-      const held = batch.some((item) => item.held === true);
-      const entries = [];
-      for (const item of batch) {
-        // 撤回的两种处理都在账上查：`action: 'drop'` 是「摘除的第二道」—— 这一批可能
-        // 已经被 splice 出来、正在异步下媒体，那时数组里已经没有它，摘不掉了。
-        const mark = findRecent(conversation.key, item.messageId);
-        if (mark?.action === 'drop') continue;
-        // 积压波里的「改写」降级成丢弃：隔八分钟再为一句撤回调侃一句，不合时宜，
-        // 而且这一轮本来就不是为它开的（模型看到的是一大段别人的话）。
-        if (held && mark?.action === 'rewrite') continue;
-        // 本条自己的图和「它在回复的那条」里的图一起取：两件事互不依赖，串起来等只是白等。
-        const [resolved, quote] = await Promise.all([mediaFor(item.message), resolveQuote(item.message)]);
-        // 再查一次：撤回可能就发生在这几十毫秒里（我们正在下媒体），而上面那次查是 await
-        // 之前 —— 一次不够，正是这段异步窗口逼出了「把 action 记在账上」这个设计。
-        if (mark?.action === 'drop') continue;
-        // 引用成功时把 `[回复]` 占位符换成真正的引用前缀：否则模型会看到
-        // 「（引用 kaguya: …）\n[回复]这啥」这种一半有内容、一半是噪音的正文。
-        const rendered = new Map(resolved?.rendered ?? []);
-        if (quote !== undefined) rendered.set(quote.index, '');
-        // 活跃对话里接上的那句没有前缀可去：按前缀长度硬切会把「然后呢」切成「后呢」。
-        const raw = messageToText(item.message, selfId, rendered.size > 0 ? rendered : undefined).trim();
-        // 改写成撤回提示：这一轮本来就为它开，模型在**同一轮**里看到「他 @ 了我又撤了」，
-        // 回一句就够 —— 不必先回一句正经的、再补一句调侃（那是两连发）。正文整个换掉，
-        // 连「他引用了谁」那一段也不接：被引用的那条正是已经不在的那条。
-        const rewritten = mark?.action === 'rewrite'
-          ? recallLine({
-              name: mark.name,
-              text: settings.recallTeaseQuote === true ? mark.text : undefined,
-              imageAllowed: imageAllowed(),
-            })
-          : undefined;
-        const body = rewritten ?? (item.continued === true ? raw : dropPrefix(raw));
-        const composed = rewritten !== undefined || quote === undefined
-          ? body
-          : body.length > 0
-            ? `${quotePrefix(quote)}\n${body}`
-            : quotePrefix(quote);
-        // 正文与引用都是空的（`admit` 里的空消息通常已经给了 `blankBody`，这里只是最后
-        // 一道防线）：绝不能给模型递一条空消息 —— 它会以为出了一条没有内容的消息。
-        const text = composed.length > 0 ? composed : (item.blankBody ?? '');
-        if (text.length === 0) continue;
-        // 裸 URL 可选地取一次标题（`linkPreview` 默认关：替群友访问任意 URL 是把部署机器的
-        // 出口 IP 暴露给发链接的人，卡片消息不联网就能解析，已经够用）。
-        const withLinks = await previewLinks(text);
-        entries.push({
-          name: item.name,
-          id: item.userId,
-          body: withLinks,
-          // 投递之后要能对回账上那一条（`submitted` / `replied` 两个进度，见 handleRecall）。
-          messageId: String(item.messageId ?? ''),
-          blank: item.blankBody !== undefined && item.blankBody.length > 0 && withLinks === item.blankBody,
-          // 这一条是什么时候到的：一波迟到消息要按它算「几分钟前」，见 renderBacklog。
-          at: Number(item.at) || 0,
-        });
-      }
-      if (entries.length === 0) return;
-      // 这一轮为什么轮到它：必须在渲染正文**之前**算出来（插话轮的正文要用它），
-      // 写进会话记录，提示词（场景 / 人设的场景段）读它。积压的一波单独一个 intent：
-      // 它既不是「刚有人跟我说话」，也不是免 @ 接话，场景提示词要说的是「你刚才在忙」。
-      const intent = held ? 'backlog' : batchIntent(batch);
-      conversation.pendingIntent = intent;
-      // 三种投递文案：插话轮要说清「这不是叫你的」；积压的一波要带相对时间（否则模型
-      // 会把八分钟前的问题当成刚发生的）；其余照旧。
-      const text = held
-        ? renderBacklog(entries, {
-            now: Date.now(),
-            maxEntries: settings.batchBacklogEntries,
-            maxChars: settings.batchBacklogChars,
-            canLookup: memory.toolsAllowed() === true,
-          })
-        : intent === 'interject'
-          ? interjectBody(entries)
-          : renderBatch(entries);
-      const names = [...new Set(entries.map((entry) => entry.name))].join('、');
-      report('info', `← ${describeConversation(conversation)} ${names}${entries.length > 1 ? `（${entries.length} 条）` : ''}${held ? '〔积压〕' : ''}: ${text.slice(0, 120)}`);
-      // 发言人：提示词里要说得清「现在是谁在跟你说话」，所以几个人的话都记下来。
-      // 同一个登记顺手保证他们都能被 @ 到（名单以「刚刚说过话」为序，见 `registerParticipant`）。
-      const speakers = new Map();
-      for (const entry of entries) speakers.set(entry.id, { name: entry.name, id: entry.id });
-      conversation.speakers = [...speakers.values()];
-      for (const speaker of conversation.speakers) registerParticipant(conversation, speaker.name, speaker.id);
-      // 长期记忆的检索查询：这一轮真正投进去的正文 + 说话人（设计 §5.1）。
-      // 只放**这一批**的正文（不是插话包装后的整段），检索要的是「他们在说什么」；
-      // 说话人（以及这一批里被 @ 的人）用来保证「人物必进」。不落盘、只留最近这一条。
-      const focusPeople = [...speakers.values()];
-      for (const item of batch) {
-        for (const mentioned of atMentions(item.message, selfId)) {
-          if (mentioned.name.length > 0) focusPeople.push({ name: mentioned.name, id: mentioned.id });
-        }
-      }
-      conversation.recallQuery = {
-        text: entries.map((entry) => entry.body).join('\n').slice(0, 4000),
-        at: Date.now(),
-        speakers: focusPeople,
-      };
-      const agent = await ensureAgent(conversation);
-      const userMessage = userMessageFor(conversation, text);
-      // 只算**真正投进这一轮**的那些（被 `action: 'drop'` 摘掉的那条不在 entries 里）：
-      // `turn/end` 之后靠它把账上那几条标成「已回复」。
-      const batchIds = entries.map((entry) => entry.messageId).filter((id) => id.length > 0);
-      for (const id of batchIds) {
-        const mark = findRecent(conversation.key, id);
-        if (mark !== undefined) mark.submitted = true;
-      }
-      // `blank`：这一批整批都是「空消息的替身」时，回复之后不挂补一句（那一轮没话题）。
-      // `quote`：积压的一波不给指向 —— 引用八分钟前哪一条都像「我刚回的是他」；
-      // 想叫谁让模型自己写 `[[@昵称]]`（`quoteHead` 也认 `backlog` 这个 intent）。
-      submitted.set(userMessage.id, {
-        key: conversation.key,
-        quote: held ? { messageId: '', userId: '', seq: 0 } : batchQuote(batch),
-        intent,
-        batchIds,
-        blank: entries.every((entry) => entry.blank === true),
-      });
-      agent.followup(userMessage);
-    }).finally(() => {
-      // 投递这一段（可能含媒体下载）结束：无论成功失败，会话都不再算「排着队」。
-      conversation.submitting = Math.max(0, (conversation.submitting ?? 1) - 1);
-    });
-  }
-
-  /**
-   * 一批消息的「为什么轮到它」。
-   *
-   * 一批里可能混着「被叫到」与「窗口里接上的一句」：只要有一条是被明确叫到的，
-   * 这一轮就是 `addressed`（模型得把它当成有人在跟它说话）；全是接话的才是 `continued`。
-   * `interject` 由 `speech-policy` 判出来，单独带在条目上（见 `admit` 的返回）。
-   * @param batch - 这一批 `{ intent }`。
-   * @returns `intent` 字符串。
-   */
-  function batchIntent(batch) {
-    const intents = batch.map((entry) => entry.intent ?? 'addressed');
-    if (intents.includes('interject')) return 'interject';
-    if (intents.includes('addressed')) return 'addressed';
-    return intents[0] ?? 'addressed';
-  }
-
-  /**
-   * 一批消息的回复指向。
-   *
-   * 只有「整批都是同一个人说的」才值得指向他最后那条；几个人一起问的时候引用谁的
-   * 截图都像是只在回他，所以裸文本发出去，谁的话谁自己认领。
-   * @param batch - 这一批 `{ userId, quote }`。
-   * @returns 要挂在本轮第一条上的 `{ messageId, userId, seq }`。
-   */
-  function batchQuote(batch) {
-    const senders = new Set(batch.map((entry) => entry.userId));
-    if (senders.size === 1) return batch[batch.length - 1].quote;
-    return { messageId: '', userId: '', seq: 0 };
-  }
-
-  /**
-   * 插话轮的正文：元信息 + 锚点那句 + 「想接就接 / 不想接就 SKIP」。
-   *
-   * 只有一条时把「谁说的、说了什么」直接写进元信息（那就是锚点）；多条时元信息说一次、
-   * 下面照常列「谁：什么」—— 否则每一行都套一句提醒，模型更容易只挑最后一句。
-   * @param entries - `{ name, body }`，按到达顺序。
-   * @returns user message 正文。
-   */
-  function interjectBody(entries) {
-    const allowed = imageAllowed();
-    if (entries.length === 1) {
-      return interjectLine(entries[0].name, entries[0].body, allowed);
-    }
-    const lines = entries.map((entry) => `${entry.name}: ${entry.body.replace(/\s+/g, ' ').trim()}`);
-    return [...interjectBatchPrompt(allowed), ...lines].join('\n');
-  }
-
-  /**
-   * 把正文里的裸 URL 换成「【标题】 — 域名 链接」（`linkPreview` 打开时才做）。
-   *
-   * 三条边界都是「不可信输入」那条线上的：
-   *   - 一条消息最多抓 **2** 个链接：不然一条刷屏消息能拖住整轮投递；
-   *   - SSRF / 大小 / 超时 / 重定向全部由 `links.js` 兜住（见那边的模块注释）；
-   *   - 抓到的标题是**数据**，原样放在方括号里渲染 —— 和 QQ 消息一样，不是指令。
-   * 抓失败（内网、超时、不是 HTML）就保留原 URL：宁可没有标题，也不要丢链接。
-   * @param text - 已渲染好的正文。
-   * @returns 替换后的正文（没有 URL 或开关关着时原样返回）。
-   */
-  async function previewLinks(text) {
-    if (!settings.linkPreview) return text;
-    const urls = [...new Set(String(text).match(/https?:\/\/[^\s<>"'（）()【】]+/g) ?? [])]
-      // 句末标点常常被粘在 URL 后面（「看这个 https://a.b/x。」），别把它们算进链接。
-      .map((url) => url.replace(/[。，、；：！？…]+$/, ''))
-      .filter((url) => url.length > 0)
-      .slice(0, 2);
-    if (urls.length === 0) return text;
-    let out = String(text);
-    for (const url of urls) {
-      const result = await fetchPageTitle(url, {
-        timeoutMs: settings.linkPreviewTimeoutMs,
-        maxBytes: settings.linkPreviewMaxBytes,
-        allowPrivateHosts: settings.linkAllowPrivateHosts,
-      });
-      const line = previewLine(result);
-      if (line === undefined) continue;
-      out = out.split(url).join(line);
-    }
-    return out;
-  }
-
-  /**
-   * 把一批消息渲染成一条 user message 的正文。
-   *
-   * 只有一条时原样返回 —— 旧行为完全不变。多条时每行标出是谁说的、并在开头点一句
-   * 「这些是几乎同时到的」，否则模型会把它读成一个人自说自话的一整段。
-   * @param entries - `{ name, body }`，按到达顺序。
-   */
-  function renderBatch(entries) {
-    if (entries.length === 1) return entries[0].body;
-    // 折掉换行：一行一条才看得出「这是几条消息」，也才说得清每句是谁说的。
-    const lines = entries.map((entry) => `${entry.name}: ${entry.body.replace(/\s+/g, ' ').trim()}`);
-    const names = [...new Set(entries.map((entry) => entry.name))];
-    const note = names.length > 1
-      ? `（下面 ${lines.length} 条是几乎同时到的，${names.join('、')} 都在跟你说话）`
-      : `（下面 ${lines.length} 条是${names[0]}连着发的）`;
-    return [note, ...lines].join('\n');
-  }
-
-  /** 这个会话今天已经回应了几次戳一戳（跨天就地归零）。 */
-  function pokeTodayUsed(conversation) {
-    const today = localDate();
-    if (conversation.pokeDay !== today) {
-      conversation.pokeDay = today;
-      conversation.pokeToday = 0;
-    }
-    return conversation.pokeToday ?? 0;
-  }
+  // ---- 戳一戳：判据、回戳、走一轮 --------------------------------------------------------
 
   /**
    * 让 OneBot 真的戳一下：不同实现的动作名不一样（`send_poke` / `group_poke` / `friend_poke`），
@@ -5094,7 +3699,7 @@ export function apply(ctx, config) {
       chance: settings.pokeReplyChance,
       roll: Math.random(),
       cooldownLeftMs: Math.max(0, (Number(conversation.pokeAt) || 0) + settings.pokeCooldownMs - now),
-      todayCount: pokeTodayUsed(conversation),
+      todayCount: dailyCount(conversation, 'pokeDay', 'pokeToday'),
       dailyMax: settings.pokeDailyMax,
     });
     if (decision.act === 'none') {
@@ -5104,7 +3709,7 @@ export function apply(ctx, config) {
     // 记账刻意在**发出去之前**：回戳失败、或者那一轮被判成 SKIP，这次机会照样用掉 —
     // 否则对方一直戳，它就一直在同一个冷却里反复尝试。
     conversation.pokeAt = now;
-    conversation.pokeToday = pokeTodayUsed(conversation) + 1;
+    conversation.pokeToday = dailyCount(conversation, 'pokeDay', 'pokeToday') + 1;
     if (decision.act === 'poke') {
       report('info', `${describeConversation(conversation)} 被 ${displayName} 戳了，回戳`);
       void pokeBack(type, id, notice.userId);
@@ -5122,6 +3727,7 @@ export function apply(ctx, config) {
           key: conversation.key,
           quote: { messageId: '', userId: '', seq: 0 },
           intent: 'poke',
+          at: Date.now(),
         });
         agent.followup(userMessage);
       } catch (error) {
@@ -5129,6 +3735,8 @@ export function apply(ctx, config) {
       }
     });
   }
+
+  // ---- 撤回：清引用、改写、补一句 --------------------------------------------------------
 
   /**
    * 撤回事件的准入：与 `handlePoke` / `rememberTranscript` 同一条纪律。
@@ -5226,16 +3834,6 @@ export function apply(ctx, config) {
     if (list === undefined) return;
     const at = list.findIndex((item) => String(item.id ?? '') === id);
     if (at >= 0) list.splice(at, 1);
-  }
-
-  /** 这个会话今天已经为撤回补了几句（跨天就地归零，与 `pokeTodayUsed` 同一套路）。 */
-  function recallTodayUsed(conversation) {
-    const today = localDate();
-    if (conversation.recallDay !== today) {
-      conversation.recallDay = today;
-      conversation.recallToday = 0;
-    }
-    return conversation.recallToday ?? 0;
   }
 
   /**
@@ -5351,7 +3949,7 @@ export function apply(ctx, config) {
       busy: busyWithTurn(conversation),
       cooldownLeftMs: Math.max(0, (Number(conversation.recallAt) || 0) + settings.recallCooldownMs - now),
       // 这个读数带「跨天就地归零」的副作用，所以只有走到这里才取 —— 判据本身是纯的。
-      todayCount: recallTodayUsed(conversation),
+      todayCount: dailyCount(conversation, 'recallDay', 'recallToday'),
       dailyMax: settings.recallDailyMax,
       chance: settings.recallChance,
       roll: Math.random(),
@@ -5362,7 +3960,7 @@ export function apply(ctx, config) {
     }
     // 先记账再发（与 poke / proactive 同一条规矩：掷中即消耗，SKIP 也算）。
     conversation.recallAt = now;
-    conversation.recallToday = recallTodayUsed(conversation) + 1;
+    conversation.recallToday = dailyCount(conversation, 'recallDay', 'recallToday') + 1;
     conversation.pendingIntent = 'recall';
     enqueue(conversation, async () => {
       try {
@@ -5382,6 +3980,7 @@ export function apply(ctx, config) {
           quote: { messageId: '', userId: '', seq: 0 },
           proactive: true,
           intent: 'recall',
+          at: Date.now(),
         });
         agent.followup(userMessage);
       } catch (error) {
@@ -5389,6 +3988,8 @@ export function apply(ctx, config) {
       }
     });
   }
+
+  // ---- 入站事件路由：消息、戳一戳、撤回 -----------------------------------------------------
 
   /** 处理一条已解码的 OneBot 事件（由 OneBotClient 的 onEvent 调用）。 */
   function handleEvent(event) {
@@ -5430,8 +4031,11 @@ export function apply(ctx, config) {
     const { conversation, message, preview, quote } = admitted;
     const sender = event.sender ?? {};
     const who = describeConversation(conversation);
-    // 兜底清理归属表，避免「消息入队了但 turn 始终没被 claim」导致无限增长。
-    if (submitted.size > 512) submitted.clear();
+    // 兜底清理归属表，避免「消息入队了但 turn 始终没被 claim」导致无限增长：
+    // 超时条目按 TTL 清掉，`submitted` 超上限时只淘汰最旧的几条。
+    // **不能整表 clear()**：那会把正在飞的消息归属一起抹掉，之后 turn/end 找不到 owner，
+    // 模型回复被静默丢弃（群里表现为「不理人」）。
+    sweepOwnership();
     // 「这条消息恰好是指令」—— 静默换代要让开它（下面那一轮换代由它自己来）。
     const isResetCommand = commanded && resetCommand.length > 0 && preview.toLowerCase() === resetCommand;
     // 静默太久之后的第一条消息：先换一轮会话，再照常攒批（见 `maybeIdleReset`）。
@@ -5488,6 +4092,8 @@ export function apply(ctx, config) {
     const owner = submitted.get(message.id);
     if (owner === undefined) return;
     submitted.delete(message.id);
+    // TTL 从 claim 这一刻重新算：模型开始跑的轮次才是「可能挂死」的那一段。
+    owner.at = Date.now();
     turnOwners.set(`${agent.id}:${turn}`, owner);
     // 私聊回复从模型**开始想**的那一刻就点亮「对方正在输入」：这一段（常常十几秒）
     // 才是对方真正在等的时间。`turn/end` 会把它停掉，随后发送步骤再按打字节奏点亮。
@@ -5519,13 +4125,14 @@ export function apply(ctx, config) {
     const conversation = conversations.get(owner?.key ?? key);
     // 这一轮不管最后发不发（SKIP / 出错 / 中止 / 空回复），「正在输入」都到此为止；
     // 真要发的话，`sendParts` 会在发送前按打字节奏重新点亮。
-    if (conversation !== undefined) stopTyping(conversation);
+    if (conversation !== undefined) {
+      stopTyping(conversation);
+      // 这一轮收尾之后它可能就闲下来了：忙的时候攒着的那一波迟到的消息可以投了。
+      // 必须放在这里（而不是某个分支里）：下面每一条提前 return（提醒、aborted、error、
+      // 空回复、SKIP、主动搭话）都可能正是「它终于闲下来」的那一刻。
+      flushIfIdle(conversation);
+    }
     if (owner === undefined) return;
-    if (conversation === undefined) return;
-    // 这一轮收尾之后它可能就闲下来了：忙的时候攒着的那一波迟到的消息可以投了。
-    // 必须放在这里（而不是某个分支里）：下面每一条提前 return（提醒、aborted、error、
-    // 空回复、SKIP、主动搭话）都可能正是「它终于闲下来」的那一刻。
-    flushIfIdle(conversation);
     const reason = event.data.reason?.kind;
     // 只发该 turn 里最后一条有文本的 assistant 消息；中间步骤的工具调用等不发给 QQ。
     const reply = list?.[list.length - 1]?.trim() ?? '';
@@ -5534,8 +4141,12 @@ export function apply(ctx, config) {
     // 这几个分支在普通轮次里是「静默丢弃」，但提醒不能静默 —— 要让 reminders.js 拿到
     // 结果去走兜底文案。`settleReminderTurn` 返回 false 说明守卫已经超时并结算过，
     // 这一条迟到的回复必须丢弃，否则同一件事会发两遍。
+    //
+    // **必须排在 `conversation === undefined` 之前**：重启之后 `conversations` 还是空的，
+    // 提醒走 `targetConversation` 造的一次性壳（不写进会话表），turn/end 这里按 key 查
+    // 不到会话。若先 return，模型这一轮的回复就白丢了，120 秒后只剩兜底文案。
     if (owner.reminderId !== undefined) {
-      conversation.pendingIntent = undefined;
+      if (conversation !== undefined) conversation.pendingIntent = undefined;
       const failed = reason === 'aborted' || reason === 'forked' || reason === 'interrupted' || reason === 'error';
       const hasText = reply.length > 0 && replyPieces(reply, true).some((piece) => piece.kind === 'text');
       const outcome = failed
@@ -5548,6 +4159,7 @@ export function apply(ctx, config) {
       }
       return;
     }
+    if (conversation === undefined) return;
 
     // 被打断 / fork 掉 / 中止的 turn 不是有效回复，静默丢弃（意图也要清，别漏到下一轮）。
     if (reason === 'aborted' || reason === 'forked' || reason === 'interrupted') {
@@ -5777,55 +4389,9 @@ export function apply(ctx, config) {
 
   // ---- 模型凭据：每天轮换的定时器 ----------------------------------------------
   //
-  // 与摘要循环同一套托管方式（`ctx.interval` + 「跑完再排」，插件卸载即清掉），只是没有
-  // 任何预热：轮换的状态全部现算（见 rotateApiKey），重启也不会跑偏。
-  if (apiKeyRotateEnabled) {
-    const hour = settings.apiKeyRotateHour;
-    const tick = () => {
-      // 定时器回调是同步的，而轮换要读盘 + 发探测请求：这里只负责把异常收进日志，
-      // 不让一个 rejected promise 变成 unhandled rejection 把进程带走。
-      void rotateApiKey(`daily at ${hourLabel(hour)}`).catch((error) => {
-        report('warn', `api key rotation failed: ${errorText(error)}`);
-      });
-    };
-    let rotateTimerDisposer;
-    ctx.effect(() => {
-      // 每天醒一次，醒来跑完再排下一次：每次算的都是「距离下一个整点还有多久」，
-      // 所以刚过点时会排到明天，不会在同一个点上反复醒。
-      const schedule = () => {
-        const wait = msUntilDailyHour(hour);
-        if (typeof ctx.interval === 'function') {
-          rotateTimerDisposer = ctx.interval(() => {
-            rotateTimerDisposer?.();
-            tick();
-            schedule();
-          }, wait);
-          return;
-        }
-        // 没有 timer 服务（测试桩或最小组合）时退回裸定时器：同样是「跑完再排」。
-        const handle = setTimeout(() => {
-          tick();
-          schedule();
-        }, wait);
-        handle.unref?.();
-        rotateTimerDisposer = () => clearTimeout(handle);
-      };
-      schedule();
-      return () => {
-        rotateTimerDisposer?.();
-        rotateTimerDisposer = undefined;
-      };
-    }, 'qq-bridge:api-key-rotate');
-    report(
-      'info',
-      `api key rotation: on, daily at ${hourLabel(hour)} — pool ${apiKeyPoolLabel}, ref ${apiKeyRefName}, ` +
-        `probe ${settings.apiKeyProbeUrl.length > 0 ? settings.apiKeyProbeUrl : '(disabled)'}`,
-    );
-  } else if (apiKeyRotateOn) {
-    // 配置本身不合法（ref 不是变量名 / 池子在 cwd 外）：启动时已经逐条 warn 过，这里不重复。
-  } else {
-    report('info', 'api key rotation is off (apiKeyRotate is false)');
-  }
+  // 定时器、启动自述与三种开关状态的日志都在 key-rotation.js 的 `start()` 里；这里只负责
+  // 在生命周期这一节把它挂上（与摘要循环同一套托管方式）。
+  keyRotation.start();
 
   // ---- 主动说话：定时器 --------------------------------------------------------
   //
