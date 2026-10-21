@@ -166,11 +166,21 @@ export function parseMemoryDoc(markdown, { file = 'MEMORY.md', scope = 'global',
     let topic = fields.rest[0];
     let body = fields.rest.slice(1).join('｜');
     // 单段行（`- kaguya：群主，周六常组织打本`）也要能认：按第一个冒号分主题与正文。
+    // 但时间里的冒号（`14:08`）不是主题分隔符 —— 真实数据：`- 群主是 1598672777（2026-10-14
+    // 14:08 …）` 曾被切成「…（2026-10-14 14」，记忆文本里插进半截 QQ 标签。
+    // 判据只看**第一个**冒号：左边不以数字结尾、或右边不是两位数字，才算主题分隔符；
+    // 不能用 `(?<!\d)` —— 那会把 `1598672777：正文` 这种 QQ 号结尾的正常写法也挡掉。
     if (fields.rest.length === 1) {
-      const colon = /^([^：:]{1,40})[：:]\s*(.+)$/.exec(topic);
-      if (colon !== null) {
-        topic = colon[1].trim();
-        body = colon[2].trim();
+      const colonAt = topic.search(/[：:]/);
+      if (colonAt > 0 && colonAt <= 40) {
+        const before = topic.slice(Math.max(0, colonAt - 2), colonAt);
+        const after = topic.slice(colonAt + 1, colonAt + 3);
+        const timeLike = /\d$/.test(before) && /^\d{2}$/.test(after);
+        const right = topic.slice(colonAt + 1).trim();
+        if (!timeLike && right.length > 0) {
+          topic = topic.slice(0, colonAt).trim();
+          body = right;
+        }
       }
     }
     const variant = splitVariants(topic);
