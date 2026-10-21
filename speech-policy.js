@@ -113,8 +113,8 @@ export function interjectLine(speaker, body, imageAllowed = false) {
   return [
     `（群里在聊天，这句不是叫你的。${name} 说：${text}）`,
     imageAllowed
-      ? '你要接就接这一句，别把它当成在问你；不想接就只写 SKIP，或者只发一张表情。'
-      : '你要接就接这一句，别把它当成在问你；不想接就只写 SKIP。',
+      ? '你要接就接这一句，别把它当成在问你；接就一条，别接一句再补一句；不想接就只写 SKIP，或者只发一张表情。'
+      : '你要接就接这一句，别把它当成在问你；接就一条，别接一句再补一句；不想接就只写 SKIP。',
   ].join('\n');
 }
 
@@ -130,6 +130,6 @@ export function interjectLine(speaker, body, imageAllowed = false) {
 export function interjectBatchPrompt(imageAllowed = false) {
   return [
     '（下面这些是群里刚才的聊天，都不是叫你的）',
-    `你要接就接其中一句，别把它们当成在问你；不想接就只写 SKIP${imageAllowed ? '，或者只发一张表情' : ''}。`,
+    `你要接就接其中一句，别把它们当成在问你；接就一条；不想接就只写 SKIP${imageAllowed ? '，或者只发一张表情' : ''}。`,
   ];
 }

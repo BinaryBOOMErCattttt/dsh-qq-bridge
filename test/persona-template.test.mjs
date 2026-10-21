@@ -111,13 +111,18 @@ test('表达模板：零警告、零体检命中、不带会读进提示词的 H
     contract.some((line) => line.includes('先接情绪')),
     '安慰要写成能执行的动作（先接情绪、不列建议），不是一句「温柔」',
   );
+  // 条数不写数字：一句式像客服，固定成两条也是模板（真实回归：1~3 条被模型读成配额 2 条）。
   assert.ok(
-    contract.some((line) => line.includes('默认 1~3 条')),
-    '默认 1~3 条 —— 固定成两条是另一种模板，一句式又像客服',
+    contract.some((line) => line.includes('别每轮都排成')),
+    '要禁止同一个两段式反复出现 —— 固定成两条是另一种模板',
   );
   assert.ok(
-    contract.some((line) => line.includes('最多 5 条')),
-    '要给出上限（5 条），否则模型会越写越多',
+    contract.some((line) => line.includes('想接着说就换行多写一条')),
+    '想多说时要告诉模型怎么发（换行 = 分条），否则它会把几条挤在一行',
+  );
+  assert.ok(
+    !contract.some((line) => /(?:默认|固定)\s*[一二两三四五1-5]\s*(?:[~～-]\s*[一二两三四五1-5]\s*)?条/.test(line)),
+    '条数不能写成数字默认值：模型会把它当成配额',
   );
   assert.ok(!text.includes('一句话能说完就只发一条'), '模板不能把「只发一条」写成默认');
   assert.ok(text.length <= 2000, '模板不能超过 styleMaxChars 的默认值');

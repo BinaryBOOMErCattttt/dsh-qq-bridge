@@ -142,11 +142,15 @@ test('lintStyleDoc：把「只回一条」写成默认会被点出来（一句�
     assert.equal(hits.length > 0, true, `应当报出：${line}`);
     assert.equal(hits[0].code, 'ONE_LINE');
     assert.ok(/一句式|工单/.test(hits[0].why), '要说清后果是一句式回复');
-    assert.ok(hits[0].fix.includes('1~3'), '要给出「默认 1~3 条」的替代做法');
+    assert.ok(/别每轮|内容决定/.test(hits[0].fix), '要给出「条数由内容决定」的替代做法');
   }
-  // 默认 1~3 条、最多 5 条的写法是对的，不能被报成噪声。
+  // 固定成两条也是模板：真实回归 ——「默认 1~3 条」被模型读成配额，11 条里 10 条正好两条。
+  const quota = lintStyleDoc({ general: ['默认 1~3 条，最多 5 条；只有插话、纯情绪时才单发一条'] });
+  assert.equal(quota.length, 1);
+  assert.equal(quota[0].code, 'COUNT_QUOTA');
+  // 新写法（不写数字默认值）不能被报成噪声。
   assert.deepEqual(
-    lintStyleDoc({ general: ['默认 1~3 条，最多 5 条；只有插话、纯情绪时才单发一条'] }),
+    lintStyleDoc({ general: ['一句能说完就一句，想接着说就换行多写一条；别每轮都排成同一个两段式'] }),
     [],
   );
 });

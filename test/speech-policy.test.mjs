@@ -120,6 +120,7 @@ test('interjectLine：先说「不是叫你的」，再给 SKIP 出口，且不�
   assert.match(text, /群里在聊天，这句不是叫你的/);
   assert.match(text, /kaguya 说：晚上吃啥/);
   assert.match(text, /不想接就只写 SKIP/);
+  assert.match(text, /接就一条/, '插话只接一句，别接一句再补一句（真实观感：固定两段式）');
   assert.doesNotMatch(text, /插件|检测到|热度/);
   // 名字里的换行不能伪造出额外一行（不可信输入）。
   assert.doesNotMatch(interjectLine('a\nb', 'x'), /\na\n/);
