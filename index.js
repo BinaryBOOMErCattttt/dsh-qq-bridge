@@ -194,6 +194,31 @@ const STICKER_FAILURE_TTL_MS = 10 * 60 * 1000;
 const BACKLOG_POLL_MS = 1000;
 
 /**
+ * 私聊「对方正在输入」的刷新间隔（毫秒）。
+ *
+ * QQ 的输入状态只亮几秒，协议端不会替我们续：不补发就会在思考到一半时自己熄灭。
+ * 4 秒是密度与成本的折中 —— 一次二三十秒的思考也才七八次调用；太密只是白花 API。
+ */
+const TYPING_REFRESH_MS = 4000;
+
+/**
+ * `set_input_status` 的超时（毫秒）。
+ *
+ * 故意比普通 OneBot 调用短得多：它只是一条「锦上添花」的状态，不值得在协议端不认这个
+ * action 时让挂起的调用撑十几秒；失败也绝不影响后面的消息本身。
+ */
+const TYPING_CALL_TIMEOUT_MS = 3000;
+
+/**
+ * 一次「正在输入」最多亮多久（毫秒）。
+ *
+ * 正常一轮回复不会超过这个量级；它是**卡死时的保险** —— turn/end 因为任何原因没来
+ * （协议断开、插件被卡住），刷新循环也不能一直每 4 秒发一次调用。到点后自己熄灭，
+ * 后面真发出消息时 `sendParts` 会重新点亮。
+ */
+const TYPING_MAX_MS = 2 * 60 * 1000;
+
+/**
  * 一个会话最多记住多少个「可以被 @ 的人」。
  *
  * 名单只用来把 `[[@昵称]]` 解析成 QQ 号，超过几十个人之后更早的发言者本来也早就
@@ -2248,8 +2273,113 @@ export function apply(ctx, config) {
     }
   }
 
-  /** `sendToConversation` 的实际发送步骤（调用方已保证同一会话串行）。 */
+  // ---- 私聊「对方正在输入」-----------------------------------------------------
+  //
+  // 真人回消息时，对方先看到「正在输入」，过一会儿才收到字。QQ 的输入状态不是常亮的：
+  // 协议端只在收到 `set_input_status` 之后替我们亮几秒，所以这里每 `TYPING_REFRESH_MS`
+  // 补一次，直到这条回复真的发出去（发消息本身也会清掉它）。
+  //
+  // 只在**私聊**里做：群里亮「正在输入」的收益远小于人多时的噪音与调用量；也只在
+  // **自动回复**（`human: true`）上做 —— 工具发消息、复读、`/reset` 的回执都不是
+  // 「我在打字」。`agent/inbox/claimed` 把它的起点提前到「模型开始想怎么回」，
+  // 因此沉默的那几秒（通常才是最长的）也不会让对方以为机器人没看见。
+  //
+  // 状态按会话 key 记，`stopTyping` 幂等：`turn/end`（任何分支）、发送结束、`/reset`
+  // 与插件卸下都会清掉它。协议端不支持这个扩展时只记一条 warn，然后这个进程里不再试。
+  const typingStates = new Map();
+  let typingUnsupported = false;
+  let typingWarned = false;
+
+  /** 这个会话该不该显示「正在输入」。 */
+  function typingEnabledFor(conversation) {
+    return settings.privateTyping === true
+      && conversation.type === 'private'
+      && typingUnsupported !== true
+      && client.connected === true;
+  }
+
+  /** 发一次输入状态（`event_type`：1 = 正在输入，0 = 停下）。失败绝不影响消息本身。 */
+  function pingTyping(conversation, typing) {
+    client.call('set_input_status', { user_id: conversation.id, event_type: typing ? 1 : 0 }, TYPING_CALL_TIMEOUT_MS)
+      .catch((error) => {
+        const detail = errorText(error);
+        // 「协议端没有这个 action」与一次网络抖动要分开：前者这个进程里再也别试，
+        // 后者只告警一次（每 4 秒一行 warn 会把日志刷满），下一次刷新还会照常发。
+        if (/not found|unknown action|unsupported|not supported|不支持/i.test(detail)) {
+          typingUnsupported = true;
+          stopAllTyping();
+          report('warn', `私聊「正在输入」已停用：协议端不支持 set_input_status（${detail}）`);
+          return;
+        }
+        if (typingWarned) return;
+        typingWarned = true;
+        report('warn', `私聊「正在输入」发送失败（不影响消息本身）：${detail}`);
+      });
+  }
+
+  /** 开始/续上这个会话的「正在输入」；重复调用无副作用。 */
+  function startTyping(conversation) {
+    if (!typingEnabledFor(conversation)) return;
+    if (typingStates.has(conversation.key)) return;
+    const state = { timer: undefined, deadline: Date.now() + TYPING_MAX_MS };
+    typingStates.set(conversation.key, state);
+    pingTyping(conversation, true);
+    const tick = () => {
+      // 已经停了、连接断了、开关被关掉（热更新前）都就地收手：别让定时器一直空转。
+      if (!typingStates.has(conversation.key)) return;
+      if (!typingEnabledFor(conversation) || Date.now() >= state.deadline) {
+        stopTyping(conversation);
+        return;
+      }
+      pingTyping(conversation, true);
+      state.timer = setTimeout(tick, TYPING_REFRESH_MS);
+      state.timer.unref?.();
+    };
+    state.timer = setTimeout(tick, TYPING_REFRESH_MS);
+    state.timer.unref?.();
+  }
+
+  /** 停掉刷新；`cancel` 时再发一条「没在输入」（发消息本身也会清掉它）。 */
+  function stopTyping(conversation, { cancel = true } = {}) {
+    const state = typingStates.get(conversation.key);
+    if (state === undefined) return;
+    typingStates.delete(conversation.key);
+    if (state.timer !== undefined) clearTimeout(state.timer);
+    if (cancel && typingEnabledFor(conversation)) pingTyping(conversation, false);
+  }
+
+  /** 进程里所有会话都停下（插件卸下 / 协议端不支持时）。 */
+  function stopAllTyping({ cancel = false } = {}) {
+    for (const [key, state] of typingStates) {
+      if (state.timer !== undefined) clearTimeout(state.timer);
+      if (!cancel) continue;
+      const conversation = conversations.get(key);
+      if (conversation !== undefined && typingEnabledFor(conversation)) pingTyping(conversation, false);
+    }
+    typingStates.clear();
+  }
+
+  /**
+   * 发一条回复（`sendToConversation` 的发送步骤）。
+   *
+   * `human` 的那一次回复在开始前点亮「正在输入」，无论成功、失败还是中途停下都在
+   * `finally` 里熄灭 —— `stopTyping` 幂等，`turn/end` 提前停过也没关系。
+   */
   async function sendParts(conversation, text, human, quote, at, intent) {
+    if (!human) return sendPieces(conversation, text, human, quote, at, intent);
+    startTyping(conversation);
+    let sent = false;
+    try {
+      sent = await sendPieces(conversation, text, human, quote, at, intent);
+      return sent;
+    } finally {
+      // 真发出去的消息本身就会清掉输入状态；一个字都没发出去时才需要显式取消。
+      stopTyping(conversation, { cancel: !sent });
+    }
+  }
+
+  /** `sendParts` 的实际发送步骤（调用方已保证同一会话串行）。 */
+  async function sendPieces(conversation, text, human, quote, at, intent) {
     const pieces = replyPieces(text, human);
     // 「昵称 → QQ 号」的名单在一次发送里只造一遍：几个分段共用同一份，也保证同一次回复里
     // 同名的解析结果一致。
@@ -2760,6 +2890,8 @@ export function apply(ctx, config) {
     }
     // 活跃对话（私聊也有）：新开一轮就该把「还聊着」这件事也忘掉，并撤掉挂着的补一句。
     cancelChime(conversation);
+    // 旧一轮的「正在输入」也不该留到新一轮：这一轮已经结束了。
+    stopTyping(conversation);
     conversation.activeUntil = 0;
     conversation.followUntil = 0;
     conversation.activeSpeakerId = '';
@@ -5357,6 +5489,10 @@ export function apply(ctx, config) {
     if (owner === undefined) return;
     submitted.delete(message.id);
     turnOwners.set(`${agent.id}:${turn}`, owner);
+    // 私聊回复从模型**开始想**的那一刻就点亮「对方正在输入」：这一段（常常十几秒）
+    // 才是对方真正在等的时间。`turn/end` 会把它停掉，随后发送步骤再按打字节奏点亮。
+    const conversation = conversations.get(owner.key);
+    if (conversation !== undefined) startTyping(conversation);
   });
 
   ctx.on('session/event', (session, event) => {
@@ -5380,8 +5516,11 @@ export function apply(ctx, config) {
     transcripts.delete(slot);
     const owner = turnOwners.get(slot);
     turnOwners.delete(slot);
+    const conversation = conversations.get(owner?.key ?? key);
+    // 这一轮不管最后发不发（SKIP / 出错 / 中止 / 空回复），「正在输入」都到此为止；
+    // 真要发的话，`sendParts` 会在发送前按打字节奏重新点亮。
+    if (conversation !== undefined) stopTyping(conversation);
     if (owner === undefined) return;
-    const conversation = conversations.get(owner.key);
     if (conversation === undefined) return;
     // 这一轮收尾之后它可能就闲下来了：忙的时候攒着的那一波迟到的消息可以投了。
     // 必须放在这里（而不是某个分支里）：下面每一条提前 return（提醒、aborted、error、
@@ -5601,6 +5740,8 @@ export function apply(ctx, config) {
   ctx.effect(() => {
     client.start();
     return () => {
+      // 插件都卸了，「正在输入」的刷新定时器也不该再醒过来（不 cancel：连接马上就没）。
+      stopAllTyping();
       // 还在等「有没有下一条」的批次跟着一起停：插件都卸了，不该再有定时器醒过来。
       for (const conversation of conversations.values()) {
         if (conversation.batchTimer !== undefined) {

@@ -191,6 +191,7 @@ export const Config = z.object({
   burstMaxParts: z.number().default(3).description('单行长句最多拆成几条；超出部分并进该行最后一条，避免刷屏'),
   burstMaxMessages: z.number().default(0).description('一轮回复最多发几条消息（连换行分出来的那些一起算）：1 = 永远只发一条（换行与长句都并进这一条，超出的用一个空格接上）；0 = 不限（默认）。这是唯一保留的条数上限，默认关着 —— 关着时模型写几条就发几条'),
   burstSingleMaxChars: z.number().default(100).description('「聊天型 / 信息型」的字数门槛（去掉空白后算）：不超过它就按聊天型处理 —— 发送途中对方又说话了，剩下的气泡不再发；超过就按信息型完整发完（贴代码 / 列步骤 / 解释一件事时该讲完的讲完）。0 = 全部按聊天型'),
+  privateTyping: z.boolean().default(true).description('私聊里显示「对方正在输入」：从它开始准备回复（模型思考也算）到消息真正发出去，对方的 QQ 上会一直显示「正在输入」；需要协议端支持 set_input_status（NapCat 支持），不支持时只记一条 warn 并自动停用。群聊不显示'),
   readDelayMs: z.number().default(800).description('发出第一条前的「读消息」基础延迟（毫秒）'),
   charsPerSecond: z.number().default(15).description('模拟打字速度（字符/秒），用于按字数计算每条消息发出前的延迟'),
   minDelayMs: z.number().default(300).description('单条消息前延迟的下限（毫秒）'),

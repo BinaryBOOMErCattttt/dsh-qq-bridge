@@ -356,6 +356,9 @@
         minDelayMs: 300
         maxDelayMs: 5000
         delayJitter: 0.4
+        # 私聊里显示「对方正在输入」：从模型开始想怎么回一直亮到消息发出去（每 4 秒续一次）。
+        # 走 NapCat 的 set_input_status 扩展，协议端不支持时插件只记一条 warn 并停用。群聊不显示。
+        privateTyping: true
         # 群聊回复的指向：auto = 只在「回的那条后面又有人说话」时才引用（默认），
         # quote = 引用被回复的那条消息，at = @ 对方，plain = 直接发
         # （指向只挂在第一条上；私聊始终是 plain）

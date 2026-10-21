@@ -810,8 +810,67 @@ test('a private message becomes an Agent turn whose reply returns to QQ', async 
   }
 });
 
-// 用例：setup 时 `systemPrompt` 服务还没 active（strict get 返回 undefined），渠道提示
-// 小节没挂上 —— 下一条消息复用 Agent 时必须补挂回来。
+// 用例：私聊里从「模型开始想怎么回」到「消息真的发出去」之间，对方能看到「正在输入」。
+// 群聊不做这件事（人多时的噪音远大于收益），而且这个动作是协议端扩展：失败绝不能拖累发送。
+test('私聊会点亮「正在输入」，并在这一轮结束时清掉', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(privateMessage('在吗'));
+    const agent = await untilInbox(host, 1, 'the private message');
+    const session = { id: agent.id };
+    // 认领 = 模型开始想怎么回：输入状态在这一刻点亮，而不是等第一条字打出来。
+    host.list.emit('agent/inbox/claimed', { agent, message: agent.inbox[0], turn: 1 });
+    const typing = await until(
+      () => onebot.calls.find((call) => call.action === 'set_input_status' && call.params.event_type === 1),
+      'the typing status while the model is thinking',
+    );
+    assert.equal(typing.params.user_id, '100000002');
+
+    host.list.emit('session/event', session, {
+      type: 'assistant/message',
+      data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '在的' }] } },
+    });
+    host.list.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+    await until(() => sentTexts(onebot, 'send_private_msg')[0], 'the private reply');
+    // 这一轮结束时先撤掉输入状态；真要发的那条会在发送前再点亮一次（见 sendParts）。
+    assert.ok(
+      onebot.calls.some((call) => call.action === 'set_input_status' && call.params.event_type === 0),
+      'the typing status should be cleared after the turn',
+    );
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：关掉 `privateTyping` 就一条输入状态都不发（协议端不支持时也能用这个开关彻底安静）。
+test('privateTyping=false 时不发输入状态', async () => {
+  const { onebot, host } = await boot({ privateTyping: false });
+  try {
+    onebot.push(privateMessage('在吗'));
+    const agent = await untilInbox(host, 1, 'the private message');
+    completeTurn(host, agent, '在的');
+    await until(() => sentTexts(onebot, 'send_private_msg')[0], 'the private reply');
+    assert.equal(onebot.calls.some((call) => call.action === 'set_input_status'), false);
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：群聊不点亮「正在输入」—— 那里人多，亮这个只是噪音。
+test('群聊不发输入状态', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(mention('在吗'));
+    const agent = await untilInbox(host, 1, 'the group message');
+    completeTurn(host, agent, '在的');
+    await until(() => sentTexts(onebot, 'send_group_msg')[0], 'the group reply');
+    assert.equal(onebot.calls.some((call) => call.action === 'set_input_status'), false);
+  } finally {
+    await onebot.close();
+  }
+});
+
+
 //
 // 真实事故：19:48 那次 resume 正好赶在服务可见之前，旧代码拿不到服务就静默 return，
 // 于是这个 Agent 带着**裸系统提示词**一直跑到下次重启：人设与表达规则全丢，群里的回复

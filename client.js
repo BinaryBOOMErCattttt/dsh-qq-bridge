@@ -528,6 +528,7 @@ window.__ModuleLoader__.load({
           'burstMaxParts',
           'burstMaxMessages',
           'burstSingleMaxChars',
+          'privateTyping',
           'readDelayMs',
           'charsPerSecond',
           'minDelayMs',

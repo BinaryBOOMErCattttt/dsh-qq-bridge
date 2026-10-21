@@ -531,10 +531,10 @@ test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来
       .length;
   assert.deepEqual(
     Object.fromEntries(mod.TABS.map((tab) => [tab.id, countOf(tab)])),
-    { connect: 12, session: 28, persona: 13, group: 30, reminder: 11, perception: 32, memory: 23 },
+    { connect: 12, session: 29, persona: 13, group: 30, reminder: 11, perception: 32, memory: 23 },
     '字段数按设计 §3.1 分布',
   );
-  assert.equal(fields.length, 149, '合计 149 项');
+  assert.equal(fields.length, 150, '合计 150 项');
 });
 
 test('定时任务：提醒页最上面有一块只读列表，取数路径与 Host 路由一致', () => {
@@ -720,7 +720,7 @@ test('表单投影：7 个 tab 覆盖全部字段，每行带草稿状态与来�
   assert.equal(state.tabs.length, 7);
   assert.equal(state.shell.writable, true);
   const rows = state.tabs.flatMap((tab) => tab.sections.flatMap((section) => section.rows));
-  assert.equal(rows.length, 149, '投影必须覆盖全部字段');
+  assert.equal(rows.length, 150, '投影必须覆盖全部字段');
   for (const tab of state.tabs) {
     for (const section of tab.sections) {
       assert.ok(section.title.length > 0, `${section.id} 的区块标题不能空`);
@@ -736,10 +736,10 @@ test('表单投影：7 个 tab 覆盖全部字段，每行带草稿状态与来�
   }
 });
 
-test('控件映射：35 个布尔是 Switch、8 个枚举是 select、长文本是 textarea', () => {
+test('控件映射：36 个布尔是 Switch、8 个枚举是 select、长文本是 textarea', () => {
   const session = mount();
   const fields = allFields(session);
-  assert.equal(fields.size, 149, '七个 tab 加起来必须刚好是 149 行（每行只渲染一次）');
+  assert.equal(fields.size, 150, '七个 tab 加起来必须刚好是 150 行（每行只渲染一次）');
 
   const kinds = new Map();
   for (const [key, field] of fields) {
@@ -761,7 +761,7 @@ test('控件映射：35 个布尔是 Switch、8 个枚举是 select、长文本�
 
   const tally = {};
   for (const kind of kinds.values()) tally[kind] = (tally[kind] ?? 0) + 1;
-  assert.deepEqual(tally, { boolean: 35, choice: 8, long: 2, input: 104 }, '按 schema 的类型分布');
+  assert.deepEqual(tally, { boolean: 36, choice: 8, long: 2, input: 104 }, '按 schema 的类型分布');
 
   // 数字框带 `inputMode="numeric"`；列表行在输入框下面给 Pill 预览。
   assert.equal(controlIn(fields.get('proactiveChance'), isInput).props.inputMode, 'numeric');
