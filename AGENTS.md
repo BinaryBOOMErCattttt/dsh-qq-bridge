@@ -57,6 +57,7 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 index.js  插件本体：运行时状态、事件路由、发送/准入/复读/存表情包/戳一戳/主动说话/活跃对话、连接生命周期
 persona.js  `PERSONA.md` 的解析与渲染：身份 / 背景 / 性格（底色 + 点缀）/ 场景；坏文件回退上一版
 style.js  表达层：聊天型 / 信息型判定、标点清洗、表达契约渲染；`STYLE.md` 的热读（**没有**掷骰 / 随机数）
+prompt.js  系统提示的装配（人设 / 表达 / 能力 / 硬性规则；只放稳定内容）
 speech-policy.js  「这条群消息该不该进 Agent、以什么身份进」：intent（addressed / continued / interject / none）+ C 路四条排除
 cognition.js  认知库与表情包目录的**纯解析**：`COGNITION.md` / `STICKERS.md` 的条目、热梗段、目录行
 docfile.js  cwd 内的热读文档（同步 + `size:mtime` 缓存 + 截断 + 越界拒绝），人设与表达共用
@@ -152,7 +153,7 @@ index.js ──▶ config.js（schema）/ settings.js ──▶ image.js（只�
          ──▶ chatter.js（三本账）/ mention.js（`[[@昵称]]` → at 段）/ speaking-rules.js（纯判据）
          ──▶ backlog.js（积压一波的裁剪与渲染，**纯函数**）
          ──▶ speech-policy.js ──▶ speaking-rules.js（intent 判定；C 路四条排除也在这里）
-         ──▶ persona.js ──▶ docfile.js ──▶ util.js（pathInside）/ style.js ──▶ docfile.js
+         ──▶ persona.js ──▶ docfile.js ──▶ util.js（pathInside）/ style.js ──▶ docfile.js；prompt.js ──▶ persona.js / style.js
          ──▶ modalities.js（消息段渲染）/ interactions.js（戳一戳）/ links.js（卡片与 URL 预览）
          ──▶ cognition.js（认知与表情包目录的纯解析；memory.js 也用它）
          ──▶ memory-select.js（记忆的记录模型 / 检索 / 滚档，**纯函数**；memory.js 用它）
@@ -192,7 +193,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 | 配置 schema | **不在这里**：在 `config.js`（入口只做 `export { Config } from './config.js'`） | 唯一真相来源，`.description()` 就是 Web UI 上给用户看的文档 |
 | 配置的取值 | **不在这里**：`settings = createSettings(liveConfig(config), process.cwd())`之后一律读 `settings.*` | 取默认值/夹紧/去空白都在 `settings.js`；`index.js` 里**没有一处**直接读 `config.xxx`。`liveConfig` 必须调：schema 是根 volatile（§5.12），`apply()` 拿到的是引用 |
 | 运行时状态 | `apply` 开头的一段 | `conversations`(key→会话) / `sessionIndex`(sessionId→key) / `turnOwners` / `submitted` / `transcripts` / `ambient` / **`chatter`**（三本账，见 `chatter.js`；搬出去前叫 `chatterSeq` / `groupChatter` / `quoteSeq`）/ `repeatStates` / `mediaResolutions`（记忆的账已搬去 `memory.js`）/ **`recent`**（「最近看见过什么」，见 §4.I；不落盘）；会话记录里还挂着 `sessionGeneration`（第几轮，`/reset` +1）/ `lastActiveAt` / `lastBotSpeakAt` / `activeInterposeSeq`（插话序号快照）与主动说话、活跃对话的记账（见 `blankConversation`） |
-| Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `channelPrompt` `personaLines` `styleLines` `hardRules` `stickerCatalogLines` | 见 §7。`channelPrompt` 是**槽位化**的：场景 → 人设 → 表达契约 → 记忆查证出口 → 能力 → 额外要求 → **硬性规则（最后）**。`stickerCatalogLines` 是表情包目录**唯一**的渲染处（走「本轮情境」，别搬回系统提示） |
+| Agent 装配 | `ensureAgent` `resolveAgentPreset` `mountAgentPreset` `restrictAgentTools` `stickerCatalogLines`；提示词装配**在 `prompt.js`** | 见 §7。`channelPrompt` 是**槽位化**的：场景 → 人设 → 表达契约 → 记忆查证出口 → 能力 → 额外要求 → **硬性规则（最后）**。`stickerCatalogLines` 是表情包目录**唯一**的渲染处（走「本轮情境」，别搬回系统提示） |
 | 发送链路 | `enqueueSend` `sendToConversation` `replyPieces` `sendParts` `sendPieces` `sendOne` `quoteHead` `conversationMentions` `startTyping` `stopTyping` | **实现在 `send.js`**（`createSender(deps)`）；`index.js` 只装配并解构同名函数，调用点没变。`quoteHead` 也搬进了 `send.js`；`conversationMentions` 仍是本文件的函数声明，作为 deps 传进去。串行队列保证同一会话不乱序；`sendOne` 顺带记 `lastBotSpeakAt`；`replyPieces` 走「拆标记 → 拆条 → **标点清洗**」；**没有掷骰 / 随机数 / 条数上限**（模型写几行发几行）；`quoteHead` 只给第一个**文字**气泡挂指向（图永不挂；被回复的那条只有表情时也不引用；**搭话轮 `continued` / `interject` 整个不挂**，`replyStyle` 再显式也一样）；正文里的 `[[@昵称]]` 在 `sendPieces` 里换成 `at` 段。`sendParts` 只是「私聊正在输入」的开关壳（`human` 时亮/灭），真正的拆分与发送在 `sendPieces`；输入状态从 `agent/inbox/claimed` 亮到这一轮结束，每 4 秒续一次（`TYPING_REFRESH_MS`），协议端不支持 `set_input_status` 时只 warn 一次并停用（`privateTyping` 默认开，只私聊） |
 | 会话管理 | `resetConversation` `conversationFor` `sessionIdFor` `resetMarkerDir` `loadConversationResetCounts` `writeConversationResetCount` `refreshSessionGeneration` `webSessionSnapshots` `resetConversationFromWeb` | `/reset` 开新一轮（**不删旧会话**，代次 +1 并落盘），以及在线会话列表（新一轮时连主动说话的节奏一起清） |
 | 设置页路由 | `registerRoutes(ctx, { … })`；**实现在 `routes.js`** | 会话列表 / 重置与定时任务看板；必须用 `ctx.inject(['connection'], …)`，不能一次性 `ctx.get`（服务晚于 `apply()` 就绪） |
@@ -257,8 +258,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 | I 撤回 | `noteSeen` 账 + 清引用（安全层永远生效）；改写不另开一轮 | §4.I |
 | J 定时提醒 | `turn/end` 的 reminder 分支必须最前；@ 由任务注入，不让模型写 | §4.J |
 
-迁移、数据目录、依赖方向这些**仍然在 §2 与 §3**；事务性的细节（比如「为什么摘要 Agent
-不能进 sessionIndex」）在完整正文里。
+迁移、数据目录、依赖方向仍在 §2 与 §3；事务性细节在完整正文里。
 ## 5. 必须知道的硬约束
 
 1. **改源码必须重启 Harness，停用/启用插件没用。**
@@ -334,7 +334,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 | 加一个不碰状态的纯函数 | `util.js`（碰磁盘的放 `filestore.js`）；**别 import `index.js`**，也别让它读闭包状态 |
 | 加一个配置项 | `config.js` 的 schema（含中文 `.description()`）+ （需要兜底/夹紧时）`settings.js` 加一行 + docs/configuration.md 的配置表 + `test/settings.test.mjs` 补边界；界面不用改，但要在 `client.js` 的 `SECTIONS` 里给它一段（见 §5.12） |
 | 改 Web UI 设置页（分组 / 标签 / 控件 / 草稿口径） | 只改 `client.js`：`TABS` / `SECTIONS`（含 `subs` 小标题）、`LABEL_OVERRIDES`、`ENUM_LABELS`、`FIELD_HINTS`、`specFor`；版式契约见 `client.js` 顶部注释与 `test/client.test.mjs` |
-| 改提示词 / 人设 | `DEFAULT_PERSONA`（内置兜底）、`channelPrompt` 的槽位、`Config.persona` / `.instructions`；**「是谁」写 `.qq-persona/PERSONA.md`、「怎么说」写 `STYLE.md`**（`persona.js` / `style.js`） |
+| 改提示词 / 人设 | `prompt.js`（`channelPrompt` 槽位、`DEFAULT_PERSONA`）、`Config.persona` / `.instructions`；**「是谁」写 `.qq-persona/PERSONA.md`、「怎么说」写 `STYLE.md`**（`persona.js` / `style.js`） |
 | 改「怎么写人设」（模板 / 题库 / 自检） | `deploy/persona/{PERSONA,STYLE}.template.md`（必须能直接跑）+ `deploy/persona/PROMPT.md` 的 18 题题库 + `docs/persona-workshop.md` 的速查表 + `scripts/persona-check.mjs` + `test/persona-template.test.mjs`；**题库 / 速查表 / 模板 / 测试要一起改**，测试会红 |
 | 改气泡数 / 标点 / 引用规则 | 气泡条数由模型按 `STYLE.md` 自己写，插件**不设上限**；标点与中断在 `style.js`（`sanitizeBubble` / `classifyReply` / `renderStyleContract`）+ `Config` 的 `burstSingleMaxChars` / `stripShortPeriod` / `replyStyle` + `send.js` 的 `burstParts` / `replyPieces` / `sendParts` / `quoteHead`（被回复的那条只有表情时不引用：`onebot.js` 的 `isEmojiOnlyMessage`；搭话轮 `continued` / `interject` 整个不挂） |
 | 改私聊补一句 | `speaking-rules.js` 的 `privateAfterthoughtAllows` + index.js 的 `scheduleChime` / `runChime` / `chimeNudge` + `Config.privateAfterthought*` |
@@ -367,7 +367,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 | 改记忆文件的写入方式（逐条 / 归一化 / 护栏 / 历史） | `cognition.js` 的 `upsert*` / `remove*` / `normalize*` / `sectionForType` + `memory-select.js` 的 `upsertMemoryRow` / `upsertPersonRow` + `memory.js` 的 `writeMemoryFile` / `backupMemoryFile` + `tools.js` 的 `qq_memory` 参数 + `test/cognition.test.mjs` / `test/memory-select.test.mjs` 与 bridge 里搜索 `upsert` 的那组 |
 | 改滚档（热层 → `archive/`） | `memory-select.js` 的 `archivePlan` / `archiveLineOf` + `memory.js` 的 `rolloverMemory` / `searchMemoryFile`（覆盖 archive）/ `listMemoryFiles` + `Config.memoryArchive*` / `digestRollover` + `test/memory-select.test.mjs` 的滚档组 |
 | 改人物表 / scope 闸门 | `memory-select.js` 的 `parsePeopleDoc` / `upsertPersonRow` + `memory.js` 的 `assertGlobalWrite` / `writeScopeOf` / `migratePeopleDoc` + `tools.js` 的 `qq` / `aliases` 参数 + `test/memory-select.test.mjs` 与 bridge 的私聊写入用例 |
-| 改「发表情只能从收藏目录发」 | `index.js` 的 `stickerSendSource` + `channelPrompt` 里的标记文案与 `stickerFailure` 回灌 + bridge 里「只认收藏目录」那组；`qq_send_image` 是显式动作，**没有**这条限制 |
+| 改「发表情只能从收藏目录发」 | `index.js` 的 `stickerSendSource` + `prompt.js` 的标记文案与 `stickerFailure` 回灌 + bridge 里「只认收藏目录」那组；`qq_send_image` 是显式动作，**没有**这条限制 |
 | 改摘要的触发时刻 | `digestAtHour` + `msUntilDailyHour`（模块级纯函数）+ `memory.js` 里 `runDigestSweep` 的日期判据 |
 | 改 API key 轮换（池子格式 / 探测 / 什么时候换） | `Config` 的 `apiKeyRotate*` + `key-rotation.js`（池子 / 探测 / 写回 / 定时器）+ 模块级 `parseApiKeyPool` / `apiKeyFingerprint` + docs/ops.md「每天轮换 API key」（见 §4.H） |
 | 改 Windows 一键配置 / 启动 NapCat（提权、窗口、隐藏、自启、快速登录） | `scripts/napcat-setup.mjs`（编排；开关 `--start` / `--window normal\|min\|hidden` / `--autostart install\|remove\|status` / `--no-log-to-file` / `--force`）+ `napcat.js` 的 `findNapcatDir` / `withAutoLoginAccount` / `withNapcatLogging` / `webuiTarget` / `startPlan` / `hiddenWrapperVbs` / `hiddenStartPlan` / `scheduledTaskXml` / `scheduledTask*Plan`（纯函数判据）+ `test/napcat.test.mjs` + docs/windows.md「Windows 桌面版」。四条实测禁令：**别改回 `launcher-user.bat`**（不提权时 QQ 注入后崩在 `QQNT.dll`）、**`wscript` 必须带 `//B`**（否则出错弹模态框卡死）、**隐藏启动走 `cmd.exe /s /c`，别把 `.bat` 直接交给 `WshShell.Run`**（文件关联 + MotW 会弹看不见的警告框）、**包装脚本与任务 XML 按 UTF-16LE + BOM 落盘** |

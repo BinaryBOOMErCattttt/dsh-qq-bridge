@@ -55,6 +55,7 @@
     "perceptual.js",
     "persona.js",
     "style.js",
+    "prompt.js",
     "speech-policy.js",
     "modalities.js",
     "links.js",

@@ -5,6 +5,12 @@
 
 ## 未发布
 
+- **系统提示的装配从 `index.js` 拆到 [`prompt.js`](prompt.js)**：`channelPrompt` /
+  `hardRules` / `personaLines` / `personaSceneFor` / `styleLines` 与内置 `DEFAULT_PERSONA`
+  整体搬出（第六批），`index.js` 只 `createPromptKit(deps)` 并解构同名函数，调用点
+  （`attachChannelPrompt` 的 `text:`、`channelTurnContext`、`speakerLine` 的场景）一个都没动。
+  文案逐字未改 —— bridge 按原句断言「系统小节稳定 / 群名不进系统提示 / 表情包目录走本轮情境」；
+  `prompt.js` 不 import `index.js`，依赖表写在文件头。
 - **`index.js` 再拆两块：`routes.js` 与 `key-rotation.js`**：设置页的两条 Host 路由
   （会话列表 / 重置、定时任务看板）搬到 [`routes.js`](routes.js)，会话动作仍是
   `webSessionSnapshots` / `resetConversationFromWeb`（由 deps 传入）；凭据轮换
