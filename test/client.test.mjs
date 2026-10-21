@@ -29,6 +29,7 @@ import { readFileSync } from 'node:fs';
 import z from '@deepseek-ai/schemastery';
 import { Config } from '../config.js';
 import { REMINDER_ROUTE_PATH } from '../reminders.js';
+import { SESSION_ROUTE_PATH } from '../util.js';
 
 // ---- 假的浏览器模块系统 ------------------------------------------------------------
 
@@ -638,6 +639,77 @@ test('定时任务列表：状态 / 模式 / 时间 / 目标 / @ / 错误都在�
 
   const empty = renderNode({ type: session.mod.ReminderTaskList, props: { t, data: { tasks: [] } } });
   assert.match(textOf(empty), /还没有记录任何定时任务/);
+});
+
+test('重置对话：会话页最上面有一块会话列表，取数/重置路径与 Host 路由一致', () => {
+  const session = mount();
+  const { mod } = session;
+  assert.equal(mod.SESSION_ROUTE_PATH, SESSION_ROUTE_PATH, '浏览器 bundle 与 util.js 的路由必须一致');
+  assert.ok(mod.SESSION_REFRESH_MS >= 1000, '刷新间隔要是个正经的秒数');
+
+  mountTree(session);
+  const tree = openTab(session, '会话');
+  const panel = nodes(tree, (node) => node.props?.role === 'tabpanel')[0];
+  assert.ok(panel, '会话页要有 tabpanel');
+  const section = nodes(
+    panel,
+    (node) => node.type === 'section' && String(node.props?.className ?? '').includes('qq-sessionsSection'),
+  )[0];
+  assert.ok(section, '会话页必须有「重置对话」区块');
+  assert.equal(textOf(panel.props.children[0]).slice(0, 4), '重置对话', '会话列表排在这一页最上面');
+  assert.match(textOf(section), /重置对话/);
+  assert.match(textOf(section), /每 15 秒自动刷新/);
+  assert.match(textOf(section), /正在读取会话/, '迷你渲染器不跑 effect，停在加载态');
+  const refresh = nodes(
+    section,
+    (node) => node.type === primitivesStub.Pill && node.props?.children === '刷新',
+  )[0];
+  assert.ok(refresh, '要有刷新按钮');
+  assert.equal(typeof refresh.props.onClick, 'function');
+});
+
+test('会话行：名字 / 轮次 / 回复中 / 重置按钮，没名字就退回会话 key', () => {
+  const session = mount();
+  const t = translator(session.host, 'zh');
+  const resets = [];
+  const row = renderNode({
+    type: session.mod.SessionRow,
+    props: {
+      t,
+      session: {
+        key: 'group:100000001',
+        type: 'group',
+        id: '100000001',
+        name: '',
+        round: 2,
+        busy: true,
+      },
+      busy: false,
+      onReset: (key) => resets.push(key),
+    },
+  });
+  assert.match(textOf(row), /group:100000001/, '没有名字时显示会话 key');
+  assert.match(textOf(row), /群 100000001/);
+  assert.match(textOf(row), /第 2 轮/);
+  assert.match(textOf(row), /回复中/);
+  const button = nodes(row, (node) => node.type === primitivesStub.Button)[0];
+  assert.ok(button, '每行要有一个重置按钮');
+  assert.equal(textOf(button), '重置');
+  button.props.onClick();
+  assert.deepEqual(resets, ['group:100000001'], '点重置把会话 key 交给上层');
+
+  const busy = renderNode({
+    type: session.mod.SessionRow,
+    props: {
+      t,
+      session: { key: 'private:100000002', type: 'private', id: '100000002', name: 'iroha', round: 0 },
+      busy: true,
+      onReset: () => {},
+    },
+  });
+  const busyButton = nodes(busy, (node) => node.type === primitivesStub.Button)[0];
+  assert.equal(textOf(busyButton), '重置中…', '这一行正在重置时按钮说明在忙');
+  assert.equal(busyButton.props.disabled, true);
 });
 
 test('表单投影：7 个 tab 覆盖全部字段，每行带草稿状态与来源上下文', () => {

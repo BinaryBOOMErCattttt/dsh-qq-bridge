@@ -521,6 +521,11 @@ noteConversationActivity（touchActivity / 戳一戳）先记下 `idleMs`（**�
   攒批 → `submitBatch`（也排在同一队列上），队列顺序是「先换轮、再投递」的唯一保证。
 - **销毁失败就不换**（`resetConversation` 返回 false）：宁可这一轮还带着上一段，也不能让新旧
   两个 Agent 同时挂在同一个会话上。
+- **Web UI 的「重置对话」按钮走同一个 `resetConversation`**（`GET/POST /api/qq-bridge/sessions`，
+  路径常量在 `util.js` 的 `SESSION_ROUTE_PATH`，挂在 Connection 的认证栅栏内）。它**不套
+  `resetUsers`**：那是 QQ 侧的白名单，而这条路由只交给已登录的操作员。列表只读本进程的
+  `conversations`（重启后要等会话再说一句才出现）；单条 / 全部重置都先 `flushBatch` 再排进
+  `conversation.queue`，与 `/reset` 同一顺序。细节见 `docs/sessions.md`。
 
 
 ### H. 每天轮换模型凭据（`apiKeyRotate`，默认开）

@@ -75,6 +75,7 @@ import {
   msUntilDailyHour,
   parseApiKeyPool,
   sessionIdFor,
+  SESSION_ROUTE_PATH,
   stickerFileName,
   visibleText,
   weekdayLabel,
@@ -84,7 +85,7 @@ import { readTextOrUndefined, writeBytesAtomic, writeJsonAtomic } from './filest
 
 // 这几个的契约由 test/bridge.test.mjs 直接从插件入口验，所以在这里再导出一次
 // （Loader 也只认 index.js 这个入口，搬走的东西必须在入口处仍然拿得到）。
-export { liveConfig, parseApiKeyPool, sessionIdFor, withinActiveHours } from './util.js';
+export { liveConfig, parseApiKeyPool, sessionIdFor, SESSION_ROUTE_PATH, withinActiveHours } from './util.js';
 
 /** 插件在 Loader 中的稳定标识（改名会导致配置/状态对不上）。 */
 export const name = 'qq-bridge';
@@ -612,6 +613,79 @@ export function apply(ctx, config) {
           : { ok: true, enabled: true, ...(await reminders.overview(at)) };
         return new Response(JSON.stringify(body), {
           headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        });
+      },
+    });
+  });
+
+  // 设置页「重置对话」：与 QQ 里的 `/reset` 调同一个 `resetConversation`，只是入口换成
+  // Web UI。为什么不复用 `resetUsers`：那是「群消息里谁能发这个指令」的白名单，而这条
+  // 路由只在 Connection 的认证栅栏内、且只交给 owner principal（别的 principal 一律 403）
+  // —— 能打开设置页的人本来就能改这份配置、重启进程，重置一个会话比那轻得多。
+  //
+  // 列表只读**这次进程**的 `conversations`：会话记录是内存态，重启后要等对方再发一条
+  // 消息才会重新出现。这一点写在 docs/sessions.md，别让页面暗示「磁盘上所有会话」。
+  ctx.inject(['connection'], (connectionCtx) => {
+    const connection = connectionCtx.get('connection');
+    if (connection === undefined || typeof connection.fetch?.register !== 'function') return;
+    connection.fetch.register({
+      path: SESSION_ROUTE_PATH,
+      methods: ['GET', 'POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        if (request.method === 'GET') {
+          return jsonResponse({ ok: true, now: Date.now(), conversations: webSessionSnapshots() });
+        }
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return jsonResponse({ ok: false, error: 'invalid-json' }, 400);
+        }
+        // `{ all: true }`：设置页的「全部重置」。逐个排进各自的串行链，一个失败不拦其余。
+        if (body?.all === true) {
+          const reset = [];
+          const failed = [];
+          for (const conversation of [...conversations.values()]) {
+            const key = conversation.key;
+            if (await resetConversationFromWeb(conversation)) {
+              reset.push({
+                key,
+                round: conversation.sessionGeneration ?? 0,
+                sessionId: sessionIdFor(key, conversation.sessionGeneration ?? 0),
+              });
+            } else {
+              failed.push({ key, reason: 'dispose-failed' });
+            }
+          }
+          // 全部重置是一次批处理：请求本身成功（200），逐项结果放在 `failed` 里，
+          // 页面据此显示「重置了几个、失败几个」。单条重置的失败才用 4xx/5xx。
+          return jsonResponse({ ok: true, reset, failed, conversations: webSessionSnapshots() });
+        }
+        const key = typeof body?.key === 'string' ? body.key.trim() : '';
+        if (key.length === 0) return jsonResponse({ ok: false, error: 'missing-key' }, 400);
+        const conversation = conversations.get(key);
+        if (conversation === undefined) {
+          return jsonResponse(
+            { ok: false, error: 'unknown-conversation', reset: [], failed: [{ key, reason: 'unknown-conversation' }] },
+            404,
+          );
+        }
+        if (!(await resetConversationFromWeb(conversation))) {
+          return jsonResponse(
+            { ok: false, error: 'dispose-failed', reset: [], failed: [{ key, reason: 'dispose-failed' }] },
+            409,
+          );
+        }
+        return jsonResponse({
+          ok: true,
+          reset: [{
+            key,
+            round: conversation.sessionGeneration ?? 0,
+            sessionId: sessionIdFor(key, conversation.sessionGeneration ?? 0),
+          }],
+          failed: [],
+          conversations: webSessionSnapshots(),
         });
       },
     });
@@ -2704,6 +2778,63 @@ export function apply(ctx, config) {
     conversation.chimeToday = 0;
     report('info', `started round ${round} for ${conversation.key} (${sessionId} → ${nextSessionId}); the old session is kept on disk`);
     return true;
+  }
+
+  /**
+   * 设置页「重置对话」要显示的会话快照。
+   *
+   * 只来自**这次进程**的 `conversations` 表：会话记录本来就是内存态，重启后要等对方
+   * 再发一条消息才会重新出现。不返回会话记录本身（里面挂着 Agent 句柄、队列、账本），
+   * 只挑设置页展示需要的字段 —— 与 `reminders.overview()` 同一个规矩。
+   * @returns 按最近活动倒序排列的会话摘要。
+   */
+  function webSessionSnapshots() {
+    return [...conversations.values()]
+      .map((conversation) => ({
+        key: conversation.key,
+        type: conversation.type,
+        id: conversation.id,
+        name: conversation.name || conversation.senderName || '',
+        round: conversation.sessionGeneration ?? 0,
+        sessionId: sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0),
+        lastActiveAt: Number(conversation.lastActiveAt) || 0,
+        busy: backlogBusy(conversation) || conversation.pending.length > 0,
+      }))
+      .sort((left, right) => right.lastActiveAt - left.lastActiveAt || left.key.localeCompare(right.key));
+  }
+
+  /**
+   * 从 Web 设置页给一个会话新开一轮：动作与 QQ 里的 `/reset` 完全一样。
+   *
+   * 顺序不能反：先把重置前攒着的那批消息投出去（它们是重置前说的），再在**同一个串行链**
+   * 上换代。直接调用 `resetConversation` 而不排队的话，`flushBatch` 刚排上的
+   * `submitBatch` 可能晚于换代执行，那几句话就会被投进新一轮。
+   *
+   * 不让 `enqueue` 的兜底 catch 把异常转发到 QQ：这是操作员在设置页点的动作，
+   * 失败应该回到设置页，而不是在聊天里冒一句「我这边出错了」。
+   * @param conversation - 要重置的会话记录。
+   * @returns 是否成功开始新一轮（false = 旧 Agent 没销毁，会话保持原样）。
+   */
+  async function resetConversationFromWeb(conversation) {
+    flushBatch(conversation, { force: true });
+    let started = false;
+    await enqueue(conversation, async () => {
+      try {
+        started = await resetConversation(conversation);
+      } catch (error) {
+        report('warn', `could not reset ${conversation.key} from the settings page: ${errorText(error)}`);
+        started = false;
+      }
+    });
+    return started;
+  }
+
+  /** 路由用的 JSON 响应：设置页是同源 fetch，一律不缓存。 */
+  function jsonResponse(body, status = 200) {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+    });
   }
 
   /**

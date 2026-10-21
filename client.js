@@ -69,6 +69,15 @@ window.__ModuleLoader__.load({
     const REMINDER_TASKS_PATH = '/api/qq-bridge/reminders';
     /** 页面开着时多久重读一次任务（建/取消任务发生在 QQ 那一侧，不会推事件过来）。 */
     const REMINDER_REFRESH_MS = 15000;
+    /**
+     * 「重置对话」的读/写接口：GET 取会话列表，POST `{ key }` / `{ all: true }` 换一轮。
+     *
+     * 与 `REMINDER_TASKS_PATH` 同一个规矩：浏览器 bundle 不能 import 主机模块，路径
+     * 只能各写一份；`test/client.test.mjs` 拿 `util.js` 的 `SESSION_ROUTE_PATH` 钉住它。
+     */
+    const SESSION_ROUTE_PATH = '/api/qq-bridge/sessions';
+    /** 页面开着时多久重读一次会话列表（回合数 / 是否在回复都会变）。 */
+    const SESSION_REFRESH_MS = 15000;
 
     // ---- 样式 ------------------------------------------------------------------
     //
@@ -158,6 +167,16 @@ window.__ModuleLoader__.load({
 .qq-taskTags{display:inline-flex;align-items:center;gap:6px;margin-left:auto;flex:none}
 .qq-taskText{margin:0;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
 .qq-taskMeta{margin:0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+.qq-sessionsToolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px}
+.qq-sessionList{display:flex;flex-direction:column;margin:8px 0 0;padding:0;list-style:none}
+.qq-session{display:flex;align-items:center;gap:12px;padding:10px 0;border-top:.5px solid var(--dsw-alias-border-l2);min-width:0}
+.qq-session:first-child{border-top:0}
+.qq-sessionMain{display:flex;flex-direction:column;gap:2px;flex:1 1 auto;min-width:0}
+.qq-sessionName{margin:0;font-size:13px;font-weight:500;line-height:20px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.qq-sessionMeta{margin:0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+.qq-sessionActions{display:flex;align-items:center;gap:8px;flex:none}
+.qq-sessionNotice{margin:8px 0 0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.qq-sessionNotice[data-tone='error']{color:var(--dsw-alias-state-error-primary)}
 @media (prefers-reduced-motion: reduce){.qq-chevron{transition:none}}
 `;
 
@@ -232,6 +251,29 @@ window.__ModuleLoader__.load({
       remindersModeText: '固定文案',
       remindersModeAgent: 'Agent 组织',
       remindersModePrompt: 'Agent 执行',
+      sessionsTitle: '重置对话',
+      sessionsNote:
+        '列出本次运行期间处理过的 QQ 会话，每 {seconds} 秒自动刷新。点「重置」等价于在 QQ 里单独发送 /reset：换一个空会话从头开始，旧会话留在磁盘上当存档，长期记忆（转录 / MEMORY.md）不动。',
+      sessionsRefresh: '刷新',
+      sessionsLoading: '正在读取会话…',
+      sessionsEmpty: '本次运行还没有处理过任何 QQ 会话。等对方再发一条消息，会话就会出现在这里。',
+      sessionsFailed: '读取会话失败：{message}',
+      sessionsCount: '共 {count} 个会话',
+      sessionsReset: '重置',
+      sessionsResetting: '重置中…',
+      sessionsResetAll: '全部重置',
+      sessionsConfirmAll: '确定全部重置？',
+      sessionsCancel: '取消',
+      sessionsResetDone: '已开始新一轮。',
+      sessionsResetPartial: '已重置 {count} 个，{failed} 个失败。',
+      sessionsResetFailed: '重置失败：{message}',
+      sessionsBusy: '回复中',
+      sessionsRound: '第 {round} 轮',
+      sessionsGroup: '群 {id}',
+      sessionsPrivate: '私聊 {id}',
+      sessionsErrorUnknown: '会话不存在（可能刚刚重启过）',
+      sessionsErrorDispose: '旧会话没能销毁，请查看机器人日志',
+      sessionsErrorGeneric: '未知错误',
     };
     const en = {
       navTitle: 'QQ Bridge',
@@ -294,6 +336,29 @@ window.__ModuleLoader__.load({
       remindersModeText: 'Verbatim',
       remindersModeAgent: 'Agent phrasing',
       remindersModePrompt: 'Agent task',
+      sessionsTitle: 'Reset conversation',
+      sessionsNote:
+        'QQ conversations handled since this process started, refreshed every {seconds} seconds. “Reset” is the same as sending /reset in QQ: a fresh empty session starts, the old one stays on disk as an archive, and long-term memory (transcripts / MEMORY.md) is untouched.',
+      sessionsRefresh: 'Refresh',
+      sessionsLoading: 'Loading conversations…',
+      sessionsEmpty: 'No QQ conversation has been handled since this process started. The next incoming message will make one appear here.',
+      sessionsFailed: 'Could not load conversations: {message}',
+      sessionsCount: '{count} conversations',
+      sessionsReset: 'Reset',
+      sessionsResetting: 'Resetting…',
+      sessionsResetAll: 'Reset all',
+      sessionsConfirmAll: 'Reset all?',
+      sessionsCancel: 'Cancel',
+      sessionsResetDone: 'A new round has started.',
+      sessionsResetPartial: 'Reset {count}, {failed} failed.',
+      sessionsResetFailed: 'Reset failed: {message}',
+      sessionsBusy: 'replying',
+      sessionsRound: 'round {round}',
+      sessionsGroup: 'Group {id}',
+      sessionsPrivate: 'DM {id}',
+      sessionsErrorUnknown: 'Conversation not found (the process may have restarted).',
+      sessionsErrorDispose: 'The old session could not be disposed; check the bot log.',
+      sessionsErrorGeneric: 'Unknown error',
     };
 
     // ---- 分组、tab 与标签 -------------------------------------------------------
@@ -1857,6 +1922,244 @@ window.__ModuleLoader__.load({
       );
     });
 
+    // ---- 重置对话（运行状态，不是配置） ------------------------------------------
+    //
+    // 数据不在 schema 里：会话表是运行时状态，Host 那条 `SESSION_ROUTE_PATH` 只送展示
+    // 字段。页面开着时每 15 秒重读一次（回合数、是否在回复都会在 QQ 那一侧变）；点
+    // 「重置」调的是与 QQ `/reset` 同一套逻辑（见 docs/sessions.md）。
+
+    /** 路由的失败代码 → 字典 key；认不出来的一律走兜底文案（别把协议码露到页面上）。 */
+    const SESSION_ERROR_KEYS = {
+      'unknown-conversation': 'sessionsErrorUnknown',
+      'dispose-failed': 'sessionsErrorDispose',
+    };
+
+    const sessionErrorText = (t, reason) => t(SESSION_ERROR_KEYS[reason] ?? 'sessionsErrorGeneric');
+
+    /** 一行会话：名字（没有就用 key）+ 群/私聊与号、第几轮、是否在回复 + 重置按钮。 */
+    const SessionRow = component(function SessionRow(props) {
+      const { t, session, busy, disabled, onReset } = props;
+      const name = typeof session.name === 'string' && session.name.length > 0 ? session.name : String(session.key ?? '');
+      const meta = [
+        session.type === 'group'
+          ? t('sessionsGroup', { id: session.id })
+          : t('sessionsPrivate', { id: session.id }),
+        t('sessionsRound', { round: Number(session.round) || 0 }),
+      ];
+      if (session.busy === true) meta.push(t('sessionsBusy'));
+      return jsxs(
+        'li',
+        {
+          className: 'qq-session',
+          children: [
+            jsxs(
+              'div',
+              {
+                className: 'qq-sessionMain',
+                children: [
+                  jsx('p', { className: 'qq-sessionName', children: name }, 'name'),
+                  jsx('p', { className: 'qq-sessionMeta', children: meta.join(' · ') }, 'meta'),
+                ],
+              },
+              'main',
+            ),
+            jsx(
+              'div',
+              {
+                className: 'qq-sessionActions',
+                children: jsx(P.Button, {
+                  size: 'sm',
+                  variant: 'outline',
+                  disabled: disabled === true || busy === true,
+                  'aria-label': `${t('sessionsReset')} ${name}`,
+                  onClick: () => onReset(session.key),
+                  children: busy ? t('sessionsResetting') : t('sessionsReset'),
+                }, 'reset'),
+              },
+              'actions',
+            ),
+          ],
+        },
+        String(session.key ?? name),
+      );
+    });
+
+    /**
+     * 「重置对话」区块：会话列表 + 单条 / 全部重置。
+     *
+     * 全部重置刻意要两下（第一下把按钮换成「确定全部重置？」，旁边给「取消」）：
+     * 它会在一次点击里给每个会话换一轮，值得一个明确的第二次确认。
+     */
+    const SessionResets = component(function SessionResets(props) {
+      const { t } = props;
+      const [reload, setReload] = useState(0);
+      const [state, setState] = useState({ status: 'loading' });
+      const [pendingKey, setPendingKey] = useState('');
+      const [confirmAll, setConfirmAll] = useState(false);
+      const [notice, setNotice] = useState(undefined);
+
+      useEffect(() => {
+        if (typeof fetch !== 'function') {
+          setState({ status: 'error', message: 'fetch is unavailable' });
+          return undefined;
+        }
+        let alive = true;
+        const load = async () => {
+          try {
+            const response = await fetch(SESSION_ROUTE_PATH, {
+              headers: { accept: 'application/json' },
+              credentials: 'same-origin',
+              cache: 'no-store',
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            if (alive) setState({ status: 'ready', data });
+          } catch (error) {
+            if (alive) setState({ status: 'error', message: String(error?.message ?? error) });
+          }
+        };
+        void load();
+        const timer = setInterval(load, SESSION_REFRESH_MS);
+        return () => {
+          alive = false;
+          clearInterval(timer);
+        };
+      }, [reload]);
+
+      // 与 ReminderTasks 同一个兜底：未知的 state 形状按「还在读」处理，别让整页炸在渲染期。
+      const view = state !== null && typeof state === 'object' && typeof state.status === 'string' ? state : { status: 'loading' };
+      const data = view.status === 'ready' ? view.data : undefined;
+      const sessions = Array.isArray(data?.conversations) ? data.conversations : [];
+      const working = pendingKey !== '';
+
+      /** 真正发一次重置；成功时 Host 会把重置后的列表一起送回来，直接用，省一次往返。 */
+      const runReset = async (body) => {
+        setPendingKey(body.all === true ? '*' : String(body.key));
+        setConfirmAll(false);
+        setNotice(undefined);
+        try {
+          const response = await fetch(SESSION_ROUTE_PATH, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', accept: 'application/json' },
+            credentials: 'same-origin',
+            cache: 'no-store',
+            body: JSON.stringify(body),
+          });
+          let result;
+          try {
+            result = await response.json();
+          } catch {
+            result = undefined;
+          }
+          if (!response.ok || result?.ok !== true) {
+            const reason = result?.failed?.[0]?.reason ?? result?.error;
+            throw new Error(reason === undefined ? `HTTP ${response.status}` : sessionErrorText(t, reason));
+          }
+          const failed = Array.isArray(result.failed) ? result.failed.length : 0;
+          if (failed > 0) {
+            const done = Array.isArray(result.reset) ? result.reset.length : 0;
+            setNotice({ tone: 'error', text: t('sessionsResetPartial', { count: done, failed }) });
+          } else {
+            setNotice({ tone: 'info', text: t('sessionsResetDone') });
+          }
+          if (Array.isArray(result.conversations)) setState({ status: 'ready', data: result });
+          else setReload((value) => value + 1);
+        } catch (error) {
+          setNotice({ tone: 'error', text: t('sessionsResetFailed', { message: String(error?.message ?? error) }) });
+        } finally {
+          setPendingKey('');
+        }
+      };
+
+      const toolbar = [
+        data === undefined
+          ? null
+          : jsx('p', { className: 'qq-tasksCount', children: t('sessionsCount', { count: sessions.length }) }, 'count'),
+        jsx(P.Pill, {
+          onClick: () => setReload((value) => value + 1),
+          children: t('sessionsRefresh'),
+        }, 'refresh'),
+      ];
+      if (sessions.length > 0) {
+        toolbar.push(jsx(P.Button, {
+          size: 'sm',
+          variant: 'outline',
+          disabled: working,
+          onClick: () => {
+            if (confirmAll) void runReset({ all: true });
+            else setConfirmAll(true);
+          },
+          children: confirmAll ? t('sessionsConfirmAll') : t('sessionsResetAll'),
+        }, 'all'));
+      }
+      if (confirmAll) {
+        toolbar.push(jsx(P.Pill, {
+          onClick: () => setConfirmAll(false),
+          children: t('sessionsCancel'),
+        }, 'cancel'));
+      }
+
+      let body;
+      if (view.status === 'loading') {
+        body = jsx('p', { className: 'qq-empty', role: 'status', children: t('sessionsLoading') }, 'loading');
+      } else if (view.status === 'error') {
+        body = jsx('p', {
+          className: 'qq-invalid',
+          role: 'alert',
+          children: t('sessionsFailed', { message: view.message }),
+        }, 'error');
+      } else if (sessions.length === 0) {
+        body = jsx('p', { className: 'qq-empty', children: t('sessionsEmpty') }, 'empty');
+      } else {
+        body = jsx('ul', {
+          className: 'qq-sessionList',
+          children: sessions.map((session) =>
+            jsx(SessionRow, {
+              t,
+              session,
+              // 一个动作在飞时所有行都不能再点（并发重置没有意义，提示也会互相覆盖）；
+              // 只有正在重置的那一行（或「全部」）显示「重置中…」。
+              busy: working && (pendingKey === '*' || pendingKey === session.key),
+              disabled: working,
+              onReset: (key) => void runReset({ key }),
+            }, String(session.key ?? '')),
+          ),
+        }, 'list');
+      }
+
+      const noticeNode = notice !== null && typeof notice === 'object' && typeof notice.text === 'string'
+        ? jsx('p', {
+            className: 'qq-sessionNotice',
+            'data-tone': notice.tone,
+            role: notice.tone === 'error' ? 'alert' : 'status',
+            children: notice.text,
+          }, 'notice')
+        : null;
+
+      return jsxs(
+        'section',
+        {
+          className: 'qq-section qq-sessionsSection',
+          'aria-labelledby': 'qq-sessions-title',
+          children: [
+            jsx('h3', {
+              id: 'qq-sessions-title',
+              className: 'qq-sectionTitle',
+              children: t('sessionsTitle'),
+            }, 'title'),
+            jsx('p', {
+              className: 'qq-sectionNote',
+              children: t('sessionsNote', { seconds: Math.round(SESSION_REFRESH_MS / 1000) }),
+            }, 'note'),
+            jsx('div', { className: 'qq-sessionsToolbar', children: toolbar }, 'toolbar'),
+            noticeNode,
+            body,
+          ],
+        },
+        'sessions',
+      );
+    });
+
     /** 工具条：搜索框 + 已改计数 + 只看已改 + 待修正计数。 */
     const Toolbar = component(function Toolbar(props) {      const { t, query, onlyChanged, changedCount, invalidCount, writable } = props;
       const items = [
@@ -2106,8 +2409,13 @@ window.__ModuleLoader__.load({
           }))
           .filter((section) => section.rows.length > 0);
         // 「提醒」页最上面先给「现在记着哪些」：任务不是配置（schema 里没有），
-        // 但用户打开这一页通常就是想看它们，所以排在配置字段前面。
-        const panelSections = active.id === 'reminder' ? [jsx(ReminderTasks, { t }, 'reminders')] : [];
+        // 但用户打开这一页通常就是想看它们，所以排在配置字段前面。「会话」页同理：
+        // 重置按钮是运行状态的动作，不是配置项。
+        const panelSections = active.id === 'reminder'
+          ? [jsx(ReminderTasks, { t }, 'reminders')]
+          : active.id === 'session'
+            ? [jsx(SessionResets, { t }, 'sessions')]
+            : [];
         panelSections.push(
           ...sections.map((section) =>
             jsx(SectionBlock, { section, t, edit: props.edit, resetField: props.resetField, writable }, section.id),
@@ -2267,6 +2575,10 @@ window.__ModuleLoader__.load({
     exports.ReminderTaskRow = ReminderTaskRow;
     exports.ReminderTaskList = ReminderTaskList;
     exports.ReminderTasks = ReminderTasks;
+    exports.SESSION_ROUTE_PATH = SESSION_ROUTE_PATH;
+    exports.SESSION_REFRESH_MS = SESSION_REFRESH_MS;
+    exports.SessionRow = SessionRow;
+    exports.SessionResets = SessionResets;
     return module.exports;
   },
 });

@@ -16,6 +16,16 @@ import crypto from 'node:crypto';
 import { resolve } from 'node:path';
 
 /**
+ * 设置页「重置对话」那一块用的 Host 路由。
+ *
+ * 它是一份**跨半侧的协议**：Host（`index.js`）在 Connection 的认证栅栏内注册它，
+ * 浏览器半侧（`client.js`，手写 bundle、不能 import 主机模块）照着字符串再写一份。
+ * 两份必须逐字相同 —— `test/client.test.mjs` 拿这个常量钉住那一份拷贝，漏改一边会红。
+ * 与 `REMINDER_ROUTE_PATH`（住在 `reminders.js`）同理。
+ */
+export const SESSION_ROUTE_PATH = '/api/qq-bridge/sessions';
+
+/**
  * 由会话 key 派生出稳定的、UUID 形状的 Session id。
  *
  * 确定性正是关键：同一个 QQ 会话在 Harness 反复重启后仍然得到同一个

@@ -22,6 +22,7 @@ import { Config, apply, inject, liveConfig, parseApiKeyPool, sessionIdFor, withi
 import { blankMessageLabel, collectMedia, isEmojiOnlyMessage, isStickerSegment, mediaLabel, mediaPlaceholder, mentionsOthers, messageToText, repeatableText, splitBurst, splitStickerLines, typingDelayMs } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
 import { REMINDER_ROUTE_PATH } from '../reminders.js';
+import { SESSION_ROUTE_PATH } from '../util.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
 import { OTHER_PNG, PIC_JPEG, PIC_PNG } from './image-fixtures.mjs';
 
@@ -1213,6 +1214,121 @@ test('the reset command delivers a pending batch before it starts the next round
     assert.ok(first, 'the pending batch should reach the Agent before the reset');
     assert.equal(first.inbox[0].content[0].text, '你好');
     await until(() => host.list.disposed.includes(first.id), 'the Agent to be disposed');
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：设置页的「重置对话」按钮 —— 列出本次运行处理过的会话，并按与 `/reset`
+// 完全相同的一套给其中一个（或全部）换一轮。
+test('the settings page can list conversations and start a new round', async () => {
+  const routes = [];
+  const connection = {
+    fetch: {
+      register(route) {
+        routes.push(route);
+        return () => {};
+      },
+    },
+  };
+  const { onebot, host } = await boot({}, { connection });
+  try {
+    onebot.push(privateMessage('你好'));
+    const first = await untilInbox(host, 1, 'the private message to reach the Agent');
+
+    const route = routes.find((candidate) => candidate.path === SESSION_ROUTE_PATH);
+    assert.ok(route, '设置页必须挂上会话列表 / 重置路由');
+    assert.deepEqual(route.methods, ['GET', 'POST']);
+    assert.equal(route.requestBody, 'buffered');
+
+    const listResponse = await route.fetch(new Request(`http://127.0.0.1${SESSION_ROUTE_PATH}`));
+    assert.equal(listResponse.status, 200);
+    assert.equal(listResponse.headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.equal(listResponse.headers.get('cache-control'), 'no-store');
+    const listed = await listResponse.json();
+    assert.equal(listed.ok, true);
+    assert.equal(listed.conversations.length, 1);
+    const [session] = listed.conversations;
+    assert.equal(session.key, 'private:100000002');
+    assert.equal(session.type, 'private');
+    assert.equal(session.name, 'iroha');
+    assert.equal(session.round, 0);
+    assert.equal(session.sessionId, first.id, '列表里的 session id 与当前这一轮一致');
+    assert.equal(Object.hasOwn(session, 'agent'), false, '内部句柄不随路由泄漏');
+
+    const resetResponse = await route.fetch(new Request(`http://127.0.0.1${SESSION_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key: 'private:100000002' }),
+    }));
+    assert.equal(resetResponse.status, 200);
+    const result = await resetResponse.json();
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.reset.map((entry) => entry.round), [1]);
+    assert.notEqual(result.reset[0].sessionId, first.id);
+    assert.equal(result.conversations[0].round, 1);
+    assert.ok(host.list.disposed.includes(first.id), '旧 Agent 必须被销毁，否则下一条消息又会 resume 回来');
+
+    // 下一条消息投进新一轮：新 Agent 的 id 就是路由刚返回的那个。
+    onebot.push(privateMessage('又见面了'));
+    const second = await until(
+      () => (host.list.created[1]?.inbox.length >= 1 ? host.list.created[1] : undefined),
+      'the next message to reach the new round',
+    );
+    assert.equal(second.id, result.reset[0].sessionId);
+    assert.notEqual(second.id, first.id);
+
+    // 「全部重置」走同一个动作，只是遍历会话表。
+    const allResponse = await route.fetch(new Request(`http://127.0.0.1${SESSION_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ all: true }),
+    }));
+    assert.equal(allResponse.status, 200);
+    const all = await allResponse.json();
+    assert.equal(all.ok, true);
+    assert.deepEqual(all.reset.map((entry) => entry.round), [2]);
+
+    // 两个失败入口都要有明确的 HTTP 语义，页面才能说清楚发生了什么。
+    const unknown = await route.fetch(new Request(`http://127.0.0.1${SESSION_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key: 'group:999999999' }),
+    }));
+    assert.equal(unknown.status, 404);
+    assert.equal((await unknown.json()).error, 'unknown-conversation');
+    const missing = await route.fetch(new Request(`http://127.0.0.1${SESSION_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    }));
+    assert.equal(missing.status, 400);
+    assert.equal((await missing.json()).error, 'missing-key');
+  } finally {
+    await onebot.close();
+  }
+});
+
+// 用例：真宿主里 Connection 是在插件 apply 之后才 provide 的 —— 重置对话的路由
+// 也必须靠 ctx.inject 等它出现，否则设置页那一块只会拿到 404。
+test('the conversation route mounts when Connection arrives late', async () => {
+  const routes = [];
+  const { onebot, host } = await boot({});
+  try {
+    assert.equal(routes.length, 0, '服务还没出现时不该凭空挂一条路由');
+    host.list.provide('connection', {
+      fetch: {
+        register(route) {
+          routes.push(route);
+          return () => {};
+        },
+      },
+    });
+    const route = routes.find((candidate) => candidate.path === SESSION_ROUTE_PATH);
+    assert.ok(route, 'Connection 晚到时也必须补挂重置对话路由');
+    const body = await (await route.fetch(new Request(`http://127.0.0.1${SESSION_ROUTE_PATH}`))).json();
+    assert.equal(body.ok, true);
+    assert.deepEqual(body.conversations, []);
   } finally {
     await onebot.close();
   }

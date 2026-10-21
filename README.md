@@ -129,7 +129,7 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | [被撤回的消息](docs/recall.md) | 三层处理、模式矩阵、配置与实现要点 |
 | [定时提醒](docs/reminders.md) | 三种模式、时间规则、权限与额度、重启/断线/`/reset` |
 | [长期记忆](docs/memory.md) | 转录、每日摘要、检索式注入、冷热分层、人物表、认知库、表情包目录、五个 skill |
-| [会话与轮次](docs/sessions.md) | 确定性 Session id、`/reset`、旧会话存档 |
+| [会话与轮次](docs/sessions.md) | 确定性 Session id、`/reset`、旧会话存档、Web UI 的「重置对话」按钮 |
 | [工具与能力面](docs/tools.md) | 工具表、`agentPreset`、`allowTools` |
 | [运维](docs/ops.md) | `scripts/ops.mjs`、`doctor` 的 finding、八个排查场景、key 轮换 |
 | [本机开发与测试](docs/development.md) | 依赖、重启规则、`node --test`、行为覆盖清单 |
