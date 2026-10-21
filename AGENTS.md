@@ -23,7 +23,7 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
   `qq_save_sticker` 把别人发的存进 `.qq-stickers/`、`qq_rename_sticker` 给已收藏的改名（文件与目录一起搬，见 §6 表）。
 - **不走模型的旁路**：群里的**自动复读**（见 §4.C）。
 - **主动说话**（`proactive`，默认开；闸门很多，见 §4.E）：群里安静下来后，插件往**该群自己的会话**里伪造一条提醒，
-  让它带着环境上下文与长期记忆自己冒个泡（见 §4.E）。
+  让它带着环境上下文与长期记忆自己冒个泡。
 - **活跃对话**：一对一的免 @ 接话（`activeFollow`，默认开）、群聊热起来后的**多人搭话**
   （`activeGroup*`）与「回完再补一句」（`activeChime*`）；见 §4.F。
 - **长期记忆**：消息落盘成转录，定时由**独立摘要会话**照 `.dsh/skills/` 的 skill 整理；聊天时用
@@ -99,14 +99,14 @@ scripts/dev-node-modules.mjs      Windows 上铺 `node_modules`（按依赖闭�
 scripts/release.mjs               打发布包（`git archive` 源码树 + 干净的 NapCat → `dist/<名>.zip`），打完体检，命中账号配置/登录态就整体失败
 docs/{install,windows,configuration}.md  安装与运行 / Windows 桌面版 / 配置项
 docs/{persona-style,speaking,repeat,proactive,media,recall,memory,reminders}.md  行为分册（人格 / 说话 / 复读 / 主动开口 / 媒体 / 撤回 / 记忆 / 定时提醒）
-docs/persona-workshop.md  写人设的入口：模板 / 18 题问答 / 组装规则 / 自检脚本怎么读 / 常见坑 / 为什么提示词不进 `.dsh/skills`
+docs/persona-workshop.md  写人设的入口：模板 / 18 题 / 组装规则 / 自检 / 常见坑 / 为什么提示词不进 `.dsh/skills`
 docs/{sessions,tools,security,ops,development}.md  会话 / 工具与能力面 / 安全 / 运维排查 / 开发测试
 .dsh/skills/message-digest/SKILL.md    聊天记录 → 长期记忆的流程（定时摘要与「以前说过什么」用它）
 .dsh/skills/learn-meme/SKILL.md        文字梗 / 黑话 / 谐音 → COGNITION.md 的流程
 .dsh/skills/learn-sticker/SKILL.md     表情包 → 先 qq_save_sticker 收藏、再写 STICKERS.md 的流程
 .dsh/skills/update-cognition/SKILL.md  **兼容壳**：只做一句话分诊（旧名字还在用）
 .dsh/skills/moegirl/SKILL.md           二次元梗 → 萌娘百科 MediaWiki 接口查意思的流程（只读，不落盘）
-test/bridge.test.mjs  集成测试：假 OneBot 服务端 + 假 Harness ctx（含假 timer），跑完整往返
+test/harness.mjs  集成测试夹具：假 OneBot 服务端 + 假 Harness ctx（含假 timer）+ boot / until；用例按主题在 bridge*.test.mjs
 test/{persona,style,speech-policy,modalities,links,interactions,cognition,migrate-cognition,ops}.test.mjs
                       0.2.0 新增的纯函数测试：人设 / 气泡 / intent / 消息段 / SSRF / 戳一戳 / 认知 / 迁移 / 运维
 test/recall.test.mjs  撤回的纯判据：认事件 / 12 条闸门逐个翻 / 文案里必须有 SKIP、默认不给原文
@@ -121,7 +121,7 @@ test/media.test.mjs  `fetchBytes` 的重定向与逐跳校验契约（SSRF 修�
 test/filestore.test.mjs 原子读写与「读不到就返回空/undefined，不抛错」这条失败语义
 test/perceptual.test.mjs  图片指纹的单元测试（同图不同编码 / 异图 / 畸形输入 / 解压炸弹）
 test/persona-template.test.mjs  人设模板 / 提示词 / 自检脚本的契约：零解析警告、STYLE 零体检、只一条底色、长度不超上限、文档不失链、退出码语义
-test/image-fixtures.mjs  上面两个测试共用的图片 fixture（真编码的字节，不是 test 文件）
+test/image-fixtures.mjs  测试共用的图片 fixture（真编码的字节）
 cordis.patch.yml      插件自带 bundle patch：注册 `qq` Agent 预设（含 skill 平面）+ 插件 config
 locale/{zh,en}.json   插件在 Web UI 里的标题/描述
 deploy/qqbot.{service,env.example}  systemd user unit 与凭据模板
@@ -168,7 +168,7 @@ index.js ──▶ config.js（schema）/ settings.js ──▶ image.js（只�
          ──▶ desktop.js（.env 段落、manifest 改写）
                       └── scripts/napcat-setup.mjs 用它，test/desktop.test.mjs 钉它
                       └── media.js 用到 onebot.js 的占位符/嗅探约定（image.js 从 util.js 取 pathInside）
-test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.test.mjs 只 import index.js
+test/*  ──▶ 直接 import 上述模块（不经过 Harness）；harness.mjs 只 import index.js
 ```
 
 **没有环**，这条要守住：`tools.js` / `settings.js` / `memory.js` / `reminders.js` / `napcat.js` / `desktop.js` /
@@ -222,8 +222,8 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
      只有 `index.js` 有。`tools.js` / `memory.js` 的 `deps` 表是样例，也是「能碰什么」的清单。
    （一开始把 `errorText` / `sessionIdFor` / `createUserMessage` 也当依赖传了进去，与直接 import
    `localDate` 并列时很怪 —— 后来收掉了。新模块别重犯。）
-2. `index.js` 里**保留再导出**（`export { Config } from './config.js'`）—— `bridge.test.mjs`
-   只 import `index.js`，Loader 也只认插件入口，搬走的东西必须在入口处仍然拿得到。
+2. `index.js` 里**保留再导出**（`export { Config } from './config.js'`）—— `bridge*.test.mjs`
+   经 harness 只 import `index.js`，Loader 也只认插件入口，搬走的东西必须在入口处仍然拿得到。
 
 **模块级纯函数都不在本文件里**：`util.js` 放「同样输入永远同样输出」的那批（`sessionIdFor` /
 `memorySlug` / `localDate` / `localStamp` / `msUntilDailyHour` / `hourLabel` /
@@ -234,7 +234,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；bridge.tes
 
 判断一个新函数该放哪：**碰闭包状态留 `index.js`，碰磁盘去 `filestore.js`，其余去 `util.js`。**
 `util.js` 里不许引入闭包状态 —— 保持纯粹才可能被单测。
-`sessionIdFor` / `parseApiKeyPool` / `withinActiveHours` 的契约由 `bridge.test.mjs` 从
+`sessionIdFor` / `parseApiKeyPool` / `withinActiveHours` 的契约由 `bridge*.test.mjs` 从
 **插件入口**验，所以 `index.js` 里对这三个保留再导出（见上面的两条纪律）。
 `msUntilDailyHour` 尤其值得单独测边界（刚过点要排到明天，不能原地反复醒）。
 
@@ -425,7 +425,7 @@ token 的人设/表达/硬性规则，十几轮就 220k，然后不间断压缩�
 `speakerLine`、`ambientPrompt`、`memory.recallText`、群名 / 对方名字、表情包目录放回
 `channelPrompt`**；要加新的动态信息，加到 `channelTurnContext` 里（群名是 `get_group_info`
 查来的，重启后第一次查询可能失败 —— 一个查空的群名就够让整份人设再追加一份，见
-`test/bridge.test.mjs`「the channel section does not depend on the group name lookup」；
+`test/bridge-send.test.mjs`「the channel section does not depend on the group name lookup」；
 表情包目录同理，它每存一张就变，见 `stickerCatalogLines` 与
 「the sticker catalogue rides on the turn context」）。系统小节只在人设 / 表达 / 配置真的
 改了时才变一次 —— 这是 `test/bridge.test.mjs`「the channel system section stays stable」钉住的。
@@ -455,17 +455,17 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
 - 加行为就加用例，用例名/注释用中文写清意图。**改哪个模块就跑哪个文件**：
   `config.js`/`settings.js`→`settings.test.mjs`；`chatter.js` 与活跃对话判定→`chatter.test.mjs`；
   `speaking-rules.js` 或 `admit` 里凑入参那几行→`speaking-rules.test.mjs`；
-  `mention.js`/`registerParticipant`/`sendParts`→`mention.test.mjs` + bridge 里那组端到端；
+  `mention.js`/`registerParticipant`/`sendParts`→`mention.test.mjs` + `bridge-send.test.mjs` 那组端到端；
   `perceptual.js` 或复读的图片判定→`perceptual.test.mjs`；`stickerFileName`/`saveSticker`→
-  `util.test.mjs` + bridge 里搜 `qq_save_sticker` / `qq_rename_sticker`（改名还要看 `test/cognition.test.mjs` 的 `renameStickerRow`）；记忆相关→bridge 末尾那组；
-  主动说话→bridge 末尾 `bootProactive` 那组（靠 `digestMinLines: 9999` 隔离摘要循环，
+  `util.test.mjs` + `bridge-stickers.test.mjs` 里搜 `qq_save_sticker` / `qq_rename_sticker`（改名还要看 `test/cognition.test.mjs` 的 `renameStickerRow`）；记忆相关→`bridge-memory.test.mjs`；
+  主动说话→`bridge-proactive.test.mjs`（靠 `digestMinLines: 9999` 隔离摘要循环，
   假 `fireInterval()` 会唤醒**所有**周期定时器）；`sessionIdFor`/`resetConversation`/`canReset`
-  →bridge 里搜 `reset`；`key-rotation.js`（轮换 / 探测 / 池子）→bridge 最后的
-  `bootKeyRotation` 那组；`napcat.js`/`desktop.js`→`napcat.test.mjs` / `desktop.test.mjs`；
+  →`bridge.test.mjs` 里搜 `reset`；`key-rotation.js`（轮换 / 探测 / 池子）→
+  `bridge-ops.test.mjs`；`napcat.js`/`desktop.js`→`napcat.test.mjs` / `desktop.test.mjs`；
   `util.js`/`filestore.js`→各自的用例；`client.js`（设置页）→`client.test.mjs`（它同时钉住
   「每个配置项都有分组」这条）；`persona.js`/`style.js`/`speech-policy.js`/`modalities.js`/
   `links.js`/`interactions.js`/`recall.js`/`cognition.js`/`ops.js`→同名 `test/<模块>.test.mjs`；
-  撤回的端到端（三种位置 × 三种模式）→bridge 末尾 `bootRecall` 那组；迁移脚本→
+  撤回的端到端（三种位置 × 三种模式）→`bridge-recall.test.mjs`；迁移脚本→
   `migrate-cognition.test.mjs`。
 - **读 `agent.inbox` 的用例要等 `untilInbox(host, n)`，别只等 `host.list.created[0]`**：假 Host 的
   `create()` 是如实照搬真宿主的 —— Agent 先记进 `created`，消息由插件**之后**才
@@ -489,11 +489,11 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
 - [ ] 动过权限判断（`resetUsers` 之类）→ 确认「不配 = 全关」，而不是「不配 = 人人可用」
 - [ ] 涉及安全面（审批策略、白名单、`cwd` 越界校验）的改动单独复核过
 - [ ] 动过记忆写入（`qq_memory` / `cognition.js` 的 upsert / normalize）→ 跑
-      `test/cognition.test.mjs` + `test/bridge.test.mjs` 里搜索 `upsert` 的那组，并确认
+      `test/cognition.test.mjs` + `test/bridge-memory.test.mjs` 里搜索 `upsert` 的那组，并确认
       「整份重写丢行会被拒」「重复标题会被合并」两条仍然成立
 - [ ] 加/改了配置项 → 跑 `test/client.test.mjs`（分组别漏、标签别退化成字段名）
 - [ ] 动过引用链（`quote` / `clearQuoteFor` / `batchQuote`）→ 确认「清一处三处生效」，且
-      bridge 的 `bootRecall` 那组仍然绿（它们钉住「不许给已撤回的消息挂 reply 段」）
+      `test/bridge-recall.test.mjs` 仍然绿（它们钉住「不许给已撤回的消息挂 reply 段」）
 
 ## 10. 常见坑速查
 
@@ -501,7 +501,7 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
 |---|---|
 | 改了代码没生效 | Loader 按 URL 缓存模块 → 必须重启进程（§5.1） |
 | **bot 完全不回复**，但 `systemctl --user is-active qqbot` 显示 active | `inject` 漏声明了代码里用到的服务：`ctx.interval` / `ctx.timeout` 属于 `timer`，cordis 不允许访问未声明的服务，`apply()` 当场抛错 → 插件整体不激活（journal 里是 `cannot get property "timer" without inject` + `dsh: warning: 1 entry did not activate`）。代码里用到的每个服务都要进 `inject` |
-| 测试全绿但真宿主上插件不激活 | 假 Host 桩比真宿主宽松（例如无条件提供 `ctx.interval`）；改桩时要连 cordis 的 inject 检查一起复现（见 `test/bridge.test.mjs` 的 `requireTimerService`） |
+| 测试全绿但真宿主上插件不激活 | 假 Host 桩比真宿主宽松（例如无条件提供 `ctx.interval`）；改桩时要连 cordis 的 inject 检查一起复现（见 `test/harness.mjs` 的 `requireTimerService`） |
 | `failed to import @deepseek-ai/*` | `node_modules` 软链被删了 |
 | journal 里没有任何插件日志 | 用了 `ctx.logger` 而不是 `report()`（§5.8） |
 | 群里回复乱序 / 串话 | 绕过了 `enqueueSend` / `enqueue` 串行队列 |

@@ -50,8 +50,8 @@ node --test test\
 > `test/speech-policy.test.mjs`、`test/modalities.test.mjs`、`test/links.test.mjs`、
 > `test/interactions.test.mjs`、`test/cognition.test.mjs`、`test/migrate-cognition.test.mjs`、
 > `test/ops.test.mjs`、`test/reminders.test.mjs`、`test/recall.test.mjs`、`test/backlog.test.mjs`、
-> `test/memory-select.test.mjs`、`test/persona-template.test.mjs`。行为层的新用例在
-> `test/bridge.test.mjs`：
+> `test/memory-select.test.mjs`、`test/persona-template.test.mjs`。行为层的用例在
+> `test/bridge*.test.mjs`（共享夹具在 `test/harness.mjs`）：
 > 气泡条数与中断、标点清洗、引用指向（表情消息不引用）、C 路四条排除、私聊补一句、戳一戳、链接预览、
 > 视频封面、语音占位、定时提醒（text / agent / SKIP / 超时 / 重启 / 权限）、撤回（三种位置 × 三种模式）、
 > 长任务期间那一波迟到的消息。
@@ -72,11 +72,14 @@ dsh --profile qqbot --port 3081 --no-open
 
 ### 跑测试
 
-`test/bridge.test.mjs` 会起一个假的 OneBot WebSocket 服务端 + 假的 Harness
-上下文，跑完整的入站/出站链路（真实使用 `ws` 与本插件的 OneBot 客户端）：
+`test/harness.mjs` 提供共享夹具：每个用例都会起一个假的 OneBot WebSocket 服务端 +
+假的 Harness 上下文，跑完整的入站/出站链路（真实使用 `ws` 与本插件的 OneBot 客户端）。
+用例按主题分在 `test/bridge*.test.mjs`（核心 / 复读 / 发送 / 媒体 / 表情包 / 记忆 /
+主动说话 / 活跃对话 / 运维 / 感知 / 人设 / 撤回 / 提醒），每册都能单独跑：
 
 ```bash
-node --test test/
+node --test test/                       # 全部
+node --test test/bridge-recall.test.mjs # 只跑撤回那册
 ```
 
 也可以走 npm 脚本：`npm test`（同上）、`npm run check`（文档一致性 + 全仓库 `node --check`，
@@ -240,7 +243,7 @@ key 由启动环境提供（`describe().writable === false`）时提前退场（
   （追加 / 原地合并且**保留用户的 debug 与 heartInterval** / 再应用一次不变 / 不就地改原对象），
   以及真落盘的那几条：**默认一个字节都不改**、允许写时先备份且第二次不再动、token 不一致
   改回同一条而不是追加第二条、坏 JSON 与不存在的目录只报告**绝不覆盖**、自动探测只认
-  「有 config 且有账号配置」的目录；`test/bridge.test.mjs` 末尾另有两条验接线：自检发现问题时
+  「有 config 且有账号配置」的目录；`test/bridge-ops.test.mjs` 末尾另有两条验接线：自检发现问题时
   warn 里带原因与修法且不改文件、`napcatAutoConfig` 打开时才写（含备份、并提示重启 NapCat）。
 - `test/desktop.test.mjs`：`.env` 维护段落的**幂等**（重复运行逐字节相同、取值变了只换一段、
   段落之外的内容不动、CRLF 检出也认得出来）与 profile manifest 的两处一起改

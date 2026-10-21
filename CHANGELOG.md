@@ -5,6 +5,12 @@
 
 ## 未发布
 
+- **集成测试拆册**：7,438 行的 [`test/bridge.test.mjs`](test/bridge.test.mjs) 拆成
+  [`test/harness.mjs`](test/harness.mjs)（假 OneBot 服务端 / 假 Harness Host / `boot` /
+  `until` / 消息构造 / 收尾钩子）+ 13 个按主题的 `test/bridge*.test.mjs`（核心 / 复读 /
+  发送 / 媒体 / 表情包 / 记忆 / 主动说话 / 活跃对话 / 运维 / 感知 / 人设 / 撤回 / 提醒）。
+  用例一条没删、断言一条没改：拆完 244 条仍然全绿，单册可以单独跑
+  （`node --test test/bridge-recall.test.mjs`），改哪块行为就只跑哪册。
 - **系统提示的装配从 `index.js` 拆到 [`prompt.js`](prompt.js)**：`channelPrompt` /
   `hardRules` / `personaLines` / `personaSceneFor` / `styleLines` 与内置 `DEFAULT_PERSONA`
   整体搬出（第六批），`index.js` 只 `createPromptKit(deps)` 并解构同名函数，调用点
