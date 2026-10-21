@@ -1295,7 +1295,7 @@ export function apply(ctx, config) {
     if (conversation.pendingIntent === 'interject') {
       // 插话轮：这句不是冲它来的。元信息已经写在 user message 里了，这里只说清场景，
       // 不能再用「刚跟你说话的人」——那正是「莫名其妙」的来源（§2.2）。
-      return '群里在聊天，下面那句不是叫你的；你只是刚好想接一句，接就一条（接不住就不接）。';
+      return '群里在聊天，下面那句不是叫你的；你只是刚好想接一句，接住那一句就行（想再说一句自己的、关心一句，可以另起一条，接不住就不接）。';
     }
     if (conversation.pendingIntent === 'backlog') {
       // 积压的一波：那些话不是「现在」说的，是它在忙别的事的时候陆续到的。

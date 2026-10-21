@@ -5,6 +5,25 @@
 
 ## 未发布
 
+- **闲聊不再是一问一答（表达层，无需改配置）**：以前闲聊几乎每轮只回一条 ——
+  `STYLE.md` 写着「接完就停」，硬性规则写着「别为了显得像人多发一条」，插话轮的提示词
+  还写着「接就一条」。现在统一改成**一件事一条**：回答、自己的情况、反问、关心各占一个气泡，
+  有几件事就几条；只是把前一条再评价 / 安慰 / 总结一遍的收尾仍然要删（防止退回
+  「接一句 + 补一句」的客服两拍）。**不写数字默认值** —— 「默认 1~3 条」曾被模型读成
+  配额（11 条里 10 条正好两条），`lintStyleDoc` 的 `COUNT_QUOTA` 继续盯着这一点。
+  - 关心 / 叮嘱也算一件事（2026-10-22 的真实例子）：「晚安，别又刷到两点半才睡」被一个
+    逗号缝成一条，观感就是客服答复；`STYLE.md` 的「标点」节现在有这一组反例 → 正例
+    「晚安」「别又刷到两点半」，硬性规则与内置契约的类目也补上了「关心」。
+  - 是非题那条也松了口：第一句仍然只写是 / 否、不解释理由，但想反问一句或说说自己的
+    情况，可以另起一条（以前群聊是「到此为止」）。
+  - 插话（`interject`）同理：先接住那一句算一条，想再说一句自己的、关心一句，可以另起一条，
+    仍然不接成一段。`speakerLine` 与 `interjectLine` / `interjectBatchPrompt` 的文案同步。
+  - 文件位置：`.qq-persona/STYLE.md`、`deploy/persona/STYLE.template.md`、`style.js` 的内置
+    契约、`prompt.js` 的 `hardRules`、`speech-policy.js`、`index.js` 的 `speakerLine`；
+    文档见 [`docs/persona-style.md`](docs/persona-style.md) 的「一条回复发几条」。
+  - `STYLE.md` 热读，改完不用重启；`prompt.js` / `speech-policy.js` / `index.js` 改了，
+    需要重启 Host 一次（`systemctl --user restart qqbot`）。
+
 - **集成测试拆册**：7,438 行的 [`test/bridge.test.mjs`](test/bridge.test.mjs) 拆成
   [`test/harness.mjs`](test/harness.mjs)（假 OneBot 服务端 / 假 Harness Host / `boot` /
   `until` / 消息构造 / 收尾钩子）+ 13 个按主题的 `test/bridge*.test.mjs`（核心 / 复读 /

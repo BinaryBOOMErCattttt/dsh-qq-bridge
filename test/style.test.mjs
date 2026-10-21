@@ -151,7 +151,7 @@ test('lintStyleDoc：把「只回一条」写成默认会被点出来（一句�
   assert.equal(quota[0].code, 'COUNT_QUOTA');
   // 新写法（不写数字默认值）不能被报成噪声。
   assert.deepEqual(
-    lintStyleDoc({ general: ['一句能说完就一句，想接着说就换行多写一条；别每轮都排成同一个两段式'] }),
+    lintStyleDoc({ general: ['一件事一条：回答、自己的情况、反问、关心各占一条；想接着说就换行多写一条；别每轮都排成同一个两段式'] }),
     [],
   );
 });
