@@ -17,6 +17,7 @@
  *     node scripts/ops.mjs napcat config|start|autologin|webui [--apply]
  *     node scripts/ops.mjs migrate cognition [--apply] [--json]
  *     node scripts/ops.mjs cleanup jm [--apply] [--json]
+ *     node scripts/ops.mjs forget group:100000001|private:100000002 [--apply] [--json]
  *     node scripts/ops.mjs selftest [--json]
  *
  * 三条硬规矩：
@@ -52,7 +53,7 @@ import {
 } from 'node:fs';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -88,6 +89,7 @@ import {
 import { PLUGIN_NAME, applyEnvBlock, pluginLinkState, withPluginInstalled } from '../desktop.js';
 import { readTextOrUndefined, writeJsonAtomic } from '../filestore.js';
 import { errorText, parseApiKeyPool } from '../util.js';
+import { applyForget, parseForgetKey, planForget } from './forget.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -98,7 +100,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
  * 两种写法都得认，所以「后面那个是不是另一个开关」要在这里判一次。
  */
 function parseArgs(argv) {
-  const valueFlags = new Set(['n', 'qq', 'unit', 'unit-path', 'task-name', 'profile', 'container', 'endpoint', 'token', 'napcat', 'port', 'log-file', 'dsh-home', 'cwd', 'window']);
+  const valueFlags = new Set(['n', 'qq', 'unit', 'unit-path', 'task-name', 'profile', 'container', 'endpoint', 'token', 'napcat', 'port', 'log-file', 'dsh-home', 'cwd', 'window', 'backup-dir', 'sessions-root', 'sessions-dir', 'memory-dir', 'media-dir']);
   const positionals = [];
   const flags = new Set();
   const values = {};
@@ -1489,6 +1491,213 @@ async function commandCleanup(platform, sub) {
 }
 
 // ---------------------------------------------------------------------------
+// 命令：forget
+// ---------------------------------------------------------------------------
+
+/** 人话里显示路径：cwd 内的用相对路径，cwd 外的（会话存档）用绝对路径。 */
+function forgetLocation(path) {
+  const rel = relative(cwd, path);
+  return rel.length > 0 && !rel.startsWith('..') ? rel : path;
+}
+
+/**
+ * 真的忘掉一个会话：长期记忆 + 索引引用 + DSH 会话存档 + reset 代次。
+ *
+ * 它和 `cleanup jm` 一样是「删数据」的动作：没有 `--apply` 只打印计划；有 `--apply`
+ * 就视为操作员授权，脚本自己做（先备份，再删）。计划与执行在 `scripts/forget.mjs`，
+ * 这里只负责三件事：凑参数、按步骤汇报、把「进程还握着会话」这件事说清楚。
+ */
+async function commandForget(platform, sub) {
+  const rawKey = String(sub ?? '').trim();
+  const parsed = parseForgetKey(rawKey);
+  if (parsed === undefined) {
+    return fail('forget', platform, `forget 后面要跟会话 key（group:<群号> / private:<QQ号>），拿到的是「${rawKey}」`);
+  }
+  const sessionsRoot = String(args.values['sessions-root'] ?? '').trim() || join(dshHome(), 'sessions');
+  const sessionsDir = String(args.values['sessions-dir'] ?? '').trim();
+  const memoryDir = String(args.values['memory-dir'] ?? '').trim();
+  const mediaDir = String(args.values['media-dir'] ?? '').trim();
+  const backupRoot = resolve(String(args.values['backup-dir'] ?? '').trim() || join(homedir(), 'qqbot-forget-backups'));
+  const withDigest = args.flags.has('with-digest');
+  const withMedia = args.flags.has('with-media');
+  let plan;
+  try {
+    plan = await planForget({
+      key: parsed.key,
+      cwd,
+      memoryDir: memoryDir.length > 0 ? memoryDir : undefined,
+      mediaDir: mediaDir.length > 0 ? mediaDir : undefined,
+      sessionsRoot,
+      sessionsDir: sessionsDir.length > 0 ? resolve(sessionsDir) : undefined,
+      withMedia,
+    });
+  } catch (error) {
+    return fail('forget', platform, errorText(error));
+  }
+  const target = plan.target;
+  const sessionBytes = plan.generations.reduce((sum, item) => sum + item.bytes, 0);
+  const deletableMedia = plan.media.filter((item) => item.exists && !item.referencedElsewhere);
+  const nothing = !plan.conversation.exists
+    && plan.index.removed === 0
+    && plan.stats.removed === 0
+    && plan.history.length === 0
+    && plan.generations.length === 0
+    && !(withDigest && plan.digest.exists)
+    && !(withMedia && deletableMedia.length > 0);
+
+  say(`会话 ${target.key} → 第 ${plan.round.count} 轮${plan.round.exists ? '' : '（没有 reset 标记，按第 0 轮算）'}`);
+  say(`  长期记忆：${plan.conversation.exists ? `${forgetLocation(target.conversationDir)}（${plan.conversation.files} 个文件 / ${formatBytes(plan.conversation.bytes)}）` : '没有'}`);
+  say(`  索引引用：INDEX.md ${plan.index.removed} 行；派生统计 ${plan.stats.removed} 条`);
+  if (plan.stats.error !== undefined) say(`  注意：memory.index.json 读不了（${plan.stats.error}），不会覆盖它`);
+  say(`  旧版本备份：${plan.history.length} 个（.history 里的 conversations/${target.slug}/MEMORY.md.*）`);
+  say(`  会话存档：${plan.generations.length} 个${plan.generations.length > 0 ? `（第 ${plan.generations[0].generation}..${plan.generations[plan.generations.length - 1].generation} 轮，共 ${formatBytes(sessionBytes)}）` : ''}`);
+  say(`  摘要会话：${plan.digest.exists ? '存在（所有会话共用；--with-digest 才删）' : '没有'}`);
+  if (withMedia) say(`  媒体引用：${plan.media.length} 个，其中可删 ${deletableMedia.length} 个`);
+
+  if (nothing) {
+    say('磁盘上没有这个会话的长期记忆 / 索引引用 / 会话存档，没什么可清。');
+    return conclude('forget', platform, {
+      steps: [{ id: 'forget-noop', status: 'skipped', requires: 'human', command: '', note: '没有可清的内容' }],
+    });
+  }
+
+  const backupPath = join(backupRoot, `${target.slug}-<时间>`);
+  if (!applyMode) {
+    const steps = [
+      { id: 'forget-backup', status: 'planned', requires: 'human', command: '', note: `会先备份到 ${backupPath}` },
+      {
+        id: 'forget-memory',
+        status: plan.conversation.exists ? 'planned' : 'skipped',
+        requires: 'human',
+        command: plan.conversation.exists ? `rm -rf ${target.conversationDir}` : '',
+        note: plan.conversation.exists ? `${plan.conversation.files} 个文件（${formatBytes(plan.conversation.bytes)}）` : '没有长期记忆目录',
+      },
+      {
+        id: 'forget-index',
+        status: plan.index.removed + plan.stats.removed > 0 ? 'planned' : 'skipped',
+        requires: 'human',
+        command: '',
+        note: `INDEX.md ${plan.index.removed} 行 / 派生统计 ${plan.stats.removed} 条`,
+      },
+      {
+        id: 'forget-history',
+        status: plan.history.length > 0 ? 'planned' : 'skipped',
+        requires: 'human',
+        command: '',
+        note: `${plan.history.length} 个 .history 旧版本备份`,
+      },
+      {
+        id: 'forget-sessions',
+        status: plan.generations.length > 0 ? 'planned' : 'skipped',
+        requires: 'human',
+        command: '',
+        note: `${plan.generations.length} 个 DSH 会话存档`,
+      },
+      {
+        id: 'forget-round',
+        status: plan.round.exists || plan.generations.length > 0 ? 'planned' : 'skipped',
+        requires: 'human',
+        command: '',
+        note: `reset 代次 ${plan.round.count} → ${plan.nextRound}`,
+      },
+    ];
+    if (withDigest) {
+      steps.push({
+        id: 'forget-digest',
+        status: plan.digest.exists ? 'planned' : 'skipped',
+        requires: 'human',
+        command: '',
+        note: plan.digest.exists ? '摘要会话（所有会话共用）' : '没有摘要会话',
+      });
+    }
+    if (withMedia) {
+      steps.push({
+        id: 'forget-media',
+        status: deletableMedia.length > 0 ? 'planned' : 'skipped',
+        requires: 'human',
+        command: '',
+        note: `删除 ${deletableMedia.length} 个只被这个会话引用的 .qq-media 文件`,
+      });
+    }
+    say(`只是计划：加 --apply 才会先备份再删（备份默认在 ${backupRoot}）。`);
+    say('注意：qqbot 正在跑的话，进程内存里可能还握着这个会话 —— 重启（或设置页「重置」）之后才彻底生效；代次已经推进，重启不会 resume 旧会话。');
+    return conclude('forget', platform, { steps });
+  }
+
+  let result;
+  try {
+    result = await applyForget(plan, { backupRoot, withDigest, withMedia });
+  } catch (error) {
+    return conclude('forget', platform, {
+      steps: [{ id: 'forget-apply', status: 'failed', requires: 'human', command: '', note: `清除失败：${errorText(error)}（备份在 ${backupPath}）` }],
+    });
+  }
+
+  const doneSteps = [
+    { id: 'forget-backup', status: 'done', requires: 'human', command: '', note: `备份在 ${result.backupDir}` },
+    {
+      id: 'forget-memory',
+      status: result.removedConversation ? 'done' : 'skipped',
+      requires: 'human',
+      command: '',
+      note: result.removedConversation ? `已删 ${forgetLocation(target.conversationDir)}` : '没有长期记忆目录',
+    },
+    {
+      id: 'forget-index',
+      status: result.prunedIndex + result.prunedStats > 0 ? 'done' : 'skipped',
+      requires: 'human',
+      command: '',
+      note: `INDEX.md 去掉 ${result.prunedIndex} 行；派生统计去掉 ${result.prunedStats} 条`,
+    },
+    {
+      id: 'forget-history',
+      status: result.removedHistory.length > 0 ? 'done' : 'skipped',
+      requires: 'human',
+      command: '',
+      note: result.removedHistory.length > 0 ? `已删 ${result.removedHistory.length} 个 .history 旧版本备份` : '没有旧版本备份',
+    },
+    {
+      id: 'forget-sessions',
+      status: result.removedSessions.length > 0 ? 'done' : 'skipped',
+      requires: 'human',
+      command: '',
+      note: `已删 ${result.removedSessions.length} 个 DSH 会话存档`,
+    },
+    {
+      id: 'forget-round',
+      status: result.wroteRound ? 'done' : 'skipped',
+      requires: 'human',
+      command: '',
+      note: result.wroteRound ? `reset 代次 ${plan.round.count} → ${result.nextRound}` : '没有 reset 标记，也没有会话存档，不需要推进',
+    },
+  ];
+  if (withDigest) {
+    doneSteps.push({
+      id: 'forget-digest',
+      status: result.removedDigest ? 'done' : 'skipped',
+      requires: 'human',
+      command: '',
+      note: result.removedDigest ? '已删摘要会话' : '没有摘要会话',
+    });
+  }
+  if (withMedia) {
+    doneSteps.push({
+      id: 'forget-media',
+      status: result.removedMedia.length > 0 ? 'done' : 'skipped',
+      requires: 'human',
+      command: '',
+      note: result.removedMedia.length > 0 ? `已删 ${result.removedMedia.length} 个 .qq-media 文件` : '没有可删的媒体',
+    });
+  }
+
+  say(`已备份到 ${result.backupDir}`);
+  say(`长期记忆：${result.removedConversation ? '已删除' : '没有'}；索引引用：${result.prunedIndex} 行 / ${result.prunedStats} 条；旧版本：${result.removedHistory.length} 个；会话存档：${result.removedSessions.length} 个`);
+  say(`reset 代次：${plan.round.count} → ${result.nextRound}（旧会话不会再被 resume）`);
+  say('注意：如果 qqbot 正在跑，进程内存里可能还握着这个会话 —— 重启（或设置页「重置」）之后才彻底生效。');
+  return conclude('forget', platform, { steps: doneSteps });
+}
+
+// ---------------------------------------------------------------------------
 // 命令：selftest
 // ---------------------------------------------------------------------------
 
@@ -1634,13 +1843,21 @@ function printUsage() {
     '  node scripts/ops.mjs napcat config|start|autologin|webui [--apply]',
     '  node scripts/ops.mjs migrate cognition [--apply] [--json]',
     '  node scripts/ops.mjs cleanup jm [--apply] [--json]',
+    '  node scripts/ops.mjs forget group:<群号>|private:<QQ号> [--apply] [--with-digest] [--with-media] [--json]',
     '  node scripts/ops.mjs selftest [--json]',
     '',
     '通用参数：',
     '  --apply        真的写 / 删（默认只打印计划）',
     '                 install / uninstall：只执行 workspace 步骤，cwd 外的写一律拒绝（退出码 2）',
-    '                 napcat / cleanup / migrate：--apply 就是「我授权改 cwd 外 / 删数据」，仍拒绝需要提权的步骤',
+    '                 napcat / cleanup / migrate / forget：--apply 就是「我授权改 cwd 外 / 删数据」，仍拒绝需要提权的步骤',
     '  --json         只往 stdout 打一个 JSON 对象（schema / ok / action / platform / findings / steps），人话走 stderr',
+    '  --with-digest   forget 时连摘要会话（bridge:digest）一起删（所有会话共用，默认保留）',
+    '  --with-media    forget 时删掉只被这个会话引用、别处不再引用的 .qq-media 缓存图',
+    '  --backup-dir <目录>  forget 的备份位置（默认 ~/qqbot-forget-backups）',
+    '  --sessions-root <目录>  DSH 会话根目录（默认 <dsh-home>/sessions，reset 标记也在这里）',
+    '  --sessions-dir <目录>   直接指定这个 cwd 的会话项目目录（默认按 DSH 的 projectKey 推导）',
+    '  --memory-dir <目录>     forget 的记忆目录（默认 .qq-memory；配了 memoryDir 的部署才需要）',
+    '  --media-dir <目录>      forget 的媒体目录（默认 .qq-media；配合 --with-media）',
     '  --fix          doctor 只做 cwd 内的修复（建 data/、写 .env.example）',
     '  --qq <号>      机器人 QQ 号（install / napcat autologin 用）',
     '  --profile <名> DSH profile 名（默认 qqbot）',
@@ -1696,6 +1913,8 @@ async function main() {
       return await commandMigrate(platform, sub);
     case 'cleanup':
       return await commandCleanup(platform, sub);
+    case 'forget':
+      return await commandForget(platform, sub);
     case 'selftest':
       return await commandSelftest(platform);
     default:

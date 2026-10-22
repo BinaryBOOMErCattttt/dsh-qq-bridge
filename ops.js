@@ -46,7 +46,7 @@ export const OPS_SCHEMA = 1;
 export const OPS_ACTIONS = ['status', 'restart', 'logs', 'install', 'uninstall', 'autostart'];
 
 /** CLI 认识的一级命令（`scripts/ops.mjs` 与这里共用，免得两边各记一份）。 */
-export const OPS_COMMANDS = ['doctor', 'status', 'restart', 'logs', 'install', 'uninstall', 'napcat', 'migrate', 'cleanup', 'selftest'];
+export const OPS_COMMANDS = ['doctor', 'status', 'restart', 'logs', 'install', 'uninstall', 'napcat', 'migrate', 'cleanup', 'forget', 'selftest'];
 
 /**
  * 步骤 / finding 的「谁来执行」三分类。
