@@ -35,6 +35,7 @@ import { mkdir, readFile } from 'node:fs/promises';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { OneBotClient, atMentions, blankMessageLabel, collectMedia, findReply, isEmojiOnlyMessage, isStickerSegment, mediaPlaceholder, mentions, mentionsOthers, messageToText, repeatableText, userDisplayName } from './onebot.js';
 import { createMediaStore } from './media.js';
+import { createStickerFrames } from './sticker-frames.js';
 import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
 import { endpointTarget, findNapcatDir, repairNapcat } from './napcat.js';
@@ -435,6 +436,22 @@ export function apply(ctx, config) {
   });
 
   /**
+   * 已收藏的动图表情也要看得见动作：`sticker-frames.js` 在后台把收藏目录里的 GIF 拆成
+   * 分镜图（落在媒体目录的子目录里），表情包目录那一行会附上「哪张是动图、分镜图在哪」。
+   * 媒体下载关掉时不写任何东西（分镜图也是下载链路的产物，`mediaDir` 同样必须在 cwd 里）。
+   */
+  const stickerFrames = createStickerFrames({
+    cwd,
+    stickerDir: settings.stickerDir,
+    mediaDirectory: mediaStore.directory,
+    enabled: mediaStore.enabled,
+    report,
+  });
+  // 启动就扫一遍收藏目录：已收藏的动图不用等到下一次存图才有分镜图。
+  // 扫描在后台跑（每张之间让出事件循环），不挡连接与消息链路。
+  stickerFrames.refreshSoon();
+
+  /**
    * 出站图片（表情包）的开关、上限与表情包目录。
    *
    * 和入站那半边（mediaStore）刚好反过来：那边把 QQ 的图落到本地给模型看，这边把
@@ -526,6 +543,7 @@ export function apply(ctx, config) {
     imageAllowed,
     allowTools,
     canReadImages,
+    stickerFrames,
   });
   const {
     root: stickerRoot,
@@ -3324,7 +3342,7 @@ export function apply(ctx, config) {
             observation.meta = { ...observation.meta, coverPath: outcome.path };
             rendered.set(item.index, renderObservation(observation));
           } else {
-            rendered.set(item.index, mediaPlaceholder(item, outcome.path));
+            rendered.set(item.index, mediaPlaceholder(item, outcome.path, undefined, outcome.animation));
           }
           return;
         }

@@ -19,6 +19,9 @@ import { mkdir, readFile, readdir, stat, unlink, utimes, writeFile } from 'node:
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { inspectGif, planFrameSample } from './gif.js';
+import { storyboard } from './storyboard.js';
+
 /**
  * 支持的图片格式：魔数判定 + 落盘用的扩展名。
  * 顺序有意义：JPEG 的魔数最短，但四种之间没有歧义，任意顺序都可。
@@ -56,6 +59,12 @@ const DEFAULTS = {
   timeoutMs: 15000,
   concurrency: 4,
 };
+
+/** 分镜图最多拼几帧（与 `storyboard.js` 的默认值一致，三列两行）。 */
+const STORYBOARD_FRAMES = 6;
+
+/** 分镜图跟原图同一个内容哈希，只多一个后缀，读日志时一眼能对上。 */
+const STORYBOARD_SUFFIX = '-frames.png';
 
 /**
  * 按文件头判断图片格式。
@@ -337,6 +346,43 @@ export function createMediaStore({
   }
 
   /**
+   * 动图 → 一张分镜图（见 `gif.js` / `storyboard.js`）。
+   *
+   * 为什么在**入站落盘时**做，而不是等模型来要：模型的图片入口只收单帧，动图会被宿主
+   * 附件层按第一页重编码 —— 等它调用 `read_image` 的时候，动画早就没了。插件手里正好有
+   * 完整字节，顺手把「几帧拼一张」这个中间产物做好，占位符里指过去就行。
+   *
+   * 只在 GIF 且确实有多帧时生成；同一张动图重复发（内容哈希相同）直接复用旧文件，
+   * 只刷 mtime —— 它是 LRU 淘汰的依据，不然第二次发的时候分镜图会先被清掉。
+   *
+   * @param bytes - 已落盘的 GIF 字节。
+   * @param hash - 内容哈希（文件名前缀）。
+   * @returns `{ path, frames, durationMs, shown, truncated }`；静图（单帧）时 undefined。
+   * @throws 拆帧失败时（调用方只记一条 warn，不影响图片本身）。
+   */
+  async function storyboardFor(bytes, hash) {
+    const info = inspectGif(bytes);
+    if (info.frameCount <= 1) return undefined;
+    const plan = planFrameSample(info, { maxFrames: STORYBOARD_FRAMES });
+    const target = join(directory, `${hash}${STORYBOARD_SUFFIX}`);
+    const meta = {
+      path: displayPath(target),
+      frames: info.frameCount,
+      durationMs: info.durationMs,
+      shown: plan.indices.length,
+      truncated: plan.truncated,
+    };
+    const existing = await stat(target).catch(() => undefined);
+    if (existing?.isFile()) {
+      await utimes(target, new Date(), new Date()).catch(() => {});
+      return meta;
+    }
+    const built = storyboard(bytes, { maxFrames: STORYBOARD_FRAMES });
+    await writeFile(target, built.png);
+    return { ...meta, bytes: built.png.length };
+  }
+
+  /**
    * 把一个媒体段落到本地缓存。
    * @param media - `collectMedia()` 给出的媒体描述（kind/label/url/file/declaredBytes…）。
    * @returns 成功时 `{ path, bytes, cached }`；失败时 `{ error }` —— 永不抛错。
@@ -362,8 +408,20 @@ export function createMediaStore({
         } else {
           await writeFile(target, bytes);
         }
+        // 动图额外拆一张分镜图；失败只记 warn —— 图本身已经落盘，退回「看第一帧」也比丢消息好。
+        let animation;
+        if (ext === 'gif') {
+          try {
+            animation = await storyboardFor(bytes, hash);
+            if (animation?.bytes !== undefined) {
+              report('info', `media: gif storyboard → ${animation.path} (${animation.shown}/${animation.frames} frames, ${animation.bytes} bytes)`);
+            }
+          } catch (error) {
+            report('warn', `media: could not build the gif storyboard: ${reasonOf(error)}`);
+          }
+        }
         await prune();
-        return { path: displayPath(target), bytes: bytes.length, cached: existing?.isFile() === true };
+        return { path: displayPath(target), bytes: bytes.length, cached: existing?.isFile() === true, animation };
       } catch (error) {
         return { error: reasonOf(error) };
       }

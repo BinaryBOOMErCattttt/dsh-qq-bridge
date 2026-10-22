@@ -16,6 +16,7 @@ import { splitStickerLines } from '../onebot.js';
 import { imageSegment, loadOutgoingImage } from '../image.js';
 import { TINY_PNG, startImageServer, promptText, turnContextText, until, untilInbox, privateMessage, privateMessageWithImage, mention, completeTurn, sentTexts, bootImages } from './harness.mjs';
 import { cleanupBoots } from './harness.mjs';
+import { buildGif } from './gif-fixtures.mjs';
 
 after(async () => { await cleanupBoots(); });
 
@@ -84,10 +85,41 @@ test('loadOutgoingImage reads paths inside cwd and URLs, and refuses everything 
 });
 
 
+test('已收藏的动图表情会在目录里带上分镜图（原图只有第一帧）', async () => {
+  const { onebot, host, cwd } = await bootImages();
+  // 模拟「这个动图在升级之前就收藏好了」：目录里本来就有它，没人再发过。
+  await writeFile(join(cwd, '.qq-stickers', '转圈.gif'), buildGif({
+    width: 8,
+    height: 8,
+    palette: [[255, 0, 0], [0, 255, 0], [0, 0, 255], [9, 9, 9]],
+    frames: [
+      { width: 8, height: 8, indices: Array(64).fill(0), delayMs: 100 },
+      { width: 8, height: 8, indices: Array(64).fill(1), delayMs: 100 },
+    ],
+  }));
+  onebot.push(privateMessage('在吗'));
+  await untilInbox(host, 1);
+  // 目录行里的分镜图是后台扫出来的：等它落盘，再让下一轮重新装配目录。
+  await until(async () => (await readdir(join(cwd, '.qq-media/sticker-frames')).catch(() => [])).length > 0, 'the sticker storyboard to be generated');
+  onebot.push(privateMessage('再看看'));
+  const agent = await untilInbox(host, 2);
+  const context = await until(
+    () => agent.inbox.map((message) => message.content.slice(1).map((block) => block.text ?? '').join('\n')).find((text) => text.includes('分镜图')),
+    'the catalogue to point at the sticker storyboard',
+  );
+  const match = /转圈\.gif（2 帧）→ (\.qq-media\/sticker-frames\/[0-9a-f]{32}\.png)/.exec(context);
+  assert.ok(match, context);
+  const sheet = await readFile(join(cwd, match[1]));
+  assert.equal(sheet.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+});
+
 test('qq_send_image sends a sticker to the QQ conversation the calling Agent belongs to', async () => {
   const { onebot, host } = await bootImages();
   onebot.push(privateMessage('在吗'));
-  const agent = await until(() => host.list.created[0], 'the conversation Agent');
+  // 等消息真的投进收件箱，而不是只等 Agent 被建出来：`sessionIndex`（工具据此反查
+  // 「我是哪个会话的 Agent」）是在 `ensureAgent` 收尾时才写的，抢在投递之前调工具
+  // 会偶发地拿不到目标（见 AGENTS §8 的 `untilInbox` 约定）。
+  const agent = await untilInbox(host, 1, 'the private Agent');
 
   const tool = host.tools.get('qq_send_image');
   assert.ok(tool, 'qq_send_image should be registered');

@@ -54,6 +54,33 @@ test('mediaPlaceholder 的三种既有文案逐字不变', () => {
   assert.equal(mediaPlaceholder({ kind: 'image', label: 'x' }, undefined, undefined), '[图片(x)]');
 });
 
+test('mediaPlaceholder：动图带上分镜图、帧数与时长（模型只有这条路能看见「动」）', () => {
+  const animation = {
+    path: '.qq-media/ab12-frames.png',
+    frames: 8,
+    durationMs: 1234,
+    shown: 6,
+    truncated: false,
+  };
+  assert.equal(
+    mediaPlaceholder({ kind: 'image', label: '动画表情' }, '.qq-media/ab12.gif', undefined, animation),
+    '[图片(动画表情): .qq-media/ab12.gif（动图 8 帧 / 1.2 秒；分镜图 .qq-media/ab12-frames.png，从左到右、从上到下按时间顺序，要理解这段动画读它）]',
+  );
+  // 只截了前几帧时必须说明，否则模型会以为整段就这几帧。
+  assert.equal(
+    mediaPlaceholder({ kind: 'mface', label: '猫' }, '.qq-media/cd.gif', undefined, { ...animation, frames: 120, shown: 6, truncated: true }),
+    '[表情包(猫): .qq-media/cd.gif（动图 120 帧 / 1.2 秒，这里只取了前 6 帧；分镜图 .qq-media/ab12-frames.png，从左到右、从上到下按时间顺序，要理解这段动画读它）]',
+  );
+  // 没有分镜图（静图 / 拆帧失败）时与旧文案逐字一致。
+  assert.equal(mediaPlaceholder({ kind: 'image', label: '动画表情' }, '.qq-media/ab12.gif', undefined, undefined), '[图片(动画表情): .qq-media/ab12.gif]');
+  assert.equal(mediaPlaceholder({ kind: 'image', label: '动画表情' }, '.qq-media/ab12.gif', undefined, { path: '' }), '[图片(动画表情): .qq-media/ab12.gif]');
+  // 失败文案不会因为多传一个分镜对象而变化。
+  assert.equal(
+    mediaPlaceholder({ kind: 'image', label: '' }, '', 'HTTP 404', animation),
+    '[图片 没能取到文件: HTTP 404]',
+  );
+});
+
 // ---------------------------------------------------------------------------
 // 文字 / @ / 回复：老行为一个字都不能变（`@bot你好` 靠 skipAtId 变成 `你好`）。
 // ---------------------------------------------------------------------------

@@ -13,7 +13,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { collectMedia, mediaLabel, mediaPlaceholder, messageToText } from '../onebot.js';
 import { createMediaStore, sniffImageExtension } from '../media.js';
-import { SELF_ID, TINY_PNG, startImageServer, promptText, turnContextText, until, privateMessageWithImage, privateMessageWithReply, groupMessage, mention, boot } from './harness.mjs';
+import { PIC_GIF_ANIM } from './image-fixtures.mjs';
+import { SELF_ID, TINY_PNG, startImageServer, promptText, turnContextText, until, untilInbox, privateMessageWithImage, privateMessageWithReply, groupMessage, mention, boot } from './harness.mjs';
 import { cleanupBoots } from './harness.mjs';
 
 after(async () => { await cleanupBoots(); });
@@ -98,6 +99,31 @@ test('an inbound image is downloaded so the agent can actually read it', async (
 });
 
 
+// 用例二十二之二：动图（GIF）除了落盘，还多一张分镜图 —— 模型那边只看得见第一帧，
+// 真正的「动作」全靠这张拼图。占位符必须把两者的关系说清楚。
+test('an animated gif comes with a storyboard the model can actually see', async () => {
+  const images = await startImageServer(PIC_GIF_ANIM);
+  const mediaRoot = await mkdtemp(join(tmpdir(), 'qq-media-anim-'));
+  const { onebot, host } = await boot({ cwd: mediaRoot, mediaDir: 'media' });
+  try {
+    onebot.push(privateMessageWithImage(images.url(), { text: '你看这个' }));
+    await until(() => host.list.created[0]?.inbox.length === 1, 'the animated image to be delivered');
+    const body = host.list.created[0].inbox[0].content[0].text;
+    const match = /\[图片\(动画表情\): (media\/[0-9a-f]{32}\.gif)（动图 2 帧 \/ 0\.2 秒；分镜图 (media\/[0-9a-f]{32}-frames\.png)，从左到右、从上到下按时间顺序，要理解这段动画读它）\]你看这个/.exec(body);
+    assert.ok(match, body);
+    // 原图是原字节；分镜图是真的 PNG，两张都在缓存目录里。
+    assert.deepEqual(await readFile(join(mediaRoot, match[1])), PIC_GIF_ANIM);
+    const sheet = await readFile(join(mediaRoot, match[2]));
+    assert.equal(sheet.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+    assert.deepEqual((await readdir(join(mediaRoot, 'media'))).sort(), [match[2].slice('media/'.length), match[1].slice('media/'.length)].sort());
+  } finally {
+    await onebot.close();
+    await images.close();
+    await rm(mediaRoot, { recursive: true, force: true });
+  }
+});
+
+
 // 用例二十三：同一张图反复发只存一份；超过上限就按最近使用时间淘汰最旧的。
 test('the media cache dedupes by content and evicts the oldest files', async () => {
   const images = await startImageServer(TINY_PNG);
@@ -168,8 +194,9 @@ test('images in group chatter are downloaded unless ambientMedia is off', async 
     await new Promise((resolve) => setTimeout(resolve, 150));
     assert.equal(quietImages.hits.length, 0, 'ambient images must not be downloaded when ambientMedia is off');
     quiet.onebot.push(mention('这啥', { messageId: 22 }));
-    await until(() => quiet.host.list.created[0], 'the group Agent');
-    const prompt = turnContextText(quiet.host.list.created[0]);
+    // 等投递完成再读正文：「本轮情境」是在投递那一刻拼好的，只看 created 会抢在它之前。
+    const quietAgent = await untilInbox(quiet.host, 1, 'the group Agent');
+    const prompt = turnContextText(quietAgent);
     assert.ok(prompt.includes('[图片(动画表情)]'), prompt);
     // 只断言「没有真的落盘路径」：提示词里作为例子提到 `.qq-media/…` 是另一回事。
     assert.ok(!/media\/[0-9a-f]{32}\./.test(prompt), prompt);

@@ -74,6 +74,31 @@ export function mediaLabel(summary) {
 }
 
 /**
+ * 动图分镜图的说明（`mediaPlaceholder` 的第四段）。
+ *
+ * 为什么非要写进占位符：模型对一张 3×2 的拼图默认会当成「一张奇怪的图」，
+ * 不告诉它「这是按时间排的」，它就会去描述每一格而看不出动作。也正因为动图在模型的
+ * 图片入口会被压成第一帧（见 gif.js 的文件头），这条路径是它**唯一**能看见过程的入口。
+ *
+ * @param animation - `media.js` 落盘时给出的 `{ path, frames, durationMs, shown, truncated }`。
+ * @returns 形如 `（动图 8 帧 / 1.2 秒；分镜图 .qq-media/ab-frames.png，从左到右、从上到下按时间顺序，要理解这段动画读它）`；
+ *   没有分镜图时为空串。
+ */
+function animationNote(animation) {
+  if (animation === null || typeof animation !== 'object') return '';
+  const path = typeof animation.path === 'string' ? animation.path.trim() : '';
+  if (path.length === 0) return '';
+  const frames = Number(animation.frames);
+  const shown = Number(animation.shown);
+  const seconds = Number(animation.durationMs) / 1000;
+  const head = Number.isFinite(frames) && frames > 1 ? `动图 ${frames} 帧` : '动图';
+  const timing = Number.isFinite(seconds) && seconds > 0 ? ` / ${seconds.toFixed(1)} 秒` : '';
+  // 只截了前几帧时要说清楚，否则模型会以为这就是全部（一个大动图的开头往往看不出梗）。
+  const clipped = animation.truncated === true && Number.isFinite(shown) && shown > 0 ? `，这里只取了前 ${shown} 帧` : '';
+  return `（${head}${timing}${clipped}；分镜图 ${path}，从左到右、从上到下按时间顺序，要理解这段动画读它）`;
+}
+
+/**
  * 媒体段的替身文本：模型看到的「这里有张图」以及它该去读哪个文件。
  *
  * 三种情况分开写，因为它们对模型的含义完全不同：
@@ -87,12 +112,13 @@ export function mediaLabel(summary) {
  * @param media - 媒体描述：`{ kind, label }`（`collectMedia()` 给出的是超集）。
  * @param localPath - 已落盘的相对路径；空串表示没有。
  * @param reason - 失败原因；给出时附在占位符里。
+ * @param animation - 动图分镜信息（见 {@link animationNote}）；静图不传。
  * @returns 例如 `[图片(动画表情): .qq-media/ab12….gif]`。
  */
-export function mediaPlaceholder(media, localPath = '', reason = '') {
+export function mediaPlaceholder(media, localPath = '', reason = '', animation = undefined) {
   const kind = media?.kind === 'mface' ? '表情包' : '图片';
   const label = typeof media?.label === 'string' && media.label.length > 0 ? `(${media.label})` : '';
-  if (typeof localPath === 'string' && localPath.length > 0) return `[${kind}${label}: ${localPath}]`;
+  if (typeof localPath === 'string' && localPath.length > 0) return `[${kind}${label}: ${localPath}${animationNote(animation)}]`;
   if (typeof reason === 'string' && reason.length > 0) return `[${kind}${label} 没能取到文件: ${reason}]`;
   return `[${kind}${label}]`;
 }

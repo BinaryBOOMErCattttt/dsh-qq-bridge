@@ -30,11 +30,12 @@ const STICKER_PROMPT_MAX = 40;
  *   - `memory`：只用于 `appendSticker` / `renameSticker` / `catalog`；
  *   - `imageMaxBytes`：存图前的字节上限（与出站图片共用）；
  *   - `imageAllowed` / `allowTools` / `canReadImages`：三个白名单口径与「能不能看图」；
+ *   - `stickerFrames`：已收藏动图的分镜图索引（`sticker-frames.js`，可缺省）；
  *   - `loadOutgoingImage` 等叶子能力直接 import，不走 deps。
  * @returns 见文件末尾的返回对象；`index.js` 会把每个字段解构成同名函数。
  */
 export function createStickerStore(deps) {
-  const { settings, cwd, report, memory, imageMaxBytes, imageAllowed, allowTools, canReadImages } = deps;
+  const { settings, cwd, report, memory, imageMaxBytes, imageAllowed, allowTools, canReadImages, stickerFrames } = deps;
 
   const stickerMaxFiles = settings.stickerMaxFiles;
   const stickerRoot = settings.stickerDir.trim().length > 0 ? resolve(cwd, settings.stickerDir.trim()) : undefined;
@@ -89,6 +90,9 @@ export function createStickerStore(deps) {
    * 目录优先用 STICKERS.md 的「名字（含义）→ 路径」（模型看含义就能判断该不该发，看裸
    * 文件名只能猜）；没有目录文件（旧部署 / 记忆关掉）时退回裸文件名。
    *
+   * 动图还会多一行「这张动图的分镜图在哪」（`sticker-frames.js` 后台扫出来的）：只看目录
+   * 里的 `.gif` 路径，模型读到的永远是第一帧。
+   *
    * @param conversation - 目标会话。
    * @returns 要拼进「本轮情境」的那几行。
    */
@@ -97,23 +101,28 @@ export function createStickerStore(deps) {
     const catalog = memory.enabled ? memory.catalog() : { stickers: [], catalog: false };
     const names = stickerNames();
     const entries = catalog.stickers.length > 0 ? catalog.stickers : names;
-    const key = entries.join('\u0000');
+    const sheetLines = stickerFrames?.lines?.() ?? [];
+    // 分镜图是后台补齐的：把它算进「目录有没有变」，补好之后下一次装配提示词时目录会再发一次。
+    const key = `${entries.join('\u0000')}\u0001${sheetLines.join('\u0000')}`;
     const generation = conversation.sessionGeneration ?? 0;
     const ledger = conversation.stickerCatalog;
     if (ledger !== undefined && ledger.generation === generation && ledger.key === key) return [];
     conversation.stickerCatalog = { generation, key };
+    // 目录内容变了：顺手重扫一遍收藏目录里的动图（新存的、手动丢进来的都能补上分镜图）。
+    stickerFrames?.refreshSoon?.();
+    const withSheets = (lines) => (sheetLines.length === 0 ? lines : [...lines, ...sheetLines]);
     const readHint = canReadImages() ? '，目录里没有的再 read_image 看一眼' : '';
     if (catalog.stickers.length > 0) {
-      return [
+      return withSheets([
         `- 你自己的表情包（名字（含义）→ 完整路径；想发哪张就把箭头后面的路径**原样**抄进标记里，别自己拼或改扩展名）${readHint}：${entries.join('、')}`,
-      ];
+      ]);
     }
     if (names.length > 0) {
-      return [
+      return withSheets([
         `- 你自己的表情包在 ${stickerLabel}/ 里：${names.join('、')}。文件名通常就是它的意思${readHint}；想发哪张就把它的路径写进标记里。`,
-      ];
+      ]);
     }
-    return [`- 你自己的表情包目录 ${stickerLabel}/ 目前是空的，没有现成的表情包可挑（别人刚发的图要先 qq_save_sticker 存下来才能发）。`];
+    return withSheets([`- 你自己的表情包目录 ${stickerLabel}/ 目前是空的，没有现成的表情包可挑（别人刚发的图要先 qq_save_sticker 存下来才能发）。`]);
   }
 
   /**
@@ -291,6 +300,8 @@ export function createStickerStore(deps) {
         report('warn', `could not add ${path} to the sticker catalogue: ${errorText(error)}`);
       }
     }
+    // 新收藏的如果是动图，顺手把分镜图补上（下一次目录变化时那一行就会出现）。
+    stickerFrames?.refreshSoon?.();
     return { path, bytes: image.bytes.length, format: image.format, source: image.label, catalog };
   }
 
@@ -375,6 +386,8 @@ export function createStickerStore(deps) {
       catalog = `updated ${memory.label}/STICKERS.md (${written.section})`;
     }
     report('info', `sticker renamed: ${previous} → ${path} (${size} bytes)`);
+    // 文件名变了，对照表里的名字要跟着换（分镜图按内容哈希存，不用重拆）。
+    stickerFrames?.refreshSoon?.();
     return { path, previous, bytes: size, renamed: true, catalog };
   }
 
