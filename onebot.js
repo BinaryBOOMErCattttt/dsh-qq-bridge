@@ -643,11 +643,19 @@ export class OneBotClient {
       this.#dispatch(payload);
     };
     socket.onerror = () => {
-      // onerror 之后必定跟一次 onclose，重连统一在那里安排。
+      // 常态是 onerror 之后跟一次 onclose（重连在那边统一安排），但 Node 22 的全局
+      // WebSocket 在「连接被拒」时只发 error、不发 close（22.23.1 实测；26.x 才补齐）。
+      // 只挂在 onclose 上，重连就会在第一轮之后永久停摆 —— 部署在 Node 22 上的实例
+      // 一遇到 NapCat 重启就再也不回来了。所以这里兜一次：`#scheduleRetry` 自带
+      // `#retryTimer` 幂等保护，close 随后到达时不会排出第二个定时器。
       this.#onError(new Error(`onebot: socket error on ${this.#endpoint}`));
+      if (this.#socket === socket) this.#scheduleRetry();
     };
     socket.onclose = () => {
-      if (this.#socket === socket) this.#socket = null;
+      // 认的是「当前这一个」socket：重连可能已经换上新的了，旧连接迟到的 close
+      // 不该把新连接的在途调用清掉、也不该再排一次重连（那会开出第二条 socket）。
+      if (this.#socket !== socket) return;
+      this.#socket = null;
       // 连接没了，所有在途 API 调用都不可能再有响应，直接全部拒绝。
       this.#settleAll(new Error('onebot: connection closed'));
       if (this.#connected) {
