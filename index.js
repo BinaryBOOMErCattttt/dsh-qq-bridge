@@ -1320,6 +1320,11 @@ export function apply(ctx, config) {
     if (conversation.pendingIntent === 'recall') {
       return '这一轮是插件在提醒你：刚才有人说的话被撤回了。';
     }
+    // 空回复之后的重问：这条 user message 是插件写的，不是对方真的又说了什么 ——
+    // 说成「又接了一句」会让模型回一句「接什么？」，说成「刚跟你说话的人」又像一次新提问。
+    if (conversation.pendingIntent === 'retry') {
+      return '这一轮是插件在提醒你：你上一条回复没有写出要发的话，那一轮什么都没发出去；按刚才的话题直接接上就行。';
+    }
     const speakers = conversation.speakers ?? [];
     if (conversation.pendingIntent === 'interject') {
       // 插话轮：这句不是冲它来的。元信息已经写在 user message 里了，这里只说清场景，
@@ -3303,6 +3308,30 @@ export function apply(ctx, config) {
     ].join('\n');
   }
 
+  /**
+   * 模型空回复之后那条「重问」。
+   *
+   * 2026-10-22 23:50 的真实事故：私聊里模型最后一步只输出了思考，没有正文
+   * （`deepseek-flash` 偶发；思考里已经写好了「不想说就不说 / 还拿我顶着盆的图来挡」），
+   * 插件把它当空回复静默丢了。对方等了半分钟发「？」，它下一轮还回了「上一条说秃了」——
+   * 那句话只存在于它自己的思考里，QQ 上从来没出现过。
+   *
+   * 空回复不是「选择不说」（那是 `SKIP`），而是这一轮**没有产出可发的东西**；对着一个
+   * 真人的轮次不能就这么算了。重问一次的成本远小于让人干等，而且模型通常第二次就能把
+   * 话说出来（它上一轮的思考里已经有了答案）。只说清「那一轮什么都没发出去」，不解释
+   * 机制、不让它道歉 —— 否则回复会变成一句「刚才卡了一下」，那比不说话更像机器人。
+   *
+   * 这条消息会留在会话历史里，所以它必须说清「不是对方发来的」；重问也只会发生一次
+   * （见 `emptyRetry`），不会和模型互相追问下去。
+   */
+  function emptyReplyNudge() {
+    return [
+      '（这不是对方发来的消息，是插件在提醒你：你上一条回复没有写出要发的话，那一轮什么都没发出去。现在直接把要说的话写出来。）',
+      '',
+      '别解释这条提醒，直接把要说的话发出来；像平时那样接话就行。',
+    ].join('\n');
+  }
+
   // ---- 媒体：入站图片与引用的落盘 --------------------------------------------------------
 
   /**
@@ -4137,12 +4166,56 @@ export function apply(ctx, config) {
       if (owner.proactive !== true) void sendToConversation(conversation, '（我这边处理时出错了，稍后再试试）');
       return;
     }
-    if (reply.length === 0) return;
+    if (reply.length === 0) {
+      // 空回复有两种：模型**选择**不说（那会写成 `SKIP`，下面才处理）与这一轮**没产出**
+      // （只写了思考 / 工具调用完就停了）。后者当空回复静默丢掉，QQ 那头看到的就是
+      // 「它没理人」，而模型下一轮还会以为自己说过 —— 它的思考里已经写好了那句话
+      // （真实事故：2026-10-22 23:50 私聊，对方等了半分钟发「？」，它回「上一条说秃了」）。
+      //
+      // 所以对着真人的轮次重问一次：主动搭话 / 补一句 / 撤回调侃（`proactive`）本来就
+      // 可以不说，重问只会平白多一次开口。`emptyRetry` 保证只重问一次，不会循环；
+      // 还有消息等着回（攒批窗口 / 积压一波）时也不重问，那些消息马上会换来一轮回复。
+      const waiting = conversation.pending.length > 0 || (conversation.submitting ?? 0) > 0;
+      if (reason === 'completed' && owner.proactive !== true && owner.emptyRetry !== true && !waiting) {
+        const retryIntent = owner.intent ?? conversation.pendingIntent ?? 'addressed';
+        report('info', `→ ${conversation.key}: 模型这一轮没有写出正文（turn ${event.data.turn}），重问一次`);
+        void enqueue(conversation, async () => {
+          try {
+            const agent = await ensureAgent(conversation);
+            // 重问这一轮的情境用 `retry`：`speakerLine` 得说清「这条不是谁发来的」，
+            // 原来的 `continued` / `interject` 会让它以为对方又接了一句 / 群里又有人说话了。
+            conversation.pendingIntent = 'retry';
+            const userMessage = userMessageFor(conversation, emptyReplyNudge());
+            submitted.set(userMessage.id, {
+              key: conversation.key,
+              quote: owner.quote,
+              // 发送侧的意图仍是原来那个（决定挂不挂引用 / @），与情境用的 `retry` 分开。
+              intent: retryIntent,
+              // 账上那几条消息的「已回复」要等重问真正发出去时才记（与普通轮次一致）。
+              batchIds: owner.batchIds,
+              // 空消息那一轮本来就没有话题，重问发出去之后也别再追一句「补一句」。
+              blank: owner.blank,
+              emptyRetry: true,
+              at: Date.now(),
+            });
+            agent.followup(userMessage);
+          } catch (error) {
+            // 重问起不来就算了（`enqueue` 的兜底会在群里发一句「我这边出错了」，
+            // 那一句对「模型空回复」这件事没有帮助）。
+            report('warn', `empty-reply retry for ${conversation.key} could not start: ${errorText(error)}`);
+          }
+        });
+        return;
+      }
+      conversation.pendingIntent = undefined;
+      report('info', `→ ${conversation.key}: 模型这一轮没有正文可发（turn ${event.data.turn}），不发消息`);
+      return;
+    }
     // `SKIP` 是**这一条会话本身**的「不说了」信号，不是「主动搭话」才有的信号：提醒
     // （`proactiveNudge` / `chimeNudge`）虽然只在那两种轮次里发，但它落在同一个会话的
     // 上下文里，模型照样可能在回别人的那一轮里学着写出来。一旦漏判，群里收到的就是
-    // 一句字面的 `SKIP` —— 它本来是用来「什么都不做」的。空回复在上面的 length 判断里
-    // 就已经静默丢弃了，这里只管那个词。
+    // 一句字面的 `SKIP` —— 它本来是用来「什么都不做」的。空回复在上一段就重问 / 丢弃了，
+    // 这里只管那个词。
     //
     // 放在最前面（而不是只放在主动搭话那一支）是必须的：真正会「引用」一条消息的正是
     // 回别人的那一轮 —— 主动搭话的 `quote` 永远是空的（没人跟它说话），所以

@@ -15,6 +15,23 @@ import { cleanupBoots } from './harness.mjs';
 after(async () => { await cleanupBoots(); });
 
 
+/**
+ * 模拟「模型只写了思考、没有写出正文」的一轮：认领 → 只有 reasoning 块 → turn/end。
+ *
+ * 2026-10-22 私聊的真实事故：模型最后一步只返回了 reasoning（要发的话就写在里面），
+ * 没有任何 text 块 —— 插件当时把空回复静默丢掉了，对方等半分钟只等到一个「？」。
+ */
+function emptyAssistantTurn(host, agent, turn) {
+  const session = { id: agent.id };
+  host.list.emit('agent/inbox/claimed', { agent, message: agent.inbox[agent.inbox.length - 1], turn });
+  host.list.emit('session/event', session, {
+    type: 'assistant/message',
+    data: { turn, step: 1, message: { content: [{ type: 'reasoning', text: '想好了要发的话，但只写在思考里' }] } },
+  });
+  host.list.emit('session/event', session, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } });
+}
+
+
 // 用例十五：自动回复拆成几条短消息，而不是一屏糊上来；条与条之间有打字间隔。
 test('an automatic reply is burst into short messages', async () => {
   const reply = '今天天气不错。要不出去走走？顺便吃个饭吧！';
@@ -44,6 +61,51 @@ test('an automatic reply is burst into short messages', async () => {
     assert.ok(sent.every((part) => part.length <= 12));
     // 两条间隔 × 30ms：证明「打字延迟」真的按配置生效，而不是一口气发完。
     assert.ok(Date.now() - started >= 50, 'the burst should be paced out, not sent at once');
+  } finally {
+    await onebot.close();
+  }
+});
+
+
+// 用例十五·补：模型只写了思考、没有正文时，重问一次而不是静默丢人。
+test('an empty assistant message is re-asked once instead of leaving the user hanging', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(privateMessage('睡了吗'));
+    const agent = await untilInbox(host, 1, 'the private message');
+    emptyAssistantTurn(host, agent, 1);
+    // 重问走的是同一个会话：一条新的 user message 被投进 Agent，而不是发一条空气泡。
+    const retried = await untilInbox(host, 2, 'the empty-reply retry');
+    assert.equal(retried.inbox.length, 2);
+    const nudge = retried.inbox[1].content[0].text;
+    // 必须说清「不是对方发来的」：否则模型会回一句「怎么了」。
+    assert.match(nudge, /不是对方发来的/);
+    assert.match(nudge, /没有写出要发的话/);
+    assert.equal(sentTexts(onebot, 'send_private_msg').length, 0, '空回复绝不能变成一条空气泡');
+
+    // 重问这一轮正常回复：发出去的是它真正要说的话。
+    completeTurn(host, retried, '没什么，睡不着', 2);
+    const sent = await until(() => sentTexts(onebot, 'send_private_msg')[0], 'the retried reply');
+    assert.equal(sent, '没什么，睡不着');
+  } finally {
+    await onebot.close();
+  }
+});
+
+
+// 用例十五·补：重问也空回复时只记一次，不再往下循环（否则会和模型互相追问）。
+test('a second empty reply stops instead of re-asking again', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(privateMessage('在吗'));
+    const agent = await untilInbox(host, 1, 'the private message');
+    emptyAssistantTurn(host, agent, 1);
+    const retried = await untilInbox(host, 2, 'the empty-reply retry');
+    emptyAssistantTurn(host, retried, 2);
+    // 没有第三次投递，也没有任何消息发到 QQ。
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(retried.inbox.length, 2);
+    assert.equal(sentTexts(onebot, 'send_private_msg').length, 0);
   } finally {
     await onebot.close();
   }

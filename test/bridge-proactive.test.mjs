@@ -227,11 +227,12 @@ test('proactive never messages a private chat', async () => {
   await until(() => agent.inbox.length >= 1, 'the private turn');
   completeTurn(host, agent, '在的', 1);
   await until(() => sentTexts(onebot, 'send_private_msg').length === 1, 'the private reply');
-  // 对方又发了一句，而这一轮模型没话可说（没有消息发回去）—— 于是这个私聊会话正好停在
+  // 对方又发了一句，这一轮模型**选择不说**（正文写 `SKIP`；空回复不是「选择不说」，
+  // 那种情况插件会重问一次，见 test/bridge-send.test.mjs）—— 于是这个私聊会话正好停在
   // 「最后说话的是对方」这个状态上：换成群，它就会进入主动说话的候选。
   onebot.push(privateMessage('你忙不'));
   await until(() => agent.inbox.length >= 2, 'the second private message to be submitted');
-  completeTurn(host, agent, '', 2);
+  completeTurn(host, agent, 'SKIP', 2);
   await settle(80);
   host.list.timers.fireInterval();
   await settle(150);
