@@ -17,6 +17,7 @@ node scripts/ops.mjs logs -n 200              # journalctl / 日志文件 / dock
 node scripts/ops.mjs restart                  # systemd 重启；Windows 只重启能独立管理的部分
 node scripts/ops.mjs install --apply          # 写 unit / 计划任务 / profile（默认只给计划）
 node scripts/ops.mjs napcat config|start|autologin|webui
+node scripts/ops.mjs forget private:<QQ号> --apply   # 真的清掉一个会话的记忆（先备份）
 node scripts/ops.mjs selftest --json          # 不需要外部依赖的自检（node 版本、目录、依赖）
 ```
 
@@ -274,3 +275,46 @@ node scripts/ops.mjs cleanup jm --apply           # 只删 .qq-jm/，绝不碰 .
 
 `migrate cognition` 退出码 `2` = 有认不出来的条目（要人看一眼），报告里逐条列出。
 `cleanup jm` 是**显式动作**：JM 下载已经移除，但旧的 PDF 与 venv 不会自动删。
+
+## 清除某个会话的记忆（`forget`）
+
+`/reset` 只换一个空会话：长期记忆（转录 / `MEMORY.md`）、这个会话的 DSH 会话存档、
+`INDEX.md` 里的引用都还在。`forget` 是操作员的「真的忘掉」—— 它不是 QQ 侧的工具
+（QQ 消息不可信，不能让群友一句话清库），入口只有运维命令：
+
+```bash
+node scripts/ops.mjs forget private:2904544617              # 只打印会删什么（不写；退出码 2）
+node scripts/ops.mjs forget private:2904544617 --apply      # 先备份，再删
+node scripts/ops.mjs forget group:709563326 --apply --json  # 给 agent 看的结构化结果
+```
+
+删的是这几样（只认 `memorySlug(key)` 算出来的那一个会话）：
+
+| 目标 | 说明 |
+|---|---|
+| `<memoryDir>/conversations/<slug>/` | 转录（`log/*.jsonl`）、`MEMORY.md`、`archive/`、`meta.json` |
+| `INDEX.md` 里的那一行 | 按 `conversations/<slug>/` 前缀匹配，别的行不动 |
+| `memory.index.json` 里的派生统计 | 按 `private:<号>` / `group:<号>` 匹配；坏 JSON 只报告、不覆盖 |
+| `.history/conversations_<slug>_MEMORY.md.*` | `MEMORY.md` 每次写入前的旧版本备份（只删这个会话的） |
+| DSH 会话存档 | 第 0..N 轮（`sessionIdFor(key, generation)`，N 从 reset 标记读） |
+| reset 代次 | +1：重启后不会 resume 旧会话 |
+
+两个共享资源默认**不动**，需要时显式打开：
+
+- `--with-digest`：连摘要会话（`bridge:digest`）一起删。它是所有会话共用的，里面可能存着
+  这个会话的一份摘要副本；删掉后下一轮摘要从零开始（`MEMORY.md` 才是真相，不会丢记忆）。
+- `--with-media`：删掉只被这个会话的 `MEMORY.md` / `archive/` 引用、且记忆目录别处已经没人
+  引用的 `.qq-media` 缓存图（`.qq-media` 是 LRU 缓存，不是记忆的真相，所以默认不动）。
+
+备份默认写到 `~/qqbot-forget-backups/<slug>-<时间>/`（`memory/`、`index/`、`history/`、`sessions/`、
+`reset.json`、`README.txt`），**先备份完再删**；`--backup-dir` 可以换位置。备份放在 cwd
+之外是故意的：放在仓库里，QQ 会话的只读文件工具就能把刚删掉的私聊记录再读回来。
+
+它只动磁盘。`qqbot` 进程还在跑的时候，内存里可能仍握着那个会话 —— 重启（或在设置页点
+「重置」）之后才彻底生效；代次已经 +1，重启不会把旧会话 resume 回来。
+
+`--sessions-root` / `--sessions-dir` 用于 DSH 会话根目录不在默认 `<dsh-home>/sessions`
+的部署；`--sessions-dir` 直接指定这个 cwd 的项目目录（默认按 DSH 的 `projectKey` 推导）。
+`--memory-dir` / `--media-dir` 对应插件配置里的 `memoryDir` / `mediaDir`（默认
+`.qq-memory` / `.qq-media`）。
+

@@ -37,7 +37,7 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
   `@目标 + 文本`（不经过模型）；`text` 原样、`agent` 让模型换语气、`prompt` 到点做事（默认关）；
   重启不丢、断线有补发窗口（见 §4.J）。
 - **感知与运维**：戳一戳 / 卡片 / 视频封面 / 语音占位（`modalities.js` / `links.js` /
-  `interactions.js`），以及跨平台 `scripts/ops.mjs doctor --json`（见 §11）。
+  `interactions.js`），以及 `scripts/ops.mjs doctor --json`（见 §11）。
 - **每天轮换模型凭据**（`apiKeyRotate`，默认开）：每天 04:00 从 `cwd/data/api-keys.txt` 挑一个
   **探测通过**的 key 交给 `ctx.credentials.set()`；池子不存在、没有第二个能用的 key、或 key 由
   启动环境提供时什么都不做（见 §4.H）。
@@ -68,9 +68,9 @@ interactions.js  戳一戳的纯判据：该不该回、回戳还是走一轮、
 recall.js  被撤回的消息的纯判据：认事件、要不要补一句（12 条闸门）、两段伪造提醒的文案
 reminders.js  定时提醒：时间推算 / 校验 / 模式决策（纯函数）+ 任务文件、单定时器、重试与兜底
 ops.js  运维的**纯计划**：平台识别、doctor findings、service/install 步骤、退出码
-scripts/ops.mjs  运维执行器 + CLI（`doctor` / `status` / `restart` / `logs` / `install` / `napcat` / `migrate` / `cleanup` / `selftest`），`--json` + `--apply`
+scripts/ops.mjs  运维执行器 + CLI（`doctor` / `status` / `restart` / `logs` / `install` / `napcat` / `migrate` / `cleanup` / `forget` / `selftest`），`--json` + `--apply`（forget 在 scripts/forget.mjs）
 scripts/migrate-cognition.mjs  老 `COGNITION.md` 的路径条目一次性迁到 `STICKERS.md`（画面指纹认图、默认 dry-run、写前备份）
-scripts/persona-check.mjs  人设自检 CLI：不启动机器人，直接跑 `parsePersonaDoc` / `renderPersona` / `parseStyleDoc` / `lintStyleDoc`，打印「模型会看到什么」+ findings；退出码 0/1/2，`--json` / `--strict`
+scripts/persona-check.mjs  人设自检 CLI：不启动机器人，直接跑人设 / 表达解析与体检，打印「模型会看到什么」+ findings；退出码 0/1/2，`--json` / `--strict`
 chatter.js  群里「谁在说话」的三本账（插话序号 / 回答指向 / 热度窗口）：只暴露语义动作，不暴露 Map
 send.js  发送链路：拆条 / 标点清洗 / 引用与 @ 指向 / 串行队列 / 私聊「正在输入」；依赖由 `index.js` 显式传入（第一批从闭包拆出的运行时模块）
 sticker.js  表情包目录：列文件 / 裸名字补全 / 存图 / 改名 / 三个写边界；依赖由 `index.js` 显式传入（第二批）
@@ -90,7 +90,7 @@ tools.js  宿主平面工具的**声明**（qq_send_* / qq_poke / qq_save_sticke
 memory.js  长期记忆子系统：转录落盘、记忆文件读写（两个记忆工具的能力来源）、检索式注入的装配、人物迁移、滚档、每日摘要循环；依赖由 index.js 显式传入
 memory-select.js  长期记忆的**纯函数**：markdown → record（人物 / 事实 / 惯例 / 在追 / 梗）、scope 过滤与打分、按节配额打包、archivePlan 滚档、MEMORY.md / PEOPLE.md 的 upsert / remove
 onebot.js  OneBot v11 客户端 + 纯函数（分条/复读/延迟/媒体采集/@ 名单提取）；文本渲染委托 `modalities.js`
-media.js  入站媒体：QQ 的图/表情包 → 按内容哈希落盘 → 给模型 read_image 的本地路径
+media.js  入站媒体：图/表情包 → 内容哈希落盘 → read_image 路径；GIF 拆一张分镜图（含已收藏，见 sticker-frames.js）
 image.js  出站图片：本地路径 / URL → 校验（大小、格式、目录越界）→ base64:// 段；收藏目录里的表情额外带 `sub_type: 1`（QQ 的「大表情」）
 napcat.js  NapCat 那一侧：目录探测（强判据 = 有账号配置；弱判据 = 有它自带的启动件）、只读探测与**幂等**写 websocketServers（含备份）、快速登录 / 日志改文件 / WebUI 地址、`startPlan`（提权）、`hiddenStartPlan`（`wscript //B` + VBS 隐藏窗口）、`scheduledTask*Plan`；插件自检与一键脚本共用
 desktop.js  装进桌面版 profile 的纯函数：`.env` 段落幂等替换、manifest 改写、`pluginLinkState`（链接指着谁）/ `removePluginLink`（junction 对 `unlink` 是 EPERM，退到 `rmdir`）
@@ -118,7 +118,7 @@ test/speaking-rules.test.mjs 主动说话 / 免 @ 接话 / 搭话抽卡 / 补一
 test/mention.test.mjs  `[[@昵称]]` → at 段的纯函数测试：标记边界、认不出来就丢、名单按会话隔离
 test/util.test.mjs      纯函数边界：写边界、memorySlug、本地时间、errorText、key 打码、isVolatileRef/liveConfig
 test/client.test.mjs    设置页契约测试（假模块系统 + 迷你渲染器）：字段全覆盖 / tab / 控件 / 草稿 / 搜索 / 只看已改 / 量纲
-test/media.test.mjs  `fetchBytes` 的重定向与逐跳校验契约（SSRF 修复的单元层）
+test/media.test.mjs  `fetchBytes` 的重定向与逐跳校验（SSRF）
 test/filestore.test.mjs 原子读写与「读不到就返回空/undefined，不抛错」这条失败语义
 test/perceptual.test.mjs  图片指纹的单元测试（同图不同编码 / 异图 / 畸形输入 / 解压炸弹）
 test/persona-template.test.mjs  人设模板 / 提示词 / 自检脚本的契约：零解析警告、STYLE 零体检、只一条底色、长度不超上限、文档不失链、退出码语义
@@ -345,7 +345,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；harness.mj
 | 加运维动作 / 改 doctor | `ops.js`（纯计划）+ `scripts/ops.mjs`（执行器）+ `test/ops.test.mjs`；写 cwd 外的步骤必须带 `requires: human|root` |
 | 加一个 Agent 工具 | 在 `tools.js` 里照 `qqSendMessage` 抄结构（`defineTool` + `output.schema` + `render` + 中文报错），再在 `registerQqTools` 里注册、在 `index.js` 的 `deps` 里补上它需要的能力；**别 import `index.js`** |
 | 改分条/打字节奏 | `onebot.js` 的 `splitBurst` / `splitStickerLines` / `typingDelayMs`（**纯函数，优先在这里改**） |
-| 改图片落盘/去重/淘汰 | `media.js` |
+| 改图片落盘/去重/淘汰，或动图分镜 | `media.js`；分镜在 `gif.js` / `storyboard.js`（抽帧、版式、PNG）+ `modalities.js` 的 `animationNote` |
 | 改出站图片校验或传输（含表情的 `sub_type` 大表情标记） | `image.js` 的 `imageSegment` + `sticker.js` 的 `isStickerFile`（收藏目录来源算表情）+ `onebot.js` 的 `isStickerSegment`（复读时单条消息算不算表情）+ `repeatStep` 的链上 OR（`sendRepeat` 收到的是补过 `sticker` 的链条目）+ `send.js` 的 `replyPieces` / `sendRepeat` 两处调用 |
 | 改「存表情包」（写边界 / 名字清洗 / 张数上限 / 什么时候能存） | `util.js` 的 `stickerFileName`（纯函数写边界）+ `sticker.js` 的 `saveSticker` / `stickerSaveAllowed` + `tools.js` 的 `qq_save_sticker` + `Config.stickerMaxFiles` + `filestore.js` 的 `writeBytesAtomic` + `allowTools` |
 | 改「给表情改名」 | `cognition.js` 的 `renameStickerRow`（纯函数：按旧名字搬整行、同区原地替换）+ `memory.js` 的 `renameStickerEntry` + `sticker.js` 的 `renameSticker` / `stickerRenameAllowed`（文件 `rename` + 目录写失败回滚）+ `tools.js` 的 `qq_rename_sticker` + `docs/media.md` 同名小节 |
@@ -459,6 +459,7 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
   `mention.js`/`registerParticipant`/`sendParts`→`mention.test.mjs` + `bridge-send.test.mjs` 那组端到端；
   `perceptual.js` 或复读的图片判定→`perceptual.test.mjs`；`stickerFileName`/`saveSticker`→
   `util.test.mjs` + `bridge-stickers.test.mjs` 里搜 `qq_save_sticker` / `qq_rename_sticker`（改名还要看 `test/cognition.test.mjs` 的 `renameStickerRow`）；记忆相关→`bridge-memory.test.mjs`；
+  动图分镜→`gif` / `storyboard` / `sticker-frames`；
   主动说话→`bridge-proactive.test.mjs`（靠 `digestMinLines: 9999` 隔离摘要循环，
   假 `fireInterval()` 会唤醒**所有**周期定时器）；`sessionIdFor`/`resetConversation`/`canReset`
   →`bridge.test.mjs` 里搜 `reset`；`key-rotation.js`（轮换 / 探测 / 池子）→

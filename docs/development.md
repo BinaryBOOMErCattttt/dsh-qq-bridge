@@ -50,7 +50,8 @@ node --test test\
 > `test/speech-policy.test.mjs`、`test/modalities.test.mjs`、`test/links.test.mjs`、
 > `test/interactions.test.mjs`、`test/cognition.test.mjs`、`test/migrate-cognition.test.mjs`、
 > `test/ops.test.mjs`、`test/reminders.test.mjs`、`test/recall.test.mjs`、`test/backlog.test.mjs`、
-> `test/memory-select.test.mjs`、`test/persona-template.test.mjs`、`test/forward.test.mjs`。行为层的用例在
+> `test/memory-select.test.mjs`、`test/persona-template.test.mjs`、`test/forward.test.mjs`、
+> `test/forget.test.mjs`（`ops forget` 的删除边界：目标会话 / 别的会话 / 共享资源）。行为层的用例在
 > `test/bridge*.test.mjs`（共享夹具在 `test/harness.mjs`）：
 > 气泡条数与中断、标点清洗、引用指向（表情消息不引用）、C 路四条排除、私聊补一句、戳一戳、链接预览、
 > 合并转发（内联 / `get_forward_msg` / 取不到时的占位 / 嵌套深度）、
@@ -159,6 +160,16 @@ CI 只跑 `check` 与静态检查；`@deepseek-ai/*` 是宿主注入的 peer，C
 `mediaDownload: false` 与超限跳过、`mediaDir` 被配到 `cwd` 外面即整体停用，外加
 `collectMedia` / `mediaPlaceholder` / `sniffImageExtension` 的纯函数用例（测试里的假
 OneBot 按真实形状回 `image` 段，另外起一个 HTTP 服务假装腾讯的图片 CDN）。
+
+动图还多一组：`test/gif.test.mjs` 逐像素钉住拆帧（整幅画面、处置方式 2 与 3、透明索引、
+8/8/4/2 隔行、局部调色板、延时折算与 0 延时兜底、均匀抽帧与像素预算、畸形/越界输入）；
+`test/storyboard.test.mjs` 钉住分镜图版式（三列两行、从左到右从上到下、底色缝、不放大、
+面积平均、PNG 的 IHDR/IDAT 能解回原像素、帧尺寸不一致报错）；`test/media.test.mjs` 钉住
+「动图落盘时多一张 `<哈希>-frames.png`、静图不拆、拆帧失败只记 warn」，`bridge-media.test.mjs`
+里有一条端到端：私聊发一张 GIF，收件箱里的占位符带着帧数/时长/分镜图路径，两个文件都在缓存目录里。
+已收藏的动图另有 `test/sticker-frames.test.mjs`（只收动图、再扫不重复、改名复用、删除清孤儿、
+坏图只跳过自己、关掉媒体下载时不落盘）与 `bridge-stickers.test.mjs` 里「升级前就收藏的动图，
+目录行会带上分镜图」那条端到端。
 
 还有「发表情包」那一组：发出去的确实是一个 `image` 段且 `base64://` 解出来就是原字节、
 从 QQ 会话里调用默认发回当前会话（群里也能显式指定群号）、把会话里刚收到的那张图

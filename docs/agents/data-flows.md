@@ -30,10 +30,19 @@ QQ ─▶ NapCat ─ws─▶ OneBotClient.onEvent ─▶ handleEvent
    ctx.on('session/event')        assistant/message → transcripts 累积
                                   turn/end        → 取**最后一条有文本的** assistant 消息，
                                                      aborted/forked/interrupted 静默丢弃，
-                                                    error 回一句固定道歉（主动搭话除外，见 §4.E）
+                                                    error 回一句固定道歉（主动搭话除外，见 §4.E），
+                                                     空回复 → 重问一次（`emptyReplyNudge`）
                                               ▼
                        sendToConversation(..., { human:true, quote }) → sendParts()
 ```
+
+空回复不是 `SKIP`：`SKIP` 是模型**选择**不说，空回复是这一轮**没产出正文**（只写了思考 /
+工具调用完就停了）。以前它被静默丢弃 —— QQ 那头看到的是「它没理人」，模型下一轮还会以为
+自己说过（它看见的是自己的思考），于是回一句「上一条说秃了」（2026-10-22 23:50 私聊的真实
+事故）。现在对着真人的轮次会往同一个会话再投一条 `emptyReplyNudge` 重问一次
+（`owner.emptyRetry` 防循环）；主动搭话 / 补一句 / 撤回调侃（`proactive`）不重问，还有消息在
+攒批窗口 / 积压里等着回时也不重问（那些消息马上会换来一轮回复）。空回复本身永远不会变成
+QQ 上的一条空气泡。
 
 ⚠️ `rememberTranscript` 必须在 `handleEvent` 的两个提前 `return`（环境上下文、`/reset`）**之前**
 调用，否则那些消息不会进转录。它也要**在 `admit` 之前**判定自己的准入规则（渠道开关 / 白名单），
