@@ -40,6 +40,21 @@ function oneLine(text) {
   return String(text ?? '').replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * 一条消息在积压波里的正文行。
+ *
+ * 普通消息折成一行；带合并转发块的消息保留多行（块本身已经排好版），续行由调用方
+ * 缩进到发言人下面。`forward` 由 `submitBatch` 在转发展开成功时打上。
+ *
+ * @param entry - `{ name, body, forward }`。
+ * @returns 至少一行的正文。
+ */
+function bodyLines(entry) {
+  const text = String(entry?.body ?? '').trim();
+  if (entry?.forward === true && text.includes('\n')) return text.split('\n');
+  return [oneLine(text)];
+}
+
 /** 一条消息在预算里占多少字（名字 + 正文；时间与括号的固定开销忽略不计）。 */
 function costOf(entry) {
   return String(entry?.name ?? '').length + String(entry?.body ?? '').length;
@@ -99,9 +114,11 @@ export function renderBacklog(entries, { now = Date.now(), maxEntries, maxChars,
   const { kept, omitted } = partitionBacklog(entries, { maxEntries, maxChars });
   if (kept.length === 0) return '';
   const at = Number(now);
-  const lines = kept.map((entry) => {
+  const lines = kept.flatMap((entry) => {
     const age = at - (Number(entry.at) || at);
-    return `${String(entry.name ?? '某人')}（${relativeTime(age)}）: ${oneLine(entry.body)}`;
+    const prefix = `${String(entry.name ?? '某人')}（${relativeTime(age)}）: `;
+    const [first, ...rest] = bodyLines(entry);
+    return [`${prefix}${first}`, ...rest.map((line) => `  ${line}`)];
   });
   const parts = [
     '（你刚才在忙别的事，下面这些是那期间陆续到的消息，你现在才抬头看到）',

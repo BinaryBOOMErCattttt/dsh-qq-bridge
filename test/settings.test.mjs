@@ -316,3 +316,26 @@ test('长期记忆 v2 的检索 / 人物 / 归档配置：默认值、0 与非�
   assert.equal(settings({ digestConsolidate: true }).digestConsolidate, true);
   assert.equal(settings({ digestConsolidate: 'yes' }).digestConsolidate, false);
 });
+
+test('合并转发：默认展开，条数/字数有地板，深度 0 是一层都不展开', () => {
+  const s = settings();
+  assert.equal(s.forwardRead, true);
+  assert.equal(s.forwardMaxNodes, 20);
+  assert.equal(s.forwardMaxChars, 1200);
+  assert.equal(s.forwardMaxDepth, 1);
+  assert.equal(s.forwardTimeoutMs, 5000);
+
+  // 只有明确的 false 才关：'no' 这类手写值不翻转语义。
+  assert.equal(settings({ forwardRead: false }).forwardRead, false);
+  assert.equal(settings({ forwardRead: 'no' }).forwardRead, true);
+  // 条数 / 字数的 0 与非法值退回默认，而不是变成「不限」或「一条都不展开」。
+  assert.equal(settings({ forwardMaxNodes: 0 }).forwardMaxNodes, 20);
+  assert.equal(settings({ forwardMaxNodes: 3 }).forwardMaxNodes, 3);
+  assert.equal(settings({ forwardMaxChars: 10 }).forwardMaxChars, 100);
+  assert.equal(settings({ forwardMaxChars: NaN }).forwardMaxChars, 1200);
+  // 深度的 0 是有效值（一层都不展开），上限夹到 5；NaN 也按 0 处理（保守方向）。
+  assert.equal(settings({ forwardMaxDepth: 0 }).forwardMaxDepth, 0);
+  assert.equal(settings({ forwardMaxDepth: 99 }).forwardMaxDepth, 5);
+  assert.equal(settings({ forwardMaxDepth: NaN }).forwardMaxDepth, 0);
+  assert.equal(settings({ forwardTimeoutMs: 10 }).forwardTimeoutMs, 1000);
+});

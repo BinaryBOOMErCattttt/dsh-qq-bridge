@@ -10,8 +10,8 @@
  *     记忆工具可见性、投递归属账；
  *   - `sendToConversation`：`enqueue` 失败时回一句「我这边出错了」；
  *   - `groupTalkActive` / `busyWithTurn`：倾听倍数与「忙不忙」的两个读数；
- *   - `findRecent` / `mediaFor` / `resolveQuote` / `imageAllowed` / `dropPrefix` /
- *     `quotePrefix` / `registerParticipant` / `ensureAgent` / `userMessageFor` /
+ *   - `findRecent` / `mediaFor` / `resolveForwards` / `resolveQuote` / `imageAllowed` /
+ *     `dropPrefix` / `quotePrefix` / `registerParticipant` / `ensureAgent` / `userMessageFor` /
  *     `describeConversation`：投递一批消息时要用到的会话侧动作。
  *
  * `renderBacklog` / `recallLine` / `interjectLine` / `fetchPageTitle` 等叶子能力直接 import。
@@ -35,6 +35,22 @@ import { MAX_TIMER_MS } from './settings.js';
 const BACKLOG_POLL_MS = 1000;
 
 /**
+ * 一批里的一条消息 → 正文行。
+ *
+ * 普通消息折成一行（旧行为：一行一条才看得出「这是几条消息」）；带合并转发块的消息
+ * 保留换行 —— 那个块本身就是多行排好的，压平会把层级和归属一起压没。`forward` 由
+ * `submitBatch` 在转发展开成功时打上；续行的缩进由调用方按自己的前缀补。
+ *
+ * @param entry - `{ name, body, forward }`。
+ * @returns 至少一行的正文；带转发的多行块按原样拆行。
+ */
+function entryBodyLines(entry) {
+  const text = String(entry?.body ?? '').trim();
+  if (entry?.forward === true && text.includes('\n')) return text.split('\n');
+  return [text.replace(/\s+/g, ' ')];
+}
+
+/**
  * 建一组攒批函数。
  * @param deps - 见文件头的依赖表。
  * @returns `enqueue` / `holdForBatch` / `backlogBusy` / `backlogShouldHold` /
@@ -52,6 +68,7 @@ export function createBatcher(deps) {
     busyWithTurn,
     findRecent,
     mediaFor,
+    resolveForwards,
     resolveQuote,
     imageAllowed,
     dropPrefix,
@@ -253,14 +270,20 @@ export function createBatcher(deps) {
         // 积压波里的「改写」降级成丢弃：隔八分钟再为一句撤回调侃一句，不合时宜，
         // 而且这一轮本来就不是为它开的（模型看到的是一大段别人的话）。
         if (held && mark?.action === 'rewrite') continue;
-        // 本条自己的图和「它在回复的那条」里的图一起取：两件事互不依赖，串起来等只是白等。
-        const [resolved, quote] = await Promise.all([mediaFor(item.message), resolveQuote(item.message)]);
+        // 本条自己的图、它在回复的那条（含转发）、以及本条里的合并转发一起取：
+        // 三件事互不依赖，串起来等只是白等（转发展开自己还会再等子消息里的图）。
+        const [resolved, quote, forwards] = await Promise.all([
+          mediaFor(item.message),
+          resolveQuote(item.message),
+          resolveForwards(item.message),
+        ]);
         // 再查一次：撤回可能就发生在这几十毫秒里（我们正在下媒体），而上面那次查是 await
         // 之前 —— 一次不够，正是这段异步窗口逼出了「把 action 记在账上」这个设计。
         if (mark?.action === 'drop') continue;
         // 引用成功时把 `[回复]` 占位符换成真正的引用前缀：否则模型会看到
         // 「（引用 kaguya: …）\n[回复]这啥」这种一半有内容、一半是噪音的正文。
         const rendered = new Map(resolved?.rendered ?? []);
+        for (const [index, expanded] of forwards ?? []) rendered.set(index, expanded);
         if (quote !== undefined) rendered.set(quote.index, '');
         // 活跃对话里接上的那句没有前缀可去：按前缀长度硬切会把「然后呢」切成「后呢」。
         const raw = messageToText(item.message, selfId, rendered.size > 0 ? rendered : undefined).trim();
@@ -291,6 +314,8 @@ export function createBatcher(deps) {
           name: item.name,
           id: item.userId,
           body: withLinks,
+          // 这条消息里有展开成功的转发块：多消息批次要保留它的换行（见 entryBodyLines）。
+          forward: forwards !== undefined,
           // 投递之后要能对回账上那一条（`submitted` / `replied` 两个进度，见 handleRecall）。
           messageId: String(item.messageId ?? ''),
           blank: item.blankBody !== undefined && item.blankBody.length > 0 && withLinks === item.blankBody,
@@ -406,9 +431,14 @@ export function createBatcher(deps) {
   function interjectBody(entries) {
     const allowed = imageAllowed();
     if (entries.length === 1) {
+      // 单条插话的文案是 `（… 某某 说：…）` 的包裹句；多行转发块塞进去会把包裹切断，
+      // 所以单条仍用 `interjectLine` 压成一行。多条走下面的 `名字: 正文` 形式，能保留块。
       return interjectLine(entries[0].name, entries[0].body, allowed);
     }
-    const lines = entries.map((entry) => `${entry.name}: ${entry.body.replace(/\s+/g, ' ').trim()}`);
+    const lines = entries.flatMap((entry) => {
+      const [first, ...rest] = entryBodyLines(entry);
+      return [`${entry.name}: ${first}`, ...rest.map((line) => `  ${line}`)];
+    });
     return [...interjectBatchPrompt(allowed), ...lines].join('\n');
   }
 
@@ -454,12 +484,16 @@ export function createBatcher(deps) {
    */
   function renderBatch(entries) {
     if (entries.length === 1) return entries[0].body;
-    // 折掉换行：一行一条才看得出「这是几条消息」，也才说得清每句是谁说的。
-    const lines = entries.map((entry) => `${entry.name}: ${entry.body.replace(/\s+/g, ' ').trim()}`);
+    // 普通消息折成一行（一行一条才看得出「这是几条消息」）；带转发的块保留多行，
+    // 续行缩进到发言人下面 —— 否则一行里会冒出 `a: [合并转发] kaguya: …` 这种归属不明。
+    const lines = entries.flatMap((entry) => {
+      const [first, ...rest] = entryBodyLines(entry);
+      return [`${entry.name}: ${first}`, ...rest.map((line) => `  ${line}`)];
+    });
     const names = [...new Set(entries.map((entry) => entry.name))];
     const note = names.length > 1
-      ? `（下面 ${lines.length} 条是几乎同时到的，${names.join('、')} 都在跟你说话）`
-      : `（下面 ${lines.length} 条是${names[0]}连着发的）`;
+      ? `（下面 ${entries.length} 条是几乎同时到的，${names.join('、')} 都在跟你说话）`
+      : `（下面 ${entries.length} 条是${names[0]}连着发的）`;
     return [note, ...lines].join('\n');
   }
 

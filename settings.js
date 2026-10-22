@@ -151,6 +151,13 @@ export function createSettings(config, defaultCwd) {
   const linkPreviewTimeoutMs = Math.max(1000, Math.floor(Number(config.linkPreviewTimeoutMs) || 0) || 8000);
   const linkPreviewMaxBytes = Math.max(1024, Math.floor(Number(config.linkPreviewMaxBytes) || 0) || 524288);
   const linkAllowPrivateHosts = config.linkAllowPrivateHosts === true;
+  // 合并转发：`forwardRead` 是总开关；三个上限都夹到「至少还有意义」的范围。
+  // `forwardMaxDepth` 的 0 是刻意保留的（= 一层都不展开），所以不走 `|| 默认值`。
+  const forwardRead = config.forwardRead !== false;
+  const forwardMaxNodes = Math.max(1, Math.floor(Number(config.forwardMaxNodes) || 0) || 20);
+  const forwardMaxChars = Math.max(100, Math.floor(Number(config.forwardMaxChars) || 0) || 1200);
+  const forwardMaxDepth = Math.min(5, Math.max(0, Math.floor(Number(config.forwardMaxDepth) || 0)));
+  const forwardTimeoutMs = Math.max(1000, Math.floor(Number(config.forwardTimeoutMs) || 0) || 5000);
   const videoCover = config.videoCover !== false;
   // 0 是**明确的不下载**（默认），非法值也并到 0：视频整段下载本来就不该随手打开。
   const videoMaxBytes = Math.max(0, Math.floor(Number(config.videoMaxBytes) || 0));
@@ -307,6 +314,11 @@ export function createSettings(config, defaultCwd) {
     linkPreviewTimeoutMs,
     linkPreviewMaxBytes,
     linkAllowPrivateHosts,
+    forwardRead,
+    forwardMaxNodes,
+    forwardMaxChars,
+    forwardMaxDepth,
+    forwardTimeoutMs,
     videoCover,
     videoMaxBytes,
     pokeReply,

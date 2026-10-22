@@ -90,6 +90,14 @@ export const Config = z.object({
   mediaTimeoutMs: z.number().default(15000).description('单个媒体的下载超时（毫秒）'),
   quoteMedia: z.boolean().default(true).description('是否把「被引用（回复）的那条消息」也取回来一起看：图片/表情包照常落盘，正文里给出「（引用 某某: …）」前缀；false = 引用段仍是 `[回复]`，什么也看不到'),
   ambientMedia: z.boolean().default(true).description('群聊环境上下文（没 @ 机器人的那几条）里的图片/表情包是否也落盘：开着时「群里最近的消息」里也带可 read_image 的路径（同一张表情包按内容哈希去重，磁盘只存一份，但每次发仍会重新下载一遍字节）'),
+  // ---- 合并转发：把「谁转了什么」展开成一段有界的聊天记录 ----
+  // 默认开：QQ 里的转发十有八九是「你看这个」，只给条数等于什么都没看见；但条数、
+  // 字数、嵌套深度都必须有上限，否则一条几十条的转发就能把整轮上下文撑爆。
+  forwardRead: z.boolean().default(true).description('是否展开合并转发（forward）的正文：打开后每条被转发的子消息渲染成「谁: 什么」，模型真的能看见内容；关掉只留 `[合并转发 N 条]` 占位符。子消息里的图也会照常落盘'),
+  forwardMaxNodes: z.number().default(20).description('一条合并转发最多展开多少条子消息：超出的部分只写一句「还有 N 条没展开」'),
+  forwardMaxChars: z.number().default(1200).description('一条合并转发展开后的字符上限（含开头那行）：到顶就停，避免一条长转发把整轮上下文撑爆'),
+  forwardMaxDepth: z.number().default(1).description('合并转发最多展开几层：0 = 一层都不展开（只留占位符）；1 = 只展开最外层，转发里套的转发仍是占位符；2 = 再展开一层……（越深越容易撑上下文，一般不用改）'),
+  forwardTimeoutMs: z.number().default(5000).description('没有内联内容、需要调 get_forward_msg 取转发内容时的超时（毫秒）：卡住就保留占位符，不拖住消息投递'),
   // ---- 表情包 / 图片：反过来，让 Agent 能主动往 QQ 发图 ----
   imageSend: z.boolean().default(true).description('是否允许 Agent 主动往 QQ 发图片/表情包：qq_send_image 工具 + 回复正文里的 `[[图片: 路径]]` 标记（整条回复只写这一行就是「只发一张表情、一个字都不说」）；关掉后两个都不可用，提示词里也不再提'),
   stickerDir: z.string().default('.qq-stickers').description('表情包目录，相对 cwd（必须落在 cwd 内）：放你给它的表情包，文件名会列进渠道提示，模型据此挑选或用 read_image 先看一眼；留空 = 不提示表情包目录（照样能发工作目录里的其它图）'),

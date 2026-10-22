@@ -118,6 +118,11 @@
 | `linkPreviewTimeoutMs` | `8000` | 抓链接标题的超时（毫秒） |
 | `linkPreviewMaxBytes` | `524288` | 抓链接标题最多读多少字节（512KB）：超过就只看已读到的部分里有没有 `<title>` |
 | `linkAllowPrivateHosts` | `false` | 是否允许抓内网地址（自建 wiki 之类才打开）：关着时 localhost / `*.local` / `*.internal` / 私有与保留 IP 一律拒绝。**它只放开字面量判定，不放开 scheme**，见[安全提醒](security.md) |
+| `forwardRead` | `true` | 是否展开合并转发（`forward`）的正文：打开后每条子消息渲染成「谁: 什么」，子消息里的图也照常落盘；`false` = 只留 `[合并转发 N 条]` 占位符，见[合并转发](media.md#合并转发forward) |
+| `forwardMaxNodes` | `20` | 一条合并转发最多展开多少条子消息：超出的部分写一句「还有 N 条没展开」 |
+| `forwardMaxChars` | `1200` | 一条合并转发展开后的字符上限（含开头那行）：到顶就停，避免一条长转发撑爆整轮上下文 |
+| `forwardMaxDepth` | `1` | 合并转发最多展开几层：`1` = 只展开最外层，转发里套的转发仍是占位符；`0` = 一层都不展开 |
+| `forwardTimeoutMs` | `5000` | 没有内联内容、需要调 `get_forward_msg` 时的超时（毫秒）：卡住就保留占位符，不拖住投递 |
 | `videoCover` | `true` | 视频消息是否下载封面图（只下封面，不下整段视频）：开着时正文是「[视频 12 秒 · 封面: .qq-media/…]」，模型能 `read_image` 看一帧 |
 | `videoMaxBytes` | `0` | 整段视频的下载上限（字节）：`0` = 不下载整段（默认，只有封面）。非 0 时会先校验大小再下；插件不做转码、模型也读不了视频，一般不需要开 |
 | `pokeReply` | `true` | 被戳一戳（双击头像）时是否回应 |

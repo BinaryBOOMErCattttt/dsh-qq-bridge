@@ -50,9 +50,10 @@ node --test test\
 > `test/speech-policy.test.mjs`、`test/modalities.test.mjs`、`test/links.test.mjs`、
 > `test/interactions.test.mjs`、`test/cognition.test.mjs`、`test/migrate-cognition.test.mjs`、
 > `test/ops.test.mjs`、`test/reminders.test.mjs`、`test/recall.test.mjs`、`test/backlog.test.mjs`、
-> `test/memory-select.test.mjs`、`test/persona-template.test.mjs`。行为层的用例在
+> `test/memory-select.test.mjs`、`test/persona-template.test.mjs`、`test/forward.test.mjs`。行为层的用例在
 > `test/bridge*.test.mjs`（共享夹具在 `test/harness.mjs`）：
 > 气泡条数与中断、标点清洗、引用指向（表情消息不引用）、C 路四条排除、私聊补一句、戳一戳、链接预览、
+> 合并转发（内联 / `get_forward_msg` / 取不到时的占位 / 嵌套深度）、
 > 视频封面、语音占位、定时提醒（text / agent / SKIP / 超时 / 重启 / 权限）、撤回（三种位置 × 三种模式）、
 > 长任务期间那一波迟到的消息。
 

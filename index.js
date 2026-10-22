@@ -62,7 +62,8 @@ import { createMemory } from './memory.js';
 import { createReminders, describeTask } from './reminders.js';
 import { builtinStyle, createStyle, renderStyleContract } from './style.js';
 import { createPersona, renderPersona } from './persona.js';
-import { observationOf, renderObservation } from './modalities.js';
+import { observationOf, renderObservation, renderSegment } from './modalities.js';
+import { expandForward, forwardId } from './forward.js';
 import { pokeAction, pokeActionType, pokeNudge, pokeNotice } from './interactions.js';
 import { recallAction, recallNudge, recallNotice } from './recall.js';
 import { decideGroupTurn } from './speech-policy.js';
@@ -162,6 +163,15 @@ const QUOTE_TEXT_CHARS = 200;
  * 锦上添花，卡住就放弃（正文里保留 `[回复]`），别让它拖住聊天。
  */
 const QUOTE_FETCH_TIMEOUT_MS = 5000;
+
+/**
+ * 一条消息里最多展开几个合并转发。
+ *
+ * QQ 正常一条消息只会带一个转发段；给到 2 是留一点余量（个别实现会把「转发 + 文字」
+ * 拆成多个段）。再多就只保留占位符 —— 否则一条消息能拖出几十次 `get_forward_msg`
+ * 与几十段聊天记录，而它们本来也不该被当成「这句话的内容」。
+ */
+const FORWARD_MAX_PER_MESSAGE = 2;
 
 /**
  * 「上一轮那张表情没发出去」这条提醒在提示词里保留多久（毫秒）。
@@ -576,6 +586,7 @@ export function apply(ctx, config) {
     busyWithTurn,
     findRecent,
     mediaFor,
+    resolveForwards,
     resolveQuote,
     imageAllowed,
     dropPrefix,
@@ -3347,6 +3358,140 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 把一条消息里的合并转发展开成「谁说了什么」。
+   *
+   * 为什么放在投递链路的异步段（与媒体、引用并列），而不是塞进 `modalities.js`：
+   *   - NapCat 默认把子消息**内联**在 `data.content` 里，但别的实现只给一个 id，要补一次
+   *     `get_forward_msg` —— 这一步有 IO，不能留在纯渲染层；
+   *   - 子消息里的图还要落盘（否则模型只看到 `[图片]`），那是 `resolveMessageMedia` 的活；
+   *   - 展开会把一整段聊天记录喂进上下文，条数 / 字数 / 嵌套深度必须在**投递前**就裁掉。
+   *
+   * 拿不到内容时返回 undefined，调用方保留 `[合并转发 N 条]` 占位符 —— 转发取不到不该
+   * 打断消息投递。`depth` 是嵌套层数：0 = 最外层，只有 `forwardMaxDepth` 放行时才往下。
+   *
+   * @param message - OneBot 的 `message` 字段（消息段数组）。
+   * @param depth - 当前嵌套层数。
+   * @returns `段下标 → 展开文本` 的映射；没有可展开的转发时 undefined。
+   */
+  async function forwardReplacements(message, depth = 0) {
+    if (settings.forwardRead !== true) return undefined;
+    if (!Array.isArray(message)) return undefined;
+    // 0 = 整条关掉（`forwardRead` 也可以关，两个都留着是为了单测边界更直白）。
+    if (depth >= settings.forwardMaxDepth) return undefined;
+    const targets = [];
+    message.forEach((segment, index) => {
+      // `node` 是 NapCat 把「转发里还有转发」上报成的段；它本身也是一条子消息。
+      if (segment?.type !== 'forward' && segment?.type !== 'node') return;
+      targets.push({ index, segment });
+    });
+    if (targets.length === 0) return undefined;
+    const rendered = new Map();
+    for (const { index, segment } of targets.slice(0, FORWARD_MAX_PER_MESSAGE)) {
+      const text = await expandForward(segment, {
+        // 超时由 `client.call` 的第三个参数控制：卡住的实现不能把整轮投递拖到 15 秒。
+        call: (action, params) => client.call(action, params, settings.forwardTimeoutMs),
+        maxNodes: settings.forwardMaxNodes,
+        maxChars: settings.forwardMaxChars,
+        // 普通正文由 `renderForwardNodeBody` 折成一行；这里只负责保留嵌套块排好的换行。
+        multiline: true,
+        // 嵌套块才要结束标记：最外层消息本身就到头了，不加能省一行。
+        closing: depth > 0,
+        renderNode: async (node) => {
+          // 子消息里的图与嵌套转发一起解析：两件事互不依赖，串起来等只是白等。
+          const [media, nested] = await Promise.all([
+            resolveMessageMedia(node.message),
+            forwardReplacements(node.message, depth + 1),
+          ]);
+          const replacements = new Map(media?.rendered ?? []);
+          for (const [nestedIndex, nestedText] of nested ?? []) replacements.set(nestedIndex, nestedText);
+          return renderForwardNodeBody(node.message, replacements, nested);
+        },
+      });
+      if (text !== undefined) {
+        // 块前后如果还有别的段，补一个换行：否则 `看这个[合并转发…` 或
+        // `…笑死怎么样` 会把块和正文粘在同一行，块的头尾都不清楚。
+        // **只给最外层补**：嵌套块的新行/缩进由 `renderForwardNodeBody` 负责，
+        // 这里再补一次会在父行和块之间多出一个空行。
+        const outer = depth === 0;
+        const before = outer && message.slice(0, index).some((segment) => segment?.type !== 'reply');
+        const after = outer && message.slice(index + 1).some((segment) => segment?.type !== 'reply');
+        rendered.set(index, `${before ? '\n' : ''}${text}${after ? '\n' : ''}`);
+        continue;
+      }
+      const id = forwardId(segment);
+      if (id !== '') report('info', `forward: 没能展开 ${id.slice(0, 32)}（消息照常投递，正文保留占位符）`);
+    }
+    return rendered.size > 0 ? rendered : undefined;
+  }
+
+  /**
+   * 投递一条消息时用的转发解析入口（固定从最外层开始）。
+   *
+   * 单独包一层是为了让 `batch.js` 的依赖表只看见「一条消息 → 段下标映射」这件事，
+   * 不用知道递归、深度与超时。
+   * @param message - OneBot 的 `message` 字段。
+   * @returns 与 {@link forwardReplacements} 同形。
+   */
+  function resolveForwards(message) {
+    return forwardReplacements(message, 0);
+  }
+
+  /**
+   * 渲染转发里的一条子消息：普通段折成一行，嵌套转发块另起一行并缩进。
+   *
+   * 为什么不能直接用 `messageToText`：它会把嵌套块当成普通正文拼进去，换行、缩进、
+   * 结束标记都没了，模型只能靠 `[合并转发 N 条]` 猜层级。这里按段走一遍：
+   *   - 普通段（文字 / 图 / 表情 / 卡片 / 深到上限的转发占位符）照常渲染，空白折成一行；
+   *   - `nested` 里的段是**已经展开好的嵌套块**，前面补一个换行、整体缩进两格；
+   *   - 块后面的文字另起一行，回到父层（不再缩进）。
+   *
+   * @param message - 子消息的 `message` 字段（消息段数组或 CQ 码字符串）。
+   * @param media - `段下标 → 替身文本`（图片/视频封面等）。
+   * @param nested - `段下标 → 嵌套转发的展开文本`（`forwardReplacements` 给出）。
+   * @returns 供 `renderForwardNodes` 使用的正文（可能含换行）。
+   */
+  function renderForwardNodeBody(message, media, nested) {
+    if (typeof message === 'string') return message.replace(/\s+/g, ' ').trim();
+    if (!Array.isArray(message)) return '';
+    const parts = [];
+    let afterBlock = false;
+    message.forEach((segment, index) => {
+      const block = nested?.get(index);
+      if (block !== undefined) {
+        // 父行已经有文字时，块另起一行、整块缩进两格；父行只有这个块时，
+        // 第一行跟着 `名字: ` 走，后续行再缩进（否则会多出一行空行）。
+        const text = indentForwardBlock(block, parts.length === 0 ? 0 : 2);
+        parts.push(parts.length === 0 ? text : `\n${text}`);
+        afterBlock = true;
+        return;
+      }
+      const rendered = String(renderSegment(segment, media?.get(index)) ?? '').replace(/\s+/g, ' ');
+      if (rendered.length === 0) return;
+      // 块后面的文字必须另起一行，否则会粘在 `[/合并转发]` 后面。
+      parts.push(afterBlock ? `\n${rendered}` : rendered);
+      afterBlock = false;
+    });
+    return parts.join('').trim();
+  }
+
+  /**
+   * 给一段嵌套转发的每一行加缩进。
+   *
+   * 第一行的缩进由父行有没有文字决定：有文字就另起一行缩进两格，没有就跟着 `名字: `。
+   * 其余行固定两格 —— 更深的层级已经在块内部自己缩进过了，这里只负责平移。
+   *
+   * @param text - 已经排好版的嵌套块。
+   * @param firstIndent - 第一行的缩进空格数。
+   * @returns 缩进后的块。
+   */
+  function indentForwardBlock(text, firstIndent) {
+    return String(text)
+      .split('\n')
+      .map((line, index) => `${' '.repeat(index === 0 ? firstIndent : 2)}${line}`)
+      .join('\n');
+  }
+
+  /**
    * 把「这条消息在回复的那一条」取回来，渲染成引用前缀。
    *
    * 为什么非要多一次 `get_msg`：OneBot 的 `reply` 段里只有一个 message_id，被引用消息
@@ -3375,8 +3520,11 @@ export function apply(ctx, config) {
     }
     const quoted = info?.message ?? info?.raw_message;
     if (quoted === undefined || quoted === null) return undefined;
-    const resolved = await resolveMessageMedia(quoted);
-    const text = messageToText(quoted, undefined, resolved?.rendered).replace(/\s+/g, ' ').trim();
+    // 被引用的那条自己也可能是一个合并转发：图与转发都取，谁先好都行。
+    const [resolved, forwards] = await Promise.all([resolveMessageMedia(quoted), forwardReplacements(quoted, 0)]);
+    const replacements = new Map(resolved?.rendered ?? []);
+    for (const [index, text] of forwards ?? []) replacements.set(index, text);
+    const text = messageToText(quoted, undefined, replacements.size > 0 ? replacements : undefined).replace(/\s+/g, ' ').trim();
     const sender = info?.sender ?? {};
     const name = String(sender.card ?? sender.nickname ?? info?.user_id ?? '某人');
     return { name, text: text.slice(0, QUOTE_TEXT_CHARS), index };

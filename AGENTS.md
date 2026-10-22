@@ -62,6 +62,7 @@ speech-policy.js  「这条群消息该不该进 Agent、以什么身份进」�
 cognition.js  认知库与表情包目录的**纯解析**：`COGNITION.md` / `STICKERS.md` 的条目、热梗段、目录行
 docfile.js  cwd 内的热读文档（同步 + `size:mtime` 缓存 + 截断 + 越界拒绝），人设与表达共用
 modalities.js  感知层：消息段 → `Observation` → 占位符（图片/表情/语音/视频/文件/卡片/转发）
+forward.js  合并转发的展开（内联 content 直接用，只有 id 才 get_forward_msg；条数/字数/深度有上限）
 links.js  卡片解析 + URL 预览（SSRF 防护、重定向逐跳校验、大小/超时/内容类型上限）
 interactions.js  戳一戳的纯判据：该不该回、回戳还是走一轮、冷却 / 每日上限
 recall.js  被撤回的消息的纯判据：认事件、要不要补一句（12 条闸门）、两段伪造提醒的文案

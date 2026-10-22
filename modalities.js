@@ -25,7 +25,8 @@ import { parseCard } from './links.js';
  *
  * 字段说明（`?` 表示可能没有）：
  *   - `kind`：归一化后的种类。`mface` 归成 `sticker`（商城表情），
- *     `record` 归成 `voice`（语音），`json`/`xml` 归成 `card`（卡片）；
+ *     `record` 归成 `voice`（语音），`json`/`xml` 归成 `card`（卡片），
+ *     `node` 归成 `forward`（转发里套转发的段）；
  *   - `order`：原来在消息段数组里的下标，调用方按它对齐 / 排序；
  *   - `label`：该段给人看（也常给模型看）的短标签，例如图片摘要、@ 的名字；
  *   - `text`：只有 `text` 段有，正文原样；
@@ -321,9 +322,13 @@ export function observationOf(segment, { index = 0, replacement } = {}) {
       };
       return { ...base, kind: 'card', label: meta.title, meta, status: meta.title.length > 0 ? 'ok' : 'skipped' };
     }
-    case 'forward': {
-      // 合并转发本轮只给条数（展开是 Phase 5 的事，展开会撑爆上下文）。
-      const content = Array.isArray(data.content) ? data.content : undefined;
+    case 'forward':
+    case 'node': {
+      // 合并转发本轮只给条数（展开是 `forward.js` 的事，展开会撑爆上下文）。
+      // `node` 是部分实现表示「转发里套转发」的段（NapCat 的 `get_forward_msg` 解析路径
+      // 会产出这种形状）；把它当转发占位符，别让模型看到协议名 `[node]`。
+      // `forward` 用 `content`，`node` 用 `message`，两者都认。
+      const content = Array.isArray(data.content) ? data.content : Array.isArray(data.message) ? data.message : undefined;
       return { ...base, kind: 'forward', meta: { count: content?.length ?? 0 }, status: 'skipped' };
     }
     case 'poke':

@@ -112,10 +112,12 @@ export async function startImageServer(body = TINY_PNG, { status = 200, contentT
  * 起一个最小 OneBot v11 服务端，并记录收到的每一次 API 调用。
  * @param options.getImage - `get_image` 的桩响应（不传则像多数实现一样报「不支持」）。
  * @param options.getMsg - `get_msg` 的桩响应：`(params) => 消息对象`（不传则报「不支持」）。
+ * @param options.getForward - `get_forward_msg` 的桩响应：`(params) => { messages: [...] }`
+ *   （不传则报「不支持」，用来验证「转发取不到就保留占位符」）。
  * @param options.uploadFails - 给出时，`upload_*_file` 一律失败（用来验证「文件发不出去」的降级）。
  * @param options.groupInfoFails - 给出时，`get_group_info` 一律失败（模拟重启后 NapCat 还没就绪）。
  */
-export async function startFakeOneBot({ getImage, getMsg, uploadFails, groupInfoFails } = {}) {
+export async function startFakeOneBot({ getImage, getMsg, getForward, uploadFails, groupInfoFails } = {}) {
   const calls = [];
   // 端口 0 = 让系统分配空闲端口，避免与真实 NapCat（3001）或并行测试冲突。
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
@@ -157,6 +159,10 @@ export async function startFakeOneBot({ getImage, getMsg, uploadFails, groupInfo
     if (frame.action === 'get_msg') {
       if (getMsg === undefined) throw new Error('get_msg is not supported by this fake');
       return await getMsg(frame.params);
+    }
+    if (frame.action === 'get_forward_msg') {
+      if (getForward === undefined) throw new Error('get_forward_msg is not supported by this fake');
+      return await getForward(frame.params);
     }
     // 文件上传：默认成功（返回一个 file_id），需要验证降级时由 uploadFails 强制失败。
     if (frame.action === 'upload_private_file' || frame.action === 'upload_group_file') {

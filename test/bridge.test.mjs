@@ -985,6 +985,21 @@ test('the channel system section stays stable while per-turn data rides on the u
 });
 
 
+test('系统提示解释合并转发的格式与归属', async () => {
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(mention('在吗', { messageId: 99 }));
+    await untilInbox(host, 1, 'the first turn');
+    const section = promptText(host, 'qq-bridge:channel');
+    assert.match(section, /\[合并转发 N 条\]/);
+    assert.match(section, /不是当前群里的发言/);
+    assert.match(section, /缩进/);
+  } finally {
+    await onebot.close();
+  }
+});
+
+
 // 用例：宿主那几段「编码代理 / Web GUI / 文件卡片」的小节，在 QQ 会话的作用域里
 // 必须被**同名**覆盖掉（`HOST_PROMPT_SHADOWS`）—— 它们压在系统提示的首尾，比渠道小节
 // 更像「我是谁」。断言的是注册的小节名字与文本，而不是拼装后的整段提示（拼装是宿主的事）。

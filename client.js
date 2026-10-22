@@ -474,12 +474,17 @@ window.__ModuleLoader__.load({
       { id: 'reminder', title: '定时提醒（到点自己开口）', prefix: ['reminder'] },
       {
         id: 'perception',
-        title: '感知与互动（链接 / 视频 / 戳一戳 / 撤回）',
+        title: '感知与互动（链接 / 转发 / 视频 / 戳一戳 / 撤回）',
         fields: [
           'linkPreview',
           'linkPreviewTimeoutMs',
           'linkPreviewMaxBytes',
           'linkAllowPrivateHosts',
+          'forwardRead',
+          'forwardMaxNodes',
+          'forwardMaxChars',
+          'forwardMaxDepth',
+          'forwardTimeoutMs',
           'videoCover',
           'videoMaxBytes',
           'pokeReply',
@@ -498,9 +503,13 @@ window.__ModuleLoader__.load({
           'recallPrivate',
           'recallMemoryMark',
         ],
-        // 这两组管的是「群友做了个动作，它要不要有反应」，与上面那几个「怎么看待一条
-        // 消息」的开关语义不同，摊成一串会看不出谁管谁。
+        // 这几组管的是「群友做了个动作，它要不要有反应」或「这类消息怎么看」，与上面
+        // 那几个单开关的语义不同，摊成一串会看不出谁管谁。
         subs: [
+          {
+            title: '合并转发',
+            fields: ['forwardRead', 'forwardMaxNodes', 'forwardMaxChars', 'forwardMaxDepth', 'forwardTimeoutMs'],
+          },
           { title: '戳一戳', fields: ['pokeReply', 'pokeMode', 'pokeReplyChance', 'pokeCooldownMs', 'pokeDailyMax'] },
           {
             title: '撤回',
@@ -574,6 +583,11 @@ window.__ModuleLoader__.load({
      */
     const LABEL_OVERRIDES = {
       quoteMedia: '被引用的消息也一起看',
+      forwardRead: '展开合并转发',
+      forwardMaxNodes: '最多展开几条',
+      forwardMaxChars: '展开后最多多少字',
+      forwardMaxDepth: '最多展开几层',
+      forwardTimeoutMs: '取转发内容的超时（毫秒）',
       endpoint: 'OneBot WebSocket 地址',
       imageSend: '让 Agent 主动发图',
       napcatAutoConfig: '自动补 NapCat 配置',
@@ -792,6 +806,7 @@ window.__ModuleLoader__.load({
       // 毫秒
       linkPreviewTimeoutMs: formatMs,
       mediaTimeoutMs: formatMs,
+      forwardTimeoutMs: formatMs,
       batchWindowMs: formatMs,
       batchMaxWaitMs: formatMs,
       batchBacklogChars: formatChars,
@@ -832,6 +847,7 @@ window.__ModuleLoader__.load({
       shortPeriodMaxChars: formatChars,
       digestMaxChars: formatChars,
       memoryPromptChars: formatChars,
+      forwardMaxChars: formatChars,
       // 本地小时
       proactiveFromHour: formatHour,
       proactiveToHour: formatHour,

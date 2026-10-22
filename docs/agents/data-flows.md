@@ -40,6 +40,12 @@ QQ ─▶ NapCat ─ws─▶ OneBotClient.onEvent ─▶ handleEvent
 因为 `admit === undefined` 的闲聊同样要记 —— 长期记忆的原料正是那些没人 @ 机器人的话。它**不建
 会话记录**（`conversations` 是「处理过哪些会话」的表），只按 key 往记忆目录追加。
 
+`submitBatch` 里对每条消息**并行**做三件异步的事：本条消息的图片/表情落盘（`mediaFor`）、
+被引用那条的取回（`resolveQuote`，其中也包含转发）、本条消息里合并转发的展开（`resolveForwards`）。
+转发展开失败只保留 `[合并转发 N 条]` 占位符，绝不打断投递；条数 / 字数 / 嵌套深度在
+`forwardMax*` 里裁。嵌套块会另起一行、缩进并以 `[/合并转发]` 收尾；批量 / 积压里保留块，
+普通消息仍一行一条（见 `docs/media.md`「合并转发」）。
+
 ### B. 出站：Agent 主动发
 
 `qq_send_message` / `qq_send_image` 直接调 `client.call('send_*', …)`；`qq_list_conversations`

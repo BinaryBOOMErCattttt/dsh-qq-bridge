@@ -126,3 +126,14 @@ test('renderBacklog：正文里的换行被折成一行，空入参返回空串'
   assert.ok(text.includes('kaguya（刚刚）: 第一行 第二行'), text);
   assert.equal(renderBacklog([], { now }), '');
 });
+
+test('renderBacklog：带转发块的消息保留多行并缩进，普通消息仍折成一行', () => {
+  const now = 1_000_000_000;
+  const list = [
+    { name: 'a', body: '[合并转发 2 条]\nkaguya: 你看这个\ntester: 笑死', forward: true, at: now - 60_000 },
+    { name: 'b', body: '普通\n多行', at: now - 30_000 },
+  ];
+  const text = renderBacklog(list, { now, maxEntries: 20, maxChars: 2000 });
+  assert.match(text, /a（1 分钟前）: \[合并转发 2 条\]\n  kaguya: 你看这个\n  tester: 笑死/);
+  assert.match(text, /b（30 秒前）: 普通 多行/);
+});

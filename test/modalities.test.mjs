@@ -313,6 +313,14 @@ test('合并转发：有内容数组时给条数', () => {
   assert.equal(render(seg('forward')), '[合并转发]');
 });
 
+test('node 段（转发里套转发）也渲染成转发占位符，不是 [node]', () => {
+  const messages = Array.from({ length: 3 }, (_, i) => ({ sender: { nickname: `u${i}` }, message: [{ type: 'text', data: { text: String(i) } }] }));
+  assert.equal(render(seg('node', { message: messages })), '[合并转发 3 条]');
+  assert.equal(observationOf(seg('node', { message: messages })).kind, 'forward');
+  // 没有 message 的 node 段只给占位符，别把协议名漏给模型。
+  assert.equal(render(seg('node')), '[合并转发]');
+});
+
 test('戳一戳渲染成 [戳一戳]', () => {
   assert.equal(render(seg('poke', { id: '1' })), '[戳一戳]');
   assert.equal(observationOf(seg('poke')).kind, 'poke');
