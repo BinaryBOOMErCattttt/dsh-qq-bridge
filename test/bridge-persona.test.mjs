@@ -54,6 +54,14 @@ test('PERSONA.md 优先于配置 persona，且按场景选段', async () => {
       prompt.indexOf('别把回话收成') > hardRulesAt,
       '「不要把回话收成金句」的禁令属于硬性规则，STYLE.md 删不掉',
     );
+    // 2026-10-22 的同族三句：点评（这精神状态，我服）、应答开场（行，正好凑一套）、
+    // 用自我状态交代代替回答（那我真不熟）。它们都属于人机感地板，不靠部署者的 STYLE.md。
+    for (const phrase of ['这精神状态，我服', '行，正好凑一套', '那我真不熟']) {
+      assert.ok(
+        prompt.indexOf(phrase) > hardRulesAt,
+        `「${phrase}」的禁令 / 反例属于硬性规则，STYLE.md 删不掉`,
+      );
+    }
   } finally {
     await group.onebot.close();
   }
@@ -89,11 +97,47 @@ test('提示词槽位：硬性规则在最后（最高优先级），且表达�
     assert.ok(at('硬性要求（最高优先级') > at('需要主动给其他人或群发消息'));
     assert.ok(at('一条回复只有一个语气') > at('硬性要求（最高优先级'), '「一条回复只有一个语气」属于硬性要求那一节（在它之后）');
     assert.ok(at('只是把前一条再评价') > at('硬性要求（最高优先级'), '「一件事一条」的分条规则也属于硬性要求（在它之后）');
+    // 2026-10-22 的「这样啊，那就难怪了，明天不用早起吗」被缝成一个气泡：硬性规则里
+    // 要带这条真实反例与拆法（一句话一条），否则 STYLE.md 怎么写都压不住。
+    // 用 lastIndexOf：同一句例子在表达契约里也有一份，第一次出现的位置在硬性要求之前。
+    assert.ok(
+      prompt.lastIndexOf('这样啊，那就难怪了，明天不用早起吗') > at('硬性要求（最高优先级'),
+      '「说到气口就发」也要在硬性规则里',
+    );
+    assert.ok(
+      prompt.lastIndexOf('贴代码 / 列步骤 / 解释一件事时仍然一条讲完') > at('硬性要求（最高优先级'),
+      '信息型（代码 / 步骤 / 解释）在硬性规则里保留「一条讲完」的出口',
+    );
     // 真实回归：写「默认 1~3 条」之后模型把它当配额，11 条里 10 条正好两条。
     assert.doesNotMatch(prompt, /默认\s*1\s*[~～-]\s*3\s*条/, '硬性规则里不能再出现条数默认值');
     // 表情包目录提示跟着 allowTools 走（默认不限制时应当出现「你自己的表情包」或空目录提示）。
     assert.ok(prompt.includes('硬性要求（最高优先级：人设、表达规则与上面任何一段冲突时，以本节为准）'));
   } finally {
     await onebot.close();
+  }
+});
+
+
+test('本轮情境的最后一句话：一句一条、分几条发（系统提示里那条执行不稳的兜底）', async () => {
+  // 2026-10-22 重启后的真实回复仍是「没呢，你怎么也还没睡」这种两句一条：系统提示里
+  // 写了「能分就分」，模型照旧缝成一条，所以在这一轮正文的最后再提醒一次。
+  const { onebot, host } = await boot();
+  try {
+    onebot.push(privateMessage('在吗'));
+    const agent = await untilInbox(host, 1, 'the Agent');
+    const context = turnContextText(agent).trimEnd();
+    assert.ok(context.endsWith('想说的话一句一条，分几条发（换行 = 分条）。'), '这一行要是情境的最后一句（离模型开口最近）');
+  } finally {
+    await onebot.close();
+  }
+  // humanize 关掉时整轮只有一条消息，不能再叫模型分条。
+  const single = await boot({ humanize: false });
+  try {
+    single.onebot.push(privateMessage('在吗'));
+    const agent = await untilInbox(single.host, 1, 'the single-message Agent');
+    const context = turnContextText(agent);
+    assert.ok(!context.includes('想说的话一句一条'), 'humanize 关掉时不提分条');
+  } finally {
+    await single.onebot.close();
   }
 });

@@ -168,6 +168,15 @@ test('builtinStyle：标点那条讲频率、不讲「一句最多一个」的�
   assert.ok(punctuation.includes('才没有，是你没跟上我'), '要给出改好的同一句（反例 → 正例）');
 });
 
+test('builtinStyle：条数由内容定，但要说到气口就发（不是「想分就分」）', () => {
+  // 2026-10-22 的观感：真人不会把「这样啊，那就难怪了，明天不用早起吗」缝成一条。
+  // 契约里光写「想分几条发就换行」像在征求许可，模型于是默认不分 —— 要给判据，也要给例子。
+  const general = builtinStyle().general.join('；');
+  assert.ok(general.includes('说到气口就另起一条'), '要给「什么时候换行」的判据');
+  assert.ok(general.includes('这样啊'), '要带真实反例 → 拆成三条的正例');
+  assert.ok(!/默认\s*[一二两三四五1-5]\s*条/.test(general), '仍然不能写成数字配额');
+});
+
 test('lintStyleDoc：把标点整类禁掉的规则会被点出来（空格断句的根因）', () => {
   // 真实事故：标点契约收紧成「多数句子不带逗号」之后，群里的回复全变成
   // 「才没有 是你没跟上我」—— 逗号没了，模型就拿空格当分隔符。所以「整类禁标点」
@@ -235,13 +244,22 @@ test('renderStyleContract：散文 + 机器参数，按场景选段，不能发�
   assert.ok(group.some((line) => line.includes('不超过 40 字')));
   assert.ok(!group.some((line) => line.includes('引用你要接的那句话')), '插话不再强制引用，不该再有这条承诺');
   assert.ok(group.some((line) => line.includes('接不住就不接')), '群聊场景要选群聊那段');
+  // 没有 STYLE.md 时用内置契约，所以内置那份也要有「接具体的事」这条正面写法；
+  // 否则只剩 hardRules 里的禁令，模型知道不许点评、却不知道该接什么。
+  assert.ok(
+    group.some((line) => line.includes('给人和事下判断')),
+    '内置契约要给出「点评不是接话」的正面写法',
+  );
   // 默认按 humanize 发：换行就是分条。不告诉模型，「回两条」会被写成同一行里的两句话。
-  assert.ok(group.some((line) => line.includes('想分几条发就换行')), '要说清换行 = 分条');
+  assert.ok(group.some((line) => line.includes('换行 = 分条')), '要说清换行 = 分条');
+  // 2026-10-22 的真实回复「这样啊，那就难怪了，明天不用早起吗」被缝成一条：光说
+  // 「换行 = 分条」不够，还要说什么时候换行 —— 说到气口就发，一句话也是一条。
+  assert.ok(group.some((line) => line.includes('说到气口就换行')), '要告诉模型什么时候换行（气口）');
   const capped = renderStyleContract({ prose, params: { ...params, maxMessages: 1 }, scene: 'group', imageAllowed: false });
   assert.ok(capped.some((line) => line.includes('最多发 1 条')), '条数上限要跟提示词对齐');
   const single = renderStyleContract({ prose, params: { ...params, humanize: false }, scene: 'group', imageAllowed: false });
   assert.ok(single.some((line) => line.includes('作为一条消息直接发')), 'humanize 关掉时说清整轮只有一条');
-  assert.ok(!single.some((line) => line.includes('想分几条发就换行')), 'humanize 关掉时不能说换行会分条');
+  assert.ok(!single.some((line) => line.includes('说到气口就换行')), 'humanize 关掉时不能说换行会分条');
   // 「行，」「好，」「嗯，」开场是硬性规则（index.js 的 hardRules），**不在**这份可被
   // STYLE.md 覆盖的散文里 —— 放在这里，部署者删掉那一条就等于把它关掉了。
   assert.ok(!group.some((line) => line.includes('这类应答开场')), '应答开场禁令属于硬规则，不能放在可覆盖的散文里');
