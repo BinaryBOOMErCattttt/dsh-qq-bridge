@@ -100,6 +100,44 @@ loginctl enable-linger "$USER"
 tmux new -s qqbot 'dsh --profile qqbot --port 3081 --no-open'
 ```
 
+### 同步本机改动（频繁迭代）
+
+插件是 `link:` 安装的，**改代码不用重装**：把文件传过去、重启进程就行。仓库里带了
+`scripts/deploy-remote.sh`，按「跑测试 → 备份旧代码 → 停服务 → 整包覆盖 → 起服务 →
+等 `connected to ws://`」一条龙做。
+
+目标机**不写在脚本里**（仓库是公开的，写进去等于公开 IP、SSH 端口和用户名），先建一份
+`.deploy.env`（已被 gitignore 挡住，不进提交）：
+
+```bash
+cp .deploy.env.example .deploy.env
+$EDITOR .deploy.env    # REMOTE=user@host、SSH_PORT、REMOTE_DIR、SERVICE
+```
+
+```bash
+scripts/deploy-remote.sh                  # 全量测试 → 同步 → 重启 → 健康检查
+scripts/deploy-remote.sh --skip-tests     # 调试期跳过全量测试
+scripts/deploy-remote.sh --with-persona   # 连 .qq-persona（人设 / 表达规则）一起传
+scripts/deploy-remote.sh --rollback       # 回滚到那台机器上一次部署前的代码
+```
+
+同名环境变量可以临时覆盖（`REMOTE=user@host scripts/deploy-remote.sh`）；`REMOTE` 或
+`REMOTE_DIR` 没给时脚本直接退出，它不会对着空地址去 ssh。
+
+几条它刻意不做的事：
+
+- **不传运行时数据**：`data/`、`.qq-media/`、`.qq-memory/`、`.qq-stickers/`、`.qq-persona/`
+  留在那台机器上（`--with-persona` 才带人设 —— 人设是部署资产，不是代码）。
+- **不删文件**：整包解压只覆盖、不清理，删掉/改名的旧模块会留在远端（不 import 就不影响运行）。
+  要彻底对齐就用 `--rollback` 回到备份，或者干脆走下面的 git 路线。每次部署前它会把
+  「代码」打包到 `~/dsh-qq-bridge.bak/`，默认留 5 份。
+- **必须先重启**：Loader 按 URL 缓存模块，停用/启用插件拿不回新代码（见 AGENTS.md §5.1），
+  所以脚本宁可断 5 秒也要先停再替换文件。
+
+**改走 git 也可以**（历史、删除、回滚都由 git 管）：目标机上 `git clone` 一份，profile 的
+`link:` 指到 clone 目录，之后每次 `git push` + 远端 `git pull` + `systemctl --user restart`。
+代价是每改一次都得先提交 —— 调试期从脏工作树直接上机，tar 那条路更顺手。
+
 ### 凭据
 
 QQ 会话用的模型是 `deepseek-official/deepseek-flash`（继承 `dsh-base` 的

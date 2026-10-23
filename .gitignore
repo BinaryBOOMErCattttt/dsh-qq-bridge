@@ -16,6 +16,9 @@ node_modules
 .env
 .env.*
 !.env.example
+# 部署现场（目标机 / 端口 / 目录）：仓库是公开的，写进脚本或文档等于公开 IP、SSH 端口与
+# 用户名。模板是 .deploy.env.example（提交），真值放 .deploy.env（不提交）。
+.deploy.env
 
 # 日志与临时文件
 *.log
