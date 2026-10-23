@@ -295,15 +295,15 @@ test('findNapcatDir：强判据优先（有账号配置），弱判据兜底（�
 
 test('withAutoLoginAccount：只动 autoLoginAccount，其余字段与幂等都要守住', () => {
   const config = { host: '::', port: 6099, token: 'abc', autoLoginAccount: '' };
-  const set = withAutoLoginAccount(config, '3347497639');
+  const set = withAutoLoginAccount(config, '123456789');
   assert.equal(set.changed, true);
-  assert.equal(set.config.autoLoginAccount, '3347497639');
+  assert.equal(set.config.autoLoginAccount, '123456789');
   assert.equal(config.autoLoginAccount, '', '原对象不能被就地修改（写盘前还要拿它做备份对账）');
   assert.equal(set.config.token, 'abc', '不能顺手抹掉 WebUI 的 token');
   assert.equal(set.config.port, 6099);
-  assert.equal(withAutoLoginAccount(set.config, '3347497639').changed, false, '幂等：已经对了就不该再写盘');
+  assert.equal(withAutoLoginAccount(set.config, '123456789').changed, false, '幂等：已经对了就不该再写盘');
   // 从别处粘过来的号码可能带空白：按去空白后的值写。
-  assert.equal(withAutoLoginAccount(config, '  3347497639  ').config.autoLoginAccount, '3347497639');
+  assert.equal(withAutoLoginAccount(config, '  123456789  ').config.autoLoginAccount, '123456789');
   // 不给号 = 什么都不做（注意：不是「把已有的清空」—— 那会把用户设好的快速登录抹掉）。
   assert.equal(withAutoLoginAccount(config, '').changed, false);
   assert.equal(withAutoLoginAccount(config, undefined).changed, false);
@@ -314,7 +314,7 @@ test('withAutoLoginAccount：只动 autoLoginAccount，其余字段与幂等都�
 });
 
 test('startPlan：Windows 上以管理员身份启动，并带上快速登录与窗口样式', () => {
-  const plan = startPlan({ platform: 'win32', launcher: 'C:\\a b\\NapCat.Shell\\launcher.bat', qq: '3347497639', windowMode: 'normal' });
+  const plan = startPlan({ platform: 'win32', launcher: 'C:\\a b\\NapCat.Shell\\launcher.bat', qq: '123456789', windowMode: 'normal' });
   assert.equal(plan.command, 'powershell.exe');
   const script = decodePlan(plan);
   assert.match(script, /Start-Process/);
@@ -322,11 +322,11 @@ test('startPlan：Windows 上以管理员身份启动，并带上快速登录与
   assert.match(script, /-Verb RunAs/);
   assert.match(script, /-WindowStyle Normal/);
   assert.match(script, /-q/);
-  assert.match(script, /3347497639/);
+  assert.match(script, /123456789/);
   // 路径里有空格也必须原样进去（走 Base64 就是为了这个）。
   assert.match(script, /C:\\a b\\NapCat\.Shell\\launcher\.bat/);
   assert.match(plan.describe, /管理员/);
-  assert.match(plan.describe, /3347497639/);
+  assert.match(plan.describe, /123456789/);
   // 认不出的取值按默认（最小化）处理，别把用户拒在门外。
   assert.match(decodePlan(startPlan({ platform: 'win32', launcher: 'x.bat', windowMode: 'min' })), /-WindowStyle Minimized/);
   assert.match(decodePlan(startPlan({ platform: 'win32', launcher: 'x.bat', windowMode: '乱写' })), /-WindowStyle Minimized/);
@@ -351,7 +351,7 @@ function vbsRunCommand(vbs) {
 }
 
 test('hiddenWrapperVbs：隐藏窗口 + 等它退出，命令行走 cmd.exe /s /c', () => {
-  const vbs = hiddenWrapperVbs({ launcher: 'C:\\a b\\NapCat.Shell\\launcher.bat', qq: '3347497639', napcatDir: 'C:\\a b\\NapCat.Shell' });
+  const vbs = hiddenWrapperVbs({ launcher: 'C:\\a b\\NapCat.Shell\\launcher.bat', qq: '123456789', napcatDir: 'C:\\a b\\NapCat.Shell' });
   assert.match(vbs, /Option Explicit/);
   assert.match(vbs, /Set sh = CreateObject\("WScript\.Shell"\)/);
   // `, 0, True` 是这条路的全部要点：0 = 窗口隐藏，True = 等它退出（进程树因此一直活着）。
@@ -359,7 +359,7 @@ test('hiddenWrapperVbs：隐藏窗口 + 等它退出，命令行走 cmd.exe /s /
   assert.ok(vbs.includes('sh.CurrentDirectory = "C:\\a b\\NapCat.Shell"'), '包装脚本要站到 NapCat 目录里');
   // 走 cmd.exe /s /c 而不是把 .bat 直接交给 WshShell.Run：后者走文件关联（ShellExecute），
   // 从下载来的 zip 里解压出来的 .bat 带 Mark-of-the-Web，会弹一个我们看不见的模态警告框。
-  assert.equal(vbsRunCommand(vbs), 'cmd.exe /s /c ""C:\\a b\\NapCat.Shell\\launcher.bat" -q 3347497639"');
+  assert.equal(vbsRunCommand(vbs), 'cmd.exe /s /c ""C:\\a b\\NapCat.Shell\\launcher.bat" -q 123456789"');
   // 中文 + 空格的路径要能原样穿过去（编码那半边由 filestore 的 UTF-16 用例钉住）。
   assert.equal(vbsRunCommand(hiddenWrapperVbs({ launcher: 'C:\\程序 目录\\launcher.bat', qq: '1' })), 'cmd.exe /s /c ""C:\\程序 目录\\launcher.bat" -q 1"');
   // 不给号就不带 -q（那时 NapCat 自己走二维码登录）。
@@ -369,7 +369,7 @@ test('hiddenWrapperVbs：隐藏窗口 + 等它退出，命令行走 cmd.exe /s /
 });
 
 test('hiddenStartPlan：提权跑 wscript（GUI 宿主，压根没有要隐藏的控制台）', () => {
-  const plan = hiddenStartPlan({ platform: 'win32', wrapper: 'C:\\a b\\hidden.vbs', qq: '3347497639' });
+  const plan = hiddenStartPlan({ platform: 'win32', wrapper: 'C:\\a b\\hidden.vbs', qq: '123456789' });
   assert.equal(plan.command, 'powershell.exe');
   const script = decodePlan(plan);
   assert.match(script, /Start-Process/);
