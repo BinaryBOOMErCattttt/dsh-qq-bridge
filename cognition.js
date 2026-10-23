@@ -28,9 +28,18 @@ const COGNITION_SECTIONS = ['黑话与缩写', '谐音与变体', '专名与作�
 const STICKER_COLLECTED = '已收藏';
 const STICKER_PENDING = '未收藏';
 
-/** 「置信」只有两种取值：确认过、存疑；缺省按确认算（手写条目很少会写这个）。 */
+/** 「置信」只有两种取值：确认过、存疑；**缺省按存疑算**（漏写的条目不该被当成事实）。 */
 const CONFIRMED = '确认';
 const DOUBTFUL = '存疑';
+
+/**
+ * 没有「核实」标记的条目，注入时带这个尾巴。
+ *
+ * 为什么打在注入层而不是解析层：条目本身是群里的说法，这不丢人；丢人的是模型把它
+ * 当世界事实讲出去（2026-10-23 09:22：「菲比是法杖修女」被当成真的，见 COGNITION 审计）。
+ * 尾巴只在提示词里，`qq_memory read` 看到的仍是原文。
+ */
+export const UNVERIFIED_MARK = '（群里的说法，未核实）';
 
 /** 日期形状：`2026-10-12`。识别它，是为了把「首见日期」与可选的「来源」分开。 */
 
@@ -59,16 +68,17 @@ function sectionName(line) {
 }
 
 /**
- * 从字段里挑出「首见日期」与「置信」。
+ * 从字段里挑出「首见日期」「置信」「核实」。
  *
- * 两条都**只按内容认、不按位置认**：格式说明里它们排在最后，但手写时经常漏掉来源，
+ * 三条都**只按内容认、不按位置认**：格式说明里它们排在最后，但手写时经常漏掉来源，
  * 于是日期会往前挪一格。按内容认，写歪一格也不会把日期当成「怎么用」。
  * @param fields - {@link splitFields} 的结果。
- * @returns `{ date, confidence, rest }`：`rest` 是剩下的普通字段。
+ * @returns `{ date, confidence, verified, rest }`：`rest` 是剩下的普通字段。
  */
 function takeMeta(fields) {
   let date = '';
   let confidence = '';
+  let verified = '';
   const rest = [];
   for (const field of fields) {
     // 「2026-10-12」与「首见 2026-10-12」都算日期：格式说明里写的是后者，但手写时
@@ -87,21 +97,28 @@ function takeMeta(fields) {
       confidence = field;
       continue;
     }
+    // 「核实 2026-10-23」＝这一条跟外部资料对过。只写「核实」也认，但没有日期时仍然
+    // 不能当成「没写」—— 那会把前面的普通字段挤到 source 的位置上去。
+    const checked = /^核实(?:日期|于)?\s*[:：]?\s*(\d{4}-\d{2}-\d{2})?$/.exec(field);
+    if (checked !== null) {
+      if (verified.length === 0) verified = checked[1] ?? '核实';
+      continue;
+    }
     rest.push(field);
   }
-  return { date, confidence, rest };
+  return { date, confidence, verified, rest };
 }
 
 /**
  * 解析 `COGNITION.md`。
  *
- * 条目格式：`写法（变体：A / B）｜一句话意思｜怎么用｜来源（可选）｜首见日期｜置信：确认`。
+ * 条目格式：`写法（变体：A / B）｜一句话意思｜怎么用｜来源（可选）｜首见日期｜置信：确认｜核实 2026-10-23（可选）`。
  * 少于两个字段的行当作「还不会解析」丢掉并记进 `warnings` —— 宁可少一条，也不要把
  * 半行字塞进提示词（模型会照着那半行编）。
  *
  * @param {string} markdown - 文件内容（可以不存在 → 传空串）。
  * @returns {{ entries: object[], warnings: string[] }} 条目按文件顺序（旧 → 新）。
- *   每条：`{ section, writeup, variants, meaning, usage, source, date, confidence, line }`。
+ *   每条：`{ section, writeup, variants, meaning, usage, source, date, confidence, verified, line }`。
  */
 export function parseCognition(markdown) {
   const entries = [];
@@ -142,7 +159,13 @@ export function parseCognition(markdown) {
       usage: fields.rest[2] ?? '',
       source: fields.rest[3] ?? '',
       date: fields.date,
-      confidence: fields.confidence.length > 0 ? fields.confidence : CONFIRMED,
+      // 缺省是「存疑」而不是「确认」（2026-10-23 之后）：漏写置信的条目宁可看不见，
+      // 也不要在每轮提示词里被当成事实。30 条老条目里查出 8 条错的，全都是漏写的那批。
+      confidence: fields.confidence.length > 0 ? fields.confidence : DOUBTFUL,
+      // 「核实 2026-10-23」：**这一条被对照过外部资料**。空串＝只是「群里这么说过」，
+      // 注入时会带「未核实」的尾巴（尾巴加在两处注入点上：`hotCognitionLines` 与
+      // `memory-select.js` 的 `renderRecord`）。
+      verified: fields.verified,
       line,
       // 文件里的行号：长期记忆的检索结果要能给出「出处」（`COGNITION.md#L12`），
       // 模型据此自己 `qq_memory read` 深挖。解析层提供，别让调用方再数一遍。
@@ -194,14 +217,31 @@ export function hotCognitionLines(entries, { limit = 15, maxChars = 1200 } = {})
   const lines = [];
   let used = 0;
   for (const entry of picked) {
-    const variants = entry.variants.length > 0 ? `（变体：${entry.variants.join(' / ')}）` : '';
-    const line = `${entry.writeup}${variants} —— ${entry.meaning}`;
+    const line = `${cognitionText(entry)}${verifiedOf(entry) ? '' : UNVERIFIED_MARK}`;
     // 超预算就停：宁可少几条，也不要把最后一条截成半句（半句会被模型当成完整意思）。
     if (used + line.length > maxChars) break;
     lines.push(line);
     used += line.length + 1;
   }
   return lines;
+}
+
+/**
+ * 一条认知在提示词里的样子：`写法（变体） —— 意思`（**不含**「未核实」尾巴）。
+ *
+ * 热梗段与检索注入（`memory-select.js` 的 `recordsFromCognition`）共用这一处，
+ * 免得两边把「写法 + 变体 + 意思」拼出两种样子。
+ * @param entry - {@link parseCognition} 的一条。
+ * @returns 一行文本。
+ */
+export function cognitionText(entry) {
+  const variants = entry.variants?.length > 0 ? `（变体：${entry.variants.join(' / ')}）` : '';
+  return `${entry.writeup}${variants} —— ${entry.meaning}`;
+}
+
+/** 这条认知对照过外部资料没有。 */
+export function verifiedOf(entry) {
+  return String(entry?.verified ?? '').trim().length > 0;
 }
 
 /**
@@ -471,6 +511,8 @@ export function cognitionRow(entry) {
     .map((field) => String(field ?? '').trim())
     .filter((field) => field.length > 0);
   const confidence = entry.confidence === DOUBTFUL ? DOUBTFUL : CONFIRMED;
+  // 刻意**不写**「核实」：重写一条条目（哪怕只改含义）就是一次内容变更，上一次的核对
+  // 对新的说法不再作数。要恢复成「已核实」，得重新查一遍、再手动补 `｜核实 <日期>`。
   return `- ${[writeup, meaning, ...tail, `置信：${confidence}`].join('｜')}`;
 }
 

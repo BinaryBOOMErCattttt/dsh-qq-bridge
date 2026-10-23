@@ -21,6 +21,10 @@
  * @module @qqbot/dsh-plugin-qq/memory-select
  */
 
+// 只取一个纯函数：认知条目在提示词里怎么渲染（含「未核实」尾巴）只能有一处定义，
+// 热梗段与检索命中都走它。`cognition.js` 不 import 任何东西，这条边不会成环。
+import { UNVERIFIED_MARK, cognitionText, verifiedOf } from './cognition.js';
+
 /**
  * 热层里认得的二级标题与它们的 record 类型。
  *
@@ -265,7 +269,11 @@ export function recordsFromCognition(entries, { file = 'COGNITION.md', scope = '
     section: '认知',
     kind: 'meme',
     scope,
-    text: `${entry.writeup}${entry.variants.length > 0 ? `（变体：${entry.variants.join(' / ')}）` : ''} —— ${entry.meaning}`,
+    // 渲染走 `cognition.js` 的 `cognitionText`：两处注入（热梗段 / 检索命中）必须
+    // 拼出同一句；「未核实」的尾巴由 `renderRecord` 加在行末（别塞在意思后面，
+    // 那会把「；怎么用：」和含义拆开）。
+    text: cognitionText(entry),
+    verified: verifiedOf(entry),
     keys: [entry.writeup, ...entry.variants].filter((key) => String(key ?? '').trim().length > 0),
     topic: entry.writeup,
     name: entry.writeup,
@@ -436,7 +444,10 @@ function renderRecord(record) {
   const ref = record.line > 0 ? `${file}#L${record.line}` : file;
   const detail = String(record.detail ?? '').trim();
   const tail = detail.length > 0 ? `；怎么用：${detail}` : '';
-  return `  - ${record.text}${tail}（${ref}）`;
+  // 认知条目没「核实」过：行末标出来，让模型知道这是群里的说法（见 COGNITION 审计）。
+  // 只认 `=== false`：别的记录类型没有这个字段，不能被顺手标上。
+  const mark = record.kind === 'meme' && record.verified === false ? UNVERIFIED_MARK : '';
+  return `  - ${record.text}${tail}${mark}（${ref}）`;
 }
 
 /** 标题 → 节定义（渲染用）。 */

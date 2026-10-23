@@ -71,6 +71,21 @@ function describeCognition() {
     assert.equal(entries[0].date, '2026-10-12');
   });
 
+  test('parseCognition：漏写置信按存疑算；「核实」进 verified，不挤占来源', () => {
+    const { entries } = parseCognition([
+      '- 没写清楚｜大概是这个意思',
+      '- 核过了｜确实如此｜2026-10-12｜置信：确认｜核实 2026-10-23',
+    ].join('\n'));
+    // 2026-10-23 的存量核验里查出错的那 8 条，全都是漏写置信的那批 —— 缺省必须是
+    // 「存疑」（看不见），而不是「确认」（每轮当成事实）。
+    assert.equal(entries[0].confidence, '存疑', '漏写置信不能默认成「确认」');
+    assert.equal(entries[0].verified, '');
+    assert.equal(entries[1].confidence, '确认');
+    assert.equal(entries[1].verified, '2026-10-23');
+    assert.equal(entries[1].source, '', '「核实」是核对记录，不是来源，不能顶到 source 的位置');
+    assert.equal(entries[1].date, '2026-10-12');
+  });
+
   test('parseCognition：半行字丢掉并记警告（宁可少一条，也不让模型照着编）', () => {
     const { entries, warnings } = parseCognition('- 只有一段\n- 好活｜有含义\n');
     assert.equal(entries.length, 1);
@@ -97,6 +112,20 @@ function describeCognition() {
     const tight = hotCognitionLines(entries, { maxChars: lines[0].length + 2 });
     assert.deepEqual(tight, [lines[0]]);
     assert.deepEqual(hotCognitionLines(entries, { limit: 0 }), []);
+  });
+
+  test('hotCognitionLines：没核实过的条目带「未核实」尾巴，核过的没有', () => {
+    const { entries } = parseCognition([
+      '## 黑话与缩写',
+      '- 群里说的｜大概是这个意思｜置信：确认',
+      '- 核过的｜确实如此｜置信：确认｜核实 2026-10-23',
+      '- 漏写置信的｜连置信都没写',
+    ].join('\n'));
+    const lines = hotCognitionLines(entries, { limit: 9 });
+    assert.deepEqual(lines, [
+      '群里说的 —— 大概是这个意思（群里的说法，未核实）',
+      '核过的 —— 确实如此',
+    ], '只有「确认但没核实」的才带尾巴；漏写置信的根本不进热梗段');
   });
 
   test('cognitionPathViolations：认知库里出现文件路径要被点名（§9 的硬规则）', () => {
@@ -189,8 +218,8 @@ function describeStickers() {
 /** 逐条写入、写入归一化、注入顺序 —— 这三组对应「模型别再整份重写 markdown」。 */
 function describeStructuredWrites() {
   test('hotCognitionLines：注入「最近」按首见日期算，不按文件里的位置', () => {
-    const a = parseCognition(['## 黑话与缩写', '- 旧梗｜很早学的｜2026-09-01', '- 新梗｜刚学的｜2026-10-17'].join('\n')).entries;
-    const b = parseCognition(['## 黑话与缩写', '- 新梗｜刚学的｜2026-10-17', '- 旧梗｜很早学的｜2026-09-01'].join('\n')).entries;
+    const a = parseCognition(['## 黑话与缩写', '- 旧梗｜很早学的｜2026-09-01｜置信：确认｜核实 2026-09-01', '- 新梗｜刚学的｜2026-10-17｜置信：确认｜核实 2026-10-17'].join('\n')).entries;
+    const b = parseCognition(['## 黑话与缩写', '- 新梗｜刚学的｜2026-10-17｜置信：确认｜核实 2026-10-17', '- 旧梗｜很早学的｜2026-09-01｜置信：确认｜核实 2026-09-01'].join('\n')).entries;
     assert.deepEqual(hotCognitionLines(a, { limit: 1 }), ['新梗 —— 刚学的']);
     assert.deepEqual(hotCognitionLines(b, { limit: 1 }), ['新梗 —— 刚学的'], '换个排列不该换成另一条');
   });
@@ -200,9 +229,9 @@ function describeStructuredWrites() {
     // 于是 15 条上限一满它就永远进不了提示词。
     const entries = parseCognition([
       '## 黑话与缩写',
-      '- 老说法｜很久以前学的，没写日期',
-      '- 新梗｜刚学的｜2026-10-17',
-      '- 更新梗｜更近学的｜2026-10-18',
+      '- 老说法｜很久以前学的，没写日期｜置信：确认｜核实 2026-10-01',
+      '- 新梗｜刚学的｜2026-10-17｜置信：确认｜核实 2026-10-17',
+      '- 更新梗｜更近学的｜2026-10-18｜置信：确认｜核实 2026-10-18',
     ].join('\n')).entries;
     // 只留最近两条：老说法紧跟在新梗之前（位置），应当挤掉它、留下两条有日期的，
     // 而不是被当成「最旧」直接出局。
@@ -211,9 +240,9 @@ function describeStructuredWrites() {
     // 于是能进前两条（这正是「写在文件后半段的老条目不再被静默丢掉」）。
     const tail = parseCognition([
       '## 黑话与缩写',
-      '- 新梗｜刚学的｜2026-10-17',
-      '- 更新梗｜更近学的｜2026-10-18',
-      '- 老说法｜很久以前学的，没写日期',
+      '- 新梗｜刚学的｜2026-10-17｜置信：确认｜核实 2026-10-17',
+      '- 更新梗｜更近学的｜2026-10-18｜置信：确认｜核实 2026-10-18',
+      '- 老说法｜很久以前学的，没写日期｜置信：确认｜核实 2026-10-01',
     ].join('\n')).entries;
     const picked = hotCognitionLines(tail, { limit: 2 });
     assert.ok(picked.some((line) => line.startsWith('老说法')), `无日期条目应当能进热梗段，实际：${picked.join(' | ')}`);

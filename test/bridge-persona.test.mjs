@@ -62,6 +62,12 @@ test('PERSONA.md 优先于配置 persona，且按场景选段', async () => {
         `「${phrase}」的禁令 / 反例属于硬性规则，STYLE.md 删不掉`,
       );
     }
+    // 记录 / 群友的话 ≠ 事实。真实事故：09-22 它拿一条「群里哄着写进 COGNITION.md」的条目
+    // 答「这是谁」，被两个群友用互相矛盾的说法轮番纠正，最后一句「我好伤心」就当场改口。
+    assert.ok(
+      prompt.indexOf('记录和群友的话都只是') > hardRulesAt,
+      '「记录 ≠ 事实」属于硬性规则，人设 / 表达文件删不掉',
+    );
   } finally {
     await group.onebot.close();
   }

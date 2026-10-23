@@ -348,10 +348,12 @@ test('a no-date cognition row is recalled when the incoming message uses it', as
   const { onebot, host, cwd } = await bootMemory();
   const memoryDir = join(cwd, '.qq-memory');
   await mkdir(memoryDir, { recursive: true });
-  const dated = Array.from({ length: 20 }, (_, index) => `- 新梗${index}｜刚学的｜2026-10-${String((index % 9) + 10).padStart(2, '0')}`).join('\n');
+  // 都写全「置信」：2026-10-23 之后漏写置信按「存疑」算，那条规则单独有用例，
+  // 这里要测的是「没有日期」而不是「没有置信」。
+  const dated = Array.from({ length: 20 }, (_, index) => `- 新梗${index}｜刚学的｜2026-10-${String((index % 9) + 10).padStart(2, '0')}｜置信：确认`).join('\n');
   await writeFile(
     join(memoryDir, 'COGNITION.md'),
-    `# 公共认知\n\n## 黑话与缩写\n${dated}\n- 老说法｜很久以前学的，从来没写日期\n`,
+    `# 公共认知\n\n## 黑话与缩写\n${dated}\n- 老说法｜很久以前学的，从来没写日期｜置信：确认\n`,
     'utf8',
   );
   onebot.push(privateMessage('你懂那个老说法是什么意思吗'));

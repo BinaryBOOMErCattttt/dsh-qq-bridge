@@ -141,7 +141,7 @@ test('无日期老梗回归：消息里出现写法 → 不看日期也进提示
   // 34 条里有 17 条没有日期，旧实现把它们当成「最旧」，永远进不了热梗段。
   const lines = [];
   for (let index = 0; index < 30; index += 1) lines.push(`- 新梗${index}｜刚学的｜2026-10-${String((index % 28) + 1).padStart(2, '0')}`);
-  lines.push('- 老说法｜很久以前学的，从来没写日期');
+  lines.push('- 老说法｜很久以前学的，从来没写日期｜置信：确认');
   const records = recordsFromCognition(parseCognition(`## 黑话与缩写\n${lines.join('\n')}\n`).entries);
   const rendered = block(records, '他又来那句老说法了', { config: { promptChars: 6000 } });
   assert.match(rendered.text, /老说法 —— 很久以前学的/);
@@ -149,10 +149,19 @@ test('无日期老梗回归：消息里出现写法 → 不看日期也进提示
 });
 
 test('梗命中变体：消息里出现变体 → 命中同一条，并带上「怎么用」', () => {
-  const records = recordsOf(MEMORY, '## 谐音与变体\n- 绷不住了（变体：蚌埠住了 / 绷不住）｜忍不住笑了｜有人发离谱东西时｜2026-10-12\n');
+  const records = recordsOf(MEMORY, '## 谐音与变体\n- 绷不住了（变体：蚌埠住了 / 绷不住）｜忍不住笑了｜有人发离谱东西时｜2026-10-12｜置信：确认\n');
   const rendered = block(records, '蚌埠住了');
   assert.match(rendered.text, /绷不住了（变体：蚌埠住了 \/ 绷不住） —— 忍不住笑了；怎么用：有人发离谱东西时/);
   assert.ok(rendered.picked.some((record) => record.kind === 'meme'));
+});
+
+test('未核实的梗在行末带「未核实」，核过的不带（尾巴在出处之前）', () => {
+  const records = recordsOf(MEMORY, '## 黑话与缩写\n- 群说法｜大概是这个意思｜置信：确认\n- 核过说法｜确实如此｜置信：确认｜核实 2026-10-23\n');
+  const rendered = block(records, '群说法 核过说法');
+  assert.match(rendered.text, /群说法 —— 大概是这个意思（群里的说法，未核实）（COGNITION\.md#L\d+）/);
+  assert.match(rendered.text, /核过说法 —— 确实如此（COGNITION\.md#L\d+）/);
+  // 尾巴不能插在含义和「怎么用」中间 —— 那会把一句话拆成两截。
+  assert.doesNotMatch(rendered.text, /（群里的说法，未核实）；怎么用/);
 });
 
 test('存疑的梗不进候选，但写法仍进词汇表：猜测不该被当成事实，模型得知道它存在', () => {
@@ -223,7 +232,7 @@ test('隐私：private:<qq> 记录不出现在群提示词里，group 之间也�
 });
 
 test('词汇表：给出全部梗的写法（含变体），不给含义；关掉时整行消失', () => {
-  const records = recordsOf(MEMORY, '## 黑话与缩写\n- 典｜讽刺经典操作\n- 绷不住了（变体：蚌埠住了）｜忍不住笑了\n');
+  const records = recordsOf(MEMORY, '## 黑话与缩写\n- 典｜讽刺经典操作｜置信：确认\n- 绷不住了（变体：蚌埠住了）｜忍不住笑了｜置信：确认\n');
   const rendered = block(records, '随便说点什么');
   assert.match(rendered.text, /词汇表/);
   assert.match(rendered.text, /典、绷不住了、蚌埠住了/);
@@ -232,7 +241,7 @@ test('词汇表：给出全部梗的写法（含变体），不给含义；关�
 });
 
 test('出处：每条记录都带文件与行号，模型能自己 read 深挖', () => {
-  const records = recordsOf(MEMORY, '## 黑话与缩写\n- 典｜讽刺经典操作\n');
+  const records = recordsOf(MEMORY, '## 黑话与缩写\n- 典｜讽刺经典操作｜置信：确认\n');
   const rendered = block(records, '典');
   assert.match(rendered.text, /MEMORY\.md#L4/);
   assert.match(rendered.text, /MEMORY\.md#L8/);

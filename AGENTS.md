@@ -156,8 +156,8 @@ index.js ──▶ config.js（schema）/ settings.js ──▶ image.js（只�
          ──▶ speech-policy.js ──▶ speaking-rules.js（intent 判定；C 路四条排除也在这里）
          ──▶ persona.js ──▶ docfile.js ──▶ util.js（pathInside）/ style.js ──▶ docfile.js；prompt.js ──▶ persona.js / style.js
          ──▶ modalities.js（消息段渲染）/ interactions.js（戳一戳）/ links.js（卡片与 URL 预览）
-         ──▶ cognition.js（认知与表情包目录的纯解析；memory.js 也用它）
-         ──▶ memory-select.js（记忆的记录模型 / 检索 / 滚档，**纯函数**；memory.js 用它）
+         ──▶ cognition.js（认知与表情包目录的纯解析；memory.js 也用它；`cognitionText` 是注入文本的唯一拼法）
+         ──▶ memory-select.js（记忆的记录模型 / 检索 / 滚档，**纯函数**；memory.js 用它；它从 cognition.js 取 `cognitionText` / `UNVERIFIED_MARK` / `verifiedOf`）
          ──▶ docfile.js（人设 / 表达规则的热读）
          ──▶ memory.js ──▶ util.js / filestore.js / memory-select.js（长期记忆子系统）
          ──▶ reminders.js ──▶ util.js / filestore.js（定时提醒的任务/调度；发送与 Agent 轮留在 index.js）
