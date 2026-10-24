@@ -1,6 +1,6 @@
 {
   "name": "@qqbot/dsh-plugin-qq",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Bidirectional QQ (OneBot v11) bridge: QQ messages drive Harness agents, and any agent can send QQ messages, images and stickers back into a chat.",
