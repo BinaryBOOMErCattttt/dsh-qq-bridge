@@ -67,12 +67,13 @@ node --test --experimental-test-isolation=none "test/*.test.mjs"
 
 | 代码树 | 用例 | 通过 | 失败 |
 | --- | --- | --- | --- |
-| 纯净上游（基线） | 760 | 757 | 3 |
+| 纯净上游（基线，受限沙箱） | 760 | 757 | 3 |
 | 覆盖方案（已废弃） | 758 | 729 | 29 |
-| **本分支（三方合并）** | **789** | **786** | **3** |
+| **本分支（三方合并，受限沙箱）** | 789 | 786 | 3 |
+| **本分支（允许起子进程）** | **789** | **789** | **0** |
 
-那 3 条失败的用例，是 `persona-template.test.mjs` 里真起子进程跑 `scripts/persona-check.mjs` 的三条：
-DSH 沙箱里 `spawnSync` 返回 `EPERM`，**纯净上游同样红**，不是代码问题。
+那 3 条只在受限沙箱里红，是 `persona-template.test.mjs` 里真起子进程跑 `scripts/persona-check.mjs` 的用例：
+沙箱给 `spawnSync` 返回 `EPERM`，**纯净上游同样红**，不是代码问题。放开子进程后全绿。
 
 `node scripts/check.mjs`：规则 2（`config.js` ↔ `docs/configuration.md` 字段同步）与规则 3 为绿；
 规则 1（`AGENTS.md` 体积）与规则 4（逐文件 `node --check`）受环境限制（同样是 spawn 被拒），
@@ -105,7 +106,7 @@ Windows / 本机开发：先把依赖铺进插件目录（`node_modules` 不是�
 
 1. **`AGENTS.md` 超出注入预算**（70040 > 65536）。上游主线本来就超，合并后更超。
    要变绿得砍约 4.5KB，属于「要不要动上游正文」的决定，暂时保留。
-2. **三条 `persona-check` 用例在沙箱里红**（`spawnSync` 被拒），普通终端里跑是全绿的。
+2. **三条 `persona-check` 用例在受限沙箱里红**（`spawnSync` 被拒），普通终端或放开子进程后全绿。
 3. **天气 / 余额没有配置项**（模块直接读环境与参数），所以设置页里没有对应分组。
 4. **`FORK.md` / `HANDOFF.md`** 是导出手册，留着当历史背景；不需要可以直接删。
 5. **TTS 只有框架**：`tts: true` 之前得先在 `tts.js` 里 `registerTtsProvider()`，否则「语音」只回「未配置」，不会联网。
