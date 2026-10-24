@@ -11,7 +11,7 @@
  * 把页面展开成节点树，断言设置页的那批契约（清单见 `client.js` 顶部注释）：
  *
  *   1. 注册位置与注入面；
- *   2. 148 个字段在 7 个 tab 的合集里恰好各出现一次、不落「其它」；
+ *   2. 170 个字段在 7 个 tab 的合集里恰好各出现一次、不落「其它」；
  *   3. 每个分组恰属一个 tab（`tabOf` 对未知分组返回 undefined）；
  *   4. 控件映射：布尔 → `Switch`、枚举 → `<select>`、数字 / 文本 → `<input>`（官方字段行
  *      几何）、长文本 → `textarea`；工具条里的搜索框才是 primitives 的 `Input`；
@@ -389,7 +389,7 @@ function fieldsIn(tree) {
   return map;
 }
 
-/** 依次点过全部 tab，收集每个字段那一行（用来做「148 个字段各自的控件」这类断言）。 */
+/** 依次点过全部 tab，收集每个字段那一行（用来做「170 个字段各自的控件」这类断言）。 */
 function allFields(session) {
   const found = new Map();
   mountTree(session);
@@ -500,7 +500,7 @@ test('字段覆盖：schema 里每一项都上了页面、都有标签、都不�
   }
 });
 
-test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来是 148', () => {
+test('tab 映射：7 个 tab、17 个分组各属一个 tab、字段数加起来是 170', () => {
   const { mod } = mount();
   const fields = mod.describeFields(new z(SCHEMA_JSON()));
 
@@ -523,6 +523,10 @@ test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来
   assert.equal(mod.tabOf('repeat').id, 'group');
   assert.equal(mod.tabOf('reminder').id, 'reminder', '定时提醒单独一页，不塞在群聊里');
   assert.equal(mod.tabOf('apikey').id, 'memory');
+  // 服务器分支新分出来的两组各自落在对的 tab 上：静默 / 受信写盘属于会话的运行环境，
+  // 语音属于感知与媒体；分组本身是界面的事，漏掉的话「不落其它」那条会先红。
+  assert.equal(mod.tabOf('quiet').id, 'session');
+  assert.equal(mod.tabOf('tts').id, 'perception');
   assert.equal(mod.tabOf('other'), undefined, 'tabOf 对未知分组返回 undefined（别静默丢字段）');
 
   const countOf = (tab) =>
@@ -531,10 +535,10 @@ test('tab 映射：7 个 tab、15 个分组各属一个 tab、字段数加起来
       .length;
   assert.deepEqual(
     Object.fromEntries(mod.TABS.map((tab) => [tab.id, countOf(tab)])),
-    { connect: 12, session: 29, persona: 13, group: 30, reminder: 11, perception: 37, memory: 23 },
+    { connect: 14, session: 40, persona: 13, group: 30, reminder: 11, perception: 39, memory: 23 },
     '字段数按设计 §3.1 分布',
   );
-  assert.equal(fields.length, 155, '合计 155 项');
+  assert.equal(fields.length, 170, '合计 170 项');
 });
 
 test('定时任务：提醒页最上面有一块只读列表，取数路径与 Host 路由一致', () => {
@@ -720,7 +724,7 @@ test('表单投影：7 个 tab 覆盖全部字段，每行带草稿状态与来�
   assert.equal(state.tabs.length, 7);
   assert.equal(state.shell.writable, true);
   const rows = state.tabs.flatMap((tab) => tab.sections.flatMap((section) => section.rows));
-  assert.equal(rows.length, 155, '投影必须覆盖全部字段');
+  assert.equal(rows.length, 170, '投影必须覆盖全部字段');
   for (const tab of state.tabs) {
     for (const section of tab.sections) {
       assert.ok(section.title.length > 0, `${section.id} 的区块标题不能空`);
@@ -736,10 +740,10 @@ test('表单投影：7 个 tab 覆盖全部字段，每行带草稿状态与来�
   }
 });
 
-test('控件映射：37 个布尔是 Switch、8 个枚举是 select、长文本是 textarea', () => {
+test('控件映射：43 个布尔是 Switch、8 个枚举是 select、长文本是 textarea', () => {
   const session = mount();
   const fields = allFields(session);
-  assert.equal(fields.size, 155, '七个 tab 加起来必须刚好是 155 行（每行只渲染一次）');
+  assert.equal(fields.size, 170, '七个 tab 加起来必须刚好是 170 行（每行只渲染一次）');
 
   const kinds = new Map();
   for (const [key, field] of fields) {
@@ -761,7 +765,7 @@ test('控件映射：37 个布尔是 Switch、8 个枚举是 select、长文本�
 
   const tally = {};
   for (const kind of kinds.values()) tally[kind] = (tally[kind] ?? 0) + 1;
-  assert.deepEqual(tally, { boolean: 37, choice: 8, long: 2, input: 108 }, '按 schema 的类型分布');
+  assert.deepEqual(tally, { boolean: 43, choice: 8, long: 2, input: 117 }, '按 schema 的类型分布');
 
   // 数字框带 `inputMode="numeric"`；列表行在输入框下面给 Pill 预览。
   assert.equal(controlIn(fields.get('proactiveChance'), isInput).props.inputMode, 'numeric');
@@ -769,9 +773,9 @@ test('控件映射：37 个布尔是 Switch、8 个枚举是 select、长文本�
   assert.ok(controlIn(listField, isInput), '列表行仍然是输入框');
   const pills = nodes(listField, (node) => node.type === primitivesStub.Pill);
   assert.equal(pills.length, 0, '默认值空列表时不渲染 Pill 预览');
-  // `allowTools` 的默认值不再为空（18 个工具名）：每个都渲染成一个可点的 Pill。
+  // `allowTools` 的默认值不再为空（23 个工具名）：每个都渲染成一个可点的 Pill。
   const allowToolsPills = nodes(fields.get('allowTools'), (node) => node.type === primitivesStub.Pill);
-  assert.equal(allowToolsPills.length, 18, '工具白名单的默认值应当逐个渲染成 Pill');
+  assert.equal(allowToolsPills.length, 23, '工具白名单的默认值应当逐个渲染成 Pill');
 });
 
 test('草稿口径：布尔收 true / 是 / 1，空串是「恢复默认」，胡说是非法', () => {
@@ -967,7 +971,7 @@ test('页面骨架：页头（标题 + 保存）/ 简介 / 通知 / 工具条 / 
     sections.map((node) => textOf(nodes(node, (child) => child.type === 'h3')[0])),
     ['连接与运行环境', '准入与触发'],
   );
-  assert.deepEqual(fieldsIn(tree).size, 12, '连接 tab 有 12 个字段');
+  assert.deepEqual(fieldsIn(tree).size, 14, '连接 tab 有 14 个字段');
 
   // 键盘 ←/→/Home/End 换 tab（事件里没有 DOM，focus 挪不动但切换必须生效）。
   const key = (name) => ({ key: name, preventDefault() {} });
@@ -1158,7 +1162,7 @@ test('搜索：按标签 / 字段名 / 描述 / 区块标题命中，跨 tab，�
   const event = { key: 'Escape', preventDefault() {} };
   input.props.onKeyDown(event);
   tree = rerender(session);
-  assert.equal(fieldsIn(tree).size, 12, '清空搜索回到当前 tab 的分组视图');
+  assert.equal(fieldsIn(tree).size, 14, '清空搜索回到当前 tab 的分组视图');
 
   // 点 tab = 清空搜索并切过去。
   tree = searchFor('proactive');

@@ -312,8 +312,9 @@ noteConversationActivity（touchActivity / 戳一戳）先记下 `idleMs`（**�
   （旧 Agent 迟到的 turn/end 会被当成这个会话的回复发出去）。
 - **长期记忆与轮次无关**：转录 / `MEMORY.md` 按会话 key（`memorySlug`）落，`/reset` 不动它们。
 - **第 0 轮的 id 是历史契约**（§5.3）：`sessionIdFor(key, 0)` 必须与改动前逐位相同。
-- **重置要过权限**（`canReset` / `Config.resetUsers`）：全项目唯一一个「白名单为空 = 谁都不能」
-  的配置项（与 `allowUsers` 相反），别顺手统一。判断点在 `handleEvent` 的 `/reset` 分支里、
+- **重置要过权限**（`canReset` / `Config.resetUsers`）：`resetUsers` 非空时以它为准，为空时由
+  `ownerAutoClaim` 认第一个私聊联系人，两者都没有才是谁都不能 —— 全项目唯一一个「名单空 = 默认
+  收紧」的配置项（与 `allowUsers` 相反），别顺手统一。判断点在 `handleEvent` 的 `/reset` 分支里、
   `flushBatch` **之前**（否则没权限的人也能让攒着的消息提前投出去），没权限时静默 return。
 - **静默换代的 `idleMs` 只能在 `lastActiveAt` 被覆盖之前算**（`noteConversationActivity`）：
   `touchActivity` 在 `admit` 之前跑，一到就把「刚才有多安静」盖掉了；而新建会话记录时

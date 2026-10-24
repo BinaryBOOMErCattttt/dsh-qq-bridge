@@ -380,7 +380,7 @@ window.__ModuleLoader__.load({
       {
         id: 'admission',
         title: '准入与触发',
-        fields: ['privateChat', 'groupChat', 'groupTrigger', 'prefix', 'blankReply', 'allowUsers', 'allowGroups'],
+        fields: ['privateChat', 'groupChat', 'groupTrigger', 'prefix', 'blankReply', 'commands', 'guestCommands', 'allowUsers', 'allowGroups'],
       },
       {
         id: 'agent',
@@ -455,11 +455,28 @@ window.__ModuleLoader__.load({
         ],
       },
       {
+        id: 'quiet',
+        title: '静默 / 主人与受信写盘',
+        fields: [
+          'wakeTriggers',
+          'wakeText',
+          'mutePersist',
+          'muteFile',
+          'ownerAutoClaim',
+          'ownerFile',
+          'ownerSettingsFile',
+          'trustedWrite',
+          'skillWriteDir',
+          'writeMaxBytes',
+        ],
+      },
+      {
         id: 'batch',
         title: '攒批与群聊上下文',
         fields: [
           'batchWindowMs',
           'batchMaxWaitMs',
+          'mediaHoldMs',
           'batchBacklog',
           'batchBacklogEntries',
           'batchBacklogChars',
@@ -529,6 +546,11 @@ window.__ModuleLoader__.load({
         ],
       },
       {
+        id: 'tts',
+        title: '语音（TTS / edge-tts）',
+        fields: ['tts', 'ttsMaxChars'],
+      },
+      {
         id: 'style',
         title: '说话方式与节奏',
         fields: [
@@ -562,11 +584,11 @@ window.__ModuleLoader__.load({
      */
     const TABS = [
       { id: 'connect', label: '连接', title: '连接与准入', sections: ['connection', 'admission'] },
-      { id: 'session', label: '会话', title: '会话与节奏', sections: ['agent', 'batch', 'style'] },
+      { id: 'session', label: '会话', title: '会话与节奏', sections: ['agent', 'quiet', 'batch', 'style'] },
       { id: 'persona', label: '人格', title: '人格与表达', sections: ['persona', 'expression'] },
       { id: 'group', label: '群聊', title: '群聊互动', sections: ['repeat', 'proactive', 'active'] },
       { id: 'reminder', label: '提醒', title: '定时提醒', sections: ['reminder'] },
-      { id: 'perception', label: '感知', title: '感知与媒体', sections: ['media', 'perception'] },
+      { id: 'perception', label: '感知', title: '感知与媒体', sections: ['media', 'perception', 'tts'] },
       { id: 'memory', label: '记忆', title: '记忆与运维', sections: ['memory', 'apikey'] },
     ];
 
@@ -588,6 +610,8 @@ window.__ModuleLoader__.load({
       forwardMaxChars: '展开后最多多少字',
       forwardMaxDepth: '最多展开几层',
       forwardTimeoutMs: '取转发内容的超时（毫秒）',
+      commands: '启用 @bot 指令',
+      guestCommands: '允许访客用指令',
       endpoint: 'OneBot WebSocket 地址',
       imageSend: '让 Agent 主动发图',
       napcatAutoConfig: '自动补 NapCat 配置',
@@ -809,7 +833,9 @@ window.__ModuleLoader__.load({
       forwardTimeoutMs: formatMs,
       batchWindowMs: formatMs,
       batchMaxWaitMs: formatMs,
+      mediaHoldMs: formatMs,
       batchBacklogChars: formatChars,
+      ttsMaxChars: formatChars,
       batchBacklogHoldMs: formatMs,
       pokeCooldownMs: formatMs,
       recallCooldownMs: formatMs,
@@ -833,6 +859,7 @@ window.__ModuleLoader__.load({
       // 字节
       mediaMaxBytes: formatBytes,
       imageMaxBytes: formatBytes,
+      writeMaxBytes: formatBytes,
       linkPreviewMaxBytes: formatBytes,
       videoMaxBytes: formatBytes,
       memoryFileMaxBytes: formatBytes,

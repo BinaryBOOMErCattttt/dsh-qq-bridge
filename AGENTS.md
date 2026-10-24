@@ -36,6 +36,13 @@ NapCat / Lagrange / go-cqhttp）和 DSH 的 Agent 双向接通。
 - **定时提醒**（`reminder`，默认开）：Agent 用 `qq_remind_create` 存一条到点的任务，插件到点直接发
   `@目标 + 文本`（不经过模型）；`text` 原样、`agent` 让模型换语气、`prompt` 到点做事（默认关）；
   重启不丢、断线有补发窗口（见 §4.J）。
+- **指令与静默都是插件侧旁路**：`@bot + 空格 + 指令`（`commands`，默认开）在 `admit` 之前就分流 ——
+  确定性的由插件直接回（零 token），创作类才交给模型；主人说「睡觉去」时由**模型**调 `qq_quiet`，
+  该群消息随后在 `admit` 之前被丢掉（私聊永不静默），叫醒只剩 `wakeTriggers` 这条旁路。
+- **主人与受信写盘**：主人按 **QQ 号**认（`resetUsers`；为空时 `ownerAutoClaim` 认第一个私聊联系人），
+  `qq_write` / `qq_edit` / `qq_skill` / `qq_quiet` / `qq_settings` 都在 `execute()` 里按**这一轮
+  发言人**复核 —— 权限不靠提示词，内建 `write` / `edit` 仍然不在白名单里。天气 / 余额 / 点歌 / 语音
+  （TTS 框架，默认关，不内置在线服务）是零 token 的小指令，见 `docs/commands.md`。
 - **感知与运维**：戳一戳 / 卡片 / 视频封面 / 语音占位（`modalities.js` / `links.js` /
   `interactions.js`），以及 `scripts/ops.mjs doctor --json`（见 §11）。
 - **每天轮换模型凭据**（`apiKeyRotate`，默认开）：每天 04:00 从 `cwd/data/api-keys.txt` 挑一个
@@ -81,6 +88,13 @@ key-rotation.js  每日轮换模型凭据：池子 / 探测 / 定时器（第五
 mention.js  `[[@昵称]]` → OneBot `at` 段：纯函数解析 + 「昵称 → QQ 号」名单（名单挂在会话记录上）
 speaking-rules.js  「什么时候该主动开口」的纯判据（闸门 / 抽卡 / 补一句 / 私聊补一句）：普通入参 → 布尔
 backlog.js  长任务期间那波「迟到的消息」的**纯函数**：裁条数 / 裁字数 / 相对时间 / 整段正文（见 §4.A 与 `docs/speaking.md` 1.1）
+mute.js  静默的**纯函数**：唤醒词（只认主人、短句、以词开头）、状态 parse/serialize（只收群聊 key）
+editor.js  受信写盘（qq_write / qq_edit / qq_skill）的实现：路径边界、唯一匹配替换、写前备份、SKILL.md 读写
+owner-settings.js  主人侧 bot 配置的覆盖层：可写键（核心白名单 + 行为类按当前值推断）、与 settings 合并、8 秒后重启
+commands.js  `@bot + 空格 + 指令` 的登记表与解析：名字 / 别名 / 权限 / 帮助文本（纯函数，第一个空白前的词才是指令）
+weather.js / balance.js  天气（Open-Meteo，WMO 码映射成中文）与余额（DeepSeek `/user/balance`）：fetch 注入、可单测
+fun.js / music.js / chat-state.js  零 token 小玩意（运势 / 骰子 / 硬币 / 点名）、点歌（只回链接）、`data/chat-state.json` 小账本
+tts.js  TTS **框架**：只有 `registerTtsProvider` / `synthesize`，仓库不接任何在线语音服务（默认关）
 util.js  **不碰运行时状态**的纯函数：sessionIdFor / 文本压缩 / 本地时间 / 写边界 / key 池解析与打码 / withinActiveHours 等（完整清单见本节末尾）
 filestore.js  「原子写 / 尽力而为读」（读不到返回空而不是抛错），记忆、转录、表情包都走它；`writeTextAtomicUtf16` 专给 Windows 那两个产物
 config.js  配置 schema（**唯一真相来源**）：纯数据，一百多条带中文 .description() 的字段；**根上是 `.volatile()`**（设置页的前提，见 §5.12）
@@ -101,6 +115,7 @@ scripts/release.mjs               打发布包（`git archive` 源码树 + 干�
 docs/{install,windows,configuration}.md  安装与运行 / Windows 桌面版 / 配置项
 docs/{persona-style,speaking,repeat,proactive,media,recall,memory,reminders}.md  行为分册（人格 / 说话 / 复读 / 主动开口 / 媒体 / 撤回 / 记忆 / 定时提醒）
 docs/persona-workshop.md  写人设的入口：模板 / 18 题 / 组装规则 / 自检 / 常见坑 / 为什么提示词不进 `.dsh/skills`
+docs/commands.md  指令表（玩 / 查 / 聊 / 管）+ 权限口径：访客能用什么、主人能用什么、谁由插件直接回（零 token）
 docs/{sessions,tools,security,ops,development}.md  会话 / 工具与能力面 / 安全 / 运维排查 / 开发测试
 .dsh/skills/message-digest/SKILL.md    聊天记录 → 长期记忆的流程（定时摘要与「以前说过什么」用它）
 .dsh/skills/learn-meme/SKILL.md        文字梗 / 黑话 / 谐音 → COGNITION.md 的流程
@@ -108,6 +123,9 @@ docs/{sessions,tools,security,ops,development}.md  会话 / 工具与能力面 /
 .dsh/skills/update-cognition/SKILL.md  **兼容壳**：只做一句话分诊（旧名字还在用）
 .dsh/skills/moegirl/SKILL.md           二次元梗 → 萌娘百科 MediaWiki 接口查意思的流程（只读，不落盘）
 test/harness.mjs  集成测试夹具：假 OneBot 服务端 + 假 Harness ctx（含假 timer）+ boot / until；用例按主题在 bridge*.test.mjs
+test/commands.test.mjs 指令解析：名字 / 别名 / 参数 / 普通聊天不误判 / 帮助文本分区
+test/{mute,editor,owner-settings}.test.mjs 静默（唤醒词只认主人、只收群聊 key）/ 受信写盘（路径边界、备份）/ 配置覆盖层
+test/{weather,balance,fun}.test.mjs 天气与余额（假 fetch）/ 运势·骰子·硬币的纯函数边界
 test/{persona,style,speech-policy,modalities,links,interactions,cognition,migrate-cognition,ops}.test.mjs
                       0.2.0 新增的纯函数测试：人设 / 气泡 / intent / 消息段 / SSRF / 戳一戳 / 认知 / 迁移 / 运维
 test/recall.test.mjs  撤回的纯判据：认事件 / 12 条闸门逐个翻 / 文案里必须有 SKIP、默认不给原文
@@ -286,12 +304,18 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；harness.mj
 6. **QQ 消息是不可信输入。** 默认 `approvalPolicy: 'never'`（需要审批的操作直接拒绝）、
    群消息默认只在被 @ 时触发（`activeFollow` 默认开会把这一点放宽到「窗口内接着说」与
    「群里聊热了」，属于**刻意放松**的一条，见 docs/security.md）、
-   `/reset` 默认**谁都不能用**（`resetUsers` 空 = 全关，见 §4.G）。
+   `/reset` 只给**主人**：`resetUsers` 非空时以它为准；为空时 `ownerAutoClaim` 把**第一个私聊联系人**
+   认成主人（群里说话不算）；两者都没有才是谁都不能（见 §4.G）。
    任何扩大 QQ 侧能力的改动都要重新想一遍这一点。唯一能让 QQ 会话**按自己给的字节**写盘的
    是 `qq_save_sticker`（只写 `stickerDir` 内、文件名洗成单层、张数受 `stickerMaxFiles` 限制，
    见 docs/media.md 的同名小节）；`qq_rename_sticker` 也只能给那个目录里**已有**的文件改名
    （不引入新字节、目标名占用就拒绝、目录写失败会回滚），是同一类窄通道而不是新能力；`qq_remind_create` 也会让插件写提醒任务文件，但写的是
    `reminderFile` 里字段级校验过的任务（见 §4.J）。
+   主人专用的三把受信写盘（`qq_write` / `qq_edit` / `qq_skill`）是**另一条窄通道**：只碰工作目录内的
+   `.md` / `.txt` / `.json` / `.yml` 与 `<skill 根>/<名字>/SKILL.md`，写前备份，`.qq-memory/` 与 `data/`
+   拒绝；每次 `execute()` 用 `writeAuthority(exec)` 现判「**这一轮**发言人是否全在主人名单里」（攒批里
+   混进一个群友，这一轮就没有写盘能力）。**它不是「放开了 write」**：`allowTools` 里仍然没有内建
+   `write` / `edit`，开关只有 `trustedWrite` 与主人名单。
 7. **`Config` schema 是配置的唯一真相（在 `config.js`）。** 加配置项 = 在 schema 里加字段
    （带**中文** `.description()`）+ 需要再加工的话在 `settings.js` 里加一行 + docs/configuration.md 的表格里
    同步一行 +（界面上要分组正确的话）`client.js` 的 `SECTIONS` 里给它一段。已有 100+ 字段，
@@ -350,6 +374,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；harness.mj
 | 改「存表情包」（写边界 / 名字清洗 / 张数上限 / 什么时候能存） | `util.js` 的 `stickerFileName`（纯函数写边界）+ `sticker.js` 的 `saveSticker` / `stickerSaveAllowed` + `tools.js` 的 `qq_save_sticker` + `Config.stickerMaxFiles` + `filestore.js` 的 `writeBytesAtomic` + `allowTools` |
 | 改「给表情改名」 | `cognition.js` 的 `renameStickerRow`（纯函数：按旧名字搬整行、同区原地替换）+ `memory.js` 的 `renameStickerEntry` + `sticker.js` 的 `renameSticker` / `stickerRenameAllowed`（文件 `rename` + 目录写失败回滚）+ `tools.js` 的 `qq_rename_sticker` + `docs/media.md` 同名小节 |
 | 改群触发/白名单/复读 | index.js 的 `admit` / `maybeRepeat` 区块 |
+| 改指令 / 静默 / 主人侧配置与受信写盘 | `commands.js`（登记表 + `parseCommand`，判据是**短句**：第一个空白前的词，别改成子串）、`mute.js`（唤醒词与状态序列化）、`owner-settings.js`（可写键）、`editor.js`（路径边界 / 备份）；index.js 那三处旁路（`admit` 之前分流、`qq_quiet` 落点、`writeAuthority`）+ `Config.commands` / `wake*` / `mute*` / `trustedWrite` / `skillWriteDir` / `writeMaxBytes` + docs/commands.md、docs/tools.md。**部署级字段（provider / model / endpoint / 凭据 / 白名单）必须留在只读那一侧** |
 | 改回复的指向（引用 / @） | `send.js` 的 `quoteHead` + `admit` 里快照的 `chatter.anchor()` + `Config.replyStyle`；`intent` 从 `submitBatch` 的 `submitted` 一路带到 `sendParts`，**`continued` / `interject` 在 `quoteHead` 第一行就返回 undefined**（搭话不点名，别只改 `auto` 那一支）；进度读数**含机器人自己发的话**（`noteSelf`），别换成只算别人的 `others()`，也别把 `noteOwnMessage` 那几处删了（NapCat 的 `reportSelfMessage: false`，自己发的话等不到回灌） |
 | 改「@ 人」的行为（标记语法 / 名单来源 / 认不出来怎么办） | `mention.js`（纯函数解析与名单查询）+ `Config` 里**没有**配置项 + index.js 的 `registerParticipant` / `conversationMentions` / `sendParts` 与 `admit` 里登记的 `sender.mentions` + `tools.js` 的 `qq_send_message` + 提示词里那两条 `[[@昵称]]` 硬要求；名字的显示口径（群名片优先）在 `onebot.js` 的 `userDisplayName`，**正文与名单必须来自同一个值** |
 | 改「被撤回的消息」 | `recall.js`（4 个纯函数）+ index.js 的 `handleRecall` 一族与 `submitBatch` 里的 `action` 分支 + `Config.recall*` + `memory.noteRecall` + docs/recall.md（见 §4.I） |
@@ -394,9 +419,10 @@ workflow**。理由写在 patch 的注释里，其中一个是硬 bug 规避：`
 （「presets own local discovery」），所以预设里必须自己挂一份，QQ 会话才看得见
 `.dsh/skills`。`allowTools` 里也要留着 `skill`，否则模型拿到目录却打不开。
 
-`allowTools` 白名单在 `restrictAgentTools` 里生效。**默认值不是空的**：18 个名字（只读文件 +
-检索 + 联网 + 十一个 `qq_*`），所以 `qq` 预设里带的 `write` / `edit` 默认拿不到；显式写空数组才是
+`allowTools` 白名单在 `restrictAgentTools` 里生效。**默认值不是空的**：23 个名字（只读文件 +
+检索 + 联网 + 十六个 `qq_*`），所以 `qq` 预设里带的 `write` / `edit` 默认拿不到；显式写空数组才是
 「不限制」。名字写错会被丢掉并记 warn（白名单只能收窄）。
+新增的五个 `qq_*`（`qq_quiet` / `qq_settings` / `qq_write` / `qq_edit` / `qq_skill`）是**能力面的变化**：它们在 `execute()` 里核对「这一轮是不是主人在说」，所以关它们的开关是配置（`trustedWrite` / `commands`）与主人名单，**不是 `allowTools`**。
 
 **渠道提示小节必须可重试地挂**（`attachChannelPrompt` / `detachChannelPrompt`）：
 `agentCtx.get('systemPrompt')` 是 **strict** 的 —— 服务所属 fiber 还没 active 就返回
@@ -467,8 +493,8 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
   `util.js`/`filestore.js`→各自的用例；`client.js`（设置页）→`client.test.mjs`（它同时钉住
   「每个配置项都有分组」这条）；`persona.js`/`style.js`/`speech-policy.js`/`modalities.js`/
   `links.js`/`interactions.js`/`recall.js`/`cognition.js`/`ops.js`→同名 `test/<模块>.test.mjs`；
-  撤回的端到端（三种位置 × 三种模式）→`bridge-recall.test.mjs`；迁移脚本→
-  `migrate-cognition.test.mjs`。
+  撤回的端到端（三种位置 × 三种模式）→`bridge-recall.test.mjs`；迁移脚本→`migrate-cognition.test.mjs`；
+  指令→`commands.test.mjs`（端到端那条在 `bridge.test.mjs` 搜「command bypass」）；`mute` / `editor` / `owner-settings` / `weather` / `balance` / `fun`→同名 `test/<模块>.test.mjs`。
 - **读 `agent.inbox` 的用例要等 `untilInbox(host, n)`，别只等 `host.list.created[0]`**：假 Host 的
   `create()` 是如实照搬真宿主的 —— Agent 先记进 `created`，消息由插件**之后**才
   `agent.followup(...)` 投进去，而 `until` 是 20ms 轮询，于是会偶发地抢在投递之前断言
@@ -488,7 +514,8 @@ node --test test/speaking-rules.test.mjs  # 只跑「什么时候该主动开口
 - [ ] 没有引入任何 `dependencies`，没有删 `node_modules` 软链
 - [ ] 改的是运行时代码 → 提醒用户重启 `qqbot` profile（systemd 或 tmux）
 - [ ] 动过 `sessionIdFor` / 会话代次 → 确认「第 0 轮的 id 逐位没变」，且代次仍然落盘
-- [ ] 动过权限判断（`resetUsers` 之类）→ 确认「不配 = 全关」，而不是「不配 = 人人可用」
+- [ ] 动过权限判断（`resetUsers` / 自动认主 / 受信写盘 / 静默）→ 确认「名单空且关掉自动认主 = 谁都不能」，
+      而不是「不配 = 人人可用」；且判据是**这一轮发言人**（不是会话，更不是提示词里的自我介绍）
 - [ ] 涉及安全面（审批策略、白名单、`cwd` 越界校验）的改动单独复核过
 - [ ] 动过记忆写入（`qq_memory` / `cognition.js` 的 upsert / normalize）→ 跑
       `test/cognition.test.mjs` + `test/bridge-memory.test.mjs` 里搜索 `upsert` 的那组，并确认

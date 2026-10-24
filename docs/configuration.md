@@ -27,11 +27,11 @@
 | tab | 全称 | 装什么 |
 |---|---|---|
 | 连接 | 连接与准入 | 连接与运行环境 / 准入与触发 |
-| 会话 | 会话与节奏 | QQ 会话与 Agent / 攒批与群聊上下文 / 说话方式与节奏 |
+| 会话 | 会话与节奏 | QQ 会话与 Agent / 静默、主人与受信写盘 / 攒批与群聊上下文 / 说话方式与节奏 |
 | 人格 | 人格与表达 | 人格与提示词（PERSONA.md 优先）/ 表达（STYLE.md / 气泡 / 标点 / 补一句） |
 | 群聊 | 群聊互动 | 自动复读 / 主动说话 / 活跃对话 |
 | 提醒 | 定时提醒 | 定时提醒的配置；这一页最上面是**已记录的定时任务**（只读，每 15 秒刷新） |
-| 感知 | 感知与媒体 | 图片与表情包 / 感知与互动（链接 / 视频 / 戳一戳 / 撤回） |
+| 感知 | 感知与媒体 | 图片与表情包 / 感知与互动（链接 / 转发 / 视频 / 戳一戳 / 撤回）/ 语音（TTS） |
 | 记忆 | 记忆与运维 | 长期记忆 / 模型凭据轮换 |
 
 默认打开「连接」；每个 tab 里是几个**扁平区块**（标题 + 分隔线 + 一行一个字段），
@@ -93,14 +93,28 @@
 | `groupTrigger` | `mention` | 群消息触发：`mention` / `prefix` / `all`（`activeFollow` 打开时，被叫到之后的窗口内同一个人接着说的话、以及群里聊热之后的「多人搭话」也都算，见[聊起来之后保持搭话](proactive.md#聊起来之后保持搭话活跃对话)） |
 | `prefix` | `/` | `groupTrigger=prefix` 时的前缀 |
 | `blankReply` | `true` | 是否理会「没有正文」的消息：群里单纯 @ 它一下、或私聊发一个空格，都照常交给模型（正文位置写明「@了你一下，没有说别的」），由它看着上下文决定回「？」、发张表情还是接上一句；`false` = 静默丢弃，见[没有正文的消息](speaking.md#没有正文的消息blankreply) |
+| `commands` | `true` | 是否启用「@bot + 空格 + 指令」的指令路由：帮助 / 天气 / 随机表情 / 表情 / 白饭 / 小作文（访客可用）、状态 / 余额 / 设置（主人专用）。关掉后这些词全部当普通聊天交给模型。判据是**短句**：第一个空白前的词命中登记表才算指令，见[指令](commands.md) |
+| `guestCommands` | `true` | 是否允许访客（非主人）用公开指令；`false` = 只有主人能用指令（主人专用指令始终只认主人） |
+| `tts` | `false` | 是否启用「语音 <文字>」指令：需要先在 `tts.js` 里注册一个 provider（本地 Kokoro / Piper / 自建服务，或你自己的授权 API）。默认关，未注册时指令只回「未配置」，**不会联网** |
+| `ttsMaxChars` | `200` | 一次语音最多念多少字（超过截断）：QQ 语音太长会失败，200 字大约 40 秒 |
 | `allowUsers` | `[]` | 私聊白名单；空 = 不限制 |
 | `allowGroups` | `[]` | 群白名单；空 = 不限制 |
 | `agentPreset` | `qq` | QQ 会话 Agent 挂载的 Agent 预设 id：默认 `qq`（本 bundle 自带：只读文件 + 检索 + 联网，没有 shell / 子代理）。空 = 用**部署的默认预设**（可能是带 shell 的 `standard`，QQ 消息是不可信输入，别轻易这么配），`none` = 不挂预设（只剩宿主平面的 `qq_*`） |
 | `provider` / `model` | `''` | QQ 会话使用的模型；空 = 用默认 |
 | `approvalPolicy` | `never` | `never` = 无人值守时一律拒绝需要审批的操作 |
-| `allowTools` | 18 个工具名 | QQ 会话可用的工具白名单：默认 `read` / `read_image` / `glob` / `grep` / `web_search` / `web_fetch` / `skill` + 十一个 `qq_*` —— **没有 write / edit / bash**。空 = 不限制（全给它继承到的工具）；写错的名字会被丢掉并记 warn，见[限制 QQ 会话的工具](tools.md#限制-qq-会话的工具allowtools) |
+| `allowTools` | 23 个工具名 | QQ 会话可用的工具白名单：默认 `read` / `read_image` / `glob` / `grep` / `web_search` / `web_fetch` / `skill` + 十六个 `qq_*` —— **没有 write / edit / bash**。`qq_write` / `qq_edit` / `qq_skill` 是主人专用的受信写盘（执行时按**这一轮发言人**核对主人身份），`qq_quiet` 是静默开关，`qq_settings` 是主人侧 bot 配置。空 = 不限制（全给它继承到的工具）；写错的名字会被丢掉并记 warn，见[限制 QQ 会话的工具](tools.md#限制-qq-会话的工具allowtools) |
 | `resetCommand` | `/reset` | 新开一轮会话（旧会话留在磁盘上当存档）的指令；空 = 禁用 |
-| `resetUsers` | `[]` | 允许用 `resetCommand` 的 QQ 号；**留空 = 谁都不能重置**（与 `allowUsers` 反过来，见[新开一轮会话](sessions.md#新开一轮会话reset)）。本仓库的 `cordis.patch.yml` 把这一项接在 `QQBOT_RESET_USERS` 环境变量上（写进 `<启动 cwd>/.env`，逗号分隔）—— 免得把自己的号提交进仓库 |
+| `resetUsers` | `[]` | **主人名单**（QQ 号）：能用 `resetCommand` 重置、能用 `qq_quiet` 静默、也是唯一能用受信写盘与 `qq_settings` 的人（与 `allowUsers` 反过来，见[新开一轮会话](sessions.md#新开一轮会话reset)）。**留空 = 走自动认主**（`ownerAutoClaim`，第一个私聊联系人）；自动认主也关掉 = 谁都不能。本仓库的 `cordis.patch.yml` 把这一项接在 `QQBOT_RESET_USERS` 环境变量上（写进 `<启动 cwd>/.env`，逗号分隔）—— 免得把自己的号提交进仓库 |
+| `wakeTriggers` | `['起床','醒醒','醒来','别睡了','重启']` | 主人说这些词时由插件**直接**结束静默（不经过模型、零 token）：睡着之后群消息根本到不了模型，所以起床必须有一条插件侧旁路。只认主人；群里不需要 @。留空 = 只能靠 `qq_quiet` 的 `wake` |
+| `wakeText` | `（揉揉眼睛）醒了醒了，刚睡过去。` | 插件侧唤醒时回的那一句（固定文案，不经过模型） |
+| `mutePersist` | `true` | 静默状态是否落盘：开着时重启进程仍然安静（不会因为一次重启就在群里突然开口）；关掉 = 只记在内存里 |
+| `muteFile` | `data/mutes.json` | 静默状态文件，相对 `cwd`；必须落在 `cwd` 内，否则只记在内存里并记一条 warn |
+| `ownerAutoClaim` | `true` | 名单为空时，是否把**第一个在私聊里跟它说话的 QQ 号**认作主人（落盘到 `ownerFile`，重启不丢；群里说话**不算**）。想手工指定就配 `resetUsers`，或关掉这一项自己写 `ownerFile` |
+| `ownerFile` | `data/owner.json` | 自动认主记下的主人 QQ 号，相对 `cwd`（必须落在 `cwd` 内）；只在 `resetUsers` 为空时生效 |
+| `ownerSettingsFile` | `data/owner-settings.json` | 主人从 QQ 侧调整 bot 配置的覆盖层（只含白名单键，优先于 GUI 里的基础配置）；`qq_settings` 读写它，`unset` / `clear` 即回退 |
+| `trustedWrite` | `true` | 是否注册受信写盘工具（`qq_write` / `qq_edit` / `qq_skill`）：只有主人名单里的人在**当前这一轮**说话时才真的能写；内建 `write` / `edit` 仍然不在白名单里 |
+| `skillWriteDir` | `''` | `qq_skill` 能读写的 skill 根目录：留空 = `$DSH_HOME/skills`（没有 `DSH_HOME` 时 `~/.dsh/skills`）。只允许碰 `<根>/<名字>/SKILL.md`，写前备份 |
+| `writeMaxBytes` | `65536` | 受信写盘单个文件的字节上限（默认 64KB）：超过就报错，不静默截断 |
 | `idleResetHours` | `0` | 会话**静默**超过这么多小时之后，下一条消息自动开新一轮（与 `/reset` 同一套机制，长期记忆不动）；`0` = 关。不需要 `resetUsers` 权限；「静默」按这个会话最后一条别人的消息算（含没 @ 机器人的闲聊），见[静默太久自动换一轮](sessions.md#静默太久自动换一轮idleresethours) |
 | `maxReplyChars` | `1500` | 单条 QQ 消息最大字符数（协议上限），超出自动分段 |
 | `mediaDownload` | `true` | 是否把消息里的图片/表情包下载到本地（模型只能读本地文件，不下载就只看到占位符） |
@@ -132,6 +146,7 @@
 | `pokeDailyMax` | `20` | 同一个会话一天最多回应几次戳一戳（本地日界线，重启归零）；`0` = 不限 |
 | `batchWindowMs` | `2000` | 收到要回的消息后先等这么久（毫秒）看还有没有下一条：几个人同时 @ / 一个人连发几句会攒成一条消息只回一轮；`0` = 关闭攒批 |
 | `batchMaxWaitMs` | `5000` | 一直有人接着说时，一批最多以第一条为起点攒这么久（毫秒）就发出去 |
+| `mediaHoldMs` | `1500` | 这一批里有图片 / 表情包时，在窗口之外**再多等**这么久（毫秒）再投给模型：QQ 里图和配文经常分两条发，多等一会儿能把「图 + 那句话」攒进同一轮，模型就能先 `read_image` 再回答，不会先回一句文字、图片那条又单独来一轮；`0` = 不额外等 |
 | `batchBacklog` | `true` | 上一轮还没跑完时收到的 @ 先攒成一波，等它闲下来只接一轮（十条以上时不再排成十几轮回复）；见[长任务期间的 @](speaking.md#11-长任务期间的-先攒一波忙完挑着接)。关掉 = 回到「每 `batchMaxWaitMs` 一批排队」 |
 | `batchBacklogEntries` | `20` | 这一波最多贴几条（至少 2）：超过就保留最早 2 条 + 最近的，中间折成一句「更早还有 N 条」 |
 | `batchBacklogChars` | `2000` | 这一波最多带多少字：超出时继续从最老的那条开始折掉，但永远保留最后一条 |

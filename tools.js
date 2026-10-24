@@ -982,6 +982,338 @@ function qqRemindCancel(deps) {
 }
 
 /**
+ * 工具十：qq_write —— 受信者（主人）让 Agent 整份写一个文本文件。
+ *
+ * 为什么不是内建 `write`：写盘权限必须按「这一轮谁在说话」判，而 `tools.restrict()`
+ * 只能按 Agent（会话）收窄。工具执行时再核一次 `writeAuthority`，群里其他人说同样的话
+ * 会直接收到拒绝。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqWrite(deps) {
+  return defineTool({
+    name: 'qq_write',
+    description:
+      'Overwrite a text file inside the QQ workspace. Only the trusted owner may use this: the bridge checks who spoke in the current turn and refuses everyone else. Allowed paths are workspace-relative .md/.txt/.json/.yml files (persona, style, .dsh/skills); .qq-memory/ and data/ are refused (use qq_memory). Use qq_edit for a small change; prefer it over rewriting a whole file.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'Workspace-relative path, e.g. `.qq-persona/STYLE.md` or `.dsh/skills/recall-context/SKILL.md`.' },
+      content: { type: 'string', required: true, description: 'Full new content of the file (UTF-8). A backup is written automatically.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true },
+          bytes: { type: 'integer', required: true },
+          backup: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: `Wrote ${value.bytes} bytes to ${value.path}${value.backup ? ` (backup: ${value.backup})` : ''}.`,
+        },
+      ],
+    },
+    async execute(args, exec) {
+      if (deps.editor === undefined) throw new Error('trusted write is disabled (trustedWrite: false)');
+      const authority = deps.writeAuthority(exec);
+      if (!authority.allowed) throw new Error(`qq_write refused: ${authority.reason}`);
+      return deps.editor.write(args.path, args.content);
+    },
+  });
+}
+
+/**
+ * 工具十一：qq_edit —— 受信者让 Agent 按 `old_text` 唯一匹配替换一段。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqEdit(deps) {
+  return defineTool({
+    name: 'qq_edit',
+    description:
+      'Replace one unique occurrence of old_text with new_text in a workspace text file. Only the trusted owner may use this. old_text must appear exactly once; include a few lines of context to make it unique. A backup is written automatically.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'Workspace-relative path, e.g. `.qq-persona/PERSONA.md`.' },
+      old_text: { type: 'string', required: true, description: 'Exact text to replace; must occur exactly once in the file.' },
+      new_text: { type: 'string', required: true, description: 'Replacement text (empty string = delete that occurrence).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true },
+          bytes: { type: 'integer', required: true },
+          backup: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: `Edited ${value.path} (now ${value.bytes} bytes)${value.backup ? ` (backup: ${value.backup})` : ''}.`,
+        },
+      ],
+    },
+    async execute(args, exec) {
+      if (deps.editor === undefined) throw new Error('trusted write is disabled (trustedWrite: false)');
+      const authority = deps.writeAuthority(exec);
+      if (!authority.allowed) throw new Error(`qq_edit refused: ${authority.reason}`);
+      return deps.editor.patch(args.path, args.old_text, args.new_text);
+    },
+  });
+}
+
+/**
+ * 工具十二：qq_skill —— 读 / 改 `~/.dsh/skills/<名字>/SKILL.md`。
+ *
+ * skill 在 cwd 之外，内建 read / write 都够不到：这是「让模型自己改 skill」的唯一
+ * 一条通道，因此它只碰那一个文件名，并且写前备份。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqSkill(deps) {
+  return defineTool({
+    name: 'qq_skill',
+    description:
+      'List, read or edit a skill in the shared skills directory (~/.dsh/skills/<name>/SKILL.md). Only the trusted owner may patch/write; list/read are also owner-only. Prefer action=patch with a unique old_text; action=write replaces the whole SKILL.md. A backup is written automatically.',
+    parameters: {
+      action: { type: 'string', required: true, enum: ['list', 'read', 'patch', 'write'], description: 'list = available skills; read = show SKILL.md; patch = unique replace; write = replace whole file.' },
+      name: { type: 'string', description: 'Skill directory name (e.g. qq-bot-notes). Required unless action=list.' },
+      old_text: { type: 'string', description: 'For action=patch: exact text, must occur exactly once.' },
+      new_text: { type: 'string', description: 'For action=patch: replacement text.' },
+      content: { type: 'string', description: 'For action=write: full new SKILL.md content.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string', required: true },
+          name: { type: 'string' },
+          content: { type: 'string' },
+          entries: { type: 'array', items: { type: 'string' } },
+          bytes: { type: 'integer' },
+          backup: { type: 'string' },
+        },
+      },
+      render: (_args, value) => {
+        if (value.action === 'list') {
+          return [{ type: 'text', text: value.entries?.length ? `Skills: ${value.entries.join(', ')}` : 'No skills found.' }];
+        }
+        if (value.action === 'read') {
+          return [{ type: 'text', text: `# ${value.name}/SKILL.md (${value.bytes} bytes)\n\n${value.content ?? ''}` }];
+        }
+        return [
+          {
+            type: 'text',
+            text: `Updated ${value.name}/SKILL.md (${value.bytes} bytes)${value.backup ? ` (backup: ${value.backup})` : ''}.`,
+          },
+        ];
+      },
+    },
+    async execute(args, exec) {
+      if (deps.editor === undefined) throw new Error('trusted write is disabled (trustedWrite: false)');
+      const authority = deps.writeAuthority(exec);
+      if (!authority.allowed) throw new Error(`qq_skill refused: ${authority.reason}`);
+      const action = String(args.action ?? '');
+      if (action === 'list') {
+        return { action, entries: await deps.editor.skillList() };
+      }
+      const name = String(args.name ?? '').trim();
+      if (name.length === 0) throw new Error('qq_skill needs a skill name (use action=list to see them)');
+      if (action === 'read') {
+        const result = await deps.editor.skillRead(name);
+        return { action, name, content: result.content, bytes: result.bytes };
+      }
+      if (action === 'patch') {
+        const result = await deps.editor.skillPatch(name, args.old_text, args.new_text);
+        return { action, name, bytes: result.bytes, backup: result.backup };
+      }
+      if (action === 'write') {
+        const result = await deps.editor.skillWrite(name, args.content);
+        return { action, name, bytes: result.bytes, backup: result.backup };
+      }
+      throw new Error(`unknown qq_skill action: ${action}`);
+    },
+  });
+}
+
+/**
+ * 工具十三：qq_quiet —— 让 bot 睡 / 醒（按群号或群名定位，插件入口拦截）。
+ *
+ * 与「回 SKIP」的区别：SKIP 仍然要为每条消息付一次模型调用；`sleep` 之后插件在
+ * `admit` 之前就把该群的消息丢掉 —— 模型根本看不到，token 为 0。所以这是一次
+ * **需要模型判断语义**的开关（主人说「睡觉去 / 别聊了 / 静默」时调用），不是关键词。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqQuiet(deps) {
+  return defineTool({
+    name: 'qq_quiet',
+    description:
+      'Put the QQ bridge to sleep (silence) for one group or all groups, wake it, or show the current state. target is the group number or the group name (the plugin resolves a name to its group number); use "all" for every group; omit target to mean the current group (sleep) or everything (wake). Once asleep, the plugin drops every message in that group BEFORE it reaches the model — it costs nothing and you will not see those messages. Only the trusted owner may use this. Call sleep only when the owner clearly asks to be quiet / go to sleep; call wake when the owner asks to wake up.',
+    parameters: {
+      action: { type: 'string', required: true, enum: ['sleep', 'wake', 'status'], description: 'sleep = silence; wake = end silence; status = what is muted now.' },
+      target: {
+        type: 'string',
+        description: 'Group number (preferred) or group name; "all" for every group. Omit: sleep = the current group (must be a group), wake = everything.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string', required: true },
+          scope: { type: 'string' },
+          target_id: { type: 'string' },
+          target_name: { type: 'string' },
+          global: { type: 'boolean' },
+          groups: { type: 'array', items: { type: 'string' } },
+          was_muted: { type: 'boolean' },
+        },
+      },
+      render: (_args, value) => {
+        if (value.action === 'status') {
+          if (value.global) return [{ type: 'text', text: 'Quiet: all groups are muted.' }];
+          const list = value.groups ?? [];
+          return [{ type: 'text', text: list.length > 0 ? `Quiet groups: ${list.join(', ')}` : 'Nothing is muted.' }];
+        }
+        const who = value.scope === 'all' ? 'all groups' : `${value.target_name ?? ''}(${value.target_id ?? ''})`;
+        if (value.action === 'sleep') {
+          return [{ type: 'text', text: `Silenced ${who}. Messages there are now dropped before the model sees them; say a short line to the owner.` }];
+        }
+        return [{ type: 'text', text: `Woke ${who}.` }];
+      },
+    },
+    async execute(args, exec) {
+      const authority = deps.writeAuthority(exec);
+      if (!authority.allowed) throw new Error(`qq_quiet refused: ${authority.reason}`);
+      const action = String(args.action ?? '');
+      if (action === 'sleep') {
+        const resolved = await deps.quiet.sleep(args.target, exec);
+        return {
+          action,
+          scope: resolved.all ? 'all' : 'group',
+          target_id: resolved.id,
+          target_name: resolved.name,
+          global: resolved.all === true,
+        };
+      }
+      if (action === 'wake') {
+        const result = await deps.quiet.wake(args.target, exec);
+        return {
+          action,
+          scope: result.all ? 'all' : 'group',
+          target_id: result.id,
+          target_name: result.name,
+          was_muted: result.wasMuted === true,
+        };
+      }
+      if (action === 'status') {
+        const status = await deps.quiet.status();
+        return {
+          action,
+          global: status.global,
+          groups: status.groups.map((group) => `${group.name}(${group.id})`),
+        };
+      }
+      throw new Error(`unknown qq_quiet action: ${action}`);
+    },
+  });
+}
+
+/**
+ * 工具十四：qq_settings —— 主人调整 **bot 自己**的配置（不是底层模型路由）。
+ *
+ * 写的是覆盖层 `data/owner-settings.json`（只含白名单键），8 秒后插件自己重启生效：
+ * GUI 改基础值、覆盖层优先，`unset` / `clear` 就回到 GUI 的值。
+ * @param {object} deps - 见 `registerQqTools` 的说明。
+ */
+function qqSettings(deps) {
+  return defineTool({
+    name: 'qq_settings',
+    description:
+      "Read or change the bot's own settings (not the underlying model/provider). Owner only. list = allowed keys + current values; get = one key or all; set = key + value; unset = remove one override; clear = remove all overrides. Changes go to the owner overlay and the plugin restarts a few seconds later to apply them. The GUI keeps the base values; the overlay wins until unset/clear.",
+    parameters: {
+      action: { type: 'string', required: true, enum: ['list', 'get', 'set', 'unset', 'clear'], description: 'What to do.' },
+      key: { type: 'string', description: 'Setting key (see action=list).' },
+      value: { type: 'string', description: 'New value for action=set. Booleans accept true/false/开/关; enums and numbers are validated.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string', required: true },
+          key: { type: 'string' },
+          value: { type: 'string' },
+          current: { type: 'array', items: { type: 'string' } },
+          pending: { type: 'array', items: { type: 'string' } },
+          entries: { type: 'array', items: { type: 'string' } },
+          restarting: { type: 'boolean' },
+        },
+      },
+      render: (_args, value) => {
+        if (value.action === 'list') {
+          return [{ type: 'text', text: (value.entries ?? []).join('\n') || 'No adjustable settings.' }];
+        }
+        if (value.action === 'get') {
+          const current = (value.current ?? []).join(', ');
+          const pending = (value.pending ?? []).join(', ');
+          return [{ type: 'text', text: `Current: ${current}${pending ? `\nPending (after restart): ${pending}` : ''}` }];
+        }
+        if (value.action === 'set') {
+          return [{ type: 'text', text: `Set ${value.key} = ${value.value}. The plugin will restart in a few seconds to apply it.` }];
+        }
+        if (value.action === 'unset') {
+          return [{ type: 'text', text: `Removed the override for ${value.key}. The GUI value will apply after the restart.` }];
+        }
+        return [{ type: 'text', text: 'Cleared all owner overrides. The GUI values will apply after the restart.' }];
+      },
+    },
+    async execute(args, exec) {
+      if (deps.settingsAdmin === undefined) throw new Error('owner settings are disabled');
+      const authority = deps.writeAuthority(exec);
+      if (!authority.allowed) throw new Error(`qq_settings refused: ${authority.reason}`);
+      const action = String(args.action ?? '');
+      if (action === 'list') {
+        return {
+          action,
+          entries: deps.settingsAdmin.list().map((entry) =>
+            `${entry.key} (${entry.kind}${entry.writable ? '' : ', 只读'}) = ${JSON.stringify(entry.value)}` +
+            `${entry.description ? ` — ${entry.description}` : ''}`),
+        };
+      }
+      if (action === 'get') {
+        const result = deps.settingsAdmin.get(args.key);
+        return {
+          action,
+          key: args.key,
+          current: Object.entries(result.current).map(([key, current]) => `${key}=${JSON.stringify(current)}`),
+          pending: Object.entries(result.pending).map(([key, pending]) => `${key}=${JSON.stringify(pending)}`),
+        };
+      }
+      if (action === 'set') {
+        if (String(args.key ?? '').trim().length === 0) throw new Error('qq_settings set needs a key');
+        if (args.value === undefined) throw new Error('qq_settings set needs a value');
+        const result = await deps.settingsAdmin.set(String(args.key).trim(), args.value);
+        return { action, key: result.key, value: String(result.value), restarting: true };
+      }
+      if (action === 'unset') {
+        if (String(args.key ?? '').trim().length === 0) throw new Error('qq_settings unset needs a key');
+        const result = await deps.settingsAdmin.unset(String(args.key).trim());
+        return { action, key: result.key, restarting: true };
+      }
+      if (action === 'clear') {
+        await deps.settingsAdmin.clear();
+        return { action, restarting: true };
+      }
+      throw new Error(`unknown qq_settings action: ${action}`);
+    },
+  });
+}
+
+/**
  * 注册全部适用的 QQ 工具。两个可选的工具族只在对应能力可用时注册：记忆工具要
  * `deps.memory`（长期记忆停用时是 undefined），`qq_save_sticker` 要 `deps.saveSticker`
  * （表情包目录不可用、或白名单没放开时是 undefined）—— 停用的功能不该留下一个
@@ -1019,6 +1351,13 @@ function qqRemindCancel(deps) {
  * @param {(args: object, exec: object, toolName: string) => object} [deps.reminderPrepare] -
  *   解析提醒的目标、创建者与 @ 名单（会话状态在 index.js 里）。
  * @param {(exec: object) => object} [deps.reminderViewer] - 解析「谁在调这个工具」。
+ * @param {object} [deps.editor] - 受信写盘编辑器（`createEditor` 的返回值）；缺失 = 不注册
+ *   `qq_write` / `qq_edit` / `qq_skill`。
+ * @param {(exec: object) => { allowed: boolean, reason?: string }} [deps.writeAuthority] -
+ *   这一轮说话的人有没有主人权限（判据在 index.js：当前这批发言人是否全在主人名单里）。
+ * @param {object} [deps.quiet] - 静默开关（`sleep` / `wake` / `status`）；缺失 = 不注册 `qq_quiet`。
+ * @param {object} [deps.settingsAdmin] - 主人侧 bot 配置（`list` / `get` / `set` / `unset` / `clear`）；
+ *   缺失 = 不注册 `qq_settings`。
  */
 export function registerQqTools(ctx, deps) {
   ctx.tools.register(qqSendMessage(deps));
@@ -1038,4 +1377,14 @@ export function registerQqTools(ctx, deps) {
     ctx.tools.register(qqRemindList(deps));
     ctx.tools.register(qqRemindCancel(deps));
   }
+  // 受信写盘：只有 trustedWrite 打开、且创建编辑器成功时才注册。
+  if (deps.editor !== undefined) {
+    ctx.tools.register(qqWrite(deps));
+    ctx.tools.register(qqEdit(deps));
+    ctx.tools.register(qqSkill(deps));
+  }
+  // 静默：始终注册（真正的权限在 writeAuthority 里按这一轮发言人判）。
+  if (deps.quiet !== undefined) ctx.tools.register(qqQuiet(deps));
+  // 主人侧 bot 配置：同样按发言人鉴权。
+  if (deps.settingsAdmin !== undefined) ctx.tools.register(qqSettings(deps));
 }

@@ -17,8 +17,13 @@
 | `qq_remind_create` | 建一条到点的提醒：到点由插件直接发消息（`text` 原样 / `agent` 让模型换语气 / `prompt` 到点做事），可 `@` 创建者或名单里的人；时间用本地 `YYYY-MM-DDTHH:MM` 或 `in_minutes`，周期支持每天 / 工作日 / 每周 / 每月，见[定时提醒](reminders.md) |
 | `qq_remind_list` | 列出提醒：默认这个会话的，`scope: "mine"` 只看自己建的，`scope: "all"` 只在 Web 操作员那里可用；带状态、下一次时间与失败原因 |
 | `qq_remind_cancel` | 按 id 取消一条还没发的提醒；只有创建者本人（或 Web 操作员）能取消 |
+| `qq_poke` | 戳一戳某个 QQ 号（NapCat 的 `friend_poke` / `group_poke`）；判据与冷却在 `interactions.js`，工具只是显式动作 |
+| `qq_quiet` | **主人专用**：把某个群（或全部群）标记为静默，之后该群消息在 `admit` 之前就被丢掉；`wake` 叫醒。见下面「主人（owner）与四个受信工具」 |
+| `qq_write` / `qq_edit` | **主人专用**的受信写盘：工作目录内的 `.md` / `.txt` / `.json` / `.yml`，写前备份到 `.dsh/.history/`；`.qq-memory/` 与 `data/` 拒绝 |
+| `qq_skill` | **主人专用**：`<skill 根>/<名字>/SKILL.md` 的 `list` / `read` / `patch` / `write`（skill 在 cwd 之外，这是改 skill 的唯一通道） |
+| `qq_settings` | **主人专用**：读写 `data/owner-settings.json` 覆盖层（`list` / `get` / `set` / `unset` / `clear`），改完 8 秒后插件自己重启 |
 
-这十个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
+这十六个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
 `qq_send_image` / `qq_save_sticker` / `qq_rename_sticker` 见[它也能发表情包](media.md#它也能发表情包)；
 `qq_transcript` / `qq_memory` 见[长期记忆](memory.md#长期记忆聊天记录--摘要--认知)，
 关掉 `memory` 后它们**根本不会注册**；关掉 `reminder`（或任务文件配到 `cwd` 外）后
@@ -106,10 +111,10 @@ allowTools:
 
 - **只影响 QQ 会话**：收窄施加在「由 QQ 消息创建出来的那个 Agent」自己的作用域上
   （DSH 的 `tools.restrict()`），Web UI 主会话等其它 Agent 完全不受影响。
-- **默认就是收窄过的**（18 个：只读文件 + 检索 + 联网 + 十一个 `qq_*`）—— 这样即使
+- **默认就是收窄过的**（23 个：只读文件 + 检索 + 联网 + 十六个 `qq_*`）—— 这样即使
   `agentPreset: qq` 的预设里带了 `write` / `edit`，QQ 会话也拿不到它们。
 - **显式写空数组 = 不限制**（与 `allowUsers` / `allowGroups` 同一套语义）：把这个 Agent
-  继承到的工具全给它。想放开某一项，就把默认那 18 个抄下来再加减，别直接清空。
+  继承到的工具全给它。想放开某一项，就把默认那 23 个抄下来再加减，别直接清空。
 - 过滤的是**继承来的**工具（宿主平面的全局工具 + 这个 Agent join 的预设里的工具）。
   ⚠️ Agent **自己作用域里注册**的工具不受影响 —— 这是设计使然（它回头作答所依赖的
   机制不能被收走），但也意味着某个预设行可能绕过白名单，典型例子就是 `standard`
@@ -128,3 +133,63 @@ allowTools:
 这类工具会启动**自己的**工具集，不再受这张白名单约束。要收紧能力面，就把它们
 留在白名单之外。同理，`run_code` 是 PTC 模式（`tools.mode: ptc/both`）自带的
 传输工具、无法被列进白名单，但它能调到的子工具仍然受白名单约束。
+
+## 主人（owner）与四个受信工具
+
+主人由 **QQ 号**确认，不看昵称（昵称可以随便改）：
+
+- 配置里写了 `resetUsers` → 以那份名单为准（推荐，最可控）；
+- 名单为空 → `ownerAutoClaim` 打开时，**第一个在私聊里跟它说话的 QQ 号**被认作主人，
+  落盘到 `data/owner.json`（群里说话不算：新 bot 被拉进群时第一条往往来自群友，
+  把那种「第一个说话的人」当成主人等于把最高权限送给陌生人）。
+
+主人拥有最高权限：`/reset`、静默、受信写盘、bot 配置。权限不靠提示词，而是每个工具
+在 `execute()` 里用 `writeAuthority(exec)` 现判「**这一轮**说话的人是否全在主人名单里」
+—— 攒批里混进一个群友，这一轮就没有这些能力。
+
+### `qq_quiet`：静默（模型判断语义，插件入口拦截）
+
+主人说「睡觉去 / 静默 / 别聊了 / 先别说话」这类意思时，**模型**调用
+`qq_quiet(action: 'sleep', target: ...)`，插件把该群标记为静默；之后该群的每条消息在
+`admit` 之前就被丢掉 —— 不进模型、不花 token，也**不会**再回一句 `SKIP`。
+
+- `target` 是**群号或群名**（群名解析成群号；重名时要求用群号）；`all` = 全部群；
+  在群里不写 target = 当前群。
+- `wake`：不给 target = 全部叫醒，给了就只叫醒那一个群（全局静默里叫醒一个群，其余
+  群继续睡）。
+- 私聊**永远不静默**（它是控制通道）。睡着之后群里唯一能进来的东西是主人说「起床」
+  （`wakeTriggers`，插件侧直接处理、零 token），所以不会出现「睡死叫不醒」。
+- 状态落盘 `data/mutes.json`（`mutePersist`）；静默期间转录照记、摘要跳过，醒来后
+  下一次摘要会把这段补上。
+
+### `qq_settings`：主人侧 bot 配置
+
+改的是 **bot 自己的行为参数**（攒批、主动说话、记忆开关、复读、戳一戳回应……），
+**不含** provider / model / endpoint / 凭据这些部署级字段。
+
+- `list` 看**全部**配置项（含只读部署项）；`get` 看某一项；`set key value`；`unset key`；`clear`。
+- 可写范围：`owner-settings.js` 的 `OWNER_SETTING_KEYS` + `EXTRA_WRITABLE_KEYS`（行为类，
+  类型按当前值推断）。`endpoint` / `cwd` / 目录 / `provider` / `model` / `agentPreset` /
+  `allowTools` / `resetUsers` / 访问白名单 / 凭据 / 整段 `persona` / `instructions` 只读。
+- 写的是 `data/owner-settings.json` 覆盖层，优先于 GUI 的基础配置；`unset` / `clear`
+  就回到 GUI 的值。**为什么不直接改写 profile 的 `cordis.patch.yml`**：那份文件是整块替换
+  语义、里面还有 `!!js process.env…` 表达式，从插件里重写它需要一个能保留表达式的 YAML
+  序列化器，而插件是零依赖的 —— 序列化错一处，重启之后连接就断了。
+- 改完 **8 秒后插件自己重启**（先让这一轮回复发出去）：`createSettings` 只在 `apply()`
+  里跑，热改一个字段不会重跑它。QQ 会短暂断线重连，会话不受影响。
+
+### 受信写盘（`qq_write` / `qq_edit` / `qq_skill`）
+
+内建 `write` / `edit` 仍然不在白名单里；这三把是**主人专用**的、边界更窄的写盘：
+
+- `qq_write` / `qq_edit`：工作目录内的 `.md` / `.txt` / `.json` / `.yml`（人设、表达、
+  `cwd/.dsh/skills/**`）。`.qq-memory/` 与 `data/` 拒绝（它们有各自的格式护栏，走
+  `qq_memory`）。写前自动备份到 `cwd/.dsh/.history/`。
+- `qq_skill`：`$DSH_HOME/skills/<名字>/SKILL.md` 的 `list` / `read` / `patch` / `write`
+  —— skill 在 cwd 之外，这是模型改 skill 的唯一通道；只碰这一个文件名，写前备份。
+- 为什么不是直接把 `write` 放进白名单：QQ 会话是**一个群一个 Agent**，群里谁都能触发它，
+  而 `tools.restrict()` 只能按 Agent（会话）收窄、没法按「这一句话是谁说的」收窄。写盘只能
+  走自己的工具，在 `execute()` 里核对这一轮的发言人。
+- 「写表情注释」不走写盘：`qq_save_sticker` / `qq_rename_sticker` / `qq_memory` 的 sticker
+  upsert 已经能写 `STICKERS.md` 的含义与场景，保留它的字段级护栏更好。
+

@@ -51,7 +51,11 @@ node --test test\
 > `test/interactions.test.mjs`、`test/cognition.test.mjs`、`test/migrate-cognition.test.mjs`、
 > `test/ops.test.mjs`、`test/reminders.test.mjs`、`test/recall.test.mjs`、`test/backlog.test.mjs`、
 > `test/memory-select.test.mjs`、`test/persona-template.test.mjs`、`test/forward.test.mjs`、
-> `test/forget.test.mjs`（`ops forget` 的删除边界：目标会话 / 别的会话 / 共享资源）。行为层的用例在
+> `test/forget.test.mjs`（`ops forget` 的删除边界：目标会话 / 别的会话 / 共享资源）、
+> `test/commands.test.mjs`、`test/mute.test.mjs`、`test/editor.test.mjs`、
+> `test/owner-settings.test.mjs`、`test/weather.test.mjs`、`test/balance.test.mjs`、
+> `test/fun.test.mjs`（指令解析 / 静默 / 受信写盘 / 配置覆盖层 / 天气 / 余额 / 零 token 小玩意；
+> 后三个的网络请求都注入假 `fetch`，不联网）。行为层的用例在
 > `test/bridge*.test.mjs`（共享夹具在 `test/harness.mjs`）：
 > 气泡条数与中断、标点清洗、引用指向（表情消息不引用）、C 路四条排除、私聊补一句、戳一戳、链接预览、
 > 合并转发（内联 / `get_forward_msg` / 取不到时的占位 / 嵌套深度）、
@@ -238,6 +242,17 @@ write / search / list 与「路径写出记忆目录一律被拒」、每天一�
 而旧会话留在磁盘上」「重开进程后仍然停在同一轮」「只有 `resetUsers` 里的人能重置，别人
 连会话都开不出来」，外加 `mentionsOthers` 的纯函数用例。
 窗口里接上的那句**不会**触发 `/reset` 这类旁路（它只是闲聊，指令要明确叫它）。
+
+还有「指令 / 静默 / 主人」这一组（服务器分支并过来的功能）：指令解析认名字与别名、
+`parseCommand` 只看**第一个空白前的词**（「天气不错」「今天天气 杭州」「帮助我写作业」都不算指令）、
+参数原样留在后面、帮助文本按「玩 / 查 / 聊 / 管」分区；`bridge.test.mjs` 另外钉住「单纯的 @
+永远走模型，不被当成指令旁路」。静默：唤醒词只认主人、只认短句、必须以词开头（「今天天气不错」
+里带「起床」也不算），状态序列化只收群聊 key（私聊永远不静默）、读回坏文件只当没静默。
+受信写盘：工作目录边界（越界拒绝）、唯一匹配替换（多处命中就报错、不猜）、写前备份到
+`.dsh/.history/`、`SKILL.md` 的 list / read / patch / write 只碰那一个文件名。配置覆盖层：
+可写键白名单（部署级字段即使写进来也不生效）、类型按当前值推断、与基础配置的合并与
+`unset` 回退。天气与余额：WMO 码映射、城市解析、播报拼接、金额与货币符号渲染、401 的
+人话报错（都是假 `fetch`，不联网）。
 
 以及「每天轮换 API key」那一组：池子文件的纯函数边界（注释 / 空行 / CRLF / 前后空白 /
 重复）、到点从**当前 key 的下一个**开始试、探测失败（401）的候选被跳过而第一个通过的

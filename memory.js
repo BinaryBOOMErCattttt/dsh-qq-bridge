@@ -134,6 +134,7 @@ export function createMemory(deps) {
     resolveAgentPreset,
     mountAgentPreset,
     restrictAgentTools,
+    isMuted = () => false,
     channelSectionOrder,
   } = deps;
 
@@ -452,6 +453,9 @@ export function createMemory(deps) {
    */
   function maybeCatchUpDigest(conversation) {
     if (!memoryEnabled || settings.digestCatchUp === false) return;
+    // 静默的会话不做摘要：摘要是一次模型调用，睡着的时候不该读群、也不该花 token。
+    // 静默期间的消息仍然在转录里，醒来之后的下一次摘要（或下一天 4:00）会补上。
+    if (isMuted(conversation.key)) return;
     const atHour = settings.digestAtHour;
     const now = new Date();
     if (now.getHours() < atHour) return; // 今天还没到点，等定时器
@@ -1869,6 +1873,8 @@ export function createMemory(deps) {
         const queue = [];
         for (const conversation of conversations.values()) {
           if (digestQueued.has(conversation.key)) continue;
+          // 静默中：不摘要、不清 dirty。醒来后 dirty 还在，下一次摘要会把静默期一起补上。
+          if (isMuted(conversation.key)) continue;
           const lastDigestAt = memoryLastDigest.get(conversation.key) ?? 0;
           // 今天已经摘要过：同一个会话一天至多一次。
           if (lastDigestAt > 0 && localDate(lastDigestAt) === today) continue;

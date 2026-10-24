@@ -27,7 +27,7 @@
  *
  * @module @qqbot/dsh-plugin-qq
  */
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,7 +40,17 @@ import { hashDistance, perceptualHash } from './perceptual.js';
 import { DEFAULT_IMAGE_MAX_BYTES, imageSegment, insideDirectory, loadOutgoingImage } from './image.js';
 import { endpointTarget, findNapcatDir, repairNapcat } from './napcat.js';
 import { registerQqTools } from './tools.js';
-import { createSettings } from './settings.js';
+import { createEditor, defaultSkillRoot, expandHome } from './editor.js';
+import { matchWakeCommand, parseMuteState, serializeMuteState } from './mute.js';
+import { OWNER_SETTING_KEYS, applyOwnerSettings, coerceOwnerSetting, isWritableKey, parseOwnerSettings, settingKind } from './owner-settings.js';
+import { helpText, parseCommand, usageLine } from './commands.js';
+import { weatherReport } from './weather.js';
+import { fetchBalance, renderBalance } from './balance.js';
+import { createChatState } from './chat-state.js';
+import { dailyFortune, flipCoin, formatFortune, parseDice, pickRandom, rollDice } from './fun.js';
+import { renderSong, searchSong } from './music.js';
+import { synthesize } from './tts.js';
+import { createSettings, MAX_TIMER_MS } from './settings.js';
 import { createChatter } from './chatter.js';
 import { buildMentionResolver, isAllMention } from './mention.js';
 import { createSender } from './send.js';
@@ -80,7 +90,7 @@ import {
   weekdayLabel,
   withinActiveHours,
 } from './util.js';
-import { writeJsonAtomic } from './filestore.js';
+import { readJsonl, readTextOrUndefined, writeBytesAtomic, writeJsonAtomic, writeTextAtomic } from './filestore.js';
 
 // 这几个的契约由 test/bridge.test.mjs 直接从插件入口验，所以在这里再导出一次
 // （Loader 也只认 index.js 这个入口，搬走的东西必须在入口处仍然拿得到）。
@@ -264,32 +274,1450 @@ export function apply(ctx, config) {
   // 拿到的 `config` 是**引用**而不是普通对象，读字段要先 `.get()`。摊平之后的这份
   // 快照只在本次 apply 里有效 —— 设置页改配置不会重跑 apply，靠下面那个
   // `loader/volatile-update` 监听重启插件来重建。
-  const settings = createSettings(liveConfig(config), process.cwd());
-  const cwd = settings.cwd;
+  const baseSettings = createSettings(liveConfig(config), process.cwd());
+  const cwd = baseSettings.cwd;
+  // 小功能共用的状态文件（米饭 / 木鱼 / 关注 / 投票 / 纪念日 / 接龙）。读坏了退回空对象。
+  const chatState = createChatState({ file: resolve(cwd, 'data/chat-state.json'), report });
+  // 主人覆盖层（qq_settings / 直接改 data/owner-settings.json）：只含白名单键，
+  // 叠在 GUI 的基础配置之上。坏值在读入时就丢掉并记 warn，绝不因为一个手滑把 bot
+  // 起不来 —— 覆盖层不是配置的唯一真相，GUI 才是。
+  const ownerSettingsRoot = baseSettings.ownerSettingsFile.length > 0 ? resolve(cwd, baseSettings.ownerSettingsFile) : undefined;
+  const ownerSettingsInside = ownerSettingsRoot !== undefined && insideDirectory(resolve(cwd), ownerSettingsRoot);
+  if (baseSettings.ownerSettingsFile.length > 0 && ownerSettingsRoot !== undefined && !ownerSettingsInside) {
+    report('warn', `ownerSettingsFile "${baseSettings.ownerSettingsFile}" resolves outside cwd (${cwd}); owner overrides are disabled`);
+  }
+  const ownerSettingsValues = loadOwnerSettings();
+  const { settings, applied: ownerSettingsApplied } = applyOwnerSettings(baseSettings, ownerSettingsValues, report);
   const approvalPolicy = settings.approvalPolicy;
+  if (ownerSettingsApplied.length > 0) {
+    report('info', `owner settings applied: ${ownerSettingsApplied.join(', ')} (from ${baseSettings.ownerSettingsFile})`);
+  }
+
+  /** 启动时读主人覆盖层（同步：`apply()` 期间就要拿它去算 settings）。 */
+  function loadOwnerSettings() {
+    if (!ownerSettingsInside) return {};
+    try {
+      const raw = JSON.parse(readFileSync(ownerSettingsRoot, 'utf8'));
+      const parsed = parseOwnerSettings(raw, report);
+      return parsed.values;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return {};
+      report('warn', `could not read ${baseSettings.ownerSettingsFile}: ${errorText(error)}`);
+      return {};
+    }
+  }
+
+  /** 把覆盖层落盘（原子写；工具出错时把原因交给模型）。 */
+  function persistOwnerSettings(values) {
+    if (!ownerSettingsInside) {
+      throw new Error('ownerSettingsFile 不在 cwd 内，主人覆盖层已停用（改配置里的 ownerSettingsFile）');
+    }
+    return mkdir(dirname(ownerSettingsRoot), { recursive: true }).then(() =>
+      writeJsonAtomic(ownerSettingsRoot, { version: 1, values }),
+    );
+  }
+
+  /**
+   * 覆盖层改动之后重启一次插件（`createSettings` 只在 apply() 里跑）。
+   *
+   * 延后 8 秒：先让这一轮回复（含打字延迟）真的发出去，否则主人只看到「设置改好了」
+   * 然后 QQ 掉线、一个字都没收到。重启不结束进程，QQ 会话下一句照样 resume。
+   */
+  let settingsRestartTimer;
+  function scheduleSettingsRestart() {
+    if (settingsRestartTimer !== undefined) return;
+    if (typeof ctx.fiber?.restart !== 'function') {
+      report('warn', 'owner settings written, but this context has no fiber.restart — restart the service to apply');
+      return;
+    }
+    settingsRestartTimer = setTimeout(() => {
+      settingsRestartTimer = undefined;
+      report('info', 'owner settings changed — restarting the plugin to apply');
+      Promise.resolve()
+        .then(() => ctx.fiber.restart())
+        .catch((error) => report('warn', `owner settings restart failed: ${errorText(error)}`));
+    }, 8000);
+    settingsRestartTimer.unref?.();
+  }
   // 工具白名单：去掉空白项与重复项。空数组 = 不限制，与 allowUsers / allowGroups 语义一致。
   const allowTools = settings.allowTools;
   // 会话重置指令：大小写不敏感，空串表示禁用。
   const resetCommand = settings.resetCommand;
-  // 谁能重置会话：同样是「去掉空白项与重复项」，**空数组表示谁都不能**（与
-  // allowUsers / allowGroups 的「空 = 不限制」相反，理由见下面的 canReset）。
-  const resetUsers = settings.resetUsers;
+  // ---- 主人（受信者）：QQ 号确认，最高权限 ----
+  //
+  // 优先级：配置里写了 `resetUsers` 就用那份名单（部署者明确指定，最可控）；名单为空
+  // 时才走「第一个在私聊里跟它说话的人自动认主」，认到的号落盘到 ownerFile —— 重启
+  // 不丢，也不需要重启才能生效。昵称可以随便改，权限只认 QQ 号。
+  const configuredOwners = settings.resetUsers;
+  const ownerFileRoot = settings.ownerFile.length > 0 ? resolve(cwd, settings.ownerFile) : undefined;
+  const ownerFileInside = ownerFileRoot !== undefined && insideDirectory(resolve(cwd), ownerFileRoot);
+  if (settings.ownerFile.length > 0 && ownerFileRoot !== undefined && !ownerFileInside) {
+    report('warn', `ownerFile "${settings.ownerFile}" resolves outside cwd (${cwd}); the owner will only live in memory`);
+  }
+  /** 主人 QQ 号列表（配置优先，否则是自动认主那一位）。 */
+  const ownerState = { ids: [...configuredOwners] };
+  if (configuredOwners.length === 0 && settings.ownerAutoClaim) loadOwnerState();
+
+  /** 启动时把自动认主的结果读回来。 */
+  function loadOwnerState() {
+    if (!ownerFileInside) return;
+    try {
+      const parsed = JSON.parse(readFileSync(ownerFileRoot, 'utf8'));
+      const id = String(parsed?.id ?? parsed?.userId ?? '').trim();
+      if (/^\d{5,12}$/.test(id)) {
+        ownerState.ids = [id];
+        report('info', `owner restored from ${settings.ownerFile}: ${id}`);
+      }
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      report('warn', `could not read ${settings.ownerFile}: ${errorText(error)}`);
+    }
+  }
+
+  /** 落盘自动认主的结果（失败只记 warn：内存里已经生效）。 */
+  function persistOwnerState() {
+    if (!ownerFileInside) return;
+    void mkdir(dirname(ownerFileRoot), { recursive: true })
+      .then(() => writeJsonAtomic(ownerFileRoot, { version: 1, id: ownerState.ids[0] ?? '', at: Date.now() }))
+      .catch((error) => report('warn', `could not save ${settings.ownerFile}: ${errorText(error)}`));
+  }
 
   /**
-   * 这个人可不可以重置会话。
+   * 第一个在**私聊**里跟它说话的 QQ 号 = 主人（只发生一次）。
    *
-   * 语义刻意**与 allowUsers / allowGroups 相反**：白名单为空 = **谁都不能**，而不是
-   * 「谁都能」。allowUsers 那种「空 = 不限制」放在准入上是合理的（不配就别用这个功能），
-   * 放在重置上是危险的 —— 群消息是不可信输入，一个「空白名单等于人人可用」的默认值
-   * 意味着群里任何一个人都能悄悄把会话记忆重置掉，而且默认没人会去配它。
+   * 群聊里说话不算：一个刚装好的 bot 被拉进群时，第一条消息往往来自群友；把那种
+   * 「第一个说话的人」当成主人等于把最高权限送给陌生人。私聊才是「加好友」的那条路。
+   * @returns 这次是否刚认主。
+   */
+  function claimOwnerIfNeeded(event, selfId) {
+    if (!settings.ownerAutoClaim || configuredOwners.length > 0) return false;
+    if (event?.message_type !== 'private') return false;
+    if (ownerState.ids.length > 0) return false;
+    const userId = String(event.user_id ?? '');
+    if (userId === '' || userId === String(selfId)) return false;
+    ownerState.ids = [userId];
+    persistOwnerState();
+    report('info', `owner claimed by the first private contact: ${userId} (set resetUsers to pin it)`);
+    return true;
+  }
+
+  /**
+   * 这个人可不可以做「主人的事」：重置会话、通过 qq_quiet 静默、用受信写盘工具。
+   *
+   * 语义刻意**与 allowUsers / allowGroups 相反**：名单为空且没认主 = **谁都不能**，
+   * 而不是「谁都能」。群消息是不可信输入，一个「空白名单等于人人可用」的默认值意味着
+   * 群里任何一个人都能悄悄重置记忆、改人设或者把 bot 按停。
    *
    * 比较时两边都折成字符串：OneBot 的 user_id 可能是数字，配置里写的是文本。
    * @param userId - 发消息的人（私聊是对方，群聊是发言者，不是群号）。
-   * @returns 允许重置时为 true。
+   * @returns 有这个权限时为 true。
    */
   function canReset(userId) {
-    return resetUsers.includes(String(userId ?? ''));
+    return ownerState.ids.includes(String(userId ?? ''));
   }
+  // 受信写盘、静默、重置共用同一份名单：只配一处，免得出现「能重置但不能改人设」。
+  const canOperate = canReset;
+  // 受信写盘（qq_write / qq_edit / qq_skill）：只在 trustedWrite 打开时装配。
+  // skillRoot 默认 `$DSH_HOME/skills`（也就是 ~/.dsh/skills），同样由配置覆盖。
+  const skillRoot = settings.trustedWrite ? (expandHome(settings.skillWriteDir) || defaultSkillRoot()) : '';
+  const editor = settings.trustedWrite
+    ? createEditor({ cwd, skillRoot, maxBytes: settings.writeMaxBytes, report })
+    : undefined;
+  // 静默状态文件：配置成 cwd 外时只记在内存里（并记一条 warn），不阻断功能。
+  const muteRoot = settings.mutePersist && settings.muteFile.length > 0 ? resolve(cwd, settings.muteFile) : undefined;
+  const muteInside = muteRoot !== undefined && insideDirectory(resolve(cwd), muteRoot);
+  if (settings.mutePersist && muteRoot !== undefined && !muteInside) {
+    report('warn', `muteFile "${settings.muteFile}" resolves outside cwd (${cwd}); quiet state will only live in memory`);
+  }
+  /** 静默状态：`global` 覆盖全部会话，`keys` 是单个会话。 */
+  const muteState = { global: false, keys: new Set(), at: 0, by: '' };
+  if (muteInside) loadMuteState();
+
+  /** 这个群现在是不是被静默了（私聊永远不静默：它是控制通道）。 */
+  function isMuted(key) {
+    if (typeof key !== 'string' || !key.startsWith('group:')) return false;
+    return muteState.global || muteState.keys.has(key);
+  }
+
+  /** 启动时把静默状态读回内存（同步：设置页保存后插件重启，第一条消息就不该漏）。 */
+  function loadMuteState() {
+    try {
+      const raw = readFileSync(muteRoot, 'utf8');
+      const parsed = parseMuteState(JSON.parse(raw));
+      muteState.global = parsed.global;
+      muteState.keys = new Set(parsed.keys);
+      muteState.at = parsed.at;
+      muteState.by = parsed.by;
+      if (muteState.global || muteState.keys.size > 0) {
+        report('info', `quiet state restored: ${muteState.global ? 'all conversations' : `${muteState.keys.size} conversation(s)`}`);
+      }
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      report('warn', `could not read ${settings.muteFile}; starting awake: ${errorText(error)}`);
+    }
+  }
+
+  /** 落盘静默状态（失败只记 warn：内存里已经生效）。 */
+  function persistMuteState() {
+    if (!settings.mutePersist || !muteInside) return;
+    void mkdir(dirname(muteRoot), { recursive: true })
+      .then(() => writeJsonAtomic(muteRoot, serializeMuteState(muteState)))
+      .catch((error) => report('warn', `could not save the quiet state: ${errorText(error)}`));
+  }
+
+  /** 一个会话身上挂着的、还没发出去的东西（攒批 / 补一句）一起清掉。 */
+  function clearPendingFor(conversation) {
+    if (conversation === undefined) return;
+    if (conversation.pending.length > 0) conversation.pending.length = 0;
+    if (conversation.batchTimer !== undefined) {
+      clearTimeout(conversation.batchTimer);
+      conversation.batchTimer = undefined;
+    }
+    cancelChime(conversation);
+  }
+
+  /**
+   * 已知的群（群号 → 群名）：静默目标要按**群号**定位，群名只是给主人用的写法。
+   *
+   * 数据来自两处：插件已经聊过的会话（有群名）+ OneBot 的 `get_group_list`（更全）。
+   * 缓存 60 秒：同一句话里连着列几个群时不该重复打接口。
+   * @param {boolean} [force] - 跳过缓存。
+   * @returns {Promise<Array<{ id: string, name: string }>>}
+   */
+  const groupDirectory = { at: 0, list: [] };
+  async function knownGroups(force = false) {
+    if (!force && groupDirectory.list.length > 0 && Date.now() - groupDirectory.at < 60_000) {
+      return groupDirectory.list;
+    }
+    const map = new Map();
+    for (const conversation of conversations.values()) {
+      if (conversation.type !== 'group') continue;
+      map.set(conversation.id, { id: conversation.id, name: conversation.name || `群${conversation.id}` });
+    }
+    if (client.connected) {
+      try {
+        const rows = await client.call('get_group_list');
+        for (const row of Array.isArray(rows) ? rows : []) {
+          const id = String(row?.group_id ?? row?.groupId ?? '').trim();
+          if (id.length === 0) continue;
+          const name = String(row?.group_name ?? row?.groupName ?? '').trim() || `群${id}`;
+          map.set(id, { id, name });
+        }
+      } catch (error) {
+        report('warn', `could not list QQ groups: ${errorText(error)}`);
+      }
+    }
+    groupDirectory.list = [...map.values()].sort((left, right) => left.id.localeCompare(right.id));
+    groupDirectory.at = Date.now();
+    return groupDirectory.list;
+  }
+
+  /** 群号 → 群名（查不到时给一个「群<号>」，绝不让提示词里出现空名字）。 */
+  function groupNameOf(id) {
+    const target = String(id ?? '');
+    const hit = groupDirectory.list.find((group) => group.id === target);
+    if (hit !== undefined) return hit.name;
+    return conversations.get(`group:${target}`)?.name || `群${target}`;
+  }
+
+  /**
+   * 把「群号 / 群名 / 全部」解析成要静默的目标。
+   *
+   * 群号是唯一标识（群名可以改，也可能重名），所以群名只是入口：匹配到唯一一个群就
+   * 换成它的群号；匹配到多个时**要求用群号**，而不是替主人猜一个。
+   * @param {unknown} raw - 工具参数 target。
+   * @param {object} [conversation] - 调用方会话（在群里时默认就是它）。
+   * @returns {Promise<{ all: boolean, id?: string, name?: string }>}
+   */
+  async function resolveQuietTarget(raw, conversation) {
+    const text = String(raw ?? '').trim();
+    if (text.length === 0) {
+      if (conversation?.type === 'group') {
+        return { all: false, id: conversation.id, name: conversation.name || groupNameOf(conversation.id) };
+      }
+      throw new Error('静默哪个群要说清楚：给群号或群名（例如「123456789」「XX群」）；所有群都睡写「全部」');
+    }
+    if (/^(?:all|全部|所有|全部群|所有群|都睡|全都)$/iu.test(text)) return { all: true };
+    if (/^\d{5,12}$/.test(text)) return { all: false, id: text, name: groupNameOf(text) };
+    const groups = await knownGroups();
+    const exact = groups.filter((group) => group.name === text);
+    if (exact.length === 1) return { all: false, id: exact[0].id, name: exact[0].name };
+    const hits = groups.filter((group) => group.name.includes(text));
+    if (hits.length === 1) return { all: false, id: hits[0].id, name: hits[0].name };
+    if (hits.length > 1) {
+      throw new Error(`「${text}」匹配到多个群：${hits.map((group) => `${group.name}(${group.id})`).join('、')}；请直接给群号`);
+    }
+    const known = groups.slice(0, 20).map((group) => `${group.name}(${group.id})`).join('、');
+    throw new Error(`找不到群「${text}」${known.length > 0 ? `；已知的群：${known}` : '（还没有已知的群；先让它在那个群说过话）'}`);
+  }
+
+  /**
+   * 静默一个 / 全部群：只影响群聊，私聊永远醒着。清掉待发批次与 chime，落盘。
+   * @param {object} options
+   * @param {unknown} options.target - 群号 / 群名 / 全部 / 空（调用方所在的群）。
+   * @param {object} [options.conversation] - 调用方会话。
+   * @param {string} [options.by] - 下命令的 QQ 号（只写日志与落盘）。
+   * @returns {Promise<{ all: boolean, id?: string, name?: string }>}
+   */
+  async function quietSleep({ target, conversation, by }) {
+    const resolved = await resolveQuietTarget(target, conversation);
+    // 真的静默成功：取消「12 秒后定档」的兜底，否则会在睡着之后又把它重开。
+    if (resolved.all) {
+      for (const item of conversations.values()) clearSleepIntent(item);
+    } else {
+      clearSleepIntent(conversations.get(`group:${resolved.id}`));
+    }
+    muteState.at = Date.now();
+    muteState.by = String(by ?? '');
+    if (resolved.all) {
+      muteState.global = true;
+      muteState.keys.clear();
+      for (const item of conversations.values()) clearPendingFor(item);
+      report('info', `quiet: all groups (by ${muteState.by || 'operator'})`);
+    } else {
+      const key = `group:${resolved.id}`;
+      muteState.keys.add(key);
+      clearPendingFor(conversations.get(key));
+      report('info', `quiet: group ${resolved.id} ${resolved.name} (by ${muteState.by || 'operator'})`);
+    }
+    persistMuteState();
+    return resolved;
+  }
+
+  /**
+   * 结束静默：不给 target = 全部叫醒；给 target = 只叫醒那一个群。
+   *
+   * 「全局静默里叫醒一个群」的语义是「其余群继续睡」：把 global 展开成具体群号，
+   * 只是这一轮的样子 —— 不展开的话，叫醒一个群等于把全部群都叫醒。
+   * @param {object} options
+   * @param {unknown} options.target - 群号 / 群名 / 全部 / 空（= 全部）。
+   * @param {object} [options.conversation] - 调用方会话。
+   * @param {string} [options.by] - 下命令的 QQ 号。
+   * @returns {Promise<{ all: boolean, wasMuted: boolean, id?: string, name?: string }>}
+   */
+  async function quietWake({ target, conversation, by }) {
+    const text = String(target ?? '').trim();
+    const all = text.length === 0 || /^(?:all|全部|所有|全部群|所有群)$/iu.test(text);
+    muteState.at = Date.now();
+    muteState.by = String(by ?? '');
+    if (all) {
+      const wasMuted = muteState.global || muteState.keys.size > 0;
+      muteState.global = false;
+      muteState.keys.clear();
+      for (const item of conversations.values()) cancelChime(item);
+      persistMuteState();
+      report('info', `quiet: wake all (by ${muteState.by || 'operator'})`);
+      return { all: true, wasMuted };
+    }
+    const resolved = await resolveQuietTarget(text, conversation);
+    if (muteState.global) {
+      muteState.global = false;
+      const groups = await knownGroups();
+      for (const group of groups) {
+        if (group.id !== resolved.id) muteState.keys.add(`group:${group.id}`);
+      }
+    } else {
+      muteState.keys.delete(`group:${resolved.id}`);
+    }
+    cancelChime(conversations.get(`group:${resolved.id}`));
+    persistMuteState();
+    report('info', `quiet: wake group ${resolved.id} ${resolved.name} (by ${muteState.by || 'operator'})`);
+    return { all: false, wasMuted: true, id: resolved.id, name: resolved.name };
+  }
+
+  /** 当前静默状态（给 `qq_quiet status` 用）：全局时列出所有已知群。 */
+  async function quietStatus() {
+    const groups = await knownGroups();
+    if (muteState.global) return { global: true, groups };
+    const muted = groups.filter((group) => muteState.keys.has(`group:${group.id}`));
+    for (const key of muteState.keys) {
+      const id = key.slice('group:'.length);
+      if (!muted.some((group) => group.id === id)) muted.push({ id, name: groupNameOf(id) });
+    }
+    return { global: false, groups: muted };
+  }
+
+  /**
+   * 睡着之后消息根本到不了模型，所以「起床」必须由插件直接识别（唯一旁路）。
+   *
+   * 只认主人、且只在**已经静默**时生效：醒着的时候「你几点起床」是一句普通聊天，
+   * 不该被插一句「醒着呢」。群里不要求 @ / 前缀 —— 静默的群本来就已经没人说话了。
+   * @param event - OneBot 消息事件。
+   * @param selfId - 机器人自己的 QQ 号。
+   * @returns 唤醒命令；不是命令时 undefined。
+   */
+  function wakeCommandFor(event, selfId) {
+    if (settings.wakeTriggers.length === 0) return undefined;
+    if (!muteState.global && muteState.keys.size === 0) return undefined;
+    const type = event?.message_type === 'group' ? 'group' : event?.message_type === 'private' ? 'private' : undefined;
+    if (type === undefined) return undefined;
+    const userId = String(event.user_id ?? '');
+    if (userId === '' || userId === String(selfId) || !canOperate(userId)) return undefined;
+    const raw = messageToText(event.message ?? event.raw_message, selfId).trim();
+    if (raw.length === 0) return undefined;
+    const text = type === 'group' && settings.groupTrigger === 'prefix' && raw.startsWith(settings.prefix)
+      ? dropPrefix(raw)
+      : raw;
+    const trigger = matchWakeCommand(text, {
+      wakeTriggers: settings.wakeTriggers,
+      prefixes: [settings.prefix],
+    });
+    if (trigger === undefined) return undefined;
+    const id = type === 'group' ? String(event.group_id) : userId;
+    const displayName = userDisplayName(event.sender ?? {}, event.user_id);
+    const conversation = conversationFor(type, id, {
+      userId,
+      userName: displayName,
+      name: displayName,
+      mentions: type === 'group' ? atMentions(event.message, selfId) : undefined,
+    });
+    return { trigger, conversation, userId };
+  }
+
+  /** 执行唤醒：回一句固定文案；如果睡着期间群里聊过，再让模型说一句「梦话」。 */
+  function applyWakeCommand(command) {
+    clearSleepIntent(command.conversation);
+    void quietWake({ target: 'all', conversation: command.conversation, by: command.userId })
+      .then(() => {
+        void sendToConversation(command.conversation, settings.wakeText);
+        const dream = dreamLines.splice(0).join('\n');
+        if (dream.length > 0) {
+          startAgentTurn(
+            command.conversation,
+            [
+              '（插件转告：你刚睡醒。睡着期间群里聊过这些：）',
+              dream,
+              '请用一句「刚睡醒的梦话」总结（不超过 80 字），像真的刚从午睡里抬头，别逐条复述。',
+            ].join('\n'),
+            { quote: command.quote, intent: 'command', command: '梦话' },
+          );
+        }
+      })
+      .catch((error) => report('warn', `wake command failed: ${errorText(error)}`));
+  }
+
+  /**
+   * 主人从 QQ 侧调整 **bot 配置**（`qq_settings`）：只碰白名单键，改完 8 秒后重启插件。
+   *
+   * 与 GUI 的关系：GUI 改的是基础配置，这里写的是覆盖层（`data/owner-settings.json`），
+   * 覆盖层优先。`unset` / `clear` 就回到 GUI 的值。模型路由（provider / model）不在
+   * 白名单里 —— 那是部署级设置，不该由聊天改。
+   */
+  const settingsAdmin = {
+    list: () => Object.keys(settings)
+      .filter((key) => key !== 'memoryOn')
+      .map((key) => {
+        const spec = OWNER_SETTING_KEYS[key];
+        return {
+          key,
+          value: settings[key],
+          writable: isWritableKey(key),
+          kind: settingKind(key, settings[key]),
+          description: spec?.description ?? '',
+        };
+      }),
+    get: (key) => {
+      if (key !== undefined && settings[key] === undefined) {
+        throw new Error(`没有「${key}」这个配置项（用 action: list 看全部）`);
+      }
+      const keys = key === undefined ? Object.keys(settings).filter((name) => name !== 'memoryOn') : [key];
+      const current = {};
+      const pending = {};
+      for (const name of keys) {
+        current[name] = settings[name];
+        if (ownerSettingsValues[name] !== undefined) pending[name] = ownerSettingsValues[name];
+      }
+      return { current, pending };
+    },
+    async set(key, raw) {
+      const value = coerceOwnerSetting(key, raw, settings[key]);
+      ownerSettingsValues[key] = value;
+      await persistOwnerSettings(ownerSettingsValues);
+      scheduleSettingsRestart();
+      return { key, value };
+    },
+    async unset(key) {
+      if (!isWritableKey(key)) throw new Error(`「${key}」不是可在 QQ 侧修改的项`);
+      delete ownerSettingsValues[key];
+      await persistOwnerSettings(ownerSettingsValues);
+      scheduleSettingsRestart();
+      return { key };
+    },
+    async clear() {
+      for (const key of Object.keys(ownerSettingsValues)) delete ownerSettingsValues[key];
+      await persistOwnerSettings(ownerSettingsValues);
+      scheduleSettingsRestart();
+      return { cleared: true };
+    },
+  };
+
+  // ---- 指令路由（@bot + 空格 + 指令）------------------------------------------
+  //
+  // 能确定性回答的指令由插件直接回（零 token）；只有「小作文 / 白饭 / 表情（按语义挑图）」
+  // 才整理成一段说明投给会话。命令表与解析在 commands.js，那里可以脱离 Harness 单测。
+
+  /** 同一条指令在同一个会话里的最小间隔（毫秒）：天气 / 余额 / 随机表情不该被连点。 */
+  const COMMAND_COOLDOWN_MS = 3000;
+  const commandCooldowns = new Map();
+
+  /**
+   * 解析「@bot + 空格 + 指令」。群聊要求 @ / 前缀 / all 触发；私聊直接判。
+   * @param event - OneBot 消息事件。
+   * @param selfId - 机器人自己的 QQ 号。
+   * @returns 指令描述；不是指令时 undefined。
+   */
+  function commandFor(event, selfId) {
+    if (settings.commands !== true) return undefined;
+    const type = event?.message_type === 'group' ? 'group' : event?.message_type === 'private' ? 'private' : undefined;
+    if (type === undefined) return undefined;
+    const userId = String(event.user_id ?? '');
+    if (userId === '' || userId === String(selfId)) return undefined;
+    const raw = messageToText(event.message ?? event.raw_message, selfId).trim();
+    if (raw.length === 0) return undefined;
+    let text = raw;
+    if (type === 'group') {
+      if (!settings.groupChat) return undefined;
+      // 静默中的群：指令一律不进来（叫醒只能靠主人说「起床」那条旁路）。
+      if (isMuted(`group:${event.group_id}`)) return undefined;
+      const prefixed = settings.groupTrigger === 'prefix' && raw.startsWith(settings.prefix);
+      const explicit = settings.groupTrigger === 'all' || mentions(event.message, selfId) || prefixed;
+      if (!explicit) return undefined;
+      if (prefixed) text = dropPrefix(raw);
+    } else if (!settings.privateChat) {
+      return undefined;
+    }
+    const parsed = parseCommand(text);
+    if (parsed === undefined) return undefined;
+    const id = type === 'group' ? String(event.group_id) : userId;
+    const displayName = userDisplayName(event.sender ?? {}, event.user_id);
+    const conversation = conversationFor(type, id, {
+      userId,
+      userName: displayName,
+      name: displayName,
+      mentions: type === 'group' ? atMentions(event.message, selfId) : undefined,
+    });
+    return {
+      command: parsed.command,
+      args: parsed.args,
+      conversation,
+      userId,
+      owner: canOperate(userId),
+      quote: {
+        messageId: String(event.message_id ?? ''),
+        userId,
+        seq: type === 'group' ? chatter.anchor(String(event.group_id)) : 0,
+        emoji: false,
+      },
+    };
+  }
+
+  /** 指令回复走和自动回复同一条发送队列（拆条 / 打字延迟都沿用）。 */
+  function commandReply(command, text) {
+    void sendToConversation(command.conversation, text);
+  }
+
+  /** 把合成好的 MP3 作为 QQ 语音发出去（OneBot 的 `record` 段，NapCat 已实测可发）。 */
+  function sendVoice(conversation, bytes) {
+    const action = conversation.type === 'group' ? 'send_group_msg' : 'send_private_msg';
+    const idKey = conversation.type === 'group' ? 'group_id' : 'user_id';
+    return enqueueSend(conversation, async () => {
+      await client.call(action, {
+        [idKey]: Number(conversation.id),
+        message: [{ type: 'record', data: { file: `base64://${bytes.toString('base64')}` } }],
+      });
+      noteOwnMessage(conversation.type, conversation.id);
+    });
+  }
+
+  /** 按字节/字符裁断（指令的硬上限，比如白饭 ≤25 字）。 */
+  function clipChars(text, max) {
+    const chars = [...String(text ?? '')];
+    return chars.length <= max ? String(text ?? '') : chars.slice(0, max).join('');
+  }
+
+  /** 拿 apiKeyRef 指向的凭据：优先走 DSH 凭据层，其次环境变量。 */
+  async function resolveApiKey() {
+    const credentials = ctx.get('credentials');
+    if (credentials !== undefined && typeof credentials.resolve === 'function') {
+      try {
+        const record = await credentials.resolve(settings.apiKeyRef);
+        return String(record?.value ?? '');
+      } catch {
+        return '';
+      }
+    }
+    return String(process.env[settings.apiKeyRef] ?? '');
+  }
+
+  /** 当前静默状态的一句话（状态指令用）。 */
+  function quietSummary() {
+    if (muteState.global) return '全部群';
+    if (muteState.keys.size > 0) return `${muteState.keys.size} 个群`;
+    return '醒着';
+  }
+
+  // ---- 小功能的共享状态与读转录 ------------------------------------------------
+  // 米饭 / 木鱼 / 关注 / 投票 / 纪念日 / 接龙都放在 data/chat-state.json，按 section 分。
+  // 读不到就退回空对象 —— 丢几个计数，比让 bot 起不来划算。
+
+  function gameData(name) {
+    return chatState.section(name, {});
+  }
+
+  function gameList(name) {
+    if (!Array.isArray(chatState.data[name])) chatState.data[name] = [];
+    return chatState.data[name];
+  }
+
+  /** 今天这个会话的转录行（记忆关掉 / 文件不存在时是空数组）。 */
+  async function todayTranscript(key) {
+    if (settings.memory === false) return [];
+    const dir = resolve(cwd, settings.memoryDir, 'conversations', memorySlug(key), 'log');
+    return readJsonl(join(dir, `${localDate()}.jsonl`));
+  }
+
+  /** 今天群里的发言统计：条数 / 人数 / 话最多 / 最近一小时 / 潜水的人。 */
+  async function groupStats(conversation) {
+    const lines = (await todayTranscript(conversation.key)).filter((line) => line.kind === 'group' && line.command === undefined);
+    const byName = new Map();
+    for (const line of lines) {
+      const name = String(line.name || line.user || '').trim();
+      if (name.length === 0) continue;
+      byName.set(name, (byName.get(name) ?? 0) + 1);
+    }
+    const top = [...byName.entries()].sort((left, right) => right[1] - left[1]).slice(0, 3);
+    const recent = lines.filter((line) => Number(line.at) >= Date.now() - 3_600_000).length;
+    const quiet = (conversation.participants ?? [])
+      .map((person) => person.name)
+      .filter((name) => name.length > 0 && !byName.has(name))
+      .slice(0, 5);
+    return { total: lines.length, speakers: byName.size, top, recent, quiet };
+  }
+
+  /** 米饭计数：按会话 + 人，跨天把 today 归零。 */
+  function riceEntry(key, userId) {
+    const rice = gameData('rice');
+    const today = localDate();
+    if (rice[key] === undefined || rice[key] === null || typeof rice[key] !== 'object') {
+      rice[key] = { total: 0, today: 0, date: today };
+    }
+    if (rice[key].date !== today) {
+      rice[key].date = today;
+      rice[key].today = 0;
+    }
+    rice[key].byUser ??= {};
+    rice[key].byUser[String(userId)] ??= { total: 0, today: 0 };
+    if (rice[key].byUser[String(userId)].date !== today) {
+      rice[key].byUser[String(userId)].date = today;
+      rice[key].byUser[String(userId)].today = 0;
+    }
+    return rice[key];
+  }
+
+  /** 纪念日：`MM-DD 内容`，只在创建它的会话里提醒。 */
+  function anniversaryList() {
+    return gameList('anniversaries');
+  }
+
+  /** 关注词：只记 {key, keyword, by, at, lastHit}。 */
+  function watchList() {
+    return gameList('watches');
+  }
+
+  /** 群成员进出：用固定文案（零 token），名字取群名片，取不到就用 QQ 号。 */
+  async function memberName(groupId, userId) {
+    try {
+      const info = await client.call('get_group_member_info', { group_id: Number(groupId), user_id: Number(userId), no_cache: true });
+      return String(info?.card || info?.nickname || userId);
+    } catch {
+      return String(userId);
+    }
+  }
+
+  async function handleGroupMember(event) {
+    if (!settings.groupChat) return;
+    const groupId = String(event.group_id ?? '');
+    if (groupId.length === 0) return;
+    if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(groupId)) return;
+    const type = event.notice_type === 'group_increase' ? 'increase' : event.notice_type === 'group_decrease' ? 'decrease' : undefined;
+    if (type === undefined) return;
+    const userId = String(event.user_id ?? '');
+    if (userId.length === 0) return;
+    const name = await memberName(groupId, userId);
+    const conversation = targetConversation('group', groupId);
+    const text = type === 'increase'
+      ? `（尾巴甩了两下）欢迎 ${name}，我是群里的普通群友，叫我小助手就行。`
+      : `（尾巴垂了垂）${name} 走了，群里安静了一点。`;
+    void sendToConversation(conversation, text);
+    report('info', `${describeConversation(conversation)} 群成员${type === 'increase' ? '加入' : '离开'}：${name}`);
+  }
+
+  /**
+   * 睡着期间把群消息留一小段（最多 40 条 / 2000 字）：醒来时拿它说一句「梦话」。
+   * 只放内存：重启就忘，不值得落盘。
+   */
+  const dreamLines = [];
+  function noteDreamLine(event, selfId) {
+    const text = messageToText(event.message ?? event.raw_message, selfId).trim();
+    if (text.length === 0) return;
+    const name = userDisplayName(event.sender ?? {}, event.user_id);
+    dreamLines.push(`${name}: ${text.slice(0, 80)}`);
+    while (dreamLines.length > 40) dreamLines.shift();
+    while (dreamLines.join('\n').length > 2000 && dreamLines.length > 1) dreamLines.shift();
+  }
+
+  /** 把「有人提到关键词」私聊给关注人；同一个词 10 分钟内只提醒一次。 */
+  async function checkWatches(conversationKey, text, senderName) {
+    if (typeof text !== 'string' || text.length === 0) return;
+    const now = Date.now();
+    let changed = false;
+    for (const watch of watchList()) {
+      if (watch.key !== conversationKey) continue;
+      if (!text.includes(String(watch.keyword ?? ''))) continue;
+      if (now - (Number(watch.lastHit) || 0) < 10 * 60 * 1000) continue;
+      watch.lastHit = now;
+      changed = true;
+      try {
+        await client.call('send_private_msg', {
+          user_id: String(watch.by),
+          message: `群里有人提到「${watch.keyword}」：${senderName}：${text.slice(0, 120)}`,
+        });
+      } catch (error) {
+        report('warn', `watch notify failed: ${errorText(error)}`);
+      }
+    }
+    if (changed) chatState.save();
+  }
+
+  /** 今天是不是某个纪念日（每个会话一天只提醒一次）。 */
+  function checkAnniversaries(conversation) {
+    const today = localDate();
+    if (conversation.lastAnniversaryDate === today) return;
+    conversation.lastAnniversaryDate = today;
+    const mmdd = today.slice(5);
+    const hits = anniversaryList().filter((item) => item.key === conversation.key && item.mmdd === mmdd);
+    if (hits.length === 0) return;
+    const lines = hits.map((item) => `· ${item.text}`);
+    void sendToConversation(conversation, `（尾巴拍了拍水面）今天是纪念日：\n${lines.join('\n')}`);
+  }
+
+  /** 从模型回复 / 入站正文里抠出最后一张图的路径（给「看图」「存表情」用）。 */
+  function lastImagePathOf(text) {
+    const matches = [...String(text ?? '').matchAll(/\[(?:图片|图片\(动画表情\)|表情包)[^\]]*?: ([^\]\n]+)\]/gu)];
+    return matches.length > 0 ? matches[matches.length - 1][1].trim() : undefined;
+  }
+
+  /**
+   * 通用的「交给模型」入口：指令 / 梦话 / 关注都走这里。
+   * @param conversation - 目标会话。
+   * @param text - 给模型看的说明。
+   * @param meta - `{ quote, intent, command }`。
+   */
+  function startAgentTurn(conversation, text, meta = {}) {
+    conversation.pendingIntent = meta.intent ?? 'command';
+    enqueue(conversation, async () => {
+      try {
+        const agent = await ensureAgent(conversation);
+        const userMessage = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } });
+        submitted.set(userMessage.id, {
+          key: conversation.key,
+          quote: meta.quote,
+          intent: meta.intent ?? 'command',
+          command: meta.command,
+        });
+        agent.followup(userMessage);
+      } catch (error) {
+        report('warn', `agent turn for ${conversation.key} could not start: ${errorText(error)}`);
+      }
+    });
+  }
+
+  /**
+   * 定档（交接）：把最近上下文与可能未完成的事写进 Markdown，归档旧会话，再新开一轮，
+   * 让新 Agent 的第一件事就是读这份文档。
+   *
+   * 为什么不是简单 `/reset`：上下文清零之后模型会「失忆」，群里正聊到一半它会像换了个人。
+   * 交接文档把「最近说了什么、还有什么没做完、当前静默/提醒状态」留下来，新会话先读它，
+   * 接得上再开口；旧会话目录移到 `data/handoff/archive/`，不再被 resume。
+   */
+  const HANDOFF_FALLBACK_MS = 12_000;
+
+  /** 主人说「睡觉去」这类短句时返回会话；群聊要求 @ / 前缀 / all。 */
+  function sleepIntentFor(event, selfId) {
+    if (event?.post_type !== 'message') return undefined;
+    const type = event.message_type === 'group' ? 'group' : event.message_type === 'private' ? 'private' : undefined;
+    if (type === undefined) return undefined;
+    const userId = String(event.user_id ?? '');
+    if (userId === '' || userId === String(selfId) || !canOperate(userId)) return undefined;
+    const raw = messageToText(event.message ?? event.raw_message, selfId).trim();
+    if (raw.length === 0) return undefined;
+    let text = raw;
+    if (type === 'group') {
+      const prefixed = settings.groupTrigger === 'prefix' && raw.startsWith(settings.prefix);
+      const explicit = settings.groupTrigger === 'all' || mentions(event.message, selfId) || prefixed;
+      if (!explicit) return undefined;
+      if (prefixed) text = dropPrefix(raw);
+    }
+    const compact = text.replace(/[\s\u3000]+/gu, '');
+    if (compact.length > 12) return undefined;
+    if (!/^(睡觉去|去睡吧|睡吧|休眠|静默|该睡了|该睡啦|睡吧你)/u.test(compact)) return undefined;
+    const id = type === 'group' ? String(event.group_id) : userId;
+    const displayName = userDisplayName(event.sender ?? {}, event.user_id);
+    return conversationFor(type, id, {
+      userId,
+      userName: displayName,
+      name: displayName,
+      mentions: type === 'group' ? atMentions(event.message, selfId) : undefined,
+    });
+  }
+
+  /** 记下「主人刚说了睡」：12 秒内没真的静默，就走定档兜底。 */
+  function markSleepIntent(conversation) {
+    conversation.sleepIntentAt = Date.now();
+    if (conversation.sleepTimer !== undefined) clearTimeout(conversation.sleepTimer);
+    const timer = setTimeout(() => {
+      conversation.sleepTimer = undefined;
+      if (conversation.sleepIntentAt === undefined) return;
+      if (isMuted(conversation.key)) {
+        conversation.sleepIntentAt = undefined;
+        return;
+      }
+      conversation.sleepIntentAt = undefined;
+      report('info', `${describeConversation(conversation)} 说了睡但没真的静默，改走定档`);
+      void handoffConversation(conversation, 'sleep-fallback');
+    }, HANDOFF_FALLBACK_MS);
+    timer.unref?.();
+    conversation.sleepTimer = timer;
+  }
+
+  /** 清掉「等它静默」的定时器（静默成功 / 被叫醒 / 已定档时调用）。 */
+  function clearSleepIntent(conversation) {
+    if (conversation === undefined) return;
+    conversation.sleepIntentAt = undefined;
+    if (conversation.sleepTimer !== undefined) {
+      clearTimeout(conversation.sleepTimer);
+      conversation.sleepTimer = undefined;
+    }
+  }
+
+  /** 把最近上下文写成交接文档；返回相对 cwd 的路径。 */
+  async function writeHandoffDoc(conversation, reason) {
+    const lines = await todayTranscript(conversation.key);
+    const tail = lines.slice(-80);
+    const tasks = lines
+      .filter((line) => /提醒|任务|待办|记得|别忘|答应/u.test(String(line.text ?? '')))
+      .slice(-10);
+    const ambientTail = conversation.type === 'group' ? (ambient.get(conversation.id) ?? []).slice(-12) : [];
+    const parts = [
+      '# 交接文档',
+      '',
+      `- 会话：${conversation.key}${conversation.name ? `（${conversation.name}）` : ''}`,
+      `- 时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+      `- 原因：${reason === 'sleep-fallback' ? '主人说睡但静默失败，自动定档' : '主人手动定档'}`,
+      `- 会话轮次：${conversation.sessionGeneration ?? 0}`,
+      `- 静默状态：${isMuted(conversation.key) ? '静默中' : '醒着'}`,
+      '',
+      '## 最近对话（旧 → 新，最多 80 条）',
+      '',
+      ...(tail.length > 0
+        ? tail.map((line) => `- ${line.name ?? line.user ?? '某人'}：${String(line.text ?? '').replace(/\s+/gu, ' ').slice(0, 200)}`)
+        : ['（今天的转录是空的，下面是群聊环境缓冲）', ...ambientTail.map((line) => `- ${line.name}：${line.text}`)]),
+      '',
+      '## 可能未完成的事（关键词命中，供参考）',
+      '',
+      ...(tasks.length > 0
+        ? tasks.map((line) => `- ${line.name ?? line.user ?? '某人'}：${String(line.text ?? '').slice(0, 200)}`)
+        : ['（没有明显命中的任务；以最近对话为准）']),
+      '',
+      '## 备注',
+      '',
+      '- 旧会话已归档到 `data/handoff/archive/`，长期记忆仍在 `.qq-memory/`。',
+      '- 读完这份文档后，先接上当前话题，不要逐条复述。',
+    ];
+    const body = parts.join('\n').slice(0, 12_000);
+    const stamp = new Date().toISOString().replace(/[:.]/gu, '-');
+    const rel = `data/handoff/${memorySlug(conversation.key)}-${stamp}.md`;
+    await mkdir(join(cwd, 'data', 'handoff'), { recursive: true });
+    await writeTextAtomic(join(cwd, rel), `${body}\n`);
+    return rel;
+  }
+
+  /** 把旧会话目录移出 sessions 根目录（保留作归档，不再被 resume）。 */
+  async function archiveSessionDir(sessionId) {
+    const persistence = ctx.get('sessionPersistence');
+    const root = persistence?.root;
+    if (typeof root !== 'string' || root.length === 0) return;
+    try {
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const source = join(root, entry.name, sessionId);
+        const info = await stat(source).catch(() => undefined);
+        if (info?.isDirectory() !== true) continue;
+        const target = join(cwd, 'data', 'handoff', 'archive', `${sessionId}-${Date.now()}`);
+        await mkdir(dirname(target), { recursive: true });
+        await rename(source, target);
+        report('info', `handoff: archived ${sessionId} → ${target}`);
+        return;
+      }
+    } catch (error) {
+      report('warn', `handoff: could not archive ${sessionId}: ${errorText(error)}`);
+    }
+  }
+
+  /** 定档：写文档 → 归档旧会话 → 新开一轮 → 第一句话读文档。 */
+  async function handoffConversation(conversation, reason) {
+    if (conversation.handoffBusy === true) return;
+    conversation.handoffBusy = true;
+    clearSleepIntent(conversation);
+    try {
+      conversation.pending.length = 0;
+      if (conversation.batchTimer !== undefined) {
+        clearTimeout(conversation.batchTimer);
+        conversation.batchTimer = undefined;
+      }
+      const oldSessionId = sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0);
+      const rel = await writeHandoffDoc(conversation, reason);
+      const ok = await resetConversation(conversation);
+      if (!ok) {
+        void sendToConversation(conversation, '（定档失败：旧会话没能关掉，先别急着重开）');
+        return;
+      }
+      await archiveSessionDir(oldSessionId);
+      void sendToConversation(conversation, `（交接文档写好了：\`${rel}\`，旧会话已归档，正在新开一轮）`);
+      startAgentTurn(
+        conversation,
+        [
+          `（插件转告：你刚接手这个会话。先用 read 读交接文档 \`${rel}\`，`,
+          '里面是上一段对话的最近上下文、可能未完成的事和当前状态。',
+          '读完用一两句话确认你接上了；不要逐条复述，也不要说“交接文档”这四个字。）',
+        ].join('\n'),
+        { intent: 'handoff', command: '定档' },
+      );
+    } finally {
+      conversation.handoffBusy = false;
+    }
+  }
+
+
+  function commandPrompt(name, args) {
+    if (name === '表情') {
+      return [
+        `（插件转告：有人用「表情」指令，想要一张和「${args}」语义相近的表情包。）`,
+        '从上面的表情包目录里挑一张最接近的，正文只写 `[[图片: 路径]]`，不要配文字。',
+        '一张都不像就只回一句「没有相近的」。别自己拼路径，别用 `.qq-media`。',
+      ].join('\n');
+    }
+    if (name === '白饭') {
+      return '（插件转告：有人点了「每日白饭」。说一句摆烂 / 摸鱼 / 不想干活的语录，不超过 25 个字。不要解释、不要引号、不要重复上一句。）';
+    }
+    if (name === '看图') {
+      return `（插件转告：有人让你看一张图，本地路径是 \`${args}\`。）用 read_image 看一眼，用一两句说出图里是什么、有没有好笑的地方；别复述路径，别编看不见的细节。`;
+    }
+    if (name === '总结链接') {
+      return `（插件转告：有人让你总结这个链接：${args}。）用 web_fetch 抓一次，然后用三句话以内说清「这是什么 / 讲了什么 / 值不值得点开」。抓不到就直说。`;
+    }
+    if (name === '梗') {
+      return `（插件转告：有人问「${args}」是什么梗。）先加载 moegirl skill 去萌娘百科查；查不到再用 web_search。用一两句话解释，别写成百科条目。`;
+    }
+    if (name === '日报') {
+      return '（插件转告：有人要今天的群日报。）用 qq_transcript 读今天这个会话的记录，压成 3~5 条「今天群里聊了什么」，每条不超过 40 字；不要逐条复述，不要编。';
+    }
+    if (name === '记忆') {
+      return `（插件转告：主人在查记忆，关键词「${args}」。）用 qq_transcript 搜聊天记录、用 qq_memory 搜记忆文件，挑 3 条以内最相关的说；查不到就说没记到，别编。`;
+    }
+    if (name === '提醒') {
+      return `（插件转告：主人要建一条提醒：${args}。）调用 qq_remind_create 建任务；时间用绝对日期时刻，建完把「什么时候提醒什么」说清楚；建不成把原因说出来。`;
+    }
+    return [
+      `（插件转告：有人点了「小作文」。主题与要素：${args || '（没给，自己编一个日常主题）'}。）`,
+      '写一篇不超过 800 字的小作文，第一人称，像群友在聊天；不要 Markdown、不要标题、不要分点。',
+    ].join('\n');
+  }
+
+  /** 指令：把一条指令交给模型（带 quote / command 标记，turn/end 里按它裁长度）。 */
+  function startCommandTurn(command, text) {
+    startAgentTurn(command.conversation, text, {
+      quote: command.quote,
+      intent: 'command',
+      command: command.command.name,
+    });
+  }
+
+  /** 复读开关：`data/chat-state.json` 里记一份关掉的会话 key。 */
+  function repeatOffList() {
+    return gameList('repeatOff');
+  }
+
+  function isRepeatOff(conversation) {
+    return conversation.repeatOff === true || repeatOffList().includes(conversation.key);
+  }
+
+  /** 投票的排版：带条形，最多 10 个选项。 */
+  function renderPoll(poll) {
+    const lines = [`投票：${poll.question}${poll.open ? '' : '（已截止）'}`];
+    poll.options.forEach((option, index) => {
+      const votes = Object.values(poll.votes ?? {}).filter((vote) => Number(vote) === index).length;
+      const bar = '▇'.repeat(Math.min(10, votes));
+      lines.push(`${index + 1}. ${option} ${votes} 票${bar ? ` ${bar}` : ''}`);
+    });
+    const total = Object.keys(poll.votes ?? {}).length;
+    lines.push(`共 ${total} 票；投票发「投票 序号」，截止发「投票 截止」。`);
+    return lines.join('\n');
+  }
+
+  /** 设置指令：不带参数看摘要，`全部` 看所有项，`键` 看一项，`键 值` 改一项。 */
+  async function settingsCommand(command) {
+    const arg = String(command.args ?? '').trim();
+    if (arg.length === 0) {
+      const entries = settingsAdmin.list();
+      const writable = entries.filter((entry) => entry.writable);
+      const preview = writable.slice(0, 18).map((entry) => entry.key).join('、');
+      commandReply(
+        command,
+        `可改 ${writable.length} 项 / 只读 ${entries.length - writable.length} 项。\n` +
+          `· 「设置 全部」看全部当前值\n· 「设置 键」看一项\n· 「设置 键 值」改一项（8 秒后重启生效）\n` +
+          `可改的有：${preview}${writable.length > 18 ? '…' : ''}`,
+      );
+      return;
+    }
+    const parts = arg.split(/[\s\u3000]+/u);
+    const key = parts[0];
+    if (parts.length === 1) {
+      if (key === '全部' || key.toLowerCase() === 'all') {
+        const lines = settingsAdmin.list().map(
+          (entry) => `${entry.key}=${JSON.stringify(entry.value)}${entry.writable ? '' : '（只读）'}`,
+        );
+        commandReply(command, `共 ${lines.length} 项：\n${lines.join('\n')}`);
+        return;
+      }
+      const hit = settingsAdmin.list().find((entry) => entry.key === key);
+      if (hit === undefined) {
+        commandReply(command, `没有「${key}」这一项。用「设置 全部」看全部。`);
+        return;
+      }
+      commandReply(
+        command,
+        `${key} = ${JSON.stringify(hit.value)}（${hit.writable ? '可改' : '只读'}，${hit.kind}）` +
+          (hit.description.length > 0 ? `\n${hit.description}` : ''),
+      );
+      return;
+    }
+    if (!isWritableKey(key)) {
+      commandReply(command, `「${key}」是部署项，只能在 GUI / 配置文件里改。`);
+      return;
+    }
+    const value = arg.slice(key.length).trim();
+    try {
+      const result = await settingsAdmin.set(key, value);
+      commandReply(command, `已把 ${key} 改成 ${JSON.stringify(result.value)}，8 秒后插件重启生效。`);
+    } catch (error) {
+      commandReply(command, `没改成：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /** 执行一条指令（插件侧 / 模型侧在这里分流）。 */
+  async function runCommand(command) {
+    const name = command.command.name;
+    if (command.command.level === 'owner' && !command.owner) {
+      commandReply(command, '这个指令只有主人能用。');
+      return;
+    }
+    if (!command.owner && settings.guestCommands !== true) {
+      commandReply(command, '访客指令现在关着，等主人开。');
+      return;
+    }
+    // 连点保护只给会打网络 / 会发图的三条；帮助 / 设置 / 状态不需要。
+    if (['天气', '余额', '随机表情', '点歌', '语音'].includes(name)) {
+      const slot = `${command.conversation.key}:${name}`;
+      const now = Date.now();
+      if (now - (commandCooldowns.get(slot) ?? 0) < COMMAND_COOLDOWN_MS) return;
+      commandCooldowns.set(slot, now);
+      if (commandCooldowns.size > 512) commandCooldowns.clear();
+    }
+    if (name === '帮助') {
+      commandReply(command, helpText(command.owner));
+      return;
+    }
+    if (name === '天气') {
+      const city = command.args.trim();
+      if (city.length === 0) {
+        commandReply(command, '要播报哪个城市？例如：@机器人 天气 杭州');
+        return;
+      }
+      try {
+        commandReply(command, await weatherReport(city));
+      } catch (error) {
+        commandReply(command, `天气没查成：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (name === '随机表情') {
+      const names = stickerFiles();
+      if (stickerLabel === undefined || names.length === 0) {
+        commandReply(command, '表情包目录还是空的，先往 .qq-stickers 里丢几张图。');
+        return;
+      }
+      const pick = names[Math.floor(Math.random() * names.length)];
+      void sendToConversation(command.conversation, `[[图片: ${stickerLabel}/${pick}]]`);
+      return;
+    }
+    if (name === '余额') {
+      const apiKey = await resolveApiKey();
+      if (apiKey.length === 0) {
+        commandReply(command, '没拿到 API key（apiKeyRef 指向的凭据为空），检查 .credentials.yaml 或环境变量。');
+        return;
+      }
+      try {
+        commandReply(command, renderBalance(await fetchBalance({ apiKey })));
+      } catch (error) {
+        commandReply(command, `查余额失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (name === '设置') {
+      await settingsCommand(command);
+      return;
+    }
+    if (name === '状态') {
+      commandReply(
+        command,
+        [
+          `连接：${client.connected ? `已连 ${client.selfId}` : '未连接'}`,
+          `静默：${quietSummary()}`,
+          `表情：${stickerLabel === undefined ? '目录不可用' : `${stickerFiles().length} 张`}`,
+          `记忆：${memory.enabled ? '开' : '关'}`,
+          `主人：${ownerState.ids.join('、') || '未认主'}`,
+          `已聊会话：${conversations.size} 个`,
+        ].join('\n'),
+      );
+      return;
+    }
+    if (name === '表情') {
+      if (command.args.length === 0) {
+        commandReply(command, '要什么感觉的表情？例如：@机器人 表情 委屈');
+        return;
+      }
+      startCommandTurn(command, commandPrompt(name, command.args));
+      return;
+    }
+    if (name === '白饭') {
+      startCommandTurn(command, commandPrompt(name, ''));
+      return;
+    }
+    if (name === '小作文') {
+      if (command.args.length === 0) {
+        commandReply(command, '小作文要主题，例如：@机器人 小作文 我的青春 夏天 蝉鸣');
+        return;
+      }
+      startCommandTurn(command, commandPrompt(name, command.args));
+      return;
+    }
+    if (name === '抽签') {
+      const who = command.owner ? '主人' : '你';
+      commandReply(command, formatFortune(dailyFortune({ userId: command.userId, date: localDate() }), who));
+      return;
+    }
+    if (name === '吃饭') {
+      const entry = riceEntry(command.conversation.key, command.userId);
+      entry.total += 1;
+      entry.today += 1;
+      entry.byUser[command.userId].total += 1;
+      entry.byUser[command.userId].today += 1;
+      chatState.save();
+      commandReply(command, `（扒了一口饭）第 ${entry.today} 碗，今天累计 ${entry.today} 碗，一辈子 ${entry.total} 碗。`);
+      return;
+    }
+    if (name === '饭量') {
+      const entry = riceEntry(command.conversation.key, command.userId);
+      const mine = entry.byUser[command.userId];
+      commandReply(command, `今天 ${entry.today} 碗（你 ${mine.today} 碗），这个会话一共 ${entry.total} 碗。`);
+      return;
+    }
+    if (name === '敲木鱼') {
+      const wood = gameData('woodfish');
+      wood[command.conversation.key] = (wood[command.conversation.key] ?? 0) + 1;
+      chatState.save();
+      commandReply(command, `功德 +1（本群共 ${wood[command.conversation.key]}）${command.owner ? '' : '，尾巴也 +1'}`);
+      return;
+    }
+    if (name === '群热度') {
+      const stats = await groupStats(command.conversation);
+      if (stats.total === 0) {
+        commandReply(command, '今天这个会话还没记到消息（记忆关着或还没人说话）。');
+        return;
+      }
+      const top = stats.top.map(([person, count]) => `${person}(${count})`).join('、') || '没有';
+      const quiet = stats.quiet.length > 0 ? stats.quiet.join('、') : '没有';
+      commandReply(
+        command,
+        [
+          `今日 ${stats.total} 条 / ${stats.speakers} 人；最近一小时 ${stats.recent} 条。`,
+          `· 话最多：${top}`,
+          `· 潜水：${quiet}`,
+        ].join('\n'),
+      );
+      return;
+    }
+    if (name === '骰子') {
+      try {
+        const spec = parseDice(command.args || 'd6');
+        const result = rollDice(spec);
+        commandReply(command, `🎲 ${spec.count}d${spec.sides}：${result.rolls.join(' + ')} = ${result.total}`);
+      } catch (error) {
+        commandReply(command, error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    if (name === '抛硬币') {
+      commandReply(command, `🪙 ${flipCoin()}`);
+      return;
+    }
+    if (name === '随机点名') {
+      const lines = await todayTranscript(command.conversation.key);
+      const names = [...new Set(lines.map((line) => String(line.name ?? '').trim()).filter((name) => name.length > 0))];
+      const pick = pickRandom(names);
+      commandReply(command, pick === undefined ? '今天还没人说话，点不到。' : `（尾巴一指）就你了，${pick}。`);
+      return;
+    }
+    if (name === '接一个') {
+      const names = stickerFiles().filter((sticker) => sticker !== command.conversation.lastSticker);
+      if (stickerLabel === undefined || names.length === 0) {
+        commandReply(command, '表情包目录是空的，接不了。');
+        return;
+      }
+      const pick = pickRandom(names);
+      commandReply(command, `[[图片: ${stickerLabel}/${pick}]]`);
+      return;
+    }
+    if (name === '语音') {
+      if (settings.tts !== true) {
+        commandReply(command, '语音功能没开：让主人设置 `tts true`（需要本机 Python + edge-tts）。');
+        return;
+      }
+      const text = command.args.trim();
+      if (text.length === 0) {
+        commandReply(command, '要念什么？例如：@机器人 语音 今天也要好好吃饭');
+        return;
+      }
+      const clipped = [...text].slice(0, settings.ttsMaxChars).join('');
+      try {
+        const { bytes } = await synthesize({ text: clipped });
+        await sendVoice(command.conversation, bytes);
+      } catch (error) {
+        commandReply(command, `语音没合成：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (name === '点歌') {
+      if (command.args.length === 0) {
+        commandReply(command, '要搜什么歌？例如：@机器人 点歌 稻香');
+        return;
+      }
+      try {
+        commandReply(command, renderSong(await searchSong(command.args)));
+      } catch (error) {
+        commandReply(command, `没搜到：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (name === '投票') {
+      const polls = gameData('polls');
+      const key = command.conversation.key;
+      const arg = command.args.trim();
+      const poll = polls[key];
+      if (arg.length === 0 || arg === '结果') {
+        commandReply(command, poll === undefined ? '这个会话还没有投票。发「投票 选项A 选项B」发起一个。' : renderPoll(poll));
+        return;
+      }
+      if (arg === '截止') {
+        if (poll === undefined) {
+          commandReply(command, '还没有投票。');
+          return;
+        }
+        poll.open = false;
+        chatState.save();
+        commandReply(command, renderPoll(poll));
+        return;
+      }
+      if (/^\d+$/u.test(arg) && poll !== undefined && poll.open) {
+        const index = Number(arg) - 1;
+        if (index < 0 || index >= poll.options.length) {
+          commandReply(command, `序号要在 1~${poll.options.length} 之间。`);
+          return;
+        }
+        poll.votes ??= {};
+        poll.votes[command.userId] = index;
+        chatState.save();
+        commandReply(command, `已投给「${poll.options[index]}」。`);
+        return;
+      }
+      const options = arg.split(/[\s\u3000]+/u).filter((item) => item.length > 0).slice(0, 10);
+      if (options.length < 2) {
+        commandReply(command, '投票至少要两个选项，例如：投票 吃火锅 吃烧烤 吃米饭');
+        return;
+      }
+      polls[key] = { question: options.join(' / '), options, votes: {}, open: true, at: Date.now(), by: command.userId };
+      chatState.save();
+      commandReply(command, renderPoll(polls[key]));
+      return;
+    }
+    if (name === '关注' || name === '取消关注' || name === '关注列表') {
+      const watches = watchList();
+      if (name === '关注列表') {
+        const mine = watches.filter((watch) => watch.by === command.userId);
+        if (mine.length === 0) {
+          commandReply(command, '还没有关注任何关键词。发「关注 演唱会」试试。');
+          return;
+        }
+        commandReply(command, mine.map((watch) => `· ${watch.key} → ${watch.keyword}`).join('\n'));
+        return;
+      }
+      if (name === '取消关注') {
+        const keyword = command.args.trim();
+        const before = watches.length;
+        for (let index = watches.length - 1; index >= 0; index -= 1) {
+          if (watches[index].by === command.userId && watches[index].keyword === keyword) watches.splice(index, 1);
+        }
+        chatState.save();
+        commandReply(command, watches.length === before ? `没找到「${keyword}」这个关注。` : `已取消关注「${keyword}」。`);
+        return;
+      }
+      let targetKey = command.conversation.key;
+      let keyword = command.args.trim();
+      if (command.conversation.type === 'private') {
+        const parts = keyword.split(/[\s\u3000]+/u);
+        if (parts.length < 2) {
+          commandReply(command, '私聊里要带上群：关注 <群号或群名> <关键词>');
+          return;
+        }
+        try {
+          const resolved = await resolveQuietTarget(parts[0], command.conversation);
+          if (resolved.all) {
+            commandReply(command, '关注要指定一个群，不能用「全部」。');
+            return;
+          }
+          targetKey = `group:${resolved.id}`;
+          keyword = parts.slice(1).join(' ');
+        } catch (error) {
+          commandReply(command, error instanceof Error ? error.message : String(error));
+          return;
+        }
+      }
+      if (keyword.length === 0) {
+        commandReply(command, '关注什么词？例如：关注 演唱会');
+        return;
+      }
+      if (watches.some((watch) => watch.key === targetKey && watch.keyword === keyword && watch.by === command.userId)) {
+        commandReply(command, `已经在关注「${keyword}」了。`);
+        return;
+      }
+      watches.push({ key: targetKey, keyword, by: command.userId, at: Date.now() });
+      chatState.save();
+      commandReply(command, `好，有人提到「${keyword}」我就私聊你。`);
+      return;
+    }
+    if (name === '定档') {
+      commandReply(command, '（开始定档：写交接文档 → 归档旧会话 → 新开一轮）');
+      void handoffConversation(command.conversation, 'manual');
+      return;
+    }
+    if (name === '纪念日' || name === '纪念日列表') {
+      if (name === '纪念日列表') {
+        const mine = anniversaryList().filter((item) => item.key === command.conversation.key);
+        commandReply(command, mine.length === 0 ? '这个会话还没有纪念日。' : mine.map((item) => `· ${item.mmdd} ${item.text}`).join('\n'));
+        return;
+      }
+      const match = /^(\d{1,2})-(\d{1,2})[\s\u3000]+(.+)$/u.exec(command.args.trim());
+      if (match === null) {
+        commandReply(command, '格式：纪念日 10-01 主人生日');
+        return;
+      }
+      const mmdd = `${String(Number(match[1])).padStart(2, '0')}-${String(Number(match[2])).padStart(2, '0')}`;
+      anniversaryList().push({ key: command.conversation.key, mmdd, text: match[3].trim(), by: command.userId, at: Date.now() });
+      chatState.save();
+      commandReply(command, `记下了：每年 ${mmdd}，${match[3].trim()}。`);
+      return;
+    }
+    if (name === '别复读' || name === '可以复读') {
+      const list = repeatOffList();
+      const off = name === '别复读';
+      if (off && !list.includes(command.conversation.key)) list.push(command.conversation.key);
+      if (!off) {
+        const index = list.indexOf(command.conversation.key);
+        if (index >= 0) list.splice(index, 1);
+      }
+      command.conversation.repeatOff = off;
+      chatState.save();
+      commandReply(command, off ? '好，这个群不跟复读了。' : '好，又能跟着复读了。');
+      return;
+    }
+    if (name === '存表情') {
+      const source = command.conversation.lastImage;
+      if (source === undefined) {
+        commandReply(command, '没找到可存的图：先发一张图 / 表情，再发「存表情 名字」。');
+        return;
+      }
+      const sticker = command.args.trim();
+      if (sticker.length === 0) {
+        commandReply(command, '给它起个名字，例如：存表情 委屈');
+        return;
+      }
+      try {
+        const saved = await saveSticker({ source, name: sticker });
+        commandReply(command, `存好了：${saved.path}`);
+      } catch (error) {
+        commandReply(command, `没存成：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (name === '看图') {
+      const source = command.args.trim() || command.conversation.lastImage;
+      if (source === undefined || source.length === 0) {
+        commandReply(command, '没找到图：先发一张，或「看图 路径」。');
+        return;
+      }
+      startCommandTurn(command, commandPrompt(name, source));
+      return;
+    }
+    if (name === '总结链接') {
+      if (command.args.length === 0) {
+        commandReply(command, '给个链接，例如：总结链接 https://example.com');
+        return;
+      }
+      startCommandTurn(command, commandPrompt(name, command.args));
+      return;
+    }
+    if (name === '梗') {
+      if (command.args.length === 0) {
+        commandReply(command, '查什么梗？例如：梗 哦鲸鲸');
+        return;
+      }
+      startCommandTurn(command, commandPrompt(name, command.args));
+      return;
+    }
+    if (name === '日报') {
+      startCommandTurn(command, commandPrompt(name, ''));
+      return;
+    }
+    if (name === '记忆') {
+      if (command.args.length === 0) {
+        commandReply(command, '查什么？例如：记忆 上次那个展');
+        return;
+      }
+      startCommandTurn(command, commandPrompt(name, command.args));
+      return;
+    }
+    if (name === '提醒') {
+      if (command.args.length === 0) {
+        commandReply(command, '格式：提醒 明天8点 交作业');
+        return;
+      }
+      startCommandTurn(command, commandPrompt(name, command.args));
+      return;
+    }
+    commandReply(command, `这条指令还没接上：${name}`);
+  }
+
   // 部署 persona 里的 `{{model}}` 取的是 `agent.options.model`，请求路由读的也是
   // 同一组字段，所以程序化创建的 Agent 必须显式带上模型选择：否则提示词装配会
   // 失败，turn 在消息被 claim 之前就死掉。下面的 route 记录当前生效的选择，
@@ -529,6 +1957,7 @@ export function apply(ctx, config) {
     resolveAgentPreset,
     mountAgentPreset,
     restrictAgentTools,
+    isMuted,
     channelSectionOrder: CHANNEL_SECTION_ORDER,
   });
 
@@ -961,6 +2390,9 @@ export function apply(ctx, config) {
    * @param conversation - 要绑定的会话记录。
    * @returns 存活的 Agent。
    */
+  // sessionId → 正在进行的 `ctx.agents.create()`：并发调用合并成一次（见 ensureAgent）。
+  const agentsInFlight = new Map();
+
   async function ensureAgent(conversation) {
     // 群名只影响日志、会话列表与「本轮情境」的可读性，查询失败绝不能挡住回复链路。
     // 放在最前面：重启后会话记录是空的，`resume` 那条路是**每一条消息**都会走的，
@@ -1030,13 +2462,36 @@ export function apply(ctx, config) {
       handle = await ctx.agents.resume({ resumeSessionId: sessionId, agentOptions, setup });
       report('info', `resumed ${sessionId} for ${conversation.key}`);
     } catch {
-      handle = await ctx.agents.create({
-        sessionId,
-        meta: presetId.length > 0 ? { cwd, agentPreset: presetId } : { cwd },
-        agentOptions,
-        setup,
-      });
-      report('info', `created ${sessionId} for ${conversation.key}`);
+      // 同一个会话可能有两个入口同时走到这里（攒批的任务 + 主动补一句 / 指令），
+      // 而 `ctx.agents.create()` 对同一个 sessionId 不是幂等的：第二个会报
+      // `session "…" already exists`。用一个 per-session 的 Promise 把并发创建合并成
+      // 一次；仍然撞上「已存在」时（例如旧 Agent 还没释放），先看 live，再 resume 一次。
+      let creating = agentsInFlight.get(sessionId);
+      if (creating === undefined) {
+        creating = ctx.agents.create({
+          sessionId,
+          meta: presetId.length > 0 ? { cwd, agentPreset: presetId } : { cwd },
+          agentOptions,
+          setup,
+        });
+        agentsInFlight.set(sessionId, creating);
+      }
+      try {
+        handle = await creating;
+        report('info', `created ${sessionId} for ${conversation.key}`);
+      } catch (error) {
+        if (!/already exists/iu.test(error?.message ?? String(error))) throw error;
+        const again = ctx.agents.get(sessionId);
+        if (again !== undefined) {
+          handle = { agent: again };
+          report('warn', `create raced for ${sessionId}; reusing the live Agent`);
+        } else {
+          handle = await ctx.agents.resume({ resumeSessionId: sessionId, agentOptions, setup });
+          report('info', `resumed ${sessionId} after a create race`);
+        }
+      } finally {
+        agentsInFlight.delete(sessionId);
+      }
     }
     conversation.agent = handle.agent;
     // 保留句柄：/reset 需要用它销毁这个 Agent（连同它的 Session 与写出句柄）。
@@ -1337,13 +2792,27 @@ export function apply(ctx, config) {
       return '你刚才在忙别的事，下面这些是那期间陆续到的消息；挑还活着的接，不用逐条回。';
     }
     if (speakers.length > 1) {
-      const list = speakers.map((speaker) => speaker.name).join('、');
+      const list = speakers.map((speaker) => speakerLabel(speaker)).join('、');
       return `几乎同时在跟你说话的是：${list} —— 他们的话是一起到的，按聊天的节奏挑着接。`;
     }
     if (conversation.pendingIntent === 'continued') {
-      return `刚才跟你说话的人又接了一句：${conversation.senderName}。`;
+      const label = speakers.length > 0 ? speakerLabel(speakers[0]) : speakerLabel({ id: conversation.senderId, name: conversation.senderName });
+      return `刚才跟你说话的人又接了一句：${label}。`;
     }
-    return `刚跟你说话的人：${conversation.senderName}。`;
+    const label = speakers.length > 0 ? speakerLabel(speakers[0]) : speakerLabel({ id: conversation.senderId, name: conversation.senderName });
+    return `刚跟你说话的人：${label}。`;
+  }
+
+  /**
+   * 发言人的展示名；受信者（主人）后面缀一个「（主人）」。
+   *
+   * 为什么不在提示词里写 QQ 号：模型会照着念出来（见 `speakerLine` 的注释）。缀一个
+   * 中文标签既能让它认出「这是主人、请求优先」，又不用把号暴露出去；写盘权限本身
+   * 不靠这个标签，靠工具执行时的 `writeAuthority` 再核一次。
+   */
+  function speakerLabel(speaker) {
+    const name = String(speaker?.name ?? '');
+    return canOperate(speaker?.id) ? `${name}（主人）` : name;
   }
 
 
@@ -1487,6 +2956,48 @@ export function apply(ctx, config) {
     if (conversation === undefined) return { key: '', callerId: '', operator: true };
     const speaker = conversationSpeaker(conversation);
     return { key: conversation.key, callerId: String(speaker.id ?? ''), operator: false };
+  }
+
+  /** 工具执行上下文 → 它来自哪个 QQ 会话（Web 主会话没有）。 */
+  function conversationOfExec(exec) {
+    if (exec?.agent?.id === undefined) return undefined;
+    return conversations.get(sessionIndex.get(exec.agent.id));
+  }
+
+  /**
+   * 这一轮说话的人有没有写盘 / 静默权限（`qq_write` / `qq_edit` / `qq_skill` / `qq_quiet`）。
+   *
+   * 判据刻意是「这一批发言人**全部**在主人名单里」：攒批会把前后脚的消息合进一轮，
+   * 只要混进一个群友，这一轮就不该有这些能力 —— 宁可让主人单独再说一句，也不要把
+   * 「群里任何人都能借主人的话头改文件 / 让 bot 睡觉」这种缝隙留着。
+   *
+   * Web 主会话（不在 `sessionIndex` 里）视为操作员：那是部署者自己在用。
+   * @param exec - 工具执行上下文（`exec.agent.id` 用来反查 QQ 会话）。
+   * @returns `{ allowed, operator, key, callerId, reason }`。
+   */
+  function writeAuthority(exec) {
+    const conversation = conversationOfExec(exec);
+    if (conversation === undefined) {
+      return { allowed: true, operator: true, key: '', callerId: 'operator', reason: '' };
+    }
+    const speakers = conversation.speakers ?? [];
+    if (speakers.length === 0) {
+      return {
+        allowed: false,
+        operator: false,
+        key: conversation.key,
+        callerId: String(conversation.senderId ?? ''),
+        reason: '还不知道这一轮是谁在说话',
+      };
+    }
+    const allowed = speakers.every((speaker) => canOperate(speaker.id));
+    return {
+      allowed,
+      operator: false,
+      key: conversation.key,
+      callerId: String(speakers[speakers.length - 1]?.id ?? ''),
+      reason: allowed ? '' : '这一轮里有人不在主人名单（只有主人能改文件 / 让 bot 静默）',
+    };
   }
 
   /** 把工具里的 @ 名字解析成 QQ 号；认不出来就报错并列出可用的昵称。 */
@@ -2086,7 +3597,12 @@ export function apply(ctx, config) {
    * @returns 去掉前缀后的正文。
    */
   function dropPrefix(text) {
-    return settings.groupTrigger === 'prefix' ? text.slice(settings.prefix.length).trim() : text;
+    if (settings.groupTrigger !== 'prefix') return text;
+    const prefix = settings.prefix;
+    // 只有**真的以唤醒词开头**才剥。原实现直接按长度硬切，于是私聊里（前缀模式对私聊
+    // 同样生效）每条消息都会被削掉开头两个字：短句被削成空串后整条丢掉，长句开头被吃掉。
+    if (prefix.length === 0 || !text.startsWith(prefix)) return text;
+    return text.slice(prefix.length).trim();
   }
 
   // ---- 准入：这条消息该不该进 Agent、以什么身份进 ---------------------------------------------
@@ -2117,6 +3633,9 @@ export function apply(ctx, config) {
       if (!settings.groupChat) return undefined;
       const groupId = String(event.group_id);
       if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(groupId)) return undefined;
+      // 静默中的群：消息在入口就丢掉（不建 turn、不花 token）；「起床」那条已经在
+      // handleEvent 里先一步处理掉了，所以这里丢掉不会让它醒不过来。
+      if (isMuted(`group:${groupId}`)) return undefined;
       const userId = String(event.user_id ?? '');
       // 这一次该怎么称呼这个人。**只有这一个地方决定**（群聊给群名片、其次昵称），
       // 因为投递给模型的正文里就写作 `名字: 内容`，而 `[[@名字]]` 拿的正是同一串字去
@@ -2252,6 +3771,7 @@ export function apply(ctx, config) {
     if (!settings.privateChat) return undefined;
     const userId = String(event.user_id);
     if (settings.allowUsers.length > 0 && !settings.allowUsers.includes(userId)) return undefined;
+    if (isMuted(`private:${userId}`)) return undefined;
     const text = messageToText(message, selfId).trim();
     // 私聊本来就不需要 @，所以「空消息」在这里是明摆着的「跟你打个招呼但没写事」——
     // 同样交给模型看着上下文决定回什么（`blankReply` 关掉时照旧丢弃）。用占位符当
@@ -2530,6 +4050,10 @@ export function apply(ctx, config) {
     if (!settings.groupChat || event?.message_type !== 'group') return;
     const groupId = String(event.group_id);
     if (settings.allowGroups.length > 0 && !settings.allowGroups.includes(groupId)) return;
+    // 静默的群不跟着复读：复读虽然不花 token，但「不说话」就得真的一个字都不发。
+    if (isMuted(`group:${groupId}`)) return;
+    const existing = conversations.get(`group:${groupId}`);
+    if (existing !== undefined && isRepeatOff(existing)) return;
     const userId = String(event.user_id ?? '');
     if (userId === String(selfId)) return;
     const message = event.message ?? event.raw_message;
@@ -2988,6 +4512,7 @@ export function apply(ctx, config) {
     const now = Date.now();
     const candidates = [];
     for (const conversation of conversations.values()) {
+      if (isMuted(conversation.key)) continue;
       if (proactiveEligible(conversation, now)) candidates.push(conversation);
     }
     if (candidates.length === 0) return;
@@ -3169,6 +4694,8 @@ export function apply(ctx, config) {
    * @param conversation - 刚回完话的会话。
    */
   function scheduleChime(conversation, owner) {
+    // 静默中不安排「补一句」：回完这一轮就该彻底安静，20 秒后再醒一次等于没睡。
+    if (isMuted(conversation.key)) return;
     // 空消息（单纯的 @、一个空格）之后的轮次不补：那一轮本来就没有话题可言。
     if (owner?.blank === true) return;
     // 刚接完一波积压也不补：它刚刚连着答完一群人的旧问题，再追一句「啊对了」是噪音。
@@ -3205,6 +4732,8 @@ export function apply(ctx, config) {
    * @param seq - 挂这个定时器时的编号（对不上说明已经被取代）。
    */
   function runChime(conversation, seq) {
+    // 定时器挂上之后才被静默的：到点再判一次，静默优先于任何「补一句」的理由。
+    if (isMuted(conversation.key)) return;
     const now = Date.now();
     // 私聊：五道闸门在 `privateAfterthoughtAllows` 里（不看 activeUntil，也不看 proactive）。
     if (conversation.type === 'private') {
@@ -3682,6 +5211,11 @@ export function apply(ctx, config) {
     });
     // 戳一戳也算「这个会话有人活动」：主动说话据此判断群是否安静下来了。
     // 走同一个记账口 —— 顺便把「刚才安静了多久」记下来（静默换代要用更新前的值）。
+    // 静默中不回应戳一戳：连「回戳」都算冒泡，睡觉就该彻底没反应。
+    if (isMuted(conversation.key)) {
+      report('info', `${describeConversation(conversation)} 戳一戳不回应（静默中）`);
+      return;
+    }
     const now = Date.now();
     noteConversationActivity(conversation, now);
     const decision = pokeAction({
@@ -3991,6 +5525,10 @@ export function apply(ctx, config) {
     // 通知事件（戳一戳 / 撤回）先于消息分流：以前这里第一行就把非 message 全丢了，
     // 于是「有人戳了它一下」（§8.3）与「有人撤回了刚说的话」它都完全收不到。
     if (event?.post_type === 'notice') {
+      if (event.notice_type === 'group_increase' || event.notice_type === 'group_decrease') {
+        void handleGroupMember(event);
+        return;
+      }
       if (event.notice_type === 'group_recall' || event.notice_type === 'friend_recall') handleRecall(event, selfId);
       else handlePoke(event, selfId);
       return;
@@ -4005,6 +5543,30 @@ export function apply(ctx, config) {
     noteChatter(event, selfId);
     // 同一时刻记一次「这个会话是活跃的」：主动说话只挑安静下来的群（见 touchActivity）。
     touchActivity(event, selfId);
+    // 睡着期间把群消息留一小段（只放内存），醒来时用来说一句「梦话」。
+    if (event.message_type === 'group' && isMuted(`group:${event.group_id}`)) noteDreamLine(event, selfId);
+    // 静默 / 唤醒：入睡由模型调用 qq_quiet 完成（语义判断在那一边）；这里只处理
+    // 睡着之后**唯一**能进来的东西 —— 主人说「起床」。它必须在准入之前判，否则
+    // 静默中的群会把这条也一起丢掉，只能去私聊里叫它。
+    claimOwnerIfNeeded(event, selfId);
+    const wakeCommand = wakeCommandFor(event, selfId);
+    if (wakeCommand !== undefined) {
+      memory.rememberTranscript(event, selfId, { admitted: undefined, reset: false });
+      applyWakeCommand(wakeCommand);
+      return;
+    }
+    // 「睡觉去」这类话：先让模型照常处理（它应该调 qq_quiet）；12 秒内没真的静默，
+    // 就自动走定档——写交接文档、归档旧会话、新开一轮。
+    const sleepConversation = sleepIntentFor(event, selfId);
+    if (sleepConversation !== undefined) markSleepIntent(sleepConversation);
+    // 「@bot + 空格 + 指令」在准入之前分流：帮助 / 天气 / 余额 / 随机表情 / 设置 / 状态
+    // 由插件直接回（零 token）；小作文 / 白饭 / 表情 才整理成说明投给模型。
+    const command = commandFor(event, selfId);
+    if (command !== undefined) {
+      memory.rememberTranscript(event, selfId, { admitted: undefined, reset: false });
+      void runCommand(command).catch((error) => report('warn', `command failed: ${errorText(error)}`));
+      return;
+    }
     const admitted = admit(event, selfId);
     // 复读链在所有别人的群消息上进账（被 @ 的那条也打断「连着」），但只有没被 @ 的才真的跟。
     maybeRepeat(event, selfId, admitted === undefined);
@@ -4018,10 +5580,17 @@ export function apply(ctx, config) {
       reset: commanded && resetCommand.length > 0 && admitted.preview.toLowerCase() === resetCommand,
     });
     if (admitted === undefined) {
+      // 没人叫它的群消息：先看有没有主人关注的关键词（命中只私聊通知，零 token）。
+      if (event.message_type === 'group') {
+        const watchKey = `group:${event.group_id}`;
+        void checkWatches(watchKey, messageToText(event.message ?? event.raw_message, selfId), userDisplayName(event.sender ?? {}, event.user_id));
+      }
       rememberAmbient(event, selfId);
       return;
     }
     const { conversation, message, preview, quote } = admitted;
+    // 今天是不是这个会话的纪念日（每个会话一天只提醒一次）。
+    checkAnniversaries(conversation);
     const sender = event.sender ?? {};
     const who = describeConversation(conversation);
     // 兜底清理归属表，避免「消息入队了但 turn 始终没被 claim」导致无限增长：
@@ -4044,7 +5613,7 @@ export function apply(ctx, config) {
       // 注意这个判断必须在 flushBatch / enqueue **之前**：那样没有权限的人连「让攒着的
       // 那批提前投出去」都做不到。
       if (!canReset(event.user_id)) {
-        report('info', `ignored ${resetCommand} from ${conversation.key} by ${event.user_id}: not in resetUsers`);
+        report('info', `ignored ${resetCommand} from ${conversation.key} by ${event.user_id}: not an owner`);
         return;
       }
       // 这批话是重置前说的，必须照旧投出去：不能因为「它还在忙」就留在 pending 里 ——
@@ -4128,7 +5697,7 @@ export function apply(ctx, config) {
     if (owner === undefined) return;
     const reason = event.data.reason?.kind;
     // 只发该 turn 里最后一条有文本的 assistant 消息；中间步骤的工具调用等不发给 QQ。
-    const reply = list?.[list.length - 1]?.trim() ?? '';
+    let reply = list?.[list.length - 1]?.trim() ?? '';
 
     // 定时提醒的 agent/prompt 轮：必须在 error / SKIP / aborted 之前收账。
     // 这几个分支在普通轮次里是「静默丢弃」，但提醒不能静默 —— 要让 reminders.js 拿到
@@ -4225,6 +5794,11 @@ export function apply(ctx, config) {
       conversation.pendingIntent = undefined;
       return;
     }
+    // 指令的硬上限：白饭 ≤25 字（配置写着「不超过 25 字」，模型偶尔会多写）；
+    // 小作文 ≤800 字（主人明确要求的上限）。只裁这两类，普通聊天不裁。
+    if (owner.command === '白饭') reply = clipChars(reply, 25);
+    else if (owner.command === '小作文') reply = clipChars(reply, 800);
+    else if (owner.command === '梦话') reply = clipChars(reply, 80);
     // 这一轮的意图在发送前就取出来（sendToConversation 是异步的，之后 pendingIntent 会变）。
     const intent = owner.intent ?? conversation.pendingIntent ?? 'addressed';
     conversation.pendingIntent = undefined;
@@ -4269,6 +5843,26 @@ export function apply(ctx, config) {
     // 存表情包：不可用时传 undefined，`registerQqTools` 会跳过那个工具
     // （与 memory.tools 同一个规矩：不留「一调就报错」的壳）。
     saveSticker: stickerSaveAllowed() ? saveSticker : undefined,
+    // 受信写盘：editor 缺失（trustedWrite 关掉）时不注册那三个工具；权限在
+    // writeAuthority 里按「这一轮谁在说话」现判（见 docs/tools.md「受信写盘」）。
+    editor,
+    writeAuthority,
+    // 静默：工具层的语义判断（睡哪个群）在模型那边，这里只执行与查询。
+    quiet: {
+      sleep: (target, exec) => quietSleep({
+        target,
+        conversation: conversationOfExec(exec),
+        by: writeAuthority(exec).callerId,
+      }),
+      wake: (target, exec) => quietWake({
+        target,
+        conversation: conversationOfExec(exec),
+        by: writeAuthority(exec).callerId,
+      }),
+      status: () => quietStatus(),
+    },
+    // 主人侧 bot 配置（qq_settings）：白名单键 + 覆盖层 + 重启生效。
+    settingsAdmin,
     // 给已收藏的表情改名：文件与 STICKERS.md 一起搬，别让模型「用新名字再存一遍」
     // 造出一张同画面的重复表情（真实事故，见 renameSticker 的注释）。记忆关掉时
     // 仍可注册：那只是少更新一份目录（与 saveSticker 同一口径）。
@@ -4568,13 +6162,33 @@ export function apply(ctx, config) {
     report('warn', `could not load the session rounds: ${errorText(error)}`);
   });
 
-  // 重置权限的启动自述：这是唯一一个「白名单为空 = 全都不能用」的配置项，很容易
-  // 配好了没生效（写错 QQ 号、忘了重启）却看不出来 —— 日志里明说一遍，排查时一眼就懂。
+  // 主人 / 静默 / 覆盖层的启动自述：排查「它怎么不听话 / 怎么没睡 / 改的设置没生效」
+  // 时先看这几行。主人名单为空且没认主 = 重置 / 静默 / 写盘全关，这是刻意的失败方向。
+  if (ownerState.ids.length > 0) {
+    report('info', `owner: ${ownerState.ids.join(', ')}${configuredOwners.length > 0 ? ' (resetUsers)' : ' (auto-claimed)'} — reset / quiet / trusted write allowed`);
+  } else {
+    report('info', `owner: none yet${settings.ownerAutoClaim ? ' — the first private contact will be claimed' : ' (ownerAutoClaim is off)'}; reset / quiet / trusted write are disabled`);
+  }
+  report(
+    'info',
+    `quiet: ${muteState.global ? 'all groups' : muteState.keys.size > 0 ? `${muteState.keys.size} group(s)` : 'awake'}` +
+      `${settings.mutePersist ? `, state at ${settings.muteFile}` : ', state in memory only'}; wake triggers: ${settings.wakeTriggers.join('、') || 'none'}`,
+  );
   if (resetCommand.length === 0) {
     report('info', 'reset command is disabled (resetCommand is empty)');
-  } else if (resetUsers.length === 0) {
-    report('info', `reset command "${resetCommand}" is disabled for everyone: resetUsers is empty`);
+  } else if (ownerState.ids.length === 0) {
+    report('info', `reset command "${resetCommand}" is disabled until an owner exists`);
   } else {
-    report('info', `reset command "${resetCommand}" is allowed for ${resetUsers.length} account(s): ${resetUsers.join(', ')}`);
+    report('info', `reset command "${resetCommand}" is allowed for ${ownerState.ids.length} owner(s)`);
   }
+  report(
+    'info',
+    `trusted write: ${editor !== undefined ? `on, skills at ${skillRoot}` : 'off'}; ` +
+      `owner settings overlay: ${ownerSettingsApplied.length > 0 ? `${ownerSettingsApplied.length} key(s) from ${settings.ownerSettingsFile}` : 'none'}`,
+  );
+  report(
+    'info',
+    `commands: ${settings.commands === true ? 'on' : 'off'}; guest commands: ${settings.guestCommands === true ? 'on' : 'off'} — @bot + space + 帮助/天气/表情/白饭/小作文 (guest), 状态/余额/设置 (owner)`,
+  );
 }
+

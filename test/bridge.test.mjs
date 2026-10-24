@@ -1141,6 +1141,13 @@ test('the bundled patch declares the narrowed preset the plugin mounts', async (
     'qq_remind_create',
     'qq_remind_list',
     'qq_remind_cancel',
+    // 服务器分支新增的五把主人侧工具：同为宿主平面的全局工具，注册后由各自的
+    // trustedWrite / 主人名单在 execute() 里复核，不属于预设能授予的能力。
+    'qq_quiet',
+    'qq_settings',
+    'qq_write',
+    'qq_edit',
+    'qq_skill',
     'skill',
   ]);
   if (bridge.config.memory !== false) for (const name of ['qq_transcript', 'qq_memory']) provided.add(name);

@@ -28,6 +28,7 @@
 | 被撤回的消息 | 清引用是安全层；要不要调侃是配置 | [被撤回的消息](docs/recall.md) |
 | 定时提醒 | 到点发固定文案 / 让模型换语气 / 到点做事，可 @ 人 | [定时提醒](docs/reminders.md) |
 | 长期记忆 | 转录 → 每日摘要 → `MEMORY.md` / `archive/` / `PEOPLE.md` / `COGNITION.md` / `STICKERS.md` → 检索式注入 | [长期记忆](docs/memory.md) |
+| 指令 | `@bot + 空格 + 指令`：帮助 / 天气 / 状态 / 余额 / 设置…；确定性的由插件直接回（零 token），创作类才交给模型 | [指令](docs/commands.md) |
 | 工具与能力面 | 自带最小 `qq` 预设 + `allowTools` 白名单 | [工具与能力面](docs/tools.md) |
 | 运维 | `doctor` / `status` / `logs` / `restart`，三套部署共用 | [运维](docs/ops.md) |
 
@@ -71,6 +72,13 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 - 群消息默认只在被 @ 时触发；私聊 / 群里的「没有正文」消息、复读、主动搭话、
   表情包那几条旁路各有自己的闸门，默认值都偏保守（见[安全提醒](docs/security.md)）。
 
+## 指令（@bot + 空格 + 指令）
+
+群里 `@机器人 帮助`、`@机器人 天气 杭州`；私聊直接发。帮助 / 天气 / 随机表情 / 状态 / 余额 /
+设置由插件直接回（零 token）；表情（按语义挑图）/ 白饭 / 小作文才交给模型。访客与主人
+两级权限，`设置` 走 `data/owner-settings.json` 覆盖层、8 秒后重启生效。完整表见
+[指令](docs/commands.md)。
+
 ## 配置
 
 全部配置项在 `cordis.patch.yml` 的 `config:` 下（schema 在 `config.js`，字段上的中文
@@ -91,7 +99,7 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | `groupTrigger` | `mention` | 群消息触发：`mention` / `prefix` / `all` |
 | `allowUsers` / `allowGroups` | `[]` | 私聊 / 群白名单；空 = 不限制 |
 | `agentPreset` | `qq` | QQ 会话挂的 Agent 预设（自带的最小预设，没有 shell） |
-| `allowTools` | 18 个工具 | QQ 会话的工具白名单；默认没有 write / edit / bash |
+| `allowTools` | 23 个工具 | QQ 会话的工具白名单；默认没有 write / edit / bash（受信写盘走主人专用的 `qq_write` / `qq_edit` / `qq_skill`） |
 | `proactive` | `true` | 允许它在群里主动开口（私聊不会） |
 | `activeFollow` | `true` | 群里聊起来之后免 @ 接话：@ 一次之后那个人的下一条不用再 @，最多连着回 10 条、间隔超过 3 分钟算断聊（刻意放松「只在被 @ 时说话」） |
 | `memory` | `true` | 长期记忆：转录 + 每日摘要 + 认知库 + 人物表 + 检索式注入 + 两个记忆工具 |
@@ -104,10 +112,14 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 - **QQ 消息是不可信输入**：默认 `approvalPolicy: never`、群消息只在被 @ 时触发。
   `activeFollow` / `proactive` / `privateAfterthought` 默认开，是**刻意**放松了「只在被叫到时说话」，
   每一条都有自己的闸门与上限；不放心就关掉。
-- **`qq_save_sticker` 是唯一让 QQ 会话按自己给的字节直接写磁盘的工具**：只写表情包目录、
+- **`qq_save_sticker` 是群友能触发的唯一一条「按自己给的字节写盘」的通道**：只写表情包目录、
   文件名洗成单层、同名不覆盖、张数受上限约束。`qq_rename_sticker` 也能动那个目录，但它只能
   给已收藏的文件换个名字（不引入新字节、失败会回滚）。`qq_remind_create` 也会落盘，但写的是
-  `reminderFile` 里由纯函数校验过字段的任务。除此之外 QQ 会话没有 write / edit / bash。
+  `reminderFile` 里由纯函数校验过字段的任务。
+- **主人专用的受信写盘**：`qq_write` / `qq_edit`（工作目录内的 .md / .txt / .json / .yml，写前
+  备份到 `.dsh/.history/`）与 `qq_skill`（`<skill 根>/<名字>/SKILL.md`）都在执行时按**这一轮
+  发言人**复核主人身份，攒批里混进一个群友这一轮就没有写盘能力；内建 `write` / `edit` 仍然
+  不在白名单里。主人名单见[工具与能力面](docs/tools.md#主人owner与四个受信工具)。
 - **会写全局状态的两处**：`apiKeyRotate` 改 `$DSH_HOME/.credentials.yaml`；
   `linkPreview` 默认关（开了等于替群里任何人访问任意 URL）。**定时提醒**会把「未来要说的话」
   写进 `data/reminders.json` 并在到点发出，所以默认只能提醒自己、@ 别人默认关。
@@ -130,7 +142,8 @@ QQ 客户端 ──▶ NapCat ──(OneBot v11 WebSocket)──▶ 本插件
 | [定时提醒](docs/reminders.md) | 三种模式、时间规则、权限与额度、重启/断线/`/reset` |
 | [长期记忆](docs/memory.md) | 转录、每日摘要、检索式注入、冷热分层、人物表、认知库、表情包目录、五个 skill |
 | [会话与轮次](docs/sessions.md) | 确定性 Session id、`/reset`、旧会话存档、Web UI 的「重置对话」按钮 |
-| [工具与能力面](docs/tools.md) | 工具表、`agentPreset`、`allowTools` |
+| [指令](docs/commands.md) | 玩 / 查 / 聊 / 管四类指令、访客与主人两级权限、静默的起床话 |
+| [工具与能力面](docs/tools.md) | 工具表、`agentPreset`、`allowTools`、主人与受信写盘 |
 | [运维](docs/ops.md) | `scripts/ops.mjs`、`doctor` 的 finding、八个排查场景、key 轮换 |
 | [本机开发与测试](docs/development.md) | 依赖、重启规则、`node --test`、行为覆盖清单 |
 | [安全提醒](docs/security.md) | 所有扩大能力面 / 主动发消息的开关与默认值 |

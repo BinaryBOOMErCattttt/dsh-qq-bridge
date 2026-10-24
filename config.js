@@ -47,6 +47,11 @@ export const Config = z.object({
   groupTrigger: z.union(['mention', 'prefix', 'all']).default('mention').description('群消息触发方式：@机器人 / 前缀 / 全部消息（另外：被叫到之后的 activeWindowMs 内，同一个人接着说的话可以算作还在跟你聊，见 activeFollow）'),
   prefix: z.string().default('/').description('groupTrigger=prefix 时使用的前缀'),
   blankReply: z.boolean().default(true).description('是否理会「没有正文」的消息：群里单纯 @ 它一下、或者私聊发一个空格 —— 这类消息照常交给模型（正文位置写明「@了你一下，没有说别的」/「发来一条空消息」），由它看着这段聊天的上下文决定回一句「？」、发张表情包、还是接上一句；false = 和以前一样静默丢弃（群里被人反复空 @ 时可以一键关掉）'),
+  commands: z.boolean().default(true).description('是否启用「@bot + 空格 + 指令」的指令路由：帮助 / 天气 / 随机表情 / 表情 / 白饭 / 小作文（访客可用）、状态 / 余额 / 设置（主人专用）。关掉后这些词全部当普通聊天交给模型'),
+  guestCommands: z.boolean().default(true).description('是否允许访客（非主人）使用公开指令：帮助 / 天气 / 随机表情 / 表情 / 白饭 / 小作文；关掉后只有主人能用指令。主人专用指令始终只认主人'),
+  // ---- 语音（TTS）：只留框架，仓库不内置任何第三方语音服务 ----
+  tts: z.boolean().default(false).description('是否启用「语音 <文字>」指令：需要先在 tts.js 里注册一个 provider（本地 Kokoro / Piper / 自建服务，或你自己的授权 API）。默认关，未注册时指令只回「未配置」，不会联网'),
+  ttsMaxChars: z.number().default(200).description('一次语音最多念多少字（超过截断）：QQ 语音太长会失败，200 字大约 40 秒'),
   allowUsers: z.array(z.string()).default([]).description('私聊白名单（QQ 号）；留空表示不限制'),
   allowGroups: z.array(z.string()).default([]).description('群白名单（群号）；留空表示不限制'),
   provider: z.string().default('').description('QQ 会话使用的模型服务商；留空使用默认'),
@@ -69,6 +74,14 @@ export const Config = z.object({
       'qq_send_image',
       'qq_save_sticker',
       'qq_rename_sticker',
+      // 静默开关（只有主人能真正执行）：插件入口拦截，不再把群消息投给模型。
+      'qq_quiet',
+      // 主人侧 bot 配置（只含行为白名单，不含模型路由）。
+      'qq_settings',
+      // 受信写盘（只有 resetUsers 里的人能让它动）：内建 write / edit 仍然不给。
+      'qq_write',
+      'qq_edit',
+      'qq_skill',
       'qq_list_conversations',
       'qq_poke',
       'qq_remind_create',
@@ -76,11 +89,29 @@ export const Config = z.object({
       'qq_remind_cancel',
     ])
     .description(
-      'QQ 会话 Agent 可用的工具白名单（工具名）：默认只放开「只读文件 + 检索 + 联网 + 十一个 qq_*」，没有 write / edit / bash —— QQ 消息是不可信输入。留空表示**不限制**（把这个 Agent 继承到的工具全给它，含预设里的一切）；写错的名字会被丢掉并记 warn（白名单只能收窄，不能凭空给出能力）',
+      'QQ 会话 Agent 可用的工具白名单（工具名）：默认只放开「只读文件 + 检索 + 联网 + 十六个 qq_*」（23 个），没有 write / edit / bash —— QQ 消息是不可信输入；受信写盘是单独的 qq_write / qq_edit / qq_skill，执行时按发言人核对主人。留空表示**不限制**（把这个 Agent 继承到的工具全给它，含预设里的一切）；写错的名字会被丢掉并记 warn（白名单只能收窄，不能凭空给出能力）',
     ),
   resetCommand: z.string().default('/reset').description('新开一轮会话的指令：在 QQ 里单独发送该指令即生效（旧的会话留在磁盘上当存档，新的一轮从零开始）；留空表示禁用'),
-  resetUsers: z.array(z.string()).default([]).description('允许使用 resetCommand 的 QQ 号白名单；留空表示**谁都不能**重置（群里任何一个人都能把会话记忆重置掉显然不合适，所以这一项默认就是关的）'),
+  resetUsers: z.array(z.string()).default([]).description('受信者（通常是主人）的 QQ 号：名单里的人能用 resetCommand 新开一轮、能通过 qq_quiet 让机器人静默、也是唯一能让 Agent 动写盘工具（qq_write / qq_edit / qq_skill）的人。留空 = 走 ownerAutoClaim 自动认主；自动认主也关掉时表示**谁都不能**重置、静默与写盘'),
   idleResetHours: z.number().default(0).description('会话静默超过这么多小时之后，下一条消息自动开新一轮（与 resetCommand 同一套机制：换代次、旧会话留档、长期记忆不动；0 = 关闭，默认关）。它按时间自动发生，不需要 resetUsers 权限；「静默」按这个会话最后一条别人的消息算（含没 @ 机器人的闲聊）'),
+  // ---- 静默模式：主人说一句「睡觉去」，模型调用 qq_quiet，插件在入口把群消息拦掉 ----
+  // 与「让它回 SKIP」的区别：SKIP 仍然要为每条消息付一次模型调用；静默是**根本不投递**。
+  // 入睡由模型判断（它懂语义），插件只执行；唤醒词是插件侧唯一的旁路（睡着之后群里
+  // 的消息到不了模型，只能由插件直接把主人叫醒）。
+  wakeTriggers: z.array(z.string()).default(['起床', '醒醒', '醒来', '别睡了', '重启']).description('主人说这些词时由**插件直接**结束静默（不经过模型、零 token）：睡着之后群消息根本到不了模型，所以起床必须有一条插件侧旁路。只认主人（resetUsers 或自动认主的那位）；群里不需要 @，私聊直接说即可。留空 = 只能靠 qq_quiet 的 wake'),
+  wakeText: z.string().default('（揉揉眼睛）醒了醒了，刚睡过去。').description('插件侧唤醒时回的那一句（固定文案，不经过模型）'),
+  mutePersist: z.boolean().default(true).description('静默状态是否落盘：开着时重启进程仍然安静（不会因为一次重启就在群里突然开口）；关掉 = 只记在内存里，重启即恢复'),
+  muteFile: z.string().default('data/mutes.json').description('静默状态文件，相对 cwd（必须落在 cwd 内，否则只记在内存里并记一条 warn）'),
+  // ---- 主人（受信者）：默认第一个在私聊里跟它说话的人 ----
+  // 由 QQ 号确认，不看昵称（昵称可以随便改，号不会）。配置里写了 resetUsers 时以那份
+  // 名单为准、不再自动认主；只有名单为空时才落到 ownerFile 里记下的那位。
+  ownerAutoClaim: z.boolean().default(true).description('名单为空时，是否把**第一个在私聊里跟它说话的 QQ 号**认作主人（落盘到 ownerFile，重启不丢；群里说话不算）。认到之后这个号拥有最高权限：重置、静默、受信写盘。想手工指定就配 resetUsers，或把这一项关掉自己写 ownerFile'),
+  ownerFile: z.string().default('data/owner.json').description('自动认主记下的主人 QQ 号，相对 cwd（必须落在 cwd 内）；只在 resetUsers 为空时生效'),
+  ownerSettingsFile: z.string().default('data/owner-settings.json').description('主人从 QQ 侧调整 bot 配置的覆盖层（只含白名单键，优先于 GUI 里的基础配置）；qq_settings 读写它，删掉某个键就回到 GUI 配置'),
+  // ---- 受信写盘：只有受信者能让 Agent 改文件（见 docs/tools.md「受信写盘」）----
+  trustedWrite: z.boolean().default(true).description('是否注册受信写盘工具（qq_write / qq_edit / qq_skill）：只有 resetUsers 里的人在**当前这一轮**说话时才真的能写；内建 write / edit 仍然不在白名单里'),
+  skillWriteDir: z.string().default('').description('qq_skill 能读写的 skill 根目录：留空 = $DSH_HOME/skills（没有 DSH_HOME 时 ~/.dsh/skills）。只允许碰 <根>/<名字>/SKILL.md，写前备份'),
+  writeMaxBytes: z.number().default(65536).description('受信写盘单个文件的字节上限（默认 64KB）：超过就报错，不静默截断'),
   maxReplyChars: z.number().default(1500).description('单条 QQ 消息的最大字符数（协议上限），超出自动分段'),
   // ---- 图片/表情包：下载到本地，让 Agent 能用 read_image 真的看见 ----
   mediaDownload: z.boolean().default(true).description('是否把 QQ 消息里的图片/表情包下载到本地（模型只能读本地文件，不下载就只看到一句占位符）'),
@@ -132,6 +163,7 @@ export const Config = z.object({
   // ---- 一次只回一轮：前后脚到的消息先攒一攒，再合成一条交给 Agent ----
   batchWindowMs: z.number().default(2000).description('收到一条要回的消息后，先等这么久（毫秒）看还有没有下一条：群里几个人同时 @、或者一个人连发几句，都会攒成一条消息只回一轮；0 = 关闭（来一条回一条）'),
   batchMaxWaitMs: z.number().default(5000).description('一直有人接着说时，一批最多攒这么久（毫秒）就必须发出去，避免机器人一直不吭声；小于 batchWindowMs 时按 batchWindowMs 算'),
+  mediaHoldMs: z.number().default(1500).description('这一批里有图片 / 表情包时，在窗口之外再多等这么久（毫秒）再投给模型：QQ 里图和配文经常分两条发，多等一会儿能把「图 + 那句话」攒进同一轮，模型就能先 read_image 再回答，不会先回一句文字、图片那条又单独来一轮。0 = 不额外等'),
   // ---- 长任务期间的 @：先攒着，忙完当「一波迟到的消息」一起接 ----
   // 没有这一组的话，十分钟的长任务会按 batchMaxWaitMs 攒出上百批、上百个 turn，每批一条
   // 回复、每轮重发一遍完整上下文，而且每条都在回答几分钟前的问题（见 backlog.js）。

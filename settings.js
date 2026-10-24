@@ -76,6 +76,26 @@ export function createSettings(config, defaultCwd) {
   // 静默换代的小时数：小数也认（测试与「半天」这种取值都靠它）；0 与非法值都是关闭。
   const idleResetHoursRaw = Number(config.idleResetHours);
   const idleResetHours = Number.isFinite(idleResetHoursRaw) && idleResetHoursRaw > 0 ? idleResetHoursRaw : 0;
+  // —— 静默模式：唤醒词去空白去重；回话留空时退回内置文案（空串回出去等于没反应）——
+  const wakeTriggers = deduped(config.wakeTriggers);
+  const wakeText = trimmed(config.wakeText) || '（揉揉眼睛）醒了醒了，刚睡过去。';
+  const mutePersist = config.mutePersist !== false;
+  const muteFile = trimmed(config.muteFile);
+  // —— 主人（受信者）——
+  const ownerAutoClaim = config.ownerAutoClaim !== false;
+  const ownerFile = trimmed(config.ownerFile);
+  const ownerSettingsFile = trimmed(config.ownerSettingsFile);
+  // —— 语音（TTS）：只留框架 ——
+  const tts = config.tts === true;
+  const ttsMaxCharsRaw = Math.floor(Number(config.ttsMaxChars));
+  const ttsMaxChars = Number.isFinite(ttsMaxCharsRaw) && ttsMaxCharsRaw > 0 ? Math.min(1000, ttsMaxCharsRaw) : 200;
+  // —— 受信写盘 ——
+  const trustedWrite = config.trustedWrite !== false;
+  const skillWriteDir = trimmed(config.skillWriteDir);
+  const writeMaxBytesRaw = Math.floor(Number(config.writeMaxBytes));
+  const writeMaxBytes = Number.isFinite(writeMaxBytesRaw) && writeMaxBytesRaw >= 1024
+    ? Math.min(1024 * 1024, writeMaxBytesRaw)
+    : 65536;
   const persona = trimmed(config.persona);
   const instructions = trimmed(config.instructions);
 
@@ -108,6 +128,8 @@ export function createSettings(config, defaultCwd) {
   const batchWindowMs = Number.isFinite(batchWindowMsRaw) && batchWindowMsRaw > 0 ? batchWindowMsRaw : 0;
   const batchMaxWaitMsRaw = Math.floor(Number(config.batchMaxWaitMs));
   const batchMaxWaitMs = Number.isFinite(batchMaxWaitMsRaw) && batchMaxWaitMsRaw > 0 ? batchMaxWaitMsRaw : 0;
+  const mediaHoldMsRaw = Math.floor(Number(config.mediaHoldMs));
+  const mediaHoldMs = Number.isFinite(mediaHoldMsRaw) && mediaHoldMsRaw > 0 ? Math.min(10_000, mediaHoldMsRaw) : 0;
   // 长任务期间的「一波迟到的消息」：条数与字数都有下限（0 没有意义 —— 那等于不贴，
   // 但「不贴」不是用户想要的，他想要的是「别贴太多」）；0 条的配置按 2 算。
   const batchBacklog = config.batchBacklog !== false;
@@ -273,6 +295,18 @@ export function createSettings(config, defaultCwd) {
     resetUsers,
     resetCommand,
     idleResetHours,
+    wakeTriggers,
+    wakeText,
+    mutePersist,
+    muteFile,
+    ownerAutoClaim,
+    ownerFile,
+    ownerSettingsFile,
+    tts,
+    ttsMaxChars,
+    trustedWrite,
+    skillWriteDir,
+    writeMaxBytes,
     persona,
     instructions,
     stickerDir,
@@ -287,6 +321,7 @@ export function createSettings(config, defaultCwd) {
     repeatMaxChars,
     batchWindowMs,
     batchMaxWaitMs,
+    mediaHoldMs,
     batchBacklog,
     batchBacklogEntries,
     batchBacklogChars,

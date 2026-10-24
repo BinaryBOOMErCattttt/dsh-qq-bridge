@@ -122,8 +122,11 @@
         cwd: !!js process.env.QQBOT_CWD ?? ''
         privateChat: true
         groupChat: true
-        # 群里只有被 @ 时才响应：mention / prefix / all
+        # 群里怎么算叫到它：mention（只认 @）/ prefix（@ 或前缀）/ all（所有消息都回）
+        # 本部署用 prefix：@ 它，或者消息以「小助手」开头，都算叫到它
         groupTrigger: mention
+        # groupTrigger=prefix 时使用的前缀（唤醒词）：消息开头写「小助手」即可
+        prefix: /
         # 无人值守：需要审批的操作一律直接拒绝
         approvalPolicy: never
         # QQ 会话挂载的 Agent 预设：上面声明的 qq（只读文件 + 检索 + 联网 + 本地 skill）。
@@ -159,6 +162,17 @@
           # 只会在「用新名字再 qq_save_sticker 存一遍」这条路上多存一张同画面的重复表情，
           # 而它自己没有删文件的通道 —— 重复了就再也清不掉（真实事故）。
           - qq_rename_sticker
+          # 静默 / 唤醒：主人说「睡觉去」时由模型调用，插件在入口把该群的消息丢掉
+          # （不进模型、零 token）。权限按「这一轮谁在说话」在工具里再核一次。
+          - qq_quiet
+          # 主人在 QQ 侧调整 bot 自己的行为配置（攒批 / 主动说话 / 记忆开关等）：
+          # 写 data/owner-settings.json 覆盖层，8 秒后插件重启生效；不含模型路由。
+          - qq_settings
+          # 受信写盘（只有主人能让它动）：改人设 / 表达 / cwd 内 skill / ~/.dsh/skills。
+          # 内建 write / edit 仍然不在白名单里。
+          - qq_write
+          - qq_edit
+          - qq_skill
           - qq_list_conversations
           # 戳一戳：表达「我叫你一下」，没有正文。群里要显式指定戳谁（不给推断）。
           - qq_poke
@@ -218,6 +232,8 @@
         # 渠道提示，模型据此挑一张用 qq_send_image 发出去。目录不存在时会自动创建。
         # 留空 = 不提示表情包目录，模型仍然可以发 .qq-media 里别人刚发的图或任何工作目录里的图。
         stickerDir: .qq-stickers
+        # 表情目录最多保留多少张：满了 qq_save_sticker 会拒绝（防止群友一直让它存）。
+        stickerMaxFiles: 60
         # 单张出站图片的字节上限：超过直接报错（不静默压缩）。默认 8MB，远低于实测的
         # NapCat WebSocket maxPayload（50MB）。
         imageMaxBytes: 8388608
@@ -293,14 +309,14 @@
         # 会话**（同一套口吻、同一份群聊上下文与长期记忆），所以接得上刚才聊的内容；
         # 模型也可以选择不说 —— 回一个 SKIP 就一个字都不发（但这次机会照样用掉）。
         proactive: true
-        # proactiveCheckMs: 600000       # 每 10 分钟考虑一次（这是考虑的节奏，不是说话频率）
-        # proactiveChance: 0.35          # 每次考虑时真开口的概率（0 = 永不主动说话）
-        # proactiveIdleMs: 2700000       # 群里安静 45 分钟以上才考虑搭话
-        # proactiveFreshMs: 86400000     # 最近 24 小时有人说话的群才值得搭话
-        # proactiveGapMs: 7200000        # 同一个群两次主动说话至少隔 2 小时
-        # proactiveDailyMax: 4           # 同一个群一天最多主动说 4 次
-        # proactiveFromHour: 9           # 只在 09:00 ~ 22:59（本地时间）之间主动说话
-        # proactiveToHour: 23            # 与 FromHour 相同 = 全天；跨零点（22 → 3）也认
+        proactiveCheckMs: 600000       # 每 10 分钟看一次（考虑的节奏，不是说话频率）
+        proactiveChance: 0.35          # 条件满足后掷一次，三次里大约说一次
+        proactiveIdleMs: 2700000       # 群里安静 45 分钟才考虑搭话
+        proactiveFreshMs: 86400000     # 最近 24 小时有人说话的群才值得搭话
+        proactiveGapMs: 7200000        # 同一个群两次主动说话至少隔 2 小时
+        proactiveDailyMax: 4           # 同一个群一天最多主动说 4 次
+        proactiveFromHour: 9           # 只在 09:00 ~ 22:59（本地时间）之间主动说话
+        proactiveToHour: 23            # 与 FromHour 相同 = 全天；跨零点（22 → 3）也认
         # ---- 活跃对话：聊起来之后保持搭话（见 docs/proactive.md「聊起来之后保持搭话」）----
         # 上面那套 proactive 只在**冷场**时开口；这一组管「正聊着」的时候。真人聊起来之后
         # 不需要你每句都叫一遍名字，也不会在你说完十秒之后就彻底闭嘴 —— 三件事各有开关：

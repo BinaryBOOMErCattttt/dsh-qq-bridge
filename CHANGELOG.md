@@ -5,6 +5,41 @@
 
 ## 未发布
 
+- **指令 / 主人权限 / 静默 / 受信工具（服务器分支移植）**：这一批功能来自服务器分支，内核按
+  当前重构后的代码走（文件地图与「改哪里」的索引见 [AGENTS.md](AGENTS.md)）。
+
+  - **指令（`@bot + 空格 + 指令`）**：`帮助` / `天气 <城市>` / `随机表情` / `表情 <描述>` /
+    `白饭` / `小作文 <主题> [要素…]` 访客可用；`状态` / `余额` / `设置` 主人专用。帮助 / 天气 /
+    余额 / 随机表情 / 设置 / 状态由插件直接回（零 token），只有创作类（表情 / 白饭 / 小作文）
+    才交给模型。判据是**短句**：第一个空白前的词命中登记表才算指令 —— 「天气不错」不会被误判。
+    见 [docs/commands.md](docs/commands.md)。
+  - **两级权限**：`guestCommands` 控制访客能不能用公开指令；主人指令按**这一轮发言人**判
+    （攒批里混进一个群友，这一轮就没有主人权限）。
+  - **静默（`qq_quiet`）**：主人说「睡觉去 / 静默 / 别聊了」时由**模型**调
+    `qq_quiet(action: 'sleep', target: 群号或群名)`，插件把该群标记为静默；之后该群的消息在
+    `admit` **之前**就被丢掉 —— 不进模型、不花 token，也不再回 `SKIP`。私聊**永远不静默**
+    （它是控制通道）；状态落盘 `data/mutes.json`（`mutePersist`），重启仍然安静；睡着之后群里
+    唯一能进来的东西是主人说「起床」（`wakeTriggers`，插件直接处理、零 token），所以不会睡死。
+  - **主人（owner）**：按 **QQ 号**认，不看昵称。`resetUsers` 非空时以它为准；为空时
+    `ownerAutoClaim` 把**第一个在私聊里跟它说话的 QQ 号**认作主人（落盘 `data/owner.json`，
+    群里说话不算 —— 新 bot 被拉进群时第一条往往来自群友）。`/reset`、静默、受信写盘、
+    `qq_settings` 共用这一份名单，权限在工具执行时复核，不靠提示词。
+  - **受信写盘**：`qq_write` / `qq_edit`（工作目录内的 `.md` / `.txt` / `.json` / `.yml`，写前
+    备份到 `cwd/.dsh/.history/`）与 `qq_skill`（`<skill 根>/<名字>/SKILL.md` 的 list / read /
+    patch / write，skill 在 cwd 之外，这是改 skill 的唯一通道）。内建 `write` / `edit` 仍然
+    不在 QQ 会话的白名单里。
+  - **`qq_settings`**：主人在 QQ 侧调整 bot 自己的**行为**配置（攒批 / 主动说话 / 记忆开关 /
+    复读 / 戳一戳回应……），写 `data/owner-settings.json` 覆盖层（优先于 GUI 的基础配置），
+    8 秒后插件自己重启生效；**不含** provider / model / endpoint / 凭据这些部署级字段。
+  - **天气 / 余额 / 点歌 / 语音**：`天气` 走 Open-Meteo（WMO 天气码在本仓库映射成中文）、
+    `余额` 读 DeepSeek `/user/balance`、`点歌` 搜网易云只回「歌名 - 歌手 + 链接」（`music` 段被
+    NapCat 拒收，不做卡片）。`语音` 只留 **TTS 框架**：`tts.js` 的 `registerTtsProvider` 由部署自己
+    注册（本地 Kokoro / Piper / 自建服务），`tts` 默认关，仓库**不内置任何在线语音服务**。
+  - 提示词：发言人名字后标「（主人）」；写盘 / 静默 / 配置三个工具都声明「只对主人开放」。
+  - 测试：新增 `test/commands.test.mjs` / `test/weather.test.mjs` / `test/balance.test.mjs` /
+    `test/fun.test.mjs` / `test/mute.test.mjs` / `test/editor.test.mjs` /
+    `test/owner-settings.test.mjs`。
+
 - **断线后能自己连回来了（Node 22）**：Node 22 的全局 `WebSocket` 在「连接被拒」时只发
   `error`、不发 `close`（22.23.1 实测；26.x 才补齐），而重连只挂在 `onclose` 上 —— 部署在
   Node 22 的实例第一次断线后就永久停摆，NapCat 一重启就再也连不回来。现在 `onerror` 也兜一次
