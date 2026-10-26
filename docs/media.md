@@ -342,6 +342,10 @@ write / edit、也没有 bash**，所以模型自己没有任何办法把那张�
   旧的那张（或改个名字）。
 - **张数上限 `stickerMaxFiles`**（默认 60，`0` = 不限制）：QQ 那头是不可信输入，群里谁都
   能让它一直存，磁盘不该被这么撑大。
+- **顺手补两份目录**：`.qq-memory/STICKERS.md` 补一行「名字（含义）→ 路径」（下一轮提示词
+  里就能按含义挑）；`.qq-stickers/SEMANTICS.md` 补一行「文件 / 情绪 / 适合 / 慎用」（心情满
+  或斗图模式放行时，模型按语义挑图而不是凭文件名猜）。文件不存在时按 `deploy/SEMANTICS.md`
+  模板新建并去掉示例行；两份目录写失败都**不回滚图片**，只记 warn（图已经落盘，比丢掉好）。
 - **不可用就不注册**：`stickerDir` 没配 / 配到 `cwd` 外、`imageSend: false`、或者
   `allowTools` 里没有 `qq_save_sticker` 时，这个工具**根本不出现**（与 `qq_transcript` /
   `qq_memory` 同一个规矩：不留「一调就报错」的壳），提示词里也不会提它。

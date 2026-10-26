@@ -339,3 +339,37 @@ test('合并转发：默认展开，条数/字数有地板，深度 0 是一层�
   assert.equal(settings({ forwardMaxDepth: NaN }).forwardMaxDepth, 0);
   assert.equal(settings({ forwardTimeoutMs: 10 }).forwardTimeoutMs, 1000);
 });
+test('心情门控：默认值、百分比互相夹紧、冷场时长的地板', () => {
+  const s = settings();
+  assert.equal(s.moodMax, 100);
+  assert.equal(s.moodTagMaxFull, 100);
+  assert.equal(s.moodTagMaxSimple, 50);
+  assert.equal(s.moodTriggerFull, 100);
+  assert.equal(s.moodTriggerSimple, 100);
+  assert.equal(s.moodDecayIdleMs, 180_000);
+  assert.equal(s.moodZeroIdleMs, 1_200_000);
+  assert.equal(s.moduleEmojiMood, true);
+  assert.equal(settings({ moduleEmojiMood: false }).moduleEmojiMood, false);
+  // 'no' 这类手写值不翻转语义：只有明确的 false 才是关。
+  assert.equal(settings({ moduleEmojiMood: 'no' }).moduleEmojiMood, true);
+
+  // 上限先算，其余三个百分比都夹到它；否则 moodMax 调小之后阈值永远够不到。
+  const small = settings({ moodMax: 30, moodTagMaxFull: 100, moodTagMaxSimple: 100, moodTriggerFull: 100, moodTriggerSimple: 100 });
+  assert.equal(small.moodMax, 30);
+  assert.equal(small.moodTagMaxFull, 30);
+  assert.equal(small.moodTagMaxSimple, 30);
+  assert.equal(small.moodTriggerFull, 30);
+  assert.equal(small.moodTriggerSimple, 30);
+
+  // 0 是有效数字，夹到下限 1（而不是退回默认）；moodMax 本身夹在 1..100。
+  assert.equal(settings({ moodMax: 0 }).moodMax, 1);
+  assert.equal(settings({ moodMax: 999 }).moodMax, 100);
+  // NaN 才退回该档默认；这个默认也被 moodMax 夹住。
+  assert.equal(settings({ moodMax: 60, moodTriggerFull: NaN }).moodTriggerFull, 60);
+  assert.equal(settings({ moodTagMaxSimple: 0 }).moodTagMaxSimple, 1);
+  // 冷场时长下限 1 秒：0 会让每次收消息都归零，心情永远攒不起来。
+  assert.equal(settings({ moodDecayIdleMs: 0 }).moodDecayIdleMs, 1000);
+  assert.equal(settings({ moodZeroIdleMs: -1 }).moodZeroIdleMs, 1000);
+  assert.equal(settings({ moodZeroIdleMs: MAX_TIMER_MS * 2 }).moodZeroIdleMs, MAX_TIMER_MS);
+});
+

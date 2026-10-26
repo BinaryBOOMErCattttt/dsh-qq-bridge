@@ -1,5 +1,5 @@
 /**
- * 运行模式：完整 / 简洁。
+ * 运行模式：完整 / 简洁 / 斗图。
  *
  * 这里只放**纯函数与常量**（同样输入永远同样输出，可以脱离 Harness 单测）；会话重建、
  * 落盘与全局状态在 `index.js`（`appMode` / `switchMode` / `modeContextText`）。
@@ -8,15 +8,15 @@
  * 让用户再逐项配一遍就失去意义了。完整模式里的 `module*` 是另一件事 —— 那是一组可以
  * 单独关掉的功能片；简洁模式直接忽略它们，只认下面的 `SIMPLE_MODULES`。
  *
- * **斗图（sticker）模式还没搬**：它整套行为挂在「心情 / 表情门控」那一片上
- * （表情常驻、不受 mood 限制、开场只注入一次表情语义），和 mood 分片一起做才不是半截。
- * 所以 `MODES` 目前只有完整 / 简洁两档，`模式 斗图` 会被当成未知参数。
+ * 斗图（sticker）模式不是「更简洁」或「更完整」：它改的是**发表情的门控**（常驻、不受
+ * 心情限制、每轮都要看到目录）。工具面与完整模式一样用部署白名单，所以它不参与
+ * `toolsForMode` 的收窄。
  *
  * @module @qqbot/dsh-plugin-qq/mode
  */
 
 /** 当前支持的模式值（落盘在 `cwd/data/mode.json`）。 */
-export const MODES = ['full', 'simple'];
+export const MODES = ['full', 'simple', 'sticker'];
 
 /**
  * 简洁模式放行的指令。
@@ -31,9 +31,10 @@ export const SIMPLE_ALLOWED_COMMANDS = new Set(['模式', '状态', '设置', '�
  * 简洁模式仍然算「核心」的模块。
  *
  * 完整模式读配置里的 `module*`，简洁模式只认这个集合 —— 这就是「简洁模式强制关掉
- * 非核心模块」的落点。`emojiMood` 等心情 / 表情分片落地后再补进来；现在没有调用方。
+ * 非核心模块」的落点。心情 / 表情门控在简洁模式里仍然**开着**（快照口径）：简洁模式
+ * 收窄的是能力面与主动性，不是「连一张表情都不许发」；它的门控口径与完整模式一致。
  */
-export const SIMPLE_MODULES = new Set(['handoff']);
+export const SIMPLE_MODULES = new Set(['handoff', 'emojiMood']);
 
 /**
  * 指令 → 所属模块。模块关掉时整条指令直接不可用（在 `runCommand` 里统一拦）。
@@ -63,21 +64,27 @@ export const SIMPLE_TOOL_SET = new Set([
 
 /**
  * 模式的中文名（日志 / 回复 / `状态` 指令共用）。
- * @param {string} mode - `full` / `simple`。
- * @returns {string} 完整 / 简洁。
+ * @param {string} mode - `full` / `simple` / `sticker`。
+ * @returns {string} 完整 / 简洁 / 斗图。
  */
 export function modeLabel(mode) {
-  return mode === 'simple' ? '简洁' : '完整';
+  if (mode === 'simple') return '简洁';
+  if (mode === 'sticker') return '斗图';
+  return '完整';
 }
 
 /**
  * 解析 `模式 <参数>`：中文与英文别名都认，大小写不敏感。
+ *
+ * 「表情包」也算斗图的别名：用户更容易这么叫它，而模式值本身必须保持 `sticker`
+ * （落盘 / 代码里都用英文，别把中文塞进 `mode.json`）。
  * @param {unknown} raw - 指令参数。
- * @returns {'full' | 'simple' | undefined} 认不出来时 undefined（调用方回用法提示）。
+ * @returns {'full' | 'simple' | 'sticker' | undefined} 认不出来时 undefined（调用方回用法提示）。
  */
 export function parseModeArg(raw) {
   const text = String(raw ?? '').trim().toLowerCase();
   if (/^(简洁|simple)$/u.test(text)) return 'simple';
+  if (/^(斗图|sticker|表情包)$/u.test(text)) return 'sticker';
   if (/^(完整|full)$/u.test(text)) return 'full';
   return undefined;
 }

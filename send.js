@@ -9,6 +9,8 @@
  *   - `client` / `settings` / `report` / `cwd`：宿主连接、配置、日志、工作目录；
  *   - `imageMaxBytes` / `imageAllowed` / `stickerSendSource` / `noteStickerFailure`：
  *     出站图片与表情包的那套边界（`image.js` / `index.js` 的 sticker 区）；
+ *   - `stickerLabel` / `moodSticker`：收藏目录的展示路径与心情门控（只有收藏目录里的
+ *     表情受门控；`.qq-media` 的普通图片不受限，否则「发张截图」也会被心情卡住）；
  *   - `styleParams` / `chatMaxChars`：标点清洗与「聊天型 / 信息型」门槛；
  *   - `chatter` / `conversationMentions`：引用指向的进度读数与 `[[@昵称]]` 的会话侧解析
  *     （`quoteHead` 也在这个模块里）；
@@ -51,8 +53,10 @@ export function createSender(deps) {
     conversations,
     chatter,
     imageAllowed,
+    stickerLabel,
     stickerSendSource,
     noteStickerFailure,
+    moodSticker = { before: () => 'free', after: () => {} },
     conversationMentions,
     describeConversation,
     noteOwnMessage,
@@ -425,6 +429,21 @@ export function createSender(deps) {
         // 引用发不出去就算了：没有任何轮次是「必须有锚点」的（插话也一样，见 `quoteHead`）。
         return sentAny;
       }
+      // 心情门控只卡**收藏目录里的表情**：`.qq-media` 的截图 / 照片不是「表情包」，
+      // 拿它去凑心情门槛只会让「发张截图」也失败。斗图模式与用户明确要表情由门控放行
+      // （见 mood.js 的 stickerBefore），这里只负责「拒绝时静默丢掉这一段」。
+      const stickerPath = stickerLabel !== undefined && String(piece.source ?? '').startsWith(`${stickerLabel}/`);
+      let moodGrant;
+      if (stickerPath) {
+        try {
+          moodGrant = moodSticker.before(conversation);
+        } catch (error) {
+          // 整条回复只有一张表情时，静默丢掉等于「机器人没理人」；但提示词已经说清默认
+          // 关闭，模型仍写标记属于越界，不能反过来用一句「不许发」把正文也顶掉。
+          report('info', `sticker blocked for ${conversation.key}: ${errorText(error)}`);
+          continue;
+        }
+      }
       let bytes;
       try {
         bytes = (await loadOutgoingImage({ source: stickerSendSource(piece.source), cwd, maxBytes: imageMaxBytes })).bytes;
@@ -444,8 +463,15 @@ export function createSender(deps) {
       // `sticker: true` 带上 QQ 的「大表情」标记 —— 这条路只发收藏目录里的表情包。
       if (!(await sendOne(conversation, [imageSegment(bytes, { sticker: true })]))) return sentAny;
       sentAny = true;
+      // 斗图模式靠这个标记判断「这一轮发过图了」（见 turn/end 的连发提醒）。
+      conversation.stickerSentThisTurn = true;
+      // 只在这张**真的发出去**之后才消耗心情许可：发送失败时模型下一轮还该能再试一次。
+      if (moodGrant !== undefined) moodSticker.after(conversation, moodGrant);
       // 发出去了就把上一条失败记录清掉：再留着会变成一句没做完的指令。
       conversation.stickerFailure = undefined;
+      // 记下「上一张发出去的表情」：`接一个` 要避开它，别原地复读自己。
+      const sentPath = String(piece.source ?? '');
+      if (stickerPath) conversation.lastSticker = sentPath.slice(stickerLabel.length + 1);
     }
     return sentAny;
   }

@@ -15,12 +15,66 @@
 import { readdirSync } from 'node:fs';
 import { mkdir, rename, stat } from 'node:fs/promises';
 import { join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { insideDirectory, loadOutgoingImage } from './image.js';
-import { writeBytesAtomic } from './filestore.js';
+import { readTextOrUndefined, writeBytesAtomic, writeTextAtomic } from './filestore.js';
 import { errorText, localDate, stickerFileName } from './util.js';
 
 /** 渠道提示里最多列多少个表情包文件名。 */
 const STICKER_PROMPT_MAX = 40;
+/** 表情语义表：与 `deploy/SEMANTICS.md` 同名，运行时住在收藏目录里。 */
+const SEMANTICS_FILE = 'SEMANTICS.md';
+/** 插件包根目录：`deploy/SEMANTICS.md` 是首次补行时的模板。 */
+const PACKAGE_ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)));
+
+/**
+ * 渲染 SEMANTICS.md 的一行（表格四列：文件 / 情绪 / 适合 / 慎用）。
+ *
+ * 为什么单独抽成导出的纯函数：格式是模型与人都要读的契约，测试直接钉它比在
+ * 保存流程里拼字符串稳。单元格里的 `|` 必须换掉，否则一行会被拆成两列。
+ * @param row.path - 表情的相对路径（如 `.qq-stickers/委屈.png`）。
+ * @param row.meaning - 情绪（模型存图时写的 meaning）。
+ * @param row.scene - 适合的场景。
+ * @returns 一行 Markdown 表格。
+ */
+export function semanticsRow({ path, meaning, scene }) {
+  const cell = (value) => String(value ?? '').replace(/\|/gu, '／').replace(/\s+/gu, ' ').trim();
+  return `| ${cell(path)} | ${cell(meaning) || '（未注明）'} | ${cell(scene) || '—'} | — |`;
+}
+
+/**
+ * 把一行写进 SEMANTICS.md：同文件已有行就替换，否则插在表格末尾。
+ *
+ * 「插在表格末尾」而不是文件末尾：模板在表格后面还有「维护约定」，直接 append 会把
+ * 新行写到约定下面，Markdown 就不再是表格的一部分了。找不到表格时才补一个表头。
+ * @param text - 现有文件内容（空串 = 还没有文件）。
+ * @param row - `semanticsRow` 的返回值。
+ * @param path - 对应的表情路径，用来认「这一张是不是已经登记过」。
+ * @returns 新的文件内容。
+ */
+export function upsertSemanticsRow(text, row, path) {
+  const lines = String(text ?? '').replace(/\r\n/gu, '\n').split('\n');
+  const fileName = String(path ?? '').split('/').pop() ?? '';
+  const firstCell = (line) => (line.startsWith('|') ? (line.split('|')[1] ?? '').trim() : '');
+  const same = lines.findIndex((line) => {
+    const cell = firstCell(line);
+    return cell.length > 0 && (cell === path || cell === fileName || cell.endsWith(`/${fileName}`));
+  });
+  if (same >= 0) {
+    lines[same] = row;
+    return lines.join('\n');
+  }
+  let lastTable = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index].startsWith('|')) lastTable = index;
+  }
+  if (lastTable >= 0) {
+    lines.splice(lastTable + 1, 0, row);
+    return lines.join('\n');
+  }
+  const header = ['', '| 文件 | 情绪 | 适合 | 慎用 |', '|---|---|---|---|', row];
+  return [...lines, ...header].join('\n');
+}
 
 /**
  * 建一份表情包目录的读写器。
@@ -93,10 +147,15 @@ export function createStickerStore(deps) {
    * 动图还会多一行「这张动图的分镜图在哪」（`sticker-frames.js` 后台扫出来的）：只看目录
    * 里的 `.gif` 路径，模型读到的永远是第一帧。
    *
+   * 斗图模式例外：那个模式的语义就是「表情常驻」，目录必须**每轮**都在眼前（只喂开场
+   * 那一轮的话，第二句起模型手里就没有目录、只剩「别滥用」的旧印象，会整轮只打字）。
+   * 由调用方传 `force: true` 绕过「目录没变就不再发」的账，账本身照记。
+   *
    * @param conversation - 目标会话。
+   * @param options.force - 即使目录没变也再给一次（斗图模式用）。
    * @returns 要拼进「本轮情境」的那几行。
    */
-  function stickerCatalogLines(conversation) {
+  function stickerCatalogLines(conversation, { force = false } = {}) {
     if (stickerLabel === undefined || !imageAllowed()) return [];
     const catalog = memory.enabled ? memory.catalog() : { stickers: [], catalog: false };
     const names = stickerNames();
@@ -106,7 +165,7 @@ export function createStickerStore(deps) {
     const key = `${entries.join('\u0000')}\u0001${sheetLines.join('\u0000')}`;
     const generation = conversation.sessionGeneration ?? 0;
     const ledger = conversation.stickerCatalog;
-    if (ledger !== undefined && ledger.generation === generation && ledger.key === key) return [];
+    if (!force && ledger !== undefined && ledger.generation === generation && ledger.key === key) return [];
     conversation.stickerCatalog = { generation, key };
     // 目录内容变了：顺手重扫一遍收藏目录里的动图（新存的、手动丢进来的都能补上分镜图）。
     stickerFrames?.refreshSoon?.();
@@ -228,6 +287,38 @@ export function createStickerStore(deps) {
   }
 
   /**
+   * 往收藏目录的 `SEMANTICS.md` 补一行（**尽力而为**，失败不影响存图）。
+   *
+   * 为什么保存图之后要顺手写它：心情满 / 斗图模式放行时，提示词让模型先读这张表、
+   * 按「情绪 + 适合」挑图。表里没有刚存的那张，模型只能凭文件名猜，或者再 read_image
+   * 看一遍 —— 前者正是这张表要消灭的问题。
+   *
+   * 文件不存在时用插件包里的 `deploy/SEMANTICS.md` 当模板（去掉示例行：那句
+   * 「（示例）委屈.webp」会让模型以为目录里真有一张叫这个的图）。模板也读不到时退回
+   * 一个最小表头，绝不因为缺模板让存表情失败。
+   *
+   * @param options.path - 表情的相对路径（如 `.qq-stickers/委屈.png`）。
+   * @param options.meaning - 情绪。
+   * @param options.scene - 适合的场景。
+   * @returns 写入的相对路径说明（给工具回显）。
+   */
+  async function appendSemantics({ path, meaning, scene }) {
+    const target = join(stickerRoot, SEMANTICS_FILE);
+    let text = await readTextOrUndefined(target);
+    let seeded = false;
+    if (text === undefined) {
+      const bundled = await readTextOrUndefined(join(PACKAGE_ROOT, 'deploy', SEMANTICS_FILE));
+      text = bundled === undefined
+        ? ''
+        : bundled.split('\n').filter((line) => !line.includes('（示例）')).join('\n');
+      seeded = true;
+    }
+    const next = `${upsertSemanticsRow(text, semanticsRow({ path, meaning, scene }), path).replace(/\n+$/u, '')}\n`;
+    await writeTextAtomic(target, next);
+    return `${stickerLabel}/${SEMANTICS_FILE}${seeded ? '（按模板新建）' : ''}`;
+  }
+
+  /**
    * 把「一张图」固化进表情包目录：`qq_save_sticker` 的全部实现。
    *
    * 为什么需要它（实测缺口）：QQ 会话按设计没有 write / edit / bash —— 那三样在不可信
@@ -300,9 +391,17 @@ export function createStickerStore(deps) {
         report('warn', `could not add ${path} to the sticker catalogue: ${errorText(error)}`);
       }
     }
+    // 语义表那一行同样**尽力而为**：图已经落盘，缺一行语义比存图失败好得多。
+    let semantics;
+    try {
+      semantics = `added to ${await appendSemantics({ path, meaning, scene })}`;
+    } catch (error) {
+      semantics = `not written to SEMANTICS.md: ${errorText(error)}`;
+      report('warn', `could not update ${SEMANTICS_FILE}: ${errorText(error)}`);
+    }
     // 新收藏的如果是动图，顺手把分镜图补上（下一次目录变化时那一行就会出现）。
     stickerFrames?.refreshSoon?.();
-    return { path, bytes: image.bytes.length, format: image.format, source: image.label, catalog };
+    return { path, bytes: image.bytes.length, format: image.format, source: image.label, catalog, semantics };
   }
 
   /**

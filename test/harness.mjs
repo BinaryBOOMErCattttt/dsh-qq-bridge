@@ -847,7 +847,10 @@ export async function bootImages(config = {}, hostOptions = {}, onebotOptions = 
   await mkdir(join(cwd, '.qq-stickers'), { recursive: true });
   await writeFile(join(cwd, '.qq-stickers', '笑死.png'), TINY_PNG);
   await writeFile(join(cwd, 'notes.txt'), 'definitely not an image');
-  const booted = await boot({ cwd, ...config }, hostOptions, onebotOptions);
+  // 表情包行为用例默认关掉心情门控：这些用例考的是「目录 / 存图 / 发送格式」，
+  // 不是「这一轮有没有放行」。门控本身在 bridge-mood.test.mjs 里单独考，
+  // 要验「默认关闭」的用例显式传 `moduleEmojiMood: true` 覆盖即可。
+  const booted = await boot({ cwd, moduleEmojiMood: false, ...config }, hostOptions, onebotOptions);
   return { ...booted, cwd };
 }
 

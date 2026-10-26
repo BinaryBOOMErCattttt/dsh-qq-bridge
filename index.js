@@ -47,6 +47,7 @@ import { helpText, parseCommand, usageLine } from './commands.js';
 import { weatherReport } from './weather.js';
 import { fetchBalance, renderBalance } from './balance.js';
 import { createChatState } from './chat-state.js';
+import { createMoodGate } from './mood.js';
 import { dailyFortune, flipCoin, formatFortune, parseDice, pickRandom, rollDice } from './fun.js';
 import { renderSong, searchSong } from './music.js';
 import { synthesize } from './tts.js';
@@ -277,14 +278,14 @@ export function apply(ctx, config) {
   // `loader/volatile-update` 监听重启插件来重建。
   const baseSettings = createSettings(liveConfig(config), process.cwd());
   const cwd = baseSettings.cwd;
-  // 运行模式：完整 / 简洁。落盘在 data/mode.json；切换时重建当前会话的上下文
+  // 运行模式：完整 / 简洁 / 斗图。落盘在 data/mode.json；切换时重建当前会话的上下文
   // （见 switchMode）。默认完整模式 —— 没有文件、文件坏了都按最全的那档起，
   // 否则一次写坏的 JSON 会让 bot 悄悄少掉一半能力。
   const MODE_FILE = join(cwd, 'data', 'mode.json');
   let appMode = 'full';
   try {
     const savedMode = JSON.parse(readFileSync(MODE_FILE, 'utf8')).mode;
-    if (savedMode === 'simple' || savedMode === 'full') appMode = savedMode;
+    if (savedMode === 'simple' || savedMode === 'sticker' || savedMode === 'full') appMode = savedMode;
   } catch {
     // 没有文件 = 默认完整模式；读坏也当没有（不因为一个手滑把模式切到一半）。
   }
@@ -301,6 +302,19 @@ export function apply(ctx, config) {
   const ownerSettingsValues = loadOwnerSettings();
   const { settings, applied: ownerSettingsApplied } = applyOwnerSettings(baseSettings, ownerSettingsValues, report);
   const approvalPolicy = settings.approvalPolicy;
+  // 心情门控：分数按会话存在 chat-state 的 mood 段（表情权限的唯一真相）。
+  // 必须等 `settings`（含主人覆盖层）算完再建 —— 门控读的是最终生效的配置。
+  // `appMode` / `moduleEnabled` 都是现读函数而不是值：模式与模块开关在运行时会变，
+  // 门控必须跟着变，否则切进斗图模式之后还得重启才「表情常驻」。
+  const mood = createMoodGate({
+    settings,
+    report,
+    gameData,
+    save: () => chatState.save(),
+    appModeOf: () => appMode,
+    moduleEnabled,
+  });
+  const { moodFor, decay: decayMood, applyTags: applyMoodTags } = mood;
   if (ownerSettingsApplied.length > 0) {
     report('info', `owner settings applied: ${ownerSettingsApplied.join(', ')} (from ${baseSettings.ownerSettingsFile})`);
   }
@@ -1382,7 +1396,7 @@ export function apply(ctx, config) {
    * 之后再也读不到「刚才聊到哪」；先读出来挂在会话记录上，下一轮由 channelTurnContext
    * 注入一次（turn/end 就清掉，免得以后每轮重复）。
    * @param {object} conversation - 当前私聊会话。
-   * @param {'full' | 'simple'} next - 目标模式。
+   * @param {'full' | 'simple' | 'sticker'} next - 目标模式。
    */
   async function switchMode(conversation, next) {
     if (next === appMode) {
@@ -1391,6 +1405,10 @@ export function apply(ctx, config) {
     }
     const turns = next === 'simple' ? 6 : 15;
     const context = await modeContextText(conversation, turns);
+    // 斗图模式退出时把那一轮会话目录归档（与定档同一套 `archiveSessionDir`）：
+    // 斗图轮次里全是图与短句，留在 sessions 根目录只会让下一次 resume 挑错档。
+    const wasSticker = appMode === 'sticker';
+    const oldSessionId = sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0);
     const ok = await resetConversation(conversation);
     if (!ok) {
       // 旧会话没能销毁时**不要**改模式：新旧两个 Agent 同时挂着，回复会串到另一档的能力面。
@@ -1399,6 +1417,7 @@ export function apply(ctx, config) {
     }
     appMode = next;
     refreshAllowTools();
+    if (wasSticker && next !== 'sticker') await archiveSessionDir(oldSessionId);
     try {
       await mkdir(dirname(MODE_FILE), { recursive: true });
       await writeJsonAtomic(MODE_FILE, { mode: next, at: Date.now() });
@@ -1408,11 +1427,18 @@ export function apply(ctx, config) {
     }
     conversation.modeContext = context;
     conversation.modeContextLabel = `最近 ${turns} 轮`;
+    // 斗图模式只在**开场那一轮**读一次 SEMANTICS.md / 建立表情目录印象：之后靠这一轮的
+    // 上下文接图，不必每轮重复同一段提示（目录本身仍会每轮随「本轮情境」给，见
+    // `stickerCatalogLines` 的 force 参数）。
+    conversation.stickerBriefPending = next === 'sticker';
+    if (next !== 'sticker') conversation.stickerMissStreak = 0;
     void sendToConversation(
       conversation,
       next === 'simple'
         ? `已切到简洁模式：只保留聊天 / 记忆 / 静默 / 设置 / 定档，记忆按最近 6 轮，攒批 5 秒，主动搭话、复读、补一句全关。\n（切换时保留了最近 6 轮上下文，下一轮接上。）`
-        : `已切回完整模式：功能全开，记忆按最近 15 轮。\n（切换时保留了最近 15 轮上下文，下一轮接上。）`,
+        : next === 'sticker'
+          ? `已切到斗图模式：表情发送常驻、不受心情门控，默认每条回复都带一张图，优先按语义接图。\n（切换时保留了最近 15 轮上下文，下一轮接上。）`
+          : `已切回完整模式：功能全开，记忆按最近 15 轮。\n（切换时保留了最近 15 轮上下文，下一轮接上。）`,
     );
   }
 
@@ -1434,8 +1460,8 @@ export function apply(ctx, config) {
         command,
         [
           `当前模式：${modeLabel(appMode)}`,
-          '可切换：完整 / 简洁',
-          command.owner ? '切换：发「模式 完整」/「模式 简洁」' : '只有主人能切换模式。',
+          '可切换：完整 / 简洁 / 斗图',
+          command.owner ? '切换：发「模式 完整」/「模式 简洁」/「模式 斗图」' : '只有主人能切换模式。',
         ].join('\n'),
       );
       return;
@@ -1446,7 +1472,7 @@ export function apply(ctx, config) {
     }
     const next = parseModeArg(arg);
     if (next === undefined) {
-      commandReply(command, '只认「模式 完整」「模式 简洁」。');
+      commandReply(command, '只认「模式 完整」「模式 简洁」「模式 斗图」。');
       return;
     }
     await switchMode(command.conversation, next);
@@ -2160,8 +2186,11 @@ export function apply(ctx, config) {
     conversations,
     chatter,
     imageAllowed,
+    stickerLabel,
     stickerSendSource,
     noteStickerFailure,
+    // 发表情的心情门控：只作用于收藏目录里的表情（见 send.js 的 replyPieces）。
+    moodSticker: { before: (conversation) => mood.stickerBefore(conversation), after: (conversation, kind) => mood.stickerAfter(conversation, kind) },
     conversationMentions,
     describeConversation,
     noteOwnMessage,
@@ -2314,6 +2343,13 @@ export function apply(ctx, config) {
     canReadImages,
     // 模式在运行时改，提示词装配时现读；切成简洁之后新建的会话才会带上简洁那段。
     modeOf: () => appMode,
+    // 心情门控的三个**稳定**口径；「这一轮放没放行」属于每轮变化的状态，
+    // 由 channelTurnContext 说（否则系统提示会随心情变化被 DSH 整段追加）。
+    emojiMood: {
+      enabled: () => moduleEnabled('emojiMood'),
+      tagCap: () => mood.tagCap(),
+      trigger: () => mood.trigger(),
+    },
   });
 
   // 设置页的两条 Host 路由（会话列表 / 重置、定时任务看板）搬去了 routes.js；
@@ -3029,10 +3065,35 @@ export function apply(ctx, config) {
         `- 上一轮你想发的表情 \`${failedSticker.path}\` 没发出去（${failedSticker.reason}）。表情包只能从 ${stickerLabel ?? '收藏目录'}/ 里挑现成的；别人的图先用 qq_save_sticker 存下来，**别自己拼 \`.qq-media\` 的哈希**。`,
       );
     }
+    // 斗图模式的开场只喂一轮：把「先读一次 SEMANTICS.md」放在这里而不是系统提示里，
+    // 是因为它随「切进斗图」出现、下一轮就该消失 —— 进稳定段会让 DSH 把整份人设再追加
+    // 一份（见 channelPrompt 的注释）。目录与「每条都要带图」的规则留在系统提示。
+    if (appMode === 'sticker' && conversation.stickerBriefPending !== false) {
+      lines.push(
+        '- 现在是斗图模式（本轮开场）：表情发送常驻、不受心情门控；这一轮先读一次 `.qq-stickers/SEMANTICS.md`，按「情绪 + 适合 + 慎用」建立印象，之后不用反复读。',
+        '- 斗图模式的核心就是「用图接话」：对方发一张，你回一张；对方连发，你也连着接，别只丢一句文字点评。文字照常保留，但每条回复默认都带一张表情。',
+        '- 需要发到别的会话再走 qq_send_image；当前会话的回复直接用 `[[图片: 路径]]`，整条只有它、一个字都不写也算一次回复。',
+      );
+    }
+    // 心情满阈值后的这一次放行：**每轮都会变**，只能放在「本轮情境」里。
+    // 放系统提示会让 DSH 每次心情变化都追加一整份提示词（真实事故，见上面长注释）。
+    if (appMode !== 'sticker' && moduleEnabled('emojiMood') && moodFor(conversation).grant === true) {
+      lines.push(
+        `- 这次表情权限已放行（心情满）：可以发一张；先读 \`.qq-stickers/SEMANTICS.md\` 按语义挑（有这张表的话），别凭文件名猜。表情包仍是一次最多一张，别每句都配。${appMode === 'simple' ? '只参考最近 6 轮语境。' : ''}`,
+      );
+    }
+    // 斗图连发提醒：模型不会自己反省「刚才为什么没发」，只会照着上一轮只打字。
+    // 计数在 turn/end 维护（见 `stickerMissStreak`），同样只能每轮现给。
+    if (appMode === 'sticker') {
+      const missed = Number(conversation.stickerMissStreak) || 0;
+      if (missed > 0) {
+        lines.push(`- 提醒：你在斗图模式里已经连续 ${missed} 轮没有发表情了。这一轮必须发一张 —— 先在目录里找一张对得上的，找不到再用文字说明。`);
+      }
+    }
     // 表情包目录：存图 / 改名之后它就得让模型看见，但它也是会变的 —— 放系统提示里等于
     // 每存一张就追加一整份人设 + 硬规则（见 `stickerCatalogLines`）。这里只在本会话第一次
-    // 或目录变了时给一次。
-    const catalogLines = stickerCatalogLines(conversation);
+    // 或目录变了时给一次；斗图模式例外（表情常驻，目录必须每轮都在眼前）。
+    const catalogLines = stickerCatalogLines(conversation, { force: appMode === 'sticker' });
     if (catalogLines.length > 0) lines.push('', ...catalogLines);
     // 模式切换时留下的最近几轮：只喂下一轮，turn/end 立刻清掉。放这里而不是系统提示，
     // 是因为它随「切模式」这个动作出现、下一轮就消失 —— 进稳定段会让 DSH 把整份人设再
@@ -5852,7 +5913,11 @@ export function apply(ctx, config) {
     // 私聊回复从模型**开始想**的那一刻就点亮「对方正在输入」：这一段（常常十几秒）
     // 才是对方真正在等的时间。`turn/end` 会把它停掉，随后发送步骤再按打字节奏点亮。
     const conversation = conversations.get(owner.key);
-    if (conversation !== undefined) startTyping(conversation);
+    if (conversation !== undefined) {
+      startTyping(conversation);
+      // 斗图模式这一轮有没有发过图：qq_send_image 与正文标记都算（见 turn/end 的连发提醒）。
+      if (appMode === 'sticker') conversation.stickerSentThisTurn = false;
+    }
   });
 
   ctx.on('session/event', (session, event) => {
@@ -5892,6 +5957,8 @@ export function apply(ctx, config) {
     if (conversation !== undefined) {
       conversation.modeContext = undefined;
       conversation.modeContextLabel = undefined;
+      // 斗图模式的开场提示也只喂一轮（见 channelTurnContext）。
+      if (appMode === 'sticker') conversation.stickerBriefPending = false;
     }
     const reason = event.data.reason?.kind;
     // 只发该 turn 里最后一条有文本的 assistant 消息；中间步骤的工具调用等不发给 QQ。
@@ -5900,6 +5967,21 @@ export function apply(ctx, config) {
     // 在 SKIP / 提醒判定之前裁：裁完才看得出这一轮到底有没有正文。
     const replyCap = appMode === 'simple' ? settings.simpleReplyMaxChars : settings.fullReplyMaxChars;
     if (Number.isFinite(replyCap) && replyCap > 0) reply = clipChars(reply, replyCap);
+    // 模型用 [[mood:upN]] / [[mood:downN]] 打分；插件在这里把 tag 从正文里删掉。
+    // 次数与分数由 mood.js 管，这里只负责「这一轮的正文」——提醒轮也算（它同样是模型写的）。
+    if (conversation !== undefined) reply = applyMoodTags(reply, conversation);
+    // 斗图模式连发提醒：这一轮是不是一张图都没发（正文标记或 qq_send_image 都算）。
+    // 只在真回了话的轮次计数；空回复 / SKIP 不算，免得把「没说话」记成「没发图」。
+    if (conversation !== undefined && appMode === 'sticker') {
+      if (reply.length > 0 && reason !== 'aborted' && reason !== 'error') {
+        const attached = /\[\[图片\s*[:：]/u.test(reply);
+        conversation.stickerMissStreak = attached || conversation.stickerSentThisTurn === true
+          ? 0
+          : (Number(conversation.stickerMissStreak) || 0) + 1;
+      } else {
+        conversation.stickerSentThisTurn = false;
+      }
+    }
 
     // 定时提醒的 agent/prompt 轮：必须在 error / SKIP / aborted 之前收账。
     // 这几个分支在普通轮次里是「静默丢弃」，但提醒不能静默 —— 要让 reminders.js 拿到
@@ -6051,6 +6133,16 @@ export function apply(ctx, config) {
     resolveStickerSource,
     // `qq_send_image` 也要区分「收藏的表情」与「普通图片」：前者带 QQ 的大表情标记发出去。
     isStickerFile,
+    // 心情门控（工具侧按「这一轮是谁在调」反查会话）：`before` 没放行就抛错，
+    // 发送成功后才调用 `after` 收尾（失败不消耗心情许可）。
+    moodSticker: {
+      before: (exec, requested) => mood.stickerBefore(conversationOfExec(exec), requested === true),
+      after: (exec, kind) => mood.stickerAfter(conversationOfExec(exec), kind),
+    },
+    noteStickerSent: (exec) => {
+      const conversation = conversationOfExec(exec);
+      if (conversation !== undefined && appMode === 'sticker') conversation.stickerSentThisTurn = true;
+    },
     // 存表情包：不可用时传 undefined，`registerQqTools` 会跳过那个工具
     // （与 memory.tools 同一个规矩：不留「一调就报错」的壳）。
     saveSticker: stickerToolsRegistered ? saveSticker : undefined,

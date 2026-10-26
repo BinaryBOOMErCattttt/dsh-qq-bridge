@@ -91,6 +91,7 @@
     "scripts/*",
     "test/*.mjs",
     "deploy/*",
+    "deploy/SEMANTICS.md",
     "batch.js",
     "reminder-runtime.js",
     "routes.js",

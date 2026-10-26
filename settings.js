@@ -115,6 +115,22 @@ export function createSettings(config, defaultCwd) {
   // 上限 0.3 是「同一套画风只换了字」的实测下限（16%~23%）留出的安全边距，见 perceptual.js。
   const repeatImageTolerance = Math.min(0.3, Math.max(0, Number(config.repeatImageTolerance) || 0));
 
+  // —— 心情门控 ——
+  // 四个百分比（上限 / 两种模式的单次涨幅 / 阈值）互相有从属关系：单次涨幅和阈值都不能
+  // 超过上限，否则「moodMax 调小」时阈值永远够不到、表情门控等于永久关闭。所以先算上限，
+  // 其余三个都以它为 high 夹一次；非法值退回该档的默认值（而不是 0 —— 0 会让门控静默失效）。
+  const moodMax = clampedInt(config.moodMax, 1, 100, 100);
+  const moodTagMaxFull = clampedInt(config.moodTagMaxFull, 1, moodMax, moodMax);
+  const moodTagMaxSimple = clampedInt(config.moodTagMaxSimple, 1, moodMax, Math.min(50, moodMax));
+  const moodTriggerFull = clampedInt(config.moodTriggerFull, 1, moodMax, moodMax);
+  const moodTriggerSimple = clampedInt(config.moodTriggerSimple, 1, moodMax, moodMax);
+  // 冷场时长：下限 1 秒（0 会让每次收消息都归零 / 衰减，心情永远攒不起来），
+  // 上限用 MAX_TIMER_MS 与定时器口径保持一致（这里其实只做时间比较，但别让配置里的
+  // 天文数字把「几乎无限等」变成负数）。
+  const moodDecayIdleMs = clampedInt(config.moodDecayIdleMs, 1000, MAX_TIMER_MS, 180_000);
+  const moodZeroIdleMs = clampedInt(config.moodZeroIdleMs, 1000, MAX_TIMER_MS, 1_200_000);
+  const moduleEmojiMood = config.moduleEmojiMood !== false;
+
   // —— 自动复读 ——
   const repeatWindowMs = Math.max(0, Math.floor(Number(config.repeatWindowMs) || 0));
   const repeatCount = Math.max(2, Math.floor(Number(config.repeatCount) || 0));
@@ -291,6 +307,14 @@ export function createSettings(config, defaultCwd) {
     provider,
     model,
     agentPreset,
+    moodMax,
+    moodTagMaxFull,
+    moodTagMaxSimple,
+    moodTriggerFull,
+    moodTriggerSimple,
+    moodDecayIdleMs,
+    moodZeroIdleMs,
+    moduleEmojiMood,
     allowTools,
     resetUsers,
     resetCommand,

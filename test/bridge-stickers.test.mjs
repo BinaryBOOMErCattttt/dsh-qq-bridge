@@ -20,6 +20,11 @@ import { buildGif } from './gif-fixtures.mjs';
 
 after(async () => { await cleanupBoots(); });
 
+/** 表情目录里的图片文件（忽略 `SEMANTICS.md` 这类说明文件：存图会顺手补一行）。 */
+async function stickerImages(cwd) {
+  return (await readdir(join(cwd, '.qq-stickers'))).filter((name) => !name.endsWith('.md')).sort();
+}
+
 
 test('loadOutgoingImage reads paths inside cwd and URLs, and refuses everything else', async () => {
   const images = await startImageServer(TINY_PNG);
@@ -243,6 +248,32 @@ test('qq_save_sticker keeps a picture the conversation posted and it shows up in
   }
 });
 
+test('qq_save_sticker 顺手把新表情补进 SEMANTICS.md（插在表格里、不重复登记）', async () => {
+  const { onebot, host, cwd } = await bootImages();
+  onebot.push(privateMessage('在吗'));
+  const agent = await untilInbox(host, 1, 'the Agent');
+  try {
+    const save = (name, meaning, scene) => host.tools.get('qq_save_sticker').execute(
+      { source: '.qq-stickers/笑死.png', name, meaning, scene },
+      { agent },
+    );
+    const first = await save('委屈', '委屈、求安慰', '对方凶我时');
+    assert.match(first.semantics, /SEMANTICS\.md/);
+    let text = await readFile(join(cwd, '.qq-stickers', 'SEMANTICS.md'), 'utf8');
+    assert.match(text, /^\| 文件 \| 情绪 \| 适合 \| 慎用 \|$/mu, '没有模板时也要有表头');
+    assert.match(text, /\| \.qq-stickers\/委屈\.png \| 委屈、求安慰 \| 对方凶我时 \| — \|/u);
+    assert.doesNotMatch(text, /（示例）/u, '模板里的示例行不能带进运行时');
+
+    await save('难过', '难过', '');
+    text = await readFile(join(cwd, '.qq-stickers', 'SEMANTICS.md'), 'utf8');
+    assert.equal((text.match(/^\| 文件 \|/gmu) ?? []).length, 1, '只有一张表');
+    assert.ok(text.indexOf('难过.png') < text.indexOf('维护约定'), '新行要插在表格里，不能跑到约定后面');
+    assert.match(text, /\| \.qq-stickers\/难过\.png \| 难过 \| — \| — \|/u);
+  } finally {
+    await onebot.close();
+  }
+});
+
 
 /**
  * 表情包目录是系统提示里最后一块**会变**的内容：存一张图 / 改个名，提示词就差几个字，
@@ -287,7 +318,7 @@ test('qq_save_sticker refuses non-images, outside paths, unusable names, and ove
     // 同名**绝不覆盖**：不然群里任何人一句「存一下」就能把现有表情换掉。
     await assert.rejects(() => tool.execute({ source: '.qq-stickers/笑死.png', name: '笑死' }, {}), /already exists/);
     // 一次都没写成功：所有校验都发生在动目录之前。
-    assert.deepEqual((await readdir(join(cwd, '.qq-stickers'))).sort(), ['笑死.png']);
+    assert.deepEqual(await stickerImages(cwd), ['笑死.png']);
   } finally {
     await onebot.close();
   }
@@ -360,7 +391,7 @@ test('qq_rename_sticker moves the file and its catalogue row together', async ()
     assert.equal(renamed.renamed, true);
     assert.equal(renamed.bytes, TINY_PNG.length);
     // 文件是**搬过去**的：旧名字不在了，也不该多出一张同画面的副本。
-    assert.deepEqual((await readdir(join(cwd, '.qq-stickers'))).sort(), ['笑死.png', '难过.png']);
+    assert.deepEqual(await stickerImages(cwd), ['笑死.png', '难过.png']);
     assert.deepEqual(await readFile(join(cwd, '.qq-stickers', '难过.png')), TINY_PNG, '改的是名字，不是字节');
     // 目录那一条跟着搬：含义 / 场景 / 路径都在新名字下，旧名字一条不剩。
     // 看的是**下一轮的情境**（目录变了才补一次，系统提示不动）。
@@ -398,7 +429,7 @@ test('qq_rename_sticker refuses taken names and unusable names', async () => {
     // 找不到来源：说清目录里有哪些，别让模型去猜。
     await assert.rejects(() => rename().execute({ from: '不存在的表情', to: '新名字' }, { agent }), /没有「不存在的表情」/);
     // 一次都没动过目录。
-    assert.deepEqual((await readdir(join(cwd, '.qq-stickers'))).sort(), ['委屈.png', '笑死.png']);
+    assert.deepEqual(await stickerImages(cwd), ['委屈.png', '笑死.png']);
     // 存进去的那一条在下一轮的情境里（系统提示不动，见「表情包目录变了」那条）。
     onebot.push(privateMessage('再看一眼目录'));
     await untilInbox(host, 2, 'the next turn');

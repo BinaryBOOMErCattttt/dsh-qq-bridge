@@ -123,6 +123,10 @@ function qqSendImage(deps) {
         type: 'string',
         description: 'QQ number (private) or group number (group) to send the image to. Defaults to the current QQ conversation.',
       },
+      user_requested: {
+        type: 'boolean',
+        description: 'Model judgment: true ONLY when the user explicitly asked for a sticker/image this turn. The plugin then grants one sticker send without requiring full mood. Do not set it otherwise.',
+      },
     },
     output: {
       schema: {
@@ -154,7 +158,17 @@ function qqSendImage(deps) {
       // 收藏目录里的表情按「大表情」发（`sub_type: 1`），其它来源（`.qq-media` 截图、
       // 任意 URL、工作目录里的照片）照旧是普通图片 —— 见 `imageSegment` 的注释。
       const sticker = deps.isStickerFile?.(args.image) === true;
+      // 心情门控只卡收藏目录里的表情（普通截图 / 照片不受限）—— 判据与发送链路一致。
+      // 放行原因（`mood` / `request`）决定发出去之后要不要清零心情，所以必须留到发送成功。
+      let moodGrant;
+      if (sticker && deps.moodSticker !== undefined) {
+        moodGrant = deps.moodSticker.before(exec, args.user_requested === true);
+      }
       await deps.client.call(action, { [idKey]: id, message: [imageSegment(image.bytes, { sticker })] });
+      if (moodGrant !== undefined) deps.moodSticker.after(exec, moodGrant);
+      // 斗图模式的「这一轮发过图了」：工具这条路不走 replyPieces，得在这里记一笔，
+      // 否则正文没有标记时 turn/end 会误判成「又一轮没发图」。
+      if (sticker) deps.noteStickerSent?.(exec);
       // 同 `qq_send_message`：我发进群的图也要算进回复指向的进度。
       deps.noteOwnMessage(type, id);
       deps.report('info', `→ ${type === 'group' ? '群' : '私聊'} ${id}: ${image.format} 图 ${image.bytes.length} bytes（来源 ${image.label}）`);
@@ -210,6 +224,7 @@ function qqSaveSticker(deps) {
           format: { type: 'string', required: true },
           source: { type: 'string', required: true },
           catalog: { type: 'string' },
+          semantics: { type: 'string' },
         },
       },
       render: (_args, value) => [
@@ -220,7 +235,8 @@ function qqSaveSticker(deps) {
             value.catalog === undefined
               ? 'No sticker catalogue was updated (long-term memory is off, or the catalogue write failed) — the file itself is saved.'
               : `Sticker catalogue: ${value.catalog}`,
-          ].join('\n'),
+            value.semantics === undefined ? undefined : `Sticker semantics: ${value.semantics}`,
+          ].filter((line) => line !== undefined).join('\n'),
         },
       ],
     },
@@ -1334,6 +1350,11 @@ function qqSettings(deps) {
  * @param {(source: string) => boolean} [deps.isStickerFile] -
  *   判断来源是不是收藏目录里的表情包：是的话出站 image 段带 `sub_type: 1`（QQ 的大表情），
  *   否则按普通图片发。缺失时一律当普通图片（测试桩里可以不传）。
+ * @param {{ before: (exec: object, requested: boolean) => string, after: (exec: object, kind: string) => void }} [deps.moodSticker] -
+ *   发收藏表情前的心情门控：`before` 返回放行原因（`mood` / `request` / `free`），
+ *   没放行就抛错；`after` 在真的发出去之后收尾。缺失 = 不门控（测试桩可省）。
+ * @param {(exec: object) => void} [deps.noteStickerSent] -
+ *   记「这一轮发过一张表情」：斗图模式的连发提醒靠它，缺失只影响那一句提醒。
  * @param {(options: object) => Promise<object>} [deps.saveSticker] -
  *   把一张图存进表情包目录（校验 + 清洗文件名 + 张数上限 + 往 STICKERS.md 补一行）；
  *   缺失 = 不注册 qq_save_sticker。

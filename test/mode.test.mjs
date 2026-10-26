@@ -1,5 +1,5 @@
 /**
- * mode.js 的纯函数测试：模式名、参数解析、两档白名单。
+ * mode.js 的纯函数测试：模式名、参数解析、三档白名单。
  *
  * 这里钉的是「切模式时到底收窄了什么」：工具白名单只收窄不放宽、简洁模式自己必须能切回去、
  * 指令 → 模块的映射不漏。端到端（重建会话 / 保留上下文 / 落盘）在
@@ -21,11 +21,12 @@ import {
   toolsForMode,
 } from '../mode.js';
 
-test('modeLabel：完整 / 简洁，未知值退回完整（默认档）', () => {
+test('modeLabel：完整 / 简洁 / 斗图，未知值退回完整（默认档）', () => {
   assert.equal(modeLabel('full'), '完整');
   assert.equal(modeLabel('simple'), '简洁');
-  assert.equal(modeLabel('sticker'), '完整', '斗图还没搬，不能冒充一个已实现的模式');
-  assert.deepEqual(MODES, ['full', 'simple']);
+  assert.equal(modeLabel('sticker'), '斗图');
+  assert.equal(modeLabel('whatever'), '完整');
+  assert.deepEqual(MODES, ['full', 'simple', 'sticker']);
 });
 
 test('parseModeArg：中文 / 英文 / 大小写 / 空白都认，别的都不认', () => {
@@ -34,7 +35,9 @@ test('parseModeArg：中文 / 英文 / 大小写 / 空白都认，别的都不�
   assert.equal(parseModeArg('FULL'), 'full');
   assert.equal(parseModeArg(' 简洁 '), 'simple');
   assert.equal(parseModeArg('simple'), 'simple');
-  assert.equal(parseModeArg('斗图'), undefined, '斗图模式还没搬，不能悄悄切过去');
+  assert.equal(parseModeArg('斗图'), 'sticker');
+  assert.equal(parseModeArg('sticker'), 'sticker');
+  assert.equal(parseModeArg('表情包'), 'sticker');
   assert.equal(parseModeArg(''), undefined);
   assert.equal(parseModeArg(undefined), undefined);
 });
@@ -69,8 +72,10 @@ test('SIMPLE_ALLOWED_COMMANDS：模式自己必须在里面（否则切进去就
   }
 });
 
-test('SIMPLE_MODULES：简洁模式只认核心模块（当前是定档）', () => {
+test('SIMPLE_MODULES：简洁模式只认定档与心情门控', () => {
   assert.equal(SIMPLE_MODULES.has('handoff'), true);
+  // 心情门控在简洁模式里仍然生效（快照口径）：收窄的是能力面与主动性，不是表情。
+  assert.equal(SIMPLE_MODULES.has('emojiMood'), true);
   for (const name of ['fun', 'lookup', 'tts', 'reminders']) {
     assert.equal(SIMPLE_MODULES.has(name), false, name + ' 在简洁模式里必须被强制关掉');
   }

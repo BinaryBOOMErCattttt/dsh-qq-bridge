@@ -472,11 +472,20 @@ window.__ModuleLoader__.load({
       },
       {
         id: 'mode',
-        title: '运行模式（完整 / 简洁）',
+        title: '运行模式（完整 / 简洁 / 斗图）',
         // 模式本身用 QQ 私聊里的「模式」指令切（`data/mode.json`）；这一段放的是
-        // 完整模式下的模块开关与两档回复上限。简洁模式有自己的固定核心集合，
-        // 这里的 module* 在简洁模式里不生效（见 mode.js 的 SIMPLE_MODULES）。
+        // 完整模式下的模块开关、两档回复上限，以及心情门控的参数。简洁模式有自己的
+        // 固定核心集合，这里的 module* 在简洁模式里不生效（见 mode.js 的 SIMPLE_MODULES）；
+        // 心情门控在简洁模式里仍然生效，所以 mood* 不在「完整模式专用」那一类里。
         fields: [
+          'moduleEmojiMood',
+          'moodMax',
+          'moodTagMaxFull',
+          'moodTagMaxSimple',
+          'moodTriggerFull',
+          'moodTriggerSimple',
+          'moodDecayIdleMs',
+          'moodZeroIdleMs',
           'moduleFun',
           'moduleLookup',
           'moduleReminders',
@@ -628,6 +637,14 @@ window.__ModuleLoader__.load({
       forwardTimeoutMs: '取转发内容的超时（毫秒）',
       commands: '启用 @bot 指令',
       guestCommands: '允许访客用指令',
+      moduleEmojiMood: '心情与表情门控',
+      moodMax: '心情上限',
+      moodTagMaxFull: '完整模式单次涨幅',
+      moodTagMaxSimple: '简洁模式单次涨幅',
+      moodTriggerFull: '完整模式放行阈值',
+      moodTriggerSimple: '简洁模式放行阈值',
+      moodDecayIdleMs: '冷场衰减间隔',
+      moodZeroIdleMs: '冷场归零时间',
       moduleFun: '玩类模块',
       moduleLookup: '查询模块',
       moduleReminders: '提醒模块',
@@ -875,6 +892,8 @@ window.__ModuleLoader__.load({
       minDelayMs: formatMs,
       maxDelayMs: formatMs,
       privateAfterthoughtIdleMs: formatMs,
+      moodDecayIdleMs: formatMs,
+      moodZeroIdleMs: formatMs,
       digestTimeoutMs: formatMs,
       apiKeyProbeTimeoutMs: formatMs,
       reminderGraceMs: formatMs,
