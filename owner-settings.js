@@ -84,6 +84,10 @@ export const EXTRA_WRITABLE_KEYS = [
   'memoryVocabHint', 'memorySearchHits', 'digestAtHour', 'digestMaxChars', 'digestTimeoutMs',
   'digestCatchUp', 'digestRollover', 'digestConsolidate',
   'wakeTriggers', 'wakeText',
+  // 运行模式：模块开关与两档回复上限都是行为参数，主人在 QQ 侧就能调；
+  // 模式本身用「模式」指令切（见 index.js 的 modeCommand），不在这里。
+  'moduleFun', 'moduleLookup', 'moduleReminders', 'moduleTts', 'moduleHandoff',
+  'simpleReplyMaxChars', 'fullReplyMaxChars',
 ];
 
 const WRITABLE = new Set([...Object.keys(OWNER_SETTING_KEYS), ...EXTRA_WRITABLE_KEYS]);

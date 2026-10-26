@@ -77,6 +77,9 @@ export function createBatcher(deps) {
     ensureAgent,
     userMessageFor,
     describeConversation,
+    // 可选的窗口覆盖（返回毫秒；0 / 非函数 = 不覆盖）：简洁模式固定 5 秒，
+    // 切模式不重建 batcher，所以每次现取而不是装配时算一次。
+    batchWindowOverride,
   } = deps;
 
   // ---- 攒批：几个人同时 @ 时只回一轮 -----------------------------------------
@@ -98,6 +101,10 @@ export function createBatcher(deps) {
 
   /** 攒批窗口（毫秒）；配置非法或为 0 时返回 0，表示关闭攒批、来一条回一条。 */
   function batchWindow(scale) {
+    // 覆盖值优先于配置：简洁模式的 5 秒是这一档的语义，不该被 batchWindowMs 拉回 2 秒
+    // （否则「切过去更快接话」的承诺就落空了）。
+    const override = typeof batchWindowOverride === 'function' ? Number(batchWindowOverride()) : 0;
+    if (Number.isFinite(override) && override > 0) return override;
     return batchWindowRule(settings.batchWindowMs, scale);
   }
 

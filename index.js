@@ -60,6 +60,7 @@ import { createBatcher } from './batch.js';
 import { registerRoutes } from './routes.js';
 import { createKeyRotation } from './key-rotation.js';
 import { createPromptKit } from './prompt.js';
+import { COMMAND_MODULES, SIMPLE_ALLOWED_COMMANDS, SIMPLE_MODULES, modeLabel, parseModeArg, toolsForMode } from './mode.js';
 import {
   activeFollowAllows as activeFollowAllowsRule,
   activeTurnsLeft as activeTurnsLeftRule,
@@ -276,6 +277,17 @@ export function apply(ctx, config) {
   // `loader/volatile-update` 监听重启插件来重建。
   const baseSettings = createSettings(liveConfig(config), process.cwd());
   const cwd = baseSettings.cwd;
+  // 运行模式：完整 / 简洁。落盘在 data/mode.json；切换时重建当前会话的上下文
+  // （见 switchMode）。默认完整模式 —— 没有文件、文件坏了都按最全的那档起，
+  // 否则一次写坏的 JSON 会让 bot 悄悄少掉一半能力。
+  const MODE_FILE = join(cwd, 'data', 'mode.json');
+  let appMode = 'full';
+  try {
+    const savedMode = JSON.parse(readFileSync(MODE_FILE, 'utf8')).mode;
+    if (savedMode === 'simple' || savedMode === 'full') appMode = savedMode;
+  } catch {
+    // 没有文件 = 默认完整模式；读坏也当没有（不因为一个手滑把模式切到一半）。
+  }
   // 小功能共用的状态文件（米饭 / 木鱼 / 关注 / 投票 / 纪念日 / 接龙）。读坏了退回空对象。
   const chatState = createChatState({ file: resolve(cwd, 'data/chat-state.json'), report });
   // 主人覆盖层（qq_settings / 直接改 data/owner-settings.json）：只含白名单键，
@@ -340,7 +352,19 @@ export function apply(ctx, config) {
     settingsRestartTimer.unref?.();
   }
   // 工具白名单：去掉空白项与重复项。空数组 = 不限制，与 allowUsers / allowGroups 语义一致。
-  const allowTools = settings.allowTools;
+  // 完整模式用部署白名单；简洁模式只挂聊天/记忆/静默/设置需要的那几格（见 mode.js）。
+  const BASE_ALLOW_TOOLS = settings.allowTools;
+  // 这个数组**必须原地改**而不是换引用：memory / sticker / prompt 在装配时拿走了同一个
+  // 数组（它们按引用读白名单），切模式时换一个新数组，它们会继续看旧的那份 —— 结果是
+  // 工具面已经收窄、提示词却还在推荐看不见的工具。原地灌值让所有持有者一起看到新值。
+  const allowTools = [...BASE_ALLOW_TOOLS];
+  /** 按当前模式重算白名单（切模式后调；新 Agent 的 restrict 会在下一条消息上生效）。 */
+  function refreshAllowTools() {
+    const next = toolsForMode(BASE_ALLOW_TOOLS, appMode);
+    allowTools.length = 0;
+    allowTools.push(...next);
+  }
+  refreshAllowTools();
   // 会话重置指令：大小写不敏感，空串表示禁用。
   const resetCommand = settings.resetCommand;
   // ---- 主人（受信者）：QQ 号确认，最高权限 ----
@@ -1315,6 +1339,119 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * 模块开关：完整模式读配置，简洁模式只认固定核心集合。
+   *
+   * 简洁模式**不**再看 `module*`：那是给完整模式逐项微调用的；简洁模式的语义是「一刀切
+   * 收窄」，让它再受那些开关影响会出现「简洁模式里玩类反而开着」的怪状态。
+   * @param {string} name - 模块名（fun / lookup / reminders / tts / handoff）。
+   * @returns {boolean} 这个模块现在是否可用。
+   */
+  function moduleEnabled(name) {
+    if (appMode === 'simple') return SIMPLE_MODULES.has(name);
+    return settings[`module${name[0].toUpperCase()}${name.slice(1)}`] !== false;
+  }
+
+  /**
+   * 取最近 N 轮上下文（按转录行近似，2N 条；没有转录就空）。
+   *
+   * 为什么按行而不是按 turn：转录是插件唯一一份「真实说过什么」的记录（记忆关掉时就是
+   * 空），而它按消息行落盘，没有 turn 边界；2N 行是「N 轮一问一答」的近似，够接上话题
+   * 又不至于把整段历史塞进新会话。
+   * @param {object} conversation - 目标会话。
+   * @param {number} turns - 保留几轮。
+   * @returns {Promise<string>} 拼好的旧上下文文本。
+   */
+  async function modeContextText(conversation, turns) {
+    const lines = await todayTranscript(conversation.key);
+    const tail = lines.slice(-Math.max(2, turns * 2));
+    if (tail.length === 0) return '（没有可保留的最近对话）';
+    return tail
+      .map((line) => `${line.name ?? line.user ?? '某人'}：${String(line.text ?? '').replace(/\s+/gu, ' ').slice(0, 200)}`)
+      .join('\n');
+  }
+
+  /**
+   * 切模式：先留上下文，再重建会话；下一轮由提示词注入这段上下文。
+   *
+   * 为什么必须重建会话：两档模式的工具面、提示词与行为都不同，同一个 Session 里接着聊
+   * 会让模型同时看到「完整模式的能力清单」和「简洁模式的限制」，它只会挑对自己有利的
+   * 那条执行。重建之后旧会话仍留在磁盘上当存档，只是不再带进新的一轮。
+   *
+   * 为什么要在重建**之前**取上下文：重建会销毁 Agent 并让下一轮 resume 一个新的空会话，
+   * 之后再也读不到「刚才聊到哪」；先读出来挂在会话记录上，下一轮由 channelTurnContext
+   * 注入一次（turn/end 就清掉，免得以后每轮重复）。
+   * @param {object} conversation - 当前私聊会话。
+   * @param {'full' | 'simple'} next - 目标模式。
+   */
+  async function switchMode(conversation, next) {
+    if (next === appMode) {
+      void sendToConversation(conversation, `现在已经是${modeLabel(next)}模式。`);
+      return;
+    }
+    const turns = next === 'simple' ? 6 : 15;
+    const context = await modeContextText(conversation, turns);
+    const ok = await resetConversation(conversation);
+    if (!ok) {
+      // 旧会话没能销毁时**不要**改模式：新旧两个 Agent 同时挂着，回复会串到另一档的能力面。
+      void sendToConversation(conversation, '切换失败：旧会话没能关掉，模式没变。');
+      return;
+    }
+    appMode = next;
+    refreshAllowTools();
+    try {
+      await mkdir(dirname(MODE_FILE), { recursive: true });
+      await writeJsonAtomic(MODE_FILE, { mode: next, at: Date.now() });
+    } catch (error) {
+      // 落盘失败不影响本次运行（内存里已经切了），只是重启后会回到完整模式。
+      report('warn', `mode file write failed: ${errorText(error)}`);
+    }
+    conversation.modeContext = context;
+    conversation.modeContextLabel = `最近 ${turns} 轮`;
+    void sendToConversation(
+      conversation,
+      next === 'simple'
+        ? `已切到简洁模式：只保留聊天 / 记忆 / 静默 / 设置 / 定档，记忆按最近 6 轮，攒批 5 秒，主动搭话、复读、补一句全关。\n（切换时保留了最近 6 轮上下文，下一轮接上。）`
+        : `已切回完整模式：功能全开，记忆按最近 15 轮。\n（切换时保留了最近 15 轮上下文，下一轮接上。）`,
+    );
+  }
+
+  /**
+   * `模式` 指令：群里只提示私聊；私聊里所有人可看，只有主人能切。
+   *
+   * 为什么看和切分开：切模式会重建会话、收窄能力面，是主人级动作；但「现在是什么模式」
+   * 本身不敏感，访客问一句也应当能答 —— 否则群里有人发现回复变短了，还得去问主人。
+   * @param {object} command - 已解析的指令。
+   */
+  async function modeCommand(command) {
+    if (command.conversation.type !== 'private') {
+      commandReply(command, '模式只在私聊里说。');
+      return;
+    }
+    const arg = String(command.args ?? '').trim().toLowerCase();
+    if (arg.length === 0) {
+      commandReply(
+        command,
+        [
+          `当前模式：${modeLabel(appMode)}`,
+          '可切换：完整 / 简洁',
+          command.owner ? '切换：发「模式 完整」/「模式 简洁」' : '只有主人能切换模式。',
+        ].join('\n'),
+      );
+      return;
+    }
+    if (!command.owner) {
+      commandReply(command, '只有主人能切换模式。');
+      return;
+    }
+    const next = parseModeArg(arg);
+    if (next === undefined) {
+      commandReply(command, '只认「模式 完整」「模式 简洁」。');
+      return;
+    }
+    await switchMode(command.conversation, next);
+  }
+
   /** 执行一条指令（插件侧 / 模型侧在这里分流）。 */
   async function runCommand(command) {
     const name = command.command.name;
@@ -1324,6 +1461,17 @@ export function apply(ctx, config) {
     }
     if (!command.owner && settings.guestCommands !== true) {
       commandReply(command, '访客指令现在关着，等主人开。');
+      return;
+    }
+    // 简洁模式只放行核心指令（模式自己也在放行名单里，否则切进去就切不回来）。
+    if (appMode === 'simple' && !SIMPLE_ALLOWED_COMMANDS.has(name)) {
+      commandReply(command, '简洁模式只保留聊天 / 记忆 / 静默 / 设置 / 定档；要更多功能就切回完整模式。');
+      return;
+    }
+    // 模块开关：完整模式下单独关掉一片时，整条指令不可用（简洁模式已经由上面那关拦住）。
+    const commandModule = COMMAND_MODULES[name];
+    if (commandModule !== undefined && !moduleEnabled(commandModule)) {
+      commandReply(command, `「${commandModule}」模块现在是关的；要开就在设置里把 module${commandModule[0].toUpperCase()}${commandModule.slice(1)} 设成 true。`);
       return;
     }
     // 连点保护只给会打网络 / 会发图的三条；帮助 / 设置 / 状态不需要。
@@ -1383,6 +1531,7 @@ export function apply(ctx, config) {
         command,
         [
           `连接：${client.connected ? `已连 ${client.selfId}` : '未连接'}`,
+          `模式：${modeLabel(appMode)}`,
           `静默：${quietSummary()}`,
           `表情：${stickerLabel === undefined ? '目录不可用' : `${stickerFiles().length} 张`}`,
           `记忆：${memory.enabled ? '开' : '关'}`,
@@ -1614,6 +1763,10 @@ export function apply(ctx, config) {
       watches.push({ key: targetKey, keyword, by: command.userId, at: Date.now() });
       chatState.save();
       commandReply(command, `好，有人提到「${keyword}」我就私聊你。`);
+      return;
+    }
+    if (name === '模式') {
+      await modeCommand(command);
       return;
     }
     if (name === '定档') {
@@ -1978,6 +2131,9 @@ export function apply(ctx, config) {
     root: stickerRoot,
     inside: stickerInside,
     label: stickerLabel,
+    // 表情包文件名清单：`随机表情` / `接一个` / `状态` 都要用它；以前漏了解构，
+    // 这三条指令一执行就抛 `stickerFiles is not defined`（状态那条被模式用例撞出来了）。
+    files: stickerFiles,
     catalogLines: stickerCatalogLines,
     resolveSource: resolveStickerSource,
     sendSource: stickerSendSource,
@@ -2042,6 +2198,9 @@ export function apply(ctx, config) {
     ensureAgent,
     userMessageFor,
     describeConversation,
+    // 简洁模式的攒批窗口固定 5 秒（快照语义：简洁要更快接话）；返回 0 = 不覆盖。
+    // 做成函数而不是数值：切模式不重建 batcher，读的时候必须拿当前 appMode。
+    batchWindowOverride: () => (appMode === 'simple' ? 5000 : 0),
   });
   const {
     enqueue,
@@ -2153,6 +2312,8 @@ export function apply(ctx, config) {
     stickerRenameAllowed,
     imageAllowed,
     canReadImages,
+    // 模式在运行时改，提示词装配时现读；切成简洁之后新建的会话才会带上简洁那段。
+    modeOf: () => appMode,
   });
 
   // 设置页的两条 Host 路由（会话列表 / 重置、定时任务看板）搬去了 routes.js；
@@ -2683,7 +2844,9 @@ export function apply(ctx, config) {
       return;
     }
     try {
-      tools.restrict({ allow: allowTools });
+      // 拷贝一份：allowTools 会在切模式时原地改，真实宿主可能保存这个数组的引用，
+      // 不拷贝的话「上一档的白名单」会随着下一次切换悄悄变化。
+      tools.restrict({ allow: [...allowTools] });
       report('info', `${agent?.id ?? 'agent'} limited to tools: ${allowTools.join(', ')}`);
       return;
     } catch (error) {
@@ -2716,9 +2879,12 @@ export function apply(ctx, config) {
     if (conversation.type !== 'group') return [];
     const list = ambient.get(conversation.id) ?? [];
     if (list.length === 0) return [];
+    // 简洁模式只给最近 6 条：这一档的承诺是「少看一点、快点接话」，把整段环境塞给它
+    // 就等于又回到完整模式的上下文开销。
+    const recent = appMode === 'simple' ? list.slice(-6) : list;
     return [
       '群里最近的消息（旧 → 新；都不是发给你的，只是让你知道大家在聊什么，不必逐条回应）：',
-      ...list.map((entry) => `  ${entry.name}: ${entry.text}`),
+      ...recent.map((entry) => `  ${entry.name}: ${entry.text}`),
       '',
     ];
   }
@@ -2868,6 +3034,16 @@ export function apply(ctx, config) {
     // 或目录变了时给一次。
     const catalogLines = stickerCatalogLines(conversation);
     if (catalogLines.length > 0) lines.push('', ...catalogLines);
+    // 模式切换时留下的最近几轮：只喂下一轮，turn/end 立刻清掉。放这里而不是系统提示，
+    // 是因为它随「切模式」这个动作出现、下一轮就消失 —— 进稳定段会让 DSH 把整份人设再
+    // 追加一份（见 channelPrompt 的注释）。
+    if (typeof conversation.modeContext === 'string' && conversation.modeContext.length > 0) {
+      lines.push(
+        '',
+        '（模式切换时保留了' + (conversation.modeContextLabel ?? '最近对话') + '，用于接上话题；以下是旧上下文：）',
+        conversation.modeContext,
+      );
+    }
     // 检索式记忆：每轮按当前消息重新检索，放系统提示里就等于每轮换一次整段提示。
     // 「同一条只给一次」的账在 memory.js（`recallLedger`）：这一轮没有新东西时一个字都不加，
     // 也不再补一句「记忆还是空的」—— 系统提示里已经说清它去哪儿查，而这块每轮都会留在
@@ -3341,6 +3517,13 @@ export function apply(ctx, config) {
        * 标记写在记录上（不是模块变量），换代之后会自然地再查一次。
        */
       nameLookup: false,
+      /**
+       * 切模式时保留下来的最近几轮旧上下文（`switchMode` 在重建会话之前读出来）。
+       * 只喂下一轮：`channelTurnContext` 读它，`turn/end` 立刻清掉 —— 留着会让以后每轮
+       * 都重复一遍「上次聊到哪」，白白撑大历史。
+       */
+      modeContext: undefined,
+      modeContextLabel: undefined,
       /**
        * 表情包目录「上次给过哪一份」的账（`{ generation, key }`），见 `stickerCatalogLines`。
        * `undefined` = 本会话还没给过，下一轮会补一次。
@@ -4046,6 +4229,9 @@ export function apply(ctx, config) {
    * @param canAct - 这条消息能不能触发复读（被 @ 的那条只能记账，不能跟）。
    */
   function maybeRepeat(event, selfId, canAct) {
+    // 简洁模式不复读：这一档明确承诺「不主动、不跟着刷」，复读虽然零 token，但它也是
+    // 一种主动开口。判定放在最前面，连记账都不做（省一次表情包下载）。
+    if (appMode === 'simple') return;
     if (!settings.repeat) return;
     if (!settings.groupChat || event?.message_type !== 'group') return;
     const groupId = String(event.group_id);
@@ -4464,6 +4650,9 @@ export function apply(ctx, config) {
    * @param now - 判定通过的时刻（毫秒）。
    */
   function proactiveSpeak(conversation, now) {
+    // 简洁模式不主动搭话：切过去就是「别自己冒泡」。放在记账之前 —— 这一轮不该消耗
+    // 当天的主动说话次数，也不该把 lastProactiveAt 往后推。
+    if (appMode === 'simple') return;
     conversation.proactiveCount = dailyCount(conversation, 'proactiveDay', 'proactiveCount') + 1;
     conversation.lastProactiveAt = now;
     // 人设的「主动搭话」场景段读它（`personaSceneFor`）；turn/end 会清掉。
@@ -4732,6 +4921,9 @@ export function apply(ctx, config) {
    * @param seq - 挂这个定时器时的编号（对不上说明已经被取代）。
    */
   function runChime(conversation, seq) {
+    // 简洁模式不补一句：与主动搭话同一个理由（这一档不做「没人问也开口」的事）。
+    // 定时器仍会被 scheduleChime 挂上，醒来发现模式不对就什么都不做，不必回头清。
+    if (appMode === 'simple') return;
     // 定时器挂上之后才被静默的：到点再判一次，静默优先于任何「补一句」的理由。
     if (isMuted(conversation.key)) return;
     const now = Date.now();
@@ -5695,9 +5887,19 @@ export function apply(ctx, config) {
       flushIfIdle(conversation);
     }
     if (owner === undefined) return;
+    // 模式切换的旧上下文只喂一轮；这一轮结束就清掉，避免以后每轮都重复。
+    // 放在 reminder 分支之前：提醒那一轮也会读到它（它同样是「下一轮」）。
+    if (conversation !== undefined) {
+      conversation.modeContext = undefined;
+      conversation.modeContextLabel = undefined;
+    }
     const reason = event.data.reason?.kind;
     // 只发该 turn 里最后一条有文本的 assistant 消息；中间步骤的工具调用等不发给 QQ。
     let reply = list?.[list.length - 1]?.trim() ?? '';
+    // 硬字数上限：简洁 400 / 完整 800（0 / 非法值 = 不截断）；协议上限仍是 maxReplyChars。
+    // 在 SKIP / 提醒判定之前裁：裁完才看得出这一轮到底有没有正文。
+    const replyCap = appMode === 'simple' ? settings.simpleReplyMaxChars : settings.fullReplyMaxChars;
+    if (Number.isFinite(replyCap) && replyCap > 0) reply = clipChars(reply, replyCap);
 
     // 定时提醒的 agent/prompt 轮：必须在 error / SKIP / aborted 之前收账。
     // 这几个分支在普通轮次里是「静默丢弃」，但提醒不能静默 —— 要让 reminders.js 拿到
@@ -5826,6 +6028,15 @@ export function apply(ctx, config) {
   // `defineTool` 声明本身没有策略（校验参数 → 调一个函数 → 拼一段 render），却占了
   // 五百多行、最深处缩进到 20 层，所以整块搬去了 `tools.js`。这里只做装配：把闭包里那
   // 几个函数显式递过去 —— 工具能碰到哪些状态，看这份依赖表就够了，不用去翻闭包。
+  // 表情包工具的注册只看**完整模式**的白名单：模式是运行时可切的，而工具注册只在
+  // apply() 跑一次 —— 用当前模式判断的话，一次以简洁模式启动就会把这两个工具永久注销，
+  // 之后切回完整模式也回不来。真正的「这一档不让用」由 tools.restrict 的白名单负责。
+  const stickerToolsRegistered = imageSend && stickerRoot !== undefined && stickerInside
+    && (BASE_ALLOW_TOOLS.length === 0
+      || (BASE_ALLOW_TOOLS.includes('qq_send_image') && BASE_ALLOW_TOOLS.includes('qq_save_sticker')));
+  const stickerRenameRegistered = imageSend && stickerRoot !== undefined && stickerInside
+    && (BASE_ALLOW_TOOLS.length === 0
+      || (BASE_ALLOW_TOOLS.includes('qq_send_image') && BASE_ALLOW_TOOLS.includes('qq_rename_sticker')));
   registerQqTools(ctx, {
     client,
     cwd,
@@ -5842,7 +6053,7 @@ export function apply(ctx, config) {
     isStickerFile,
     // 存表情包：不可用时传 undefined，`registerQqTools` 会跳过那个工具
     // （与 memory.tools 同一个规矩：不留「一调就报错」的壳）。
-    saveSticker: stickerSaveAllowed() ? saveSticker : undefined,
+    saveSticker: stickerToolsRegistered ? saveSticker : undefined,
     // 受信写盘：editor 缺失（trustedWrite 关掉）时不注册那三个工具；权限在
     // writeAuthority 里按「这一轮谁在说话」现判（见 docs/tools.md「受信写盘」）。
     editor,
@@ -5866,7 +6077,7 @@ export function apply(ctx, config) {
     // 给已收藏的表情改名：文件与 STICKERS.md 一起搬，别让模型「用新名字再存一遍」
     // 造出一张同画面的重复表情（真实事故，见 renameSticker 的注释）。记忆关掉时
     // 仍可注册：那只是少更新一份目录（与 saveSticker 同一口径）。
-    renameSticker: stickerRenameAllowed() ? renameSticker : undefined,
+    renameSticker: stickerRenameRegistered ? renameSticker : undefined,
     // 戳一戳：与通知事件共用同一个「怎么戳」（动作名在不同实现里不一样，见 pokeBack）。
     poke: settings.pokeReply === true ? pokeBack : undefined,
     imageSend,

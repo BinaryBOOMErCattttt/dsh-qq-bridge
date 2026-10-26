@@ -54,7 +54,8 @@ node --test test\
 > `test/forget.test.mjs`（`ops forget` 的删除边界：目标会话 / 别的会话 / 共享资源）、
 > `test/commands.test.mjs`、`test/mute.test.mjs`、`test/editor.test.mjs`、
 > `test/owner-settings.test.mjs`、`test/weather.test.mjs`、`test/balance.test.mjs`、
-> `test/fun.test.mjs`（指令解析 / 静默 / 受信写盘 / 配置覆盖层 / 天气 / 余额 / 零 token 小玩意；
+> `test/fun.test.mjs`、`test/mode.test.mjs`（运行模式的两档白名单；端到端见 `test/bridge-mode.test.mjs`）
+> （指令解析 / 静默 / 受信写盘 / 配置覆盖层 / 天气 / 余额 / 零 token 小玩意；
 > 后三个的网络请求都注入假 `fetch`，不联网）。行为层的用例在
 > `test/bridge*.test.mjs`（共享夹具在 `test/harness.mjs`）：
 > 气泡条数与中断、标点清洗、引用指向（表情消息不引用）、C 路四条排除、私聊补一句、戳一戳、链接预览、

@@ -58,6 +58,7 @@ export const COMMANDS = [
   { name: '取消关注', aliases: ['取关'], level: 'owner', kind: 'plugin', group: '管', args: '<关键词>', summary: '取消一个关键词关注' },
   { name: '关注列表', aliases: ['订阅列表'], level: 'owner', kind: 'plugin', group: '管', args: '', summary: '看当前关注的关键词' },
   { name: '纪念日', aliases: ['记纪念日'], level: 'owner', kind: 'plugin', group: '管', args: '<MM-DD> <内容>', summary: '记一个每年提醒的纪念日' },
+  { name: '模式', aliases: ['mode', '运行模式'], level: 'guest', kind: 'plugin', group: '管', args: '[完整|简洁]', summary: '看当前运行模式；主人可在私聊里切完整 / 简洁' },
   { name: '定档', aliases: ['交接', '存档重开'], level: 'owner', kind: 'plugin', group: '管', args: '', summary: '把上下文写进交接文档，归档旧会话并新开一轮' },
   { name: '纪念日列表', aliases: ['纪念日们'], level: 'owner', kind: 'plugin', group: '管', args: '', summary: '看已记的纪念日' },
   { name: '别复读', aliases: ['关复读', '闭嘴复读'], level: 'owner', kind: 'plugin', group: '管', args: '', summary: '这个群不再自动复读' },

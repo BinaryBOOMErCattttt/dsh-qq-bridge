@@ -471,6 +471,22 @@ window.__ModuleLoader__.load({
         ],
       },
       {
+        id: 'mode',
+        title: '运行模式（完整 / 简洁）',
+        // 模式本身用 QQ 私聊里的「模式」指令切（`data/mode.json`）；这一段放的是
+        // 完整模式下的模块开关与两档回复上限。简洁模式有自己的固定核心集合，
+        // 这里的 module* 在简洁模式里不生效（见 mode.js 的 SIMPLE_MODULES）。
+        fields: [
+          'moduleFun',
+          'moduleLookup',
+          'moduleReminders',
+          'moduleTts',
+          'moduleHandoff',
+          'simpleReplyMaxChars',
+          'fullReplyMaxChars',
+        ],
+      },
+      {
         id: 'batch',
         title: '攒批与群聊上下文',
         fields: [
@@ -584,7 +600,7 @@ window.__ModuleLoader__.load({
      */
     const TABS = [
       { id: 'connect', label: '连接', title: '连接与准入', sections: ['connection', 'admission'] },
-      { id: 'session', label: '会话', title: '会话与节奏', sections: ['agent', 'quiet', 'batch', 'style'] },
+      { id: 'session', label: '会话', title: '会话与节奏', sections: ['agent', 'mode', 'quiet', 'batch', 'style'] },
       { id: 'persona', label: '人格', title: '人格与表达', sections: ['persona', 'expression'] },
       { id: 'group', label: '群聊', title: '群聊互动', sections: ['repeat', 'proactive', 'active'] },
       { id: 'reminder', label: '提醒', title: '定时提醒', sections: ['reminder'] },
@@ -612,6 +628,13 @@ window.__ModuleLoader__.load({
       forwardTimeoutMs: '取转发内容的超时（毫秒）',
       commands: '启用 @bot 指令',
       guestCommands: '允许访客用指令',
+      moduleFun: '玩类模块',
+      moduleLookup: '查询模块',
+      moduleReminders: '提醒模块',
+      moduleTts: '语音模块',
+      moduleHandoff: '定档模块',
+      simpleReplyMaxChars: '简洁模式回复上限',
+      fullReplyMaxChars: '完整模式回复上限',
       endpoint: 'OneBot WebSocket 地址',
       imageSend: '让 Agent 主动发图',
       napcatAutoConfig: '自动补 NapCat 配置',
@@ -865,6 +888,8 @@ window.__ModuleLoader__.load({
       memoryFileMaxBytes: formatBytes,
       // 字符
       maxReplyChars: formatChars,
+      simpleReplyMaxChars: formatChars,
+      fullReplyMaxChars: formatChars,
       ambientLineChars: formatChars,
       repeatMaxChars: formatChars,
       personaMaxChars: formatChars,

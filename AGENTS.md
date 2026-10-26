@@ -95,6 +95,7 @@ mute.js         静默纯函数：唤醒词（只认主人）、状态 parse/ser
 editor.js       受信写盘：路径边界、唯一匹配替换、写前备份、SKILL.md
 owner-settings.js  主人侧配置覆盖层：可写键、与 settings 合并、8 秒后重启
 commands.js     指令登记表与解析（第一个空白前的词才是指令）
+mode.js         运行模式纯函数：完整 / 简洁两档、简洁放行的指令 / 模块 / 工具集合
 weather.js / balance.js  天气（Open-Meteo）与余额（`/user/balance`）：fetch 注入、可单测
 fun.js / music.js / chat-state.js  零 token 小玩意、点歌（只回链接）、`data/chat-state.json`
 tts.js          TTS 框架（`registerTtsProvider` / `synthesize`），不接在线服务（默认关）
@@ -102,7 +103,7 @@ util.js         **不碰运行时状态**的纯函数（清单见本节末）
 filestore.js    原子写 / 尽力而为读（读不到返空而不抛错）；`writeTextAtomicUtf16` 专给 Windows 产物
 config.js       配置 schema（**唯一真相**）：100+ 带中文 `.description()` 的字段；根上 `.volatile()`（§5.12）
 settings.js     配置运行时视图：默认值/类型/夹紧/去空白（`index.js` 只读 `settings.*`）
-client.js       浏览器半侧（手写 bundle）：schema → 设置页；7 `TABS` / 15 `SECTIONS`（§5.12）
+client.js       浏览器半侧（手写 bundle）：schema → 设置页；7 `TABS` / 18 `SECTIONS`（§5.12）
 tools.js        宿主平面工具的**声明**（qq_send_*/qq_poke/qq_save_sticker/qq_rename_sticker/qq_list_conversations/qq_transcript/qq_memory/qq_remind_*）
 memory.js       长期记忆子系统：转录落盘、记忆读写、检索注入、迁移、滚档、摘要
 memory-select.js  记忆纯函数：markdown → record、打分、按节配额、archivePlan、upsert/remove
@@ -131,7 +132,7 @@ test/<模块>.test.mjs   纯函数与契约用例（一行一模块）：
   speaking-rules（每例只翻一个字段）、mention（标记边界、名单按会话隔离）、util（写边界、memorySlug、
   本地时间、errorText、key 打码、isVolatileRef/liveConfig）、filestore（不抛错的失败语义）、
   perceptual（畸形输入、解压炸弹）、media（fetchBytes 的 SSRF）、mute、editor、owner-settings、weather、
-  balance、fun、commands、migrate-cognition、napcat、desktop
+  balance、fun、commands、mode、migrate-cognition、napcat、desktop
 test/persona-template.test.mjs  人设模板/提示词/自检的契约（零解析警告、单底色、长度上限、不失链、退出码）
 test/image-fixtures.mjs  测试共用的图片 fixture（真编码的字节）
 cordis.patch.yml      插件自带 bundle patch：注册 `qq` Agent 预设（含 skill 平面）+ 插件 config
@@ -341,6 +342,7 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；harness.mj
 | 改「存表情包」 | `util.js` 的 `stickerFileName`（写边界）+ `sticker.js` 的 `saveSticker`/`stickerSaveAllowed` + `Config.stickerMaxFiles` + `writeBytesAtomic` + `allowTools` |
 | 改「给表情改名」 | `cognition.js` 的 `renameStickerRow` + `memory.js` 的 `renameStickerEntry` + `sticker.js` 的 `renameSticker`/`stickerRenameAllowed`（写失败回滚）+ docs/media.md |
 | 改群触发 / 白名单 / 复读 | `index.js` 的 `admit` / `maybeRepeat` 区块 |
+| 改运行模式（完整 / 简洁） | `mode.js`（两档常量与白名单）+ `index.js` 的 `appMode` / `switchMode` / `modeContextText` / `modeCommand` / `moduleEnabled` + `batch.js` 的窗口覆盖 + `prompt.js` 的简洁段 + `Config` 的 `module*` / `*ReplyMaxChars` + `client.js` 的 `mode` 分组 + docs/commands.md、docs/configuration.md + `test/mode.test.mjs` / `test/bridge-mode.test.mjs` |
 | 改指令 / 静默 / 受信写盘 | `commands.js`（`parseCommand`，判据是**短句**：第一个空白前的词）+ `mute.js` + `owner-settings.js` + `editor.js` + `index.js` 三处旁路（`admit` 前分流 / `qq_quiet` / `writeAuthority`）+ `Config.commands`/`wake*`/`mute*`/`trustedWrite`/`skillWriteDir`/`writeMaxBytes` + docs/commands.md、docs/tools.md；**部署级字段（provider/model/endpoint/凭据/白名单）只能留在只读那侧** |
 | 改回复的指向（引用 / @） | `send.js` 的 `quoteHead` + `admit` 快照的 `chatter.anchor()` + `Config.replyStyle`；**`continued`/`interject` 在第一行就返回 undefined**；进度读数**含机器人自己发的话**（`noteSelf`，别换 `others()`，也别删 `noteOwnMessage` —— NapCat `reportSelfMessage: false`，自己发的话等不到回灌） |
 | 改「@ 人」 | `mention.js` + `index.js` 的 `registerParticipant`/`conversationMentions`/`sendParts` 与 `sender.mentions` + `qq_send_message` + 提示词那两条 `[[@昵称]]`；显示口径（群名片优先）在 `userDisplayName`，**正文与名单同源**；`Config` 里**没有**配置项 |

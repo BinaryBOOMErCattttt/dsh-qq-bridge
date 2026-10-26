@@ -49,6 +49,18 @@ export const Config = z.object({
   blankReply: z.boolean().default(true).description('是否理会「没有正文」的消息：群里单纯 @ 它一下、或者私聊发一个空格 —— 这类消息照常交给模型（正文位置写明「@了你一下，没有说别的」/「发来一条空消息」），由它看着这段聊天的上下文决定回一句「？」、发张表情包、还是接上一句；false = 和以前一样静默丢弃（群里被人反复空 @ 时可以一键关掉）'),
   commands: z.boolean().default(true).description('是否启用「@bot + 空格 + 指令」的指令路由：帮助 / 天气 / 随机表情 / 表情 / 白饭 / 小作文（访客可用）、状态 / 余额 / 设置（主人专用）。关掉后这些词全部当普通聊天交给模型'),
   guestCommands: z.boolean().default(true).description('是否允许访客（非主人）使用公开指令：帮助 / 天气 / 随机表情 / 表情 / 白饭 / 小作文；关掉后只有主人能用指令。主人专用指令始终只认主人'),
+  // ---- 运行模式：完整 / 简洁（私聊发「模式」切换，见 docs/commands.md）----
+  // 为什么是一组模块开关而不是把功能写死：完整模式要能单独关掉一片（例如不想让它玩骰子），
+  // 简洁模式则是**整套**收窄 —— 它只认固定的核心集合，这里的 module* 在简洁模式里不生效
+  // （见 mode.js 的 SIMPLE_MODULES）。只收已经搬进本仓库的模块；调试 / 心情 / 软命令那几个
+  // 开关等对应分片落地时再加，免得出现「配了却没有任何行为」的死字段。
+  moduleFun: z.boolean().default(true).description('玩类模块：抽签 / 吃饭 / 骰子 / 硬币 / 点名 / 点歌 / 接一个 / 投票 / 复读 / 存表情等指令'),
+  moduleLookup: z.boolean().default(true).description('查询模块：天气 / 余额 / 群热度 / 随机表情'),
+  moduleReminders: z.boolean().default(true).description('提醒模块：`提醒` 指令（定时任务本身仍由 reminder 开关控制，关掉这一项不会让已建的任务失效）'),
+  moduleTts: z.boolean().default(true).description('语音模块：`语音` 指令（还需要 tts 打开并注册 provider）'),
+  moduleHandoff: z.boolean().default(true).description('定档模块：`定档` 指令'),
+  simpleReplyMaxChars: z.number().default(400).description('简洁模式一次回复的硬上限（字符）：超过直接截断，避免啰嗦；0 = 不截断（协议上限仍是 maxReplyChars）'),
+  fullReplyMaxChars: z.number().default(800).description('完整模式一次回复的硬上限（字符）：超过直接截断；协议上限仍是 maxReplyChars；0 = 不截断'),
   // ---- 语音（TTS）：只留框架，仓库不内置任何第三方语音服务 ----
   tts: z.boolean().default(false).description('是否启用「语音 <文字>」指令：需要先在 tts.js 里注册一个 provider（本地 Kokoro / Piper / 自建服务，或你自己的授权 API）。默认关，未注册时指令只回「未配置」，不会联网'),
   ttsMaxChars: z.number().default(200).description('一次语音最多念多少字（超过截断）：QQ 语音太长会失败，200 字大约 40 秒'),
