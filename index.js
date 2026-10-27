@@ -3105,9 +3105,6 @@ export function apply(ctx, config) {
     // 私聊仍然是「没呢，你怎么也还没睡」这种两句一条。那一轮的情境里还有一句人设的
     // 「别连着轰炸」在反向拉，两者都改掉之后，再在这里补一枪：这一行离模型开口最近。
     // 用**正向**写法、不写条数；reminder 轮的原样发送不走拟人分条，humanize 关掉时也没有。
-    if (settings.humanize === true && conversation.pendingIntent !== 'reminder') {
-      lines.push('', '- 想说的话一句一条，分几条发（换行 = 分条）。');
-    }
     // 调试提权：给模型这段「你现在能碰什么」的说明。它只在 10 分钟窗口里出现、
     // 且只对开启它的那个私聊会话，属于**每轮会变**的东西 —— 不能放系统提示（见
     // channelPrompt 的注释：那会让 DSH 每次开 / 关 debug 都追加一整份人设）。
@@ -3120,6 +3117,11 @@ export function apply(ctx, config) {
     const topicBrief = topics.briefLines(conversation);
     if (topicBrief.length > 0) {
       lines.push('', '（长期话题：这些是高频率话题的短摘要，不是本轮聊天记录。）', ...topicBrief);
+    }
+    // 「一句一条」必须是情境的最后一行（离模型开口最近）。话题摘要 / 调试说明都属于
+    // 会变的信息，只能排在它前面 —— 否则这条提醒会被挤到中间，模型照旧缝成一条。
+    if (settings.humanize === true && conversation.pendingIntent !== 'reminder') {
+      lines.push('', '- 想说的话一句一条，分几条发（换行 = 分条）。');
     }
     const body = lines.join('\n').trim();
     if (body.length === 0) return '';
