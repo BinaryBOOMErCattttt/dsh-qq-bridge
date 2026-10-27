@@ -13,7 +13,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sessionIdFor } from '../index.js';
-import { promptText, turnContextText, until, untilInbox, privateMessage, groupMessage, mention, settle, bootMemory, msUntilHour, readMemory, waitForDigestRecord, localDateOf } from './harness.mjs';
+import { promptText, turnContextText, until, untilInbox, untilAgent, privateMessage, groupMessage, mention, settle, bootMemory, msUntilHour, readMemory, waitForDigestRecord, localDateOf } from './harness.mjs';
 import { cleanupBoots } from './harness.mjs';
 
 after(async () => { await cleanupBoots(); });
@@ -59,10 +59,13 @@ test('every incoming message is appended to the transcript, including ambient gr
 
 /** qq_transcript 的 list / read / search 三个动作，以及「默认就是当前会话」。 */
 test('qq_transcript lists conversations and reads and searches their records', async () => {
-  const { onebot, host } = await bootMemory();
+  const { onebot, host, cwd } = await bootMemory();
   onebot.push(privateMessage('周六去看那个展吗'));
   onebot.push(privateMessage('展叫什么来着'));
-  const agent = await until(() => host.list.created[0], 'the conversation Agent to be created');
+  // 等消息真的投进收件箱，而不是只等 created[0]：插件把 Agent 登记进 sessionIndex 是在
+  // create() 返回**之后**，所以抢跑时下面「默认就是当前会话」那种 `{ agent }` 调用会报
+  // 「cannot tell which conversation this is about」。消息进了收件箱 ⇒ 登记已经做完。
+  const agent = await untilInbox(host, 1, 'the conversation Agent to receive its message');
   const tool = host.tools.get('qq_transcript');
   assert.ok(tool, 'qq_transcript should be registered');
   // 等两条都进转录（第二条提交后才算完一轮，但转录是先写的）。
@@ -71,6 +74,14 @@ test('qq_transcript lists conversations and reads and searches their records', a
     return value.returned >= 2 ? value : undefined;
   }, 'both private messages to be recorded');
 
+  // `list` 报的会话名来自 `<会话目录>/meta.json`，而这份元信息和 jsonl 是**两条**互不等待
+  // 的后台写盘线（appendTranscript 里一个按会话排队、一个是 fire-and-forget）。所以
+  // 「转录里已经有两行」并不等于「meta.json 已经落盘」——等这份元信息真的写出来再断言，
+  // 否则 list 会退回目录名（private-100000002），随机红成「会话名不对」。
+  await until(
+    () => existsSync(join(cwd, '.qq-memory', 'conversations', 'private-100000002', 'meta.json')),
+    'the transcript metadata to be written',
+  );
   const listed = await tool.execute({ action: 'list' }, {});
   assert.equal(listed.lines.length, 1);
   assert.equal(listed.lines[0].conversation, 'private:100000002');
@@ -212,7 +223,12 @@ test('a digest sweep summarizes a conversation that has something new', async ()
   assert.equal(record.lastDigestDate, localDateOf(), 'the digest should be recorded under today\'s date');
 
   // 摘要 Agent 是一个**独立会话**（不是那个正在聊天的会话），它拿到的正文是转录窗口。
-  const digestAgent = host.list.created.find((agent) => agent.id !== host.list.created[0].id);
+  // 等「摘要会话收到它那条指令」：digest.json 落盘与 followup 是两条异步线，
+  // 只按 id 找会读到空收件箱（下面就读 inbox[last]）。
+  const digestAgent = await until(
+    () => host.list.created.find((agent) => agent.id !== host.list.created[0].id && agent.inbox.length >= 1),
+    'the digest session to receive its instruction',
+  );
   assert.ok(digestAgent, 'a separate digest session should have been created');
   const instruction = digestAgent.inbox[digestAgent.inbox.length - 1].content[0].text;
   assert.match(instruction, /private:100000002/);
@@ -390,7 +406,9 @@ test('a private chat cannot write the global COGNITION.md or PEOPLE.md', async (
   const tool = host.tools.get('qq_memory');
   onebot.push(privateMessage('私聊里聊点事'));
   const privateId = sessionIdFor('private:100000002');
-  const privateAgent = await until(() => host.list.created.find((agent) => agent.id === privateId), 'the private Agent');
+  // 等「这个 Agent 收到了自己那条消息」：插件登记 sessionIndex 在 create() 返回之后，
+  // 抢跑时下面 `{ agent }` 的调用认不出会话，记忆写入闸门会对私聊写入 fail-open（假红）。
+  const privateAgent = await untilAgent(host, privateId, 1, 'the private Agent to receive its message');
   await assert.rejects(
     () => tool.execute({ action: 'upsert', path: 'COGNITION.md', name: '私聊梗', meaning: '私聊里学的说法' }, { agent: privateAgent }),
     /private chat must not write/,
@@ -413,7 +431,8 @@ test('a private chat cannot write the global COGNITION.md or PEOPLE.md', async (
   // 对照：群会话写同一个全局文件是允许的（闸门不是一刀切）。
   onebot.push(mention('群里也说一个梗'));
   const groupId = sessionIdFor('group:100000001');
-  const groupAgent = await until(() => host.list.created.find((agent) => agent.id === groupId), 'the group Agent');
+  // 同上：群会话的 Agent 也要等消息落进收件箱，`{ agent }` 才认得它。
+  const groupAgent = await untilAgent(host, groupId, 1, 'the group Agent to receive its message');
   await tool.execute({ action: 'upsert', path: 'COGNITION.md', name: '公共梗', meaning: '群里公开说的' }, { agent: groupAgent });
   assert.match(await readMemory(cwd, 'COGNITION.md'), /公共梗｜群里公开说的/);
   // 人物表与热层记忆也支持逐条 upsert（新的结构化路径）。
@@ -476,7 +495,8 @@ test('memory rollover archives the least active rows instead of deleting them', 
   const tool = host.tools.get('qq_memory');
   onebot.push(privateMessage('你好'));
   const privateId = sessionIdFor('private:100000002');
-  const agent = await until(() => host.list.created.find((item) => item.id === privateId), 'the private Agent');
+  // 等收件箱里真有那条消息：`{ agent }` 写记忆要靠 sessionIndex，而它在 create() 之后才登记。
+  const agent = await untilAgent(host, privateId, 1, 'the private Agent to receive its message');
   const rows = [];
   for (let index = 0; index < 40; index += 1) {
     rows.push(`- 事实${index}｜一句话事实一句话事实｜首见 2026-10-0${(index % 9) + 1}`);
@@ -525,7 +545,8 @@ test('a failed archive write leaves the hot layer untouched', async () => {
   const { onebot, host, cwd } = await bootMemory({ memoryFileMaxBytes: 4096, memoryArchiveRatio: 0.5 });
   onebot.push(privateMessage('你好'));
   const privateId = sessionIdFor('private:100000002');
-  const agent = await until(() => host.list.created.find((item) => item.id === privateId), 'the private Agent');
+  // 同上：等消息投递到位再拿这个 Agent 去调工具。
+  const agent = await untilAgent(host, privateId, 1, 'the private Agent to receive its message');
   const convDir = join(cwd, '.qq-memory', 'conversations', 'private-100000002');
   await mkdir(convDir, { recursive: true });
   // 占住 archive/ 这个路径：rollover 的 mkdir 会失败。

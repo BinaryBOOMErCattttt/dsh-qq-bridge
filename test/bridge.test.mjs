@@ -837,7 +837,9 @@ test('allowTools restricts the QQ agent to the configured tools', async () => {
   const restricted = await boot({ allowTools: ['read', 'qq_send_message'] });
   try {
     restricted.onebot.push(privateMessage('你好'));
-    const agent = await until(() => restricted.host.list.created[0], 'the restricted Agent');
+    // 收窄发生在 setup 里（created 之前），但下面的「消息照常投递」读的是 inbox：
+    // 只等 created[0] 会抢在 followup 之前。等收件箱里真的有那条消息。
+    const agent = await untilInbox(restricted.host, 1, 'the restricted Agent');
     assert.deepEqual(restricted.host.list.restrictions, [{ sessionId: agent.id, filter: { allow: ['read', 'qq_send_message'] } }]);
     // 消息照常投递：收窄工具不影响对话链路本身。
     assert.equal(agent.inbox.length, 1);
@@ -868,7 +870,8 @@ test('unknown names in allowTools degrade instead of breaking the conversation',
   const broken = await boot({ allowTools: ['nope_a', 'nope_b'] });
   try {
     broken.onebot.push(privateMessage('你好'));
-    const agent = await until(() => broken.host.list.created[0], 'the Agent');
+    // 断言的「会话本身仍然活着（能收消息）」就是收件箱：等后置条件，别等 created。
+    const agent = await untilInbox(broken.host, 1, 'the Agent');
     assert.deepEqual(broken.host.list.restrictions, [{ sessionId: agent.id, filter: { allow: [] } }]);
     assert.equal(agent.inbox.length, 1);
   } finally {
@@ -939,7 +942,9 @@ test('an unavailable agentPresets service is retried on the next message', async
   const { onebot, host } = await boot({ agentPreset: '', allowTools: ['read'] }, { presets, presetSetupFailures: 2 });
   try {
     onebot.push(privateMessage('第一句'));
-    const agent = await until(() => host.list.created[0], 'the Agent');
+    // 这条用例要先看「setup 里没挂上」的 warn，再看「消息照常投递」——
+    // 后者等的是收件箱，不是 created（假 Host 先 push created、之后才 followup）。
+    const agent = await untilInbox(host, 1, 'the Agent');
     // setup 里没挂上：只记一条 warn，回复链路照常。
     assert.deepEqual(host.list.mountedPresets, []);
     assert.ok(host.list.warnings.some((line) => line.includes('agent preset') || line.includes('agentPresets')), host.list.warnings.join('|'));
@@ -1069,7 +1074,8 @@ test('agentPreset selects the mount explicitly and none skips it', async () => {
   const broken = await boot({ agentPreset: 'no_such_preset' }, { presets });
   try {
     broken.onebot.push(privateMessage('你好'));
-    const agent = await until(() => broken.host.list.created[0], 'the Agent');
+    // 「消息照常投递」等的是收件箱里真有那条消息（理由见 untilInbox）。
+    const agent = await untilInbox(broken.host, 1, 'the Agent');
     assert.deepEqual(broken.host.list.mountedPresets, []);
     assert.ok(broken.host.list.warnings.some((line) => line.includes('no_such_preset')));
     assert.equal(agent.inbox.length, 1);
@@ -1207,7 +1213,13 @@ test('the bundled patch reads the QQBOT_* variables the Windows setup script wri
 // 所以真实宿主里插件会把每条日志再镜像一行到 stderr。这里把这条行为钉住，
 // 免得有人「顺手」把 stderr 那一份删掉。
 test('plugin logs are mirrored to stderr in a real host', async () => {
-  const capture = async (hostOptions) => {
+  // 只挑本插件每次创建 Agent 必打的那条：先前用例留下的客户端会不定期
+  // 重连并打日志，不能对其他行做断言。
+  // 会话 id 由 PRIVATE_USER_ID 经 SHA-256 派生，所以这里**现算**前缀 ——
+  // 写死一个常量的话，改测试用的 QQ 号就会莫名其妙地弄红这个用例。
+  const prefix = sessionIdFor(`private:${PRIVATE_USER_ID}`, 0).slice(0, 8);
+  const mirrored = (lines) => lines.filter((line) => line.startsWith('qq-bridge: ') && line.includes(`created ${prefix}`));
+  const capture = async (hostOptions, { expectMirror }) => {
     const lines = [];
     const original = process.stderr.write;
     process.stderr.write = (chunk) => {
@@ -1218,25 +1230,25 @@ test('plugin logs are mirrored to stderr in a real host', async () => {
       const booted = await boot({}, hostOptions);
       try {
         booted.onebot.push(privateMessage('你好'));
-        await until(() => booted.host.list.created[0], 'the Agent');
+        // 等的是「后置条件真的发生」：有 exporter 的那一侧要等那一行镜像日志真的写出来
+        // （假 Host 在 create() 内部就 push created，插件是 await 回来之后才打日志，
+        // 只等 created[0] 会抓不到）；没有 exporter 的那一侧等消息进了收件箱就够了 ——
+        // 那已经远在「该打日志」之后，等到它仍然可能一条都没有才是这条用例要钉的。
+        if (expectMirror) await until(() => mirrored(lines).length >= 1, 'the mirrored created log line');
+        else await untilInbox(booted.host, 1, 'the Agent to receive its message');
       } finally {
         await booted.onebot.close();
       }
     } finally {
       process.stderr.write = original;
     }
-    // 只挑本插件每次创建 Agent 必打的那条：先前用例留下的客户端会不定期
-    // 重连并打日志，不能对其他行做断言。
-    // 会话 id 由 PRIVATE_USER_ID 经 SHA-256 派生，所以这里**现算**前缀 ——
-    // 写死一个常量的话，改测试用的 QQ 号就会莫名其妙地弄红这个用例。
-    const prefix = sessionIdFor(`private:${PRIVATE_USER_ID}`, 0).slice(0, 8);
-    return lines.filter((line) => line.startsWith('qq-bridge: ') && line.includes(`created ${prefix}`));
+    return mirrored(lines);
   };
 
   // 真实宿主的 logger 门面带 exporter() -> 镜像。
-  assert.equal((await capture({ loggerExporter: true })).length, 1);
+  assert.equal((await capture({ loggerExporter: true }, { expectMirror: true })).length, 1);
   // 测试用的普通日志桩没有 -> 不镜像（同时让测试输出保持干净）。
-  assert.deepEqual(await capture({}), []);
+  assert.deepEqual(await capture({}, { expectMirror: false }), []);
 });
 
 
@@ -1267,7 +1279,9 @@ test('the reset command opens a new session instead of deleting the old one', as
     // 再来一条消息：必须是新的 Agent（新对象）**并且换了 Session id**，
     // 证明新一轮既没有复用旧 Agent，也没有 resume 旧会话。
     onebot.push(privateMessage('还记得我刚才说什么吗'));
-    const second = await until(() => host.list.created[1], 'a fresh Agent after the reset');
+    // 第二个 Agent 也要等它的消息投递到位：下面直接读 second.inbox[0]，
+    // 只等 created[1] 会读到空收件箱（假 Host 先记 created 再 followup）。
+    const second = await untilInbox(host, 1, 'a fresh Agent after the reset', 1);
     assert.notEqual(second, first);
     assert.notEqual(second.id, first.id, 'the new round must use a different session id');
     assert.equal(second.inbox.length, 1);
@@ -1422,7 +1436,8 @@ test('idleResetHours opens a new round after a long silence', async () => {
     completeTurn(host, first, '嗯');
     await new Promise((resolve) => setTimeout(resolve, 120));
     onebot.push(privateMessage('第二句'));
-    const second = await until(() => host.list.created[1], 'a fresh Agent after the idle gap');
+    // 换轮之后同样要等「那条触发换轮的消息」真的投进新 Agent 的收件箱。
+    const second = await untilInbox(host, 1, 'a fresh Agent after the idle gap', 1);
     assert.notEqual(second.id, first.id, '静默超过 idleResetHours 之后必须换一个 Session id');
     assert.ok(host.list.disposed.includes(first.id), '旧 Agent 必须销毁，不能让两个同时挂在同一个会话上');
     assert.equal(second.inbox[0].content[0].text, '第二句', '触发换轮的那条消息本身不能被丢掉');
@@ -1494,7 +1509,9 @@ test('group chatter the bot was not addressed in becomes ambient context', async
     assert.equal(host.list.created.length, 0);
 
     onebot.push(mention('你们说呢', { messageId: 13 }));
-    const agent = await until(() => host.list.created[0], 'the group Agent');
+    // 环境块是从收件箱里那条消息的第二个 text block 取的：等消息真投进去再看，
+    // 否则读到的是空串（这里要断言「闲聊出现在环境块里」，空串会假红）。
+    const agent = await untilInbox(host, 1, 'the group Agent');
     const text = turnContextText(agent);
     // 之前的闲聊按「昵称: 内容」出现，模型因此知道大家在聊什么。
     assert.ok(text.includes('kaguya: 晚上吃啥'), text);
@@ -1513,7 +1530,9 @@ test('ambientMessages: 0 disables the group context', async () => {
   try {
     onebot.push(groupMessage([{ type: 'text', data: { text: '晚上吃啥' } }], { messageId: 11 }));
     onebot.push(mention('你们说呢', { messageId: 12 }));
-    const agent = await until(() => host.list.created[0], 'the group Agent');
+    // 这条断言的是「没有」：收件箱空着时也会「没有」，所以必须等消息真投进去，
+    // 否则这句会变成永远成立的假绿。
+    const agent = await untilInbox(host, 1, 'the group Agent');
     const text = turnContextText(agent);
     assert.ok(!text.includes('晚上吃啥'));
     // 环境块的表头（「群里最近的消息（旧 → 新；…）」）不该出现。注意别只匹配

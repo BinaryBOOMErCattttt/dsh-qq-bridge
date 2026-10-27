@@ -43,6 +43,22 @@ function messageEvent({ text = '睡觉去', type = 'private', userId = OWNER_ID,
 }
 
 /**
+ * 等异步副作用真的落地：定档是「写文档 → 换代 → 开一轮」的三段异步链，
+ * 固定 `setTimeout(20)` 在跑全量（机器忙、事件循环排队）时会赶在链跑完之前断言。
+ * 等的是后置条件本身，不是「过了多久」。
+ */
+async function untilDone(check, message, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await check();
+    if (value) return value;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for: ${message}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+
+/**
  * 建一套定档动作：会话、转录、发送、换代、归档根全是假的，只有文档写入是真的
  * （写进临时 cwd，好断言文件名与内容）。
  */
@@ -155,8 +171,10 @@ test('markSleepIntent：12 秒后没静默才定档；真静默了就什么都�
   assert.equal(awake.timers.length, 1);
   assert.equal(awake.timers[0].ms, HANDOFF_FALLBACK_MS);
   awake.timers[0].fn();
-  // 定档是异步的（写文档 → 换代 → 开一轮），等一个 tick。
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  // 定档是异步的（写文档 → 换代 → 开一轮）：等「真的换代了」与「确认发出去了」两个
+  // 后置条件，而不是等一个固定 tick（跑全量时 20ms 常常不够，会随机红）。
+  await untilDone(() => awake.conversation.sessionGeneration === CONVERSATION.sessionGeneration + 1, 'the sleep fallback to switch rounds');
+  await untilDone(() => awake.sent.length >= 1, 'the handoff confirmation to go out');
   assert.equal(awake.conversation.sessionGeneration, CONVERSATION.sessionGeneration + 1, '兜底真的换代了');
   assert.equal(awake.sent[0].text.includes('交接文档写好了'), true);
   assert.equal(awake.conversation.sleepIntentAt, undefined);
@@ -164,6 +182,8 @@ test('markSleepIntent：12 秒后没静默才定档；真静默了就什么都�
   const slept = await fixture({ muted: true });
   slept.handoff.markSleepIntent(slept.conversation);
   slept.timers[0].fn();
+  // 已经静默时这条分支在定时器回调里**同步**返回（不排任何异步任务），
+  // 所以这里等一小会儿只是给「如果不该定档却定了档」留出翻车的时间。
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(slept.conversation.sessionGeneration, CONVERSATION.sessionGeneration, '已经静默了就不该定档');
   assert.equal(slept.sent.length, 0);

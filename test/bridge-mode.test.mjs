@@ -242,10 +242,12 @@ test('模式：简洁模式回复硬上限 400 字，完整模式 800 字', asyn
     simple.onebot.push(pokeNotice({ userId: PRIVATE_USER_ID, targetId: SELF_ID }));
     const agent = await untilInbox(simple.host);
     completeTurn(simple.host, agent, 'x'.repeat(500));
+    // 等后置条件而不是「发出第一条」：回复会被拆成好几条气泡，等到第一条就断言
+    // join 的长度会读到半截（全量并发跑时机器一忙就随机红）。等 400 字全到齐。
     const replies = await until(() => {
       const all = said(simple.onebot, 'send_private_msg');
-      return all.length > 0 ? all : undefined;
-    }, 'the simple-mode reply');
+      return all.join('').length >= 400 ? all : undefined;
+    }, 'the whole simple-mode reply');
     assert.equal(replies.join('').length, 400, '简洁模式截到 400 字');
   } finally {
     await simple.onebot.close();
@@ -256,10 +258,11 @@ test('模式：简洁模式回复硬上限 400 字，完整模式 800 字', asyn
     full.onebot.push(privateMessage('在吗'));
     const agent = await untilInbox(full.host);
     completeTurn(full.host, agent, 'x'.repeat(500));
+    // 同上：完整模式不截断，500 字也要全发完再比长度。
     const replies = await until(() => {
       const all = said(full.onebot, 'send_private_msg');
-      return all.length > 0 ? all : undefined;
-    }, 'the full-mode reply');
+      return all.join('').length >= 500 ? all : undefined;
+    }, 'the whole full-mode reply');
     assert.equal(replies.join('').length, 500, '完整模式 500 字原样发');
   } finally {
     await full.onebot.close();

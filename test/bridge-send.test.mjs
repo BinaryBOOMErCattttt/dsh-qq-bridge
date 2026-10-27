@@ -137,7 +137,9 @@ test('burstMaxMessages: 1 collapses a whole reply into a single message', async 
   const first = await boot({ burstMaxChars: 12, burstMaxParts: 3, burstMaxMessages: 1, readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0 });
   try {
     first.onebot.push(privateMessage('在吗'));
-    const agent = await until(() => first.host.list.created[0], 'the Agent');
+    // 等消息真的进了收件箱再开这一轮：只等 created[0] 会抢在 followup 之前，
+    // completeTurn 于是拿着 message: undefined 去开 turn（理由见 untilInbox）。
+    const agent = await untilInbox(first.host, 1, 'the Agent');
     completeTurn(first.host, agent, oneLine);
     const sent = await until(() => sentTexts(first.onebot, 'send_private_msg')[0], 'the single reply');
     assert.deepEqual(sentTexts(first.onebot, 'send_private_msg'), [oneLine]);
@@ -151,7 +153,8 @@ test('burstMaxMessages: 1 collapses a whole reply into a single message', async 
   const second = await boot({ burstMaxChars: 12, burstMaxParts: 3, burstMaxMessages: 1, readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0 });
   try {
     second.onebot.push(privateMessage('在吗'));
-    const agent = await until(() => second.host.list.created[0], 'the Agent');
+    // 同上：完成一轮的前提是那条消息已经在收件箱里。
+    const agent = await untilInbox(second.host, 1, 'the Agent');
     completeTurn(second.host, agent, multiline);
     await until(() => sentTexts(second.onebot, 'send_private_msg')[0], 'the single reply');
     assert.deepEqual(sentTexts(second.onebot, 'send_private_msg'), ['今天天气不错。 要不出去走走？顺便吃个饭吧！']);
@@ -164,7 +167,7 @@ test('burstMaxMessages: 1 collapses a whole reply into a single message', async 
   const third = await boot({ burstMaxChars: 12, burstMaxParts: 3, burstMaxMessages: 1, maxReplyChars: 20, readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0 });
   try {
     third.onebot.push(privateMessage('在吗'));
-    const agent = await until(() => third.host.list.created[0], 'the Agent');
+    const agent = await untilInbox(third.host, 1, 'the Agent');
     completeTurn(third.host, agent, oneLine);
     await until(() => sentTexts(third.onebot, 'send_private_msg').length === 2, 'the protocol-limit chunks');
     const chunks = sentTexts(third.onebot, 'send_private_msg');
@@ -193,7 +196,8 @@ test('chat and informational replies both send every line the model wrote', asyn
   const short = await boot(options);
   try {
     short.onebot.push(privateMessage('在吗'));
-    const agent = await until(() => short.host.list.created[0], 'the Agent');
+    // 等后置条件：消息已投递（否则这一轮根本没开，等到的是 5 秒超时而不是条数）。
+    const agent = await untilInbox(short.host, 1, 'the Agent');
     completeTurn(short.host, agent, '在的\n刚吃完');
     const sent = await until(() => {
       const list = sentTexts(short.onebot, 'send_private_msg');
@@ -209,7 +213,7 @@ test('chat and informational replies both send every line the model wrote', asyn
   const deep = await boot(options);
   try {
     deep.onebot.push(privateMessage('在吗'));
-    const agent = await until(() => deep.host.list.created[0], 'the Agent');
+    const agent = await untilInbox(deep.host, 1, 'the Agent');
     completeTurn(deep.host, agent, long);
     const sent = await until(() => {
       const list = sentTexts(deep.onebot, 'send_private_msg');
@@ -228,7 +232,8 @@ test('bubble count has no cap: five lines become five messages', async () => {
   const { onebot, host } = await boot({ readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0 });
   try {
     onebot.push(privateMessage('在吗'));
-    const agent = await until(() => host.list.created[0], 'the Agent');
+    // 五条气泡的前提是这一轮真的开起来了：等消息进收件箱，不是等 created[0]。
+    const agent = await untilInbox(host, 1, 'the Agent');
     completeTurn(host, agent, '在的\n刚吃完\n你呢\n要不要出去走走\n顺便吃个饭');
     const sent = await until(() => {
       const list = sentTexts(onebot, 'send_private_msg');
@@ -246,7 +251,7 @@ test('stripShortPeriod removes the trailing full stop of a short bubble', async 
   const { onebot, host } = await boot({ readDelayMs: 0, minDelayMs: 0, maxDelayMs: 0, delayJitter: 0, shortPeriodMaxChars: 40 });
   try {
     onebot.push(privateMessage('在吗'));
-    const agent = await until(() => host.list.created[0], 'the Agent');
+    const agent = await untilInbox(host, 1, 'the Agent');
     completeTurn(host, agent, '在的。');
     await until(() => sentTexts(onebot, 'send_private_msg')[0], 'the reply');
     assert.deepEqual(sentTexts(onebot, 'send_private_msg'), ['在的']);
@@ -277,7 +282,8 @@ test('group replies can quote or mention the message they answer', async () => {
   const mentioned = await boot({ replyStyle: 'at' });
   try {
     mentioned.onebot.push(mention('在吗', { messageId: 4242, userId: 100000003 }));
-    const agent = await until(() => mentioned.host.list.created[0], 'the group Agent');
+    // 等消息已投递：引用段是按这一轮真正收到的那条算的，抢跑会拿不到 message。
+    const agent = await untilInbox(mentioned.host, 1, 'the group Agent');
     completeTurn(mentioned.host, agent, '在的');
     const sent = await until(() => sentTexts(mentioned.onebot)[0], 'the mentioned reply');
     assert.deepEqual(sent, [
@@ -292,7 +298,7 @@ test('group replies can quote or mention the message they answer', async () => {
   const plain = await boot({ replyStyle: 'plain' });
   try {
     plain.onebot.push(mention('在吗', { messageId: 4242 }));
-    const agent = await until(() => plain.host.list.created[0], 'the group Agent');
+    const agent = await untilInbox(plain.host, 1, 'the group Agent');
     completeTurn(plain.host, agent, '在的');
     assert.equal(await until(() => sentTexts(plain.onebot)[0], 'the plain reply'), '在的');
   } finally {
@@ -613,8 +619,10 @@ test('the channel section does not depend on the group name lookup', async () =>
   try {
     withName.onebot.push(mention('在吗', { messageId: 21 }));
     withoutName.onebot.push(mention('在吗', { messageId: 21 }));
+    // 两个实例都要等到「消息已投递」：下面比的是系统小节 + 这轮的「本轮情境」，
+    // 而情境是从收件箱里那条消息的第二个 text block 取的 —— 只等 created[0] 会读到空串。
     const [a, b] = await until(
-      () => withName.host.list.created[0] && withoutName.host.list.created[0]
+      () => withName.host.list.created[0]?.inbox.length >= 1 && withoutName.host.list.created[0]?.inbox.length >= 1
         ? [withName.host.list.created[0], withoutName.host.list.created[0]]
         : undefined,
       'both group Agents',

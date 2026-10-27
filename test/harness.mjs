@@ -624,9 +624,34 @@ export async function until(check, message, timeoutMs = 5000) {
  *
  * 所以「要读 inbox 的用例」统一用这个等待；只关心 Agent 被创建（例如断言创建了**几个**、
  * 或只是想 emit 事件）的用例仍然直接用 `until(() => host.list.created[0], …)`。
+ *
+ * `index` 选「第几个 Agent」：/reset、切模式、静默换轮那几组要等的是**第二个** Agent，裸等
+ * `created[1]` 同样会抢在它的 followup 之前（同一个竞态，只是换了个下标）。
  */
-export async function untilInbox(host, count = 1, message = 'the message to reach the Agent') {
-  return until(() => (host.list.created[0]?.inbox.length >= count ? host.list.created[0] : undefined), message);
+export async function untilInbox(host, count = 1, message = 'the message to reach the Agent', index = 0) {
+  return until(
+    () => (host.list.created[index]?.inbox.length >= count ? host.list.created[index] : undefined),
+    message,
+  );
+}
+
+
+/**
+ * 同上的「按 sessionId 找」版本：等某个特定会话的 Agent **造出来并且收件箱里有消息**。
+ *
+ * 为什么不能只 `created.find(...)`：那是同一个竞态换了个找法 —— 插件把 Agent 登记进
+ * `sessionIndex`、把工具调用能看见的会话信息凑齐，都在 `create()` 返回**之后**。
+ * 抢跑期间用 `{ agent }` 调工具会落到「不认识这个 Agent」的那一支（记忆写入闸门甚至
+ * 会 fail-open），于是用例随机红成「该拒的没拒」。
+ */
+export async function untilAgent(host, sessionId, count = 1, message = 'the message to reach the Agent') {
+  return until(
+    () => {
+      const found = host.list.created.find((agent) => agent.id === sessionId);
+      return found !== undefined && found.inbox.length >= count ? found : undefined;
+    },
+    message,
+  );
 }
 
 

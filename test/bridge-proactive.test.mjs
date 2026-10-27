@@ -12,7 +12,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withinActiveHours } from '../index.js';
-import { SELF_ID, turnContextText, until, privateMessage, privateMessageWithReply, groupMessage, mention, completeTurn, sentTexts, boot, settle, bootProactive, groupWhereBotSpoke, groupChatter } from './harness.mjs';
+import { SELF_ID, turnContextText, until, untilInbox, privateMessage, privateMessageWithReply, groupMessage, mention, completeTurn, sentTexts, boot, settle, bootProactive, groupWhereBotSpoke, groupChatter } from './harness.mjs';
 import { cleanupBoots } from './harness.mjs';
 
 after(async () => { await cleanupBoots(); });
@@ -333,7 +333,9 @@ test('proactive forgets its own pacing when the conversation is reset', async ()
   await groupChatter(onebot, '那继续吧', { messageId: 7004 });
   host.list.timers.fireInterval();
   // 会话真的被重建了：旧 Agent 被销毁，主动搭话投给了新造的那个 Agent。
-  const fresh = await until(() => host.list.created[1], 'a fresh Agent for the proactive turn');
+  // 等的是「新 Agent 的收件箱里真有那条主动消息」——只等 created[1] 会抢在 followup 之前，
+  // 下面两行读到的就是空收件箱。
+  const fresh = await untilInbox(host, 1, 'a fresh Agent for the proactive turn', 1);
   assert.equal(fresh.inbox.length, 1);
   assert.match(fresh.inbox[0].content[0].text, /不是谁发给你的消息/);
   assert.ok(host.list.disposed.length >= 1, 'the reset should have disposed the old Agent');
