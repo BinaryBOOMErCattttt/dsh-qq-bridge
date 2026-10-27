@@ -521,3 +521,26 @@ OneBot    容器 napcat（mlikiowa/napcat-docker），端口 3001 = WebSocket **
 ```
 
 调试实时行为可以直接开 3081 的 Web UI 看 QQ 会话（每个 QQ 会话就是一个 Session）。
+
+## 12. 部署后冒烟（同步完仓库第一件事）
+
+**只要你是「同步仓库 / 部署 / 更新」之后第一次在这个目录里干活，就先跑这一条，别急着改代码：**
+
+```bash
+node scripts/smoke.mjs --service        # 人看
+node scripts/smoke.mjs --json --service # 机读，写交接文档用
+```
+
+它把验证分成三档，**语义必须照抄，别自己改口径**：
+
+| 档 | 含义 | 写交接文档时怎么写 |
+| --- | --- | --- |
+| `ok` / `fail` | 静态可判：版本、五个新模块（mode/mood/debug/topics/handoff）、24 个 `qq_*` 工具、11 个新配置键、`check.mjs`、运行时产物 | `fail` 必须原样写出来，不许含糊成「基本正常」 |
+| `warn` | 两种：运行时产物缺失（`data/mode.json` 等，**正常**，没玩过就没有）／工作树脏、服务没起（**要处理**） | 分开写，别混成一句「有警告」 |
+| `todo` | 只能在真实 QQ 里点一遍（切模式、斗图、心情、debug、话题、定档、动图分镜） | **原文照抄**「怎么验 / 期望」两段；**不许写成「已验证」** |
+
+另外三条：
+
+1. 改了源码 → 冒烟之前先 `systemctl --user restart qqbot`（Loader 按 URL 缓存模块，不重启等于没改）。
+2. 交接文档必须带 `git rev-parse HEAD` 与 `package.json` 的版本 —— `smoke.mjs` 两个都报，别只写「最新版」。
+3. `todo` 不是失败。**没验过就写「未验」**，写「通过」是最糟的一种错。
