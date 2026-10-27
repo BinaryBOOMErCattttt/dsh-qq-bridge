@@ -488,6 +488,96 @@ test('a private digest cannot promote facts into COGNITION.md or PEOPLE.md', asy
 
 
 /**
+ * 私聊闸门的第二条防线：**查不清调用者**也不能放行。
+ *
+ * /reset 会把旧 session id 从「活会话」路由表（sessionIndex）里删掉 —— 旧 Agent 迟到的
+ * turn/end 不该再往 QQ 发东西。但「这个 Agent 属于哪个会话」是永久事实：闸门拿不到这一点时
+ * 如果当成「部署者在操作」放行，重置之后还在飞的那一轮就能拿旧 Agent 写全局记忆文件。
+ * 断言没变，变的是归属表从「活会话索引」换成了「永久归属表」。
+ */
+test('私聊的写入闸门：/reset 之后的旧 Agent 写全局文件仍然被拒，而不是当成部署者放行', async () => {
+  const { onebot, host, cwd } = await bootMemory({ resetUsers: ['100000002'] });
+  const tool = host.tools.get('qq_memory');
+  onebot.push(privateMessage('私聊里聊点事'));
+  const agent = await untilInbox(host, 1, 'the private Agent to receive its message');
+
+  onebot.push(privateMessage('/reset'));
+  await until(() => host.list.disposed.includes(agent.id), 'the old Agent to be disposed');
+
+  await assert.rejects(
+    () => tool.execute({ action: 'upsert', path: 'COGNITION.md', name: '重置之后学的梗', meaning: '私聊里知道的说法' }, { agent }),
+    /private chat must not write/,
+  );
+  await assert.rejects(
+    () => tool.execute({ action: 'upsert', path: 'PEOPLE.md', name: 'kaguya', qq: '100000001', meaning: '群主' }, { agent }),
+    /private chat must not write/,
+  );
+  assert.equal(existsSync(join(cwd, '.qq-memory', 'COGNITION.md')), false, '被拒绝的写入不能留下文件');
+  assert.equal(existsSync(join(cwd, '.qq-memory', 'PEOPLE.md')), false, '被拒绝的写入不能留下文件');
+});
+
+
+/**
+ * 防「修过头」：**群**会话的摘要轮必须仍然能写全局文件。
+ *
+ * 摘要 Agent 不在 sessionIndex 里，靠 digestTarget（被摘要的会话）进闸门；群目标是
+ * 「公共的梗可以进全局」，这正是设计里允许的那条路。闸门一旦对摘要整条关死，摘要就废了。
+ */
+test('群会话的摘要轮仍然能写全局记忆文件（闸门只挡私聊，不挡摘要）', async () => {
+  const { onebot, host, cwd } = await bootMemory({ digestAtHour: 0, digestMinLines: 1, digestCatchUp: true });
+  const digestId = sessionIdFor('bridge:digest');
+  const written = [];
+  host.list.onFollowup = async (agent) => {
+    if (agent.id !== digestId) return;
+    const tool = host.tools.get('qq_memory');
+    for (const path of ['COGNITION.md', 'PEOPLE.md']) {
+      const value = await tool.execute(
+        { action: 'upsert', path, name: '群里公开的梗', meaning: '群里公开说的', qq: '123456' },
+        { agent },
+      );
+      written.push(value.action);
+    }
+  };
+
+  onebot.push(mention('群里说个梗'));
+  await waitForDigestRecord(cwd, 'group:100000001');
+  assert.deepEqual(written, ['upsert', 'upsert'], '群摘要对两个全局文件的写入都该成功');
+  assert.match(await readMemory(cwd, 'COGNITION.md'), /群里公开的梗｜群里公开说的/);
+  assert.match(await readMemory(cwd, 'PEOPLE.md'), /群里公开的梗/);
+});
+
+
+/**
+ * 认得出是摘要会话、却查不出它这一轮在写哪个会话 → **拒绝**。
+ *
+ * 真实路径：摘要硬超时（digestTimeoutMs）之后 digestTarget 被清掉，而模型那边可能还有
+ * 工具调用在飞。以前这种情况和「压根没有调用者」共用一个 undefined 分支，被当成部署者
+ * 放行；现在必须报错，否则一条超时的摘要轮可以绕过私聊闸门去写全局文件。
+ */
+test('摘要轮结束之后，摘要会话再写全局文件被拒（认不出在写哪个会话就不许写）', async () => {
+  const { onebot, host, cwd } = await bootMemory({ digestAtHour: 0, digestMinLines: 1, digestCatchUp: true });
+  const digestId = sessionIdFor('bridge:digest');
+  let digestAgent;
+  host.list.onFollowup = async (agent) => {
+    if (agent.id === digestId) digestAgent = agent;
+  };
+
+  onebot.push(mention('群里说个梗'));
+  await waitForDigestRecord(cwd, 'group:100000001');
+  assert.ok(digestAgent, '摘要会话应该真的跑过一轮');
+
+  await assert.rejects(
+    () => host.tools.get('qq_memory').execute(
+      { action: 'upsert', path: 'COGNITION.md', name: '轮外写的梗', meaning: '不该写进去' },
+      { agent: digestAgent },
+    ),
+    /outside a digest run/,
+  );
+  assert.equal(existsSync(join(cwd, '.qq-memory', 'COGNITION.md')), false, '被拒绝的写入不能留下文件');
+});
+
+
+/**
  * 滚档：热层超过阈值时，最不活跃的条目先进 archive/、再从热层删掉；search 仍然搜得到。
  */
 test('memory rollover archives the least active rows instead of deleting them', async () => {

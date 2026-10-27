@@ -1970,6 +1970,16 @@ export function apply(ctx, config) {
   const conversations = new Map();
   /** Session id → 会话 key，用于把 session 事件路由回来源会话。 */
   const sessionIndex = new Map();
+  /**
+   * Session id → 会话 key，**只增不删**：回答「这个 Agent 是我们造的、它属于哪个会话」。
+   *
+   * 与 `sessionIndex` 刻意分开：那张表是**活会话**的路由表，`/reset`、切思考强度、静默换轮
+   * 都会把旧 id 从里面删掉（旧 Agent 迟到的 turn/end 不能再往 QQ 发东西）。但「这个 id 属于
+   * 哪个会话」是**永久事实** —— 记忆写入闸门（`memory.js` 的 `assertGlobalWrite`）要靠它把
+   * 旧 Agent 迟到的写入仍然算在它自己那个会话头上，而不是因为「查不到调用者」就当成部署者放行。
+   * 一个会话每换一轮只多一个 UUID 字符串，进程重启即清空。
+   */
+  const sessionOwners = new Map();
   /** `<sessionId>:<turn>` → `{ key, quote }`，标记这一轮欠 QQ 一条回复，并记住该回复谁。 */
   const turnOwners = new Map();
   /** 已提交的消息 id → `{ key, quote }`，用来把「消息被 claim」归属到对应会话。 */
@@ -2151,6 +2161,7 @@ export function apply(ctx, config) {
     report,
     conversations,
     sessionIndex,
+    sessionOwners,
     ambientQuery: ambientQueryFor,
     allowTools,
     approvalPolicy,
@@ -2677,12 +2688,20 @@ export function apply(ctx, config) {
         .catch(() => '');
     }
     const sessionId = sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0);
+    // 先登记归属，再开 Agent：宿主可能在 `create()`/`resume()` 返回**之前**就把 Agent 暴露
+    // 出来（假 Host 如实照搬这一点：先 push 进 created，消息由插件随后才 followup），而工具
+    // 执行上下文里的 `agent.id` 就是这个 sessionId。晚一行登记，这一小段里的工具调用就会
+    // 「认不出调用者」（记忆闸门会把这个 Agent 当成部署者，qq_transcript 也认不出默认会话）。
+    // 映射只取决于 key + 代次，重复设置是幂等的。
+    sessionOwners.set(sessionId, conversation.key);
+    sessionIndex.set(sessionId, conversation.key);
     const live = ctx.agents.get(sessionId);
     if (live !== undefined) {
       conversation.agent = live;
       // 句柄只在「还是同一个 Agent」时保留：换了 Agent 对象说明旧句柄已经失效。
       if (conversation.handle?.agent !== live) conversation.handle = undefined;
       sessionIndex.set(live.id, conversation.key);
+      sessionOwners.set(live.id, conversation.key);
       // 预设也补挂一次：resume 时 agentPresets 服务可能还没 active（见 attachAgentPreset），
       // 那一轮挂上的是部署默认预设；下一条消息把它换成 qq（工具白名单 + 更低压缩门槛）。
       // 不补这一段，上下文会一路涨到默认门槛（0.8×1M）才压缩 —— 真实事故。
@@ -2768,6 +2787,7 @@ export function apply(ctx, config) {
     // 保留句柄：/reset 需要用它销毁这个 Agent（连同它的 Session 与写出句柄）。
     conversation.handle = handle;
     sessionIndex.set(handle.agent.id, conversation.key);
+    sessionOwners.set(handle.agent.id, conversation.key);
     // 无人值守的 QQ 会话默认一律拒绝需要审批的操作（工具会直接报「被拒绝」），
     // 避免群里的人通过机器人指挥它执行危险命令。
     if (approvalPolicy === 'never') {

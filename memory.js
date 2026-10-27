@@ -107,6 +107,9 @@ const MEMORY_FILE_RETURN_CHARS = 12000;
  *   - `cwd`：Agent 工作目录，同时也是 `memoryDir` 越界校验的基准。
  *   - `report`：`(level, msg)` 运维日志（index.js 里那个 logger + stderr 的镜像）。
  *   - `conversations` / `sessionIndex`：会话表与 session id → key 的反查，解析「在说哪个会话」用。
+ *   - `sessionOwners`：session id → key 的**永久**归属表（`sessionIndex` 会在 `/reset`、
+ *     静默换轮时把旧 id 删掉，那张表是活会话路由用的）。写闸门靠它认出「这个 Agent 是我们
+ *     造的、属于哪个会话」，见 `writeScopeOf`。
  *   - `ambientQuery`：`(conversation) => string`，把这个群最近几条闲聊拼成检索查询；
  *     主动说话 / 补一句 / 提醒这些「没有来消息」的轮次靠它决定这一轮该捞哪些记忆。
  *   - `allowTools`：工具白名单 —— 「记忆工具到底可不可见」跟着它走。
@@ -127,6 +130,8 @@ export function createMemory(deps) {
     report,
     conversations,
     sessionIndex,
+    // 缺省空表：直接 import 本模块做单测时不必构造它（只影响「老 id 还能不能认出会话」）。
+    sessionOwners = new Map(),
     ambientQuery,
     allowTools,
     approvalPolicy,
@@ -1076,14 +1081,19 @@ export function createMemory(deps) {
   /**
    * 这次工具调用「是从哪个会话发起的」。
    *
-   * 三个来源：QQ 会话的 Agent（`sessionIndex` 反查）、摘要 Agent（`digestTarget`）、
-   * 宿主平面的 Web 主会话（都不是 → undefined，不受私聊写入闸门限制 —— 那是部署者
-   * 在操作，不是 QQ 消息）。
+   * 三个来源：QQ 会话的 Agent（`sessionIndex` 反查，查不到再退到**永久**归属表
+   * `sessionOwners`）、摘要 Agent（`digestTarget`）、宿主平面的 Web 主会话（都不是 →
+   * undefined，不受私聊写入闸门限制 —— 那是部署者在操作，不是 QQ 消息）。
+   *
+   * 为什么要有 `sessionOwners` 这层兜底：`sessionIndex` 是活会话的路由表，`/reset`、
+   * 切思考强度、静默换轮都会删掉旧 id。删掉之后到这里就查不出调用者了，而闸门原本把
+   * 「查不出」当成「部署者在操作」放行 —— 于是重置之后还在飞的那一轮能拿旧 Agent 写全局
+   * 记忆文件。归属是永久事实，认得出是我们造的 Agent，就必然查得出它属于哪个会话。
    */
   function writeScopeOf(exec) {
     const agentId = exec?.agent?.id;
     if (agentId === undefined) return undefined;
-    const key = sessionIndex.get(agentId);
+    const key = sessionIndex.get(agentId) ?? sessionOwners.get(agentId);
     if (key !== undefined) return key;
     if (agentId === digestSessionId) return digestTarget;
     return undefined;
@@ -1092,15 +1102,18 @@ export function createMemory(deps) {
   /**
    * 调用者如果是**某个 QQ 会话**的 Agent，返回那个会话的 key。
    *
-   * 摘要 Agent（`digestSessionId`）与宿主平面的 Web 主会话都不在 `sessionIndex` 里，
+   * 摘要 Agent（`digestSessionId`）与宿主平面的 Web 主会话都不在归属表里，
    * 这里返回 undefined —— 它们需要跨会话读（摘要按任务读目标会话，宿主是部署者）。
    * 这个区分就是「QQ 会话只能碰自己」的判据，**别用 `writeScopeOf` 代替**：那个函数
    * 对摘要会话返回 `digestTarget`，会把「摘要目标」误当成「调用者自己的会话」。
+   *
+   * 同样退到 `sessionOwners`：`/reset` 之后旧 Agent 迟到的读写仍然只能碰它自己那个会话，
+   * 而不是因为「活索引里没有它」就变成可以碰任何会话的部署者。
    */
   function qqCallerKey(exec) {
     const agentId = exec?.agent?.id;
     if (agentId === undefined) return undefined;
-    return sessionIndex.get(agentId);
+    return sessionIndex.get(agentId) ?? sessionOwners.get(agentId);
   }
 
   /** 记忆目录顶层、所有会话共享的文件：QQ 会话可以读（写仍由 `assertGlobalWrite` 管）。 */
@@ -1151,11 +1164,29 @@ export function createMemory(deps) {
    *
    * 摘要 Agent 走同一条闸门（`digestTarget` 是被摘要的那个会话），它在私聊的摘要轮里
    * 一样拿不到这两个写通道。
+   *
+   * 第三条分支刻意**不放行**：认得出这个 Agent 是本插件造的（摘要会话），却查不出它这一轮
+   * 在写哪个会话 —— 摘要硬超时之后模型才调工具就是这条路径（`digestTarget` 已经被清掉）。
+   * 以前它和「压根没有调用者」共用同一个 `undefined` 分支，于是被当成部署者在操作而写成功；
+   * 现在明确拒绝。QQ 会话的 Agent 不会走到这里：`sessionOwners` 记的是**永久**归属，
+   * 认得出它属于哪个会话（`/reset` 删掉了活索引也照样查得到）。
    */
   function assertGlobalWrite(relative, exec) {
     if (relative !== COGNITION_FILE && relative !== PEOPLE_FILE) return;
     const scope = writeScopeOf(exec);
-    if (scope === undefined || !String(scope).startsWith('private:')) return;
+    if (scope === undefined) {
+      if (exec?.agent?.id === digestSessionId) {
+        throw new Error(
+          `qq_memory: cannot tell which conversation is writing ${memoryLabel}/${relative} — the digest session is ` +
+            'outside a digest run (a digest that timed out may still have tool calls in flight). ' +
+            "Write it from the target conversation's own turn instead.",
+        );
+      }
+      // 没有 agent（插件内部调用：存表情包补目录、滚档、迁移）或宿主平面的 Web 主会话：
+      // 那是部署者在操作，不是 QQ 消息，照旧放行。
+      return;
+    }
+    if (!String(scope).startsWith('private:')) return;
     throw new Error(
       `qq_memory: ${memoryLabel}/${relative} is shared by every conversation — a private chat must not write it ` +
         `(the same thing learned in a group, or verified from a public source, can be written there instead). ` +

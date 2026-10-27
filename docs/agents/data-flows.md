@@ -154,6 +154,10 @@ ctx.interval（排到下一个 digestAtHour，默认 04:00）─▶ runDigestSwe
   文件的任何写请求在 `memory.js` 的 `assertGlobalWrite` 里**直接拒绝**（摘要 Agent 走
   `digestTarget` 同一条闸门）；检索在打分**之前**按 scope 硬过滤。`PEOPLE.md` 的启动迁移
   只扫群目录，不碰 `private-*`。
+  **「查不清调用者」不放行**：闸门要能从 `agent.id` 反查出会话（`sessionIndex`，查不到再退到
+  只增不删的 `sessionOwners`）；认得出是摘要会话、却不在摘要轮里（`digestTarget` 已清掉，
+  典型是硬超时之后还在飞的工具调用）→ 直接报错。只有**没有 agent** 的调用（插件内部补
+  目录 / 滚档 / 迁移）和宿主平面的 Web 主会话才按「部署者在操作」放行。
 - **无日期条目按文件位置排**（`hotCognitionLines` 的 `effectiveDate`）：继承它前面最近一个
   有日期的条目的日期，不再一律当最旧（设计 §1.2 的回归）。
 - **滚档只搬不删**：`archivePlan`（纯函数）只减不增、没有可滚条目时返回原因、热层不写指针行；
