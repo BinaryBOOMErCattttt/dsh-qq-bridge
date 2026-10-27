@@ -3118,14 +3118,15 @@ export function apply(ctx, config) {
     if (topicBrief.length > 0) {
       lines.push('', '（长期话题：这些是高频率话题的短摘要，不是本轮聊天记录。）', ...topicBrief);
     }
-    // 「一句一条」必须是情境的最后一行（离模型开口最近）。话题摘要 / 调试说明都属于
-    // 会变的信息，只能排在它前面 —— 否则这条提醒会被挤到中间，模型照旧缝成一条。
-    if (settings.humanize === true && conversation.pendingIntent !== 'reminder') {
-      lines.push('', '- 想说的话一句一条，分几条发（换行 = 分条）。');
-    }
     const body = lines.join('\n').trim();
     if (body.length === 0) return '';
-    return `（下面这些是这一轮的情境，每轮都会刷新，以这一条为准；不是对方发来的话。）\n\n${body}`;
+    // 「一句一条」必须离模型开口最近，所以它拼在**字符串末尾**，而不是 lines 里的一行：
+    // 以后往 lines 加任何动态段落（时间感 / 调试 / 话题 / 待发提醒 …）都只能排在它前面，
+    // 结构上不可能把它挤走（2026-10-24 话题摘要就这么踩过一次，见 test/bridge-persona.test.mjs）。
+    const tail = settings.humanize === true && conversation.pendingIntent !== 'reminder'
+      ? '\n\n- 想说的话一句一条，分几条发（换行 = 分条）。'
+      : '';
+    return `（下面这些是这一轮的情境，每轮都会刷新，以这一条为准；不是对方发来的话。）\n\n${body}${tail}`;
   }
 
   /**
