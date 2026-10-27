@@ -81,7 +81,7 @@ const HISTORY_KEEP = 20;
  * 索引是部署者 / 摘要 Agent 手写的**短**索引，不是记忆正文；这里的截断只是兜底，
  * 防止一份被写坏的索引把 `memoryPromptChars` 吃光。真正的记忆走检索（memory-select）。
  */
-const INDEX_PROMPT_MAX_CHARS = 1500;
+const INDEX_PROMPT_MAX_CHARS = 400;
 
 /** 派生索引统计写的防抖（毫秒）：提示词每轮都会装配，不能每次都写一次盘。 */
 const STATS_SAVE_MS = 2000;
@@ -788,7 +788,7 @@ export function createMemory(deps) {
    * @param conversation - 目标会话。
    * @returns 可直接拼进提示词的整段；这一轮没有新东西（或记忆是空的）时为空串。
    */
-  function recallText(conversation) {
+  function recallText(conversation, options = {}) {
     if (!memoryEnabled) return '';
     const ledger = recallLedgerFor(conversation);
     const index = readSyncText(memoryIndexFile);
@@ -823,8 +823,8 @@ export function createMemory(deps) {
       fallback: ledger.baselined !== true,
       stats: memoryStats,
       config: {
-        promptChars: settings.memoryPromptChars,
-        recallK: settings.memoryRecallK,
+        promptChars: options.promptChars ?? settings.memoryPromptChars,
+        recallK: options.recallK ?? settings.memoryRecallK,
         peopleMax: settings.memoryPeopleMax,
         vocabHint: settings.memoryVocabHint,
       },

@@ -1671,48 +1671,59 @@ function qqTopic(deps) {
     },
   });
 }
+/** 工具描述只留 1–2 句；细节在 docs/tools.md，避免每轮 schema 吃掉前缀 token。 */
+function briefTool(tool) {
+  const description = String(tool?.description ?? '');
+  if (description.length <= 220) return tool;
+  const window = description.slice(0, 220);
+  const cut = Math.max(window.lastIndexOf('。'), window.lastIndexOf('. '), window.lastIndexOf(';'));
+  tool.description = `${cut >= 80 ? window.slice(0, cut + 1) : window} 细节见 docs/tools.md。`;
+  return tool;
+}
+
 export function registerQqTools(ctx, deps) {
-  ctx.tools.register(qqSendMessage(deps));
-  ctx.tools.register(qqSendImage(deps));
+  const register = (tool) => ctx.tools.register(briefTool(tool));
+  register(qqSendMessage(deps));
+  register(qqSendImage(deps));
   // 表情包目录不可用（没配 / 配到 cwd 外）或白名单里没有它时整个跳过：留一个必然报错的
   // 工具，只会让模型浪费一次调用去撞墙。
-  if (deps.saveSticker !== undefined) ctx.tools.register(qqSaveSticker(deps));
-  if (deps.renameSticker !== undefined) ctx.tools.register(qqRenameSticker(deps));
-  ctx.tools.register(qqPoke(deps));
-  ctx.tools.register(qqListConversations(deps));
+  if (deps.saveSticker !== undefined) register(qqSaveSticker(deps));
+  if (deps.renameSticker !== undefined) register(qqRenameSticker(deps));
+  register(qqPoke(deps));
+  register(qqListConversations(deps));
   if (deps.memory !== undefined) {
-    ctx.tools.register(qqTranscript(deps));
-    ctx.tools.register(qqMemory(deps));
+    register(qqTranscript(deps));
+    register(qqMemory(deps));
   }
   if (deps.reminders !== undefined) {
-    ctx.tools.register(qqRemindCreate(deps));
-    ctx.tools.register(qqRemindList(deps));
-    ctx.tools.register(qqRemindCancel(deps));
+    register(qqRemindCreate(deps));
+    register(qqRemindList(deps));
+    register(qqRemindCancel(deps));
   }
   // 受信写盘：只有 trustedWrite 打开、且创建编辑器成功时才注册。
   if (deps.editor !== undefined) {
-    ctx.tools.register(qqWrite(deps));
-    ctx.tools.register(qqEdit(deps));
-    ctx.tools.register(qqSkill(deps));
+    register(qqWrite(deps));
+    register(qqEdit(deps));
+    register(qqSkill(deps));
   }
   // 静默：始终注册（真正的权限在 writeAuthority 里按这一轮发言人判）。
-  if (deps.quiet !== undefined) ctx.tools.register(qqQuiet(deps));
+  if (deps.quiet !== undefined) register(qqQuiet(deps));
   // 主人侧 bot 配置：同样按发言人鉴权。
-  if (deps.settingsAdmin !== undefined) ctx.tools.register(qqSettings(deps));
+  if (deps.settingsAdmin !== undefined) register(qqSettings(deps));
   // 精确时间 / 话题：没有权限门槛（它们不改任何东西），永远注册；
   // qq_topic 要话题账本（deps.topicSet），没有就跳过 —— 不留「一调就报错」的壳。
-  ctx.tools.register(qqTime());
-  if (deps.topicSet !== undefined) ctx.tools.register(qqTopic(deps));
+  register(qqTime());
+  if (deps.topicSet !== undefined) register(qqTopic(deps));
   // 软命令：**始终注册**，开关（modelAutoTool / moduleAutoTool / 模式）在 execute 里判。
   // 注册期判会踩两个坑：预设 / allowTools 里写着 qq_auto_tool 却找不到工具（白名单只能
   // 收窄，写错的名字会被丢掉并记 warn），以及打开配置后还得重启插件才能用。
-  if (deps.runSoftCommand !== undefined) ctx.tools.register(qqAutoTool(deps));
+  if (deps.runSoftCommand !== undefined) register(qqAutoTool(deps));
   // 调试提权：开关 / 会话 / TTL / 主人都在 deps.debug.guard 里；注册不代表能用。
   if (deps.debug !== undefined) {
-    ctx.tools.register(qqDebugRead(deps));
-    ctx.tools.register(qqDebugWrite(deps));
-    ctx.tools.register(qqDebugList(deps));
-    ctx.tools.register(qqDebugShell(deps));
-    ctx.tools.register(qqDebugLog(deps));
+    register(qqDebugRead(deps));
+    register(qqDebugWrite(deps));
+    register(qqDebugList(deps));
+    register(qqDebugShell(deps));
+    register(qqDebugLog(deps));
   }
 }

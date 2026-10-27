@@ -388,6 +388,7 @@ window.__ModuleLoader__.load({
         fields: [
           'provider',
           'model',
+          'modeSwitchSession',
           'approvalPolicy',
           'agentPreset',
           'allowTools',
@@ -518,7 +519,7 @@ window.__ModuleLoader__.load({
       { id: 'reminder', title: '定时提醒（到点自己开口）', prefix: ['reminder'] },
       {
         id: 'perception',
-        title: '感知与互动（链接 / 转发 / 视频 / 戳一戳 / 撤回）',
+        title: '感知与互动（链接 / 转发 / 视频 / 语音转写 / 戳一戳 / 撤回）',
         fields: [
           'linkPreview',
           'linkPreviewTimeoutMs',
@@ -531,6 +532,9 @@ window.__ModuleLoader__.load({
           'forwardTimeoutMs',
           'videoCover',
           'videoMaxBytes',
+          'voiceTranscript',
+          'voiceTranscriptTimeoutMs',
+          'voiceTranscriptMaxChars',
           'pokeReply',
           'pokeMode',
           'pokeReplyChance',
@@ -554,6 +558,7 @@ window.__ModuleLoader__.load({
             title: '合并转发',
             fields: ['forwardRead', 'forwardMaxNodes', 'forwardMaxChars', 'forwardMaxDepth', 'forwardTimeoutMs'],
           },
+          { title: '语音转文字', fields: ['voiceTranscript', 'voiceTranscriptTimeoutMs', 'voiceTranscriptMaxChars'] },
           { title: '戳一戳', fields: ['pokeReply', 'pokeMode', 'pokeReplyChance', 'pokeCooldownMs', 'pokeDailyMax'] },
           {
             title: '撤回',
@@ -679,6 +684,9 @@ window.__ModuleLoader__.load({
       privateAfterthoughtDailyMax: '私聊每天最多补几句',
       pokeCooldownMs: '戳一戳冷却（毫秒）',
       pokeDailyMax: '每天最多回应几次戳',
+      voiceTranscript: '语音转文字',
+      voiceTranscriptTimeoutMs: '转写超时（毫秒）',
+      voiceTranscriptMaxChars: '转写最多多少字',
       recallMode: '被撤回时的做法',
       recallAddressed: '被 @ 的那条撤回了还回不回',
       recallScope: '调侃谁的撤回',
@@ -737,6 +745,7 @@ window.__ModuleLoader__.load({
      */
     const ENUM_LABELS = {
       groupTrigger: { mention: '按 @ 提及', prefix: '按前缀', all: '全部消息' },
+      modeSwitchSession: { reset: '重建会话（省 token）', keep: '保留原 session（连续）' },
       approvalPolicy: { never: '一律拒绝（无人值守）', inherit: '跟随宿主' },
       pokeMode: { random: '随机（回戳或走一轮）', poke: '总是回戳', text: '走一轮模型', ignore: '不回' },
       recallMode: { off: '不处理（只修引用）', ignore: '假装没看到', tease: '调侃一下' },
@@ -882,6 +891,7 @@ window.__ModuleLoader__.load({
       mediaHoldMs: formatMs,
       batchBacklogChars: formatChars,
       ttsMaxChars: formatChars,
+      voiceTranscriptMaxChars: formatChars,
       batchBacklogHoldMs: formatMs,
       pokeCooldownMs: formatMs,
       recallCooldownMs: formatMs,
@@ -904,6 +914,7 @@ window.__ModuleLoader__.load({
       apiKeyProbeTimeoutMs: formatMs,
       reminderGraceMs: formatMs,
       reminderAgentTimeoutMs: formatMs,
+      voiceTranscriptTimeoutMs: formatMs,
       // 字节
       mediaMaxBytes: formatBytes,
       imageMaxBytes: formatBytes,

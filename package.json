@@ -72,6 +72,7 @@
     "prompt.js",
     "speech-policy.js",
     "modalities.js",
+    "voice.js",
     "forward.js",
     "links.js",
     "interactions.js",

@@ -77,6 +77,7 @@ export const EXTRA_WRITABLE_KEYS = [
   'reminder', 'reminderMentionOthers', 'reminderAllowAll', 'reminderDailyMax', 'reminderMaxActive',
   'reminderGraceMs', 'reminderModes', 'reminderAgentTimeoutMs', 'reminderAgentDailyMax',
   'burstMaxChars', 'burstMaxParts', 'burstMaxMessages', 'burstSingleMaxChars',
+  'modeSwitchSession',
   'readDelayMs', 'charsPerSecond', 'minDelayMs', 'maxDelayMs', 'delayJitter',
   'personaMaxChars', 'personaSceneOverlays', 'styleMaxChars', 'stripShortPeriod', 'shortPeriodMaxChars',
   'privateAfterthought', 'privateAfterthoughtChance', 'privateAfterthoughtIdleMs', 'privateAfterthoughtDailyMax',

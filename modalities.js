@@ -214,6 +214,19 @@ function faceLabel(data) {
 }
 
 /**
+ * 语音段里自带的转写文字（部分实现会直接放在 `text` / `transcript` 里）。
+ * @param data - 段的 `data` 字段。
+ * @returns 原样文字；没有可用内容时为空串。
+ */
+export function inlineVoiceTranscript(data) {
+  if (data === null || typeof data !== 'object') return '';
+  for (const field of [data.text, data.transcript]) {
+    if (typeof field === 'string' && field.trim().length > 0) return field;
+  }
+  return '';
+}
+
+/**
  * 卡片/链接的渲染：`[链接: 【标题】 — example.com https://…]`。
  *
  * 标题存在才算「看得见的链接」；解析失败或卡片压根没标题时退回 `[卡片消息]`，
@@ -296,13 +309,17 @@ export function observationOf(segment, { index = 0, replacement } = {}) {
     }
     case 'record':
     case 'voice': {
-      // 语音本轮只做时长占位，不转写也不下载（见 doc §8.5）——所以是 skipped。
+      // 语音不下载；转写由 voice.js 调 QQ 官方接口补进 meta.transcript。
+      const transcript = inlineVoiceTranscript(data);
       return {
         ...base,
         kind: 'voice',
         url: typeof data.url === 'string' ? data.url : undefined,
-        meta: { durationMs: durationMilliseconds(data.duration) },
-        status: 'skipped',
+        meta: {
+          durationMs: durationMilliseconds(data.duration),
+          ...(transcript.length > 0 ? { transcript } : {}),
+        },
+        status: transcript.length > 0 ? 'ok' : 'skipped',
       };
     }
     case 'video': {
@@ -418,7 +435,10 @@ export function renderObservation(observation) {
     }
     case 'voice': {
       const seconds = secondsFromMilliseconds(meta.durationMs);
-      return seconds === undefined ? '[语音]' : `[语音 ${seconds} 秒]`;
+      const head = seconds === undefined ? '语音' : `语音 ${seconds} 秒`;
+      const transcript = typeof meta.transcript === 'string' ? meta.transcript.replace(/\s+/g, ' ').trim() : '';
+      if (transcript.length > 0) return `[${head}｜这是一条语音消息，语音转文字内容如下：${transcript}]`;
+      return `[${head}]`;
     }
     case 'video': {
       const seconds = secondsFromMilliseconds(meta.durationMs);

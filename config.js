@@ -85,6 +85,7 @@ export const Config = z.object({
   allowGroups: z.array(z.string()).default([]).description('群白名单（群号）；留空表示不限制'),
   provider: z.string().default('').description('QQ 会话使用的模型服务商；留空使用默认'),
   model: z.string().default('').description('QQ 会话使用的模型；留空使用默认'),
+  modeSwitchSession: z.union(['reset', 'keep']).default('reset').description('切换模式时怎么处理会话：reset = 新开一轮并注入最近 6/15 轮（省 token，默认）；keep = 保留原 session 历史，只重建 Agent 和工具面（连续性好，但输入更大，适合完整 ↔ 斗图）'),
   approvalPolicy: z.union(['never', 'inherit']).default('never').description('QQ 会话的工具审批策略：never 表示无人值守时一律拒绝需要审批的操作'),
   agentPreset: z.string().default('qq').description('QQ 会话 Agent 挂载的 Agent 预设 id；默认 qq（本 bundle 自带：只读文件 + 检索 + 联网，没有 shell / 子代理）。留空表示用**部署的默认预设**（可能是带 shell 的 standard 预设 —— QQ 消息是不可信输入，别轻易这么配）；填 none 表示不挂载预设（QQ 会话只有宿主平面的全局工具）'),
   allowTools: z
@@ -182,6 +183,9 @@ export const Config = z.object({
   linkAllowPrivateHosts: z.boolean().default(false).description('是否允许抓内网地址（自建 wiki 之类才打开）：关着时 localhost / *.local / *.internal / 私有与保留 IP 一律拒绝'),
   videoCover: z.boolean().default(true).description('视频消息是否下载封面图（只下封面，不下整段视频）：开着时正文是「[视频 12 秒 · 封面: .qq-media/…]」，模型能 read_image 看一帧'),
   videoMaxBytes: z.number().default(0).description('整段视频的下载上限（字节）：0 = 不下载整段（默认；只有封面）。非 0 时会先校验大小再下，但插件不做转码、模型也读不了视频，一般不需要开'),
+  voiceTranscript: z.boolean().default(true).description('是否把语音消息转成文字交给模型（调 NapCat 的 fetch_ptt_text，用 QQ 官方语音转文字）：开着时正文是「[语音 3 秒｜这是一条语音消息，语音转文字内容如下：…]」，模型能直接回答内容；false = 只留 [语音 N 秒] 占位符，一次接口都不调'),
+  voiceTranscriptTimeoutMs: z.number().default(8000).description('等语音转写的超时（毫秒）：QQ 那边没给结果时不拖住整条消息，保留占位符照常投递；默认 8 秒'),
+  voiceTranscriptMaxChars: z.number().default(500).description('一段语音转写最多交给模型多少字（超过截断并补 …）：防止一段超长语音把整轮上下文撑爆'),
   pokeReply: z.boolean().default(true).description('被戳一戳（双击头像）时是否回应'),
   pokeMode: z.union(['random', 'poke', 'text', 'ignore']).default('random').description('怎么回应戳一戳：random = 按 pokeReplyChance 在「回戳」与「走一轮模型」之间掷（默认）；poke = 总是回戳（最快、最像群友）；text = 走一轮模型（正文是「X 戳了你一下」，允许 SKIP）；ignore = 不回'),
   pokeReplyChance: z.number().default(0.7).description('pokeMode: random 时选择「回戳」的概率（0~1）：其余情况走一轮模型'),

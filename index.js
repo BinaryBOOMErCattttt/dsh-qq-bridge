@@ -79,6 +79,7 @@ import { createReminders, describeTask } from './reminders.js';
 import { builtinStyle, createStyle, renderStyleContract } from './style.js';
 import { createPersona, renderPersona } from './persona.js';
 import { observationOf, renderObservation, renderSegment } from './modalities.js';
+import { resolveVoiceTranscripts } from './voice.js';
 import { expandForward, forwardId } from './forward.js';
 import { pokeAction, pokeActionType, pokeNudge, pokeNotice } from './interactions.js';
 import { recallAction, recallNudge, recallNotice } from './recall.js';
@@ -295,6 +296,15 @@ export function apply(ctx, config) {
     if (savedMode === 'simple' || savedMode === 'sticker' || savedMode === 'full') appMode = savedMode;
   } catch {
     // 没有文件 = 默认完整模式；读坏也当没有（不因为一个手滑把模式切到一半）。
+  }
+  // 思考强度：单独给 bot 的运行时设置，不走配置项 / 设置页。
+  const REASONING_FILE = join(cwd, 'data', 'reasoning.json');
+  let reasoningEffort = 'auto';
+  try {
+    const savedReasoning = JSON.parse(readFileSync(REASONING_FILE, 'utf8')).effort;
+    if (['auto', 'off', 'low', 'high', 'max'].includes(savedReasoning)) reasoningEffort = savedReasoning;
+  } catch {
+    // 没有文件 = auto；读坏也当 auto
   }
   // 小功能共用的状态文件（米饭 / 木鱼 / 关注 / 投票 / 纪念日 / 接龙）。读坏了退回空对象。
   const chatState = createChatState({ file: resolve(cwd, 'data/chat-state.json'), report });
@@ -1309,18 +1319,64 @@ export function apply(ctx, config) {
    * @param {object} conversation - 当前私聊会话。
    * @param {'full' | 'simple' | 'sticker'} next - 目标模式。
    */
+  /**
+   * 切模式但保留原 session：只销毁 Agent / 作用域，不清代次、不删历史。
+   * 下一轮 ensureAgent 会用同一个 session id resume，因此上下文连续；system / tools
+   * 仍然会换，缓存会在切换点 miss 一次，之后按新前缀重新建立。
+   */
+  async function disposeForModeKeep(conversation) {
+    const sessionId = sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0);
+    const live = conversation.agent ?? ctx.agents.get(sessionId);
+    if (live !== undefined) {
+      try {
+        if (conversation.handle?.agent === live) await conversation.handle.dispose();
+        else if (typeof live.scope?.dispose === 'function') await live.scope.dispose();
+        else throw new Error('no disposer available for the live agent');
+      } catch (error) {
+        report('warn', `could not dispose ${sessionId}: ${error?.message ?? error}`);
+        return false;
+      }
+    }
+    conversation.agent = undefined;
+    conversation.handle = undefined;
+    detachChannelPrompt(conversation);
+    conversation.agentCtx = undefined;
+    conversation.channelPromptMissing = false;
+    conversation.agentOptions = undefined;
+    conversation.presetMounted = undefined;
+    conversation.presetMissing = false;
+    conversation.presetId = undefined;
+    conversation.presetRetryAt = 0;
+    sessionIndex.delete(sessionId);
+    for (const [slot, owner] of turnOwners) {
+      if (owner?.key === conversation.key || slot.startsWith(`${sessionId}:`)) turnOwners.delete(slot);
+    }
+    for (const [slot, owner] of submitted) {
+      if (owner?.key === conversation.key) submitted.delete(slot);
+    }
+    for (const slot of [...transcripts.keys()]) {
+      if (slot.startsWith(`${sessionId}:`)) transcripts.delete(slot);
+    }
+    cancelChime(conversation);
+    stopTyping(conversation);
+    conversation.pendingIntent = undefined;
+    conversation.modeContext = undefined;
+    return true;
+  }
+
   async function switchMode(conversation, next) {
     if (next === appMode) {
       void sendToConversation(conversation, `现在已经是${modeLabel(next)}模式。`);
       return;
     }
     const turns = next === 'simple' ? 6 : 15;
-    const context = await modeContextText(conversation, turns);
+    const keepSession = settings.modeSwitchSession === 'keep';
+    const context = keepSession ? undefined : await modeContextText(conversation, turns);
     // 斗图模式退出时把那一轮会话目录归档（与定档同一套 `archiveSessionDir`）：
     // 斗图轮次里全是图与短句，留在 sessions 根目录只会让下一次 resume 挑错档。
     const wasSticker = appMode === 'sticker';
     const oldSessionId = sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0);
-    const ok = await resetConversation(conversation);
+    const ok = keepSession ? await disposeForModeKeep(conversation) : await resetConversation(conversation);
     if (!ok) {
       // 旧会话没能销毁时**不要**改模式：新旧两个 Agent 同时挂着，回复会串到另一档的能力面。
       void sendToConversation(conversation, '切换失败：旧会话没能关掉，模式没变。');
@@ -1328,7 +1384,8 @@ export function apply(ctx, config) {
     }
     appMode = next;
     refreshAllowTools();
-    if (wasSticker && next !== 'sticker') await archiveSessionDir(oldSessionId);
+    // keep 模式下旧 session 还在原地，不能把正在用的目录当“旧档”归档。
+    if (!keepSession && wasSticker && next !== 'sticker') await archiveSessionDir(oldSessionId);
     try {
       await mkdir(dirname(MODE_FILE), { recursive: true });
       await writeJsonAtomic(MODE_FILE, { mode: next, at: Date.now() });
@@ -1337,7 +1394,7 @@ export function apply(ctx, config) {
       report('warn', `mode file write failed: ${errorText(error)}`);
     }
     conversation.modeContext = context;
-    conversation.modeContextLabel = `最近 ${turns} 轮`;
+    conversation.modeContextLabel = keepSession ? undefined : `最近 ${turns} 轮`;
     // 斗图模式只在**开场那一轮**读一次 SEMANTICS.md / 建立表情目录印象：之后靠这一轮的
     // 上下文接图，不必每轮重复同一段提示（目录本身仍会每轮随「本轮情境」给，见
     // `stickerCatalogLines` 的 force 参数）。
@@ -1346,25 +1403,56 @@ export function apply(ctx, config) {
     void sendToConversation(
       conversation,
       next === 'simple'
-        ? `已切到简洁模式：只保留聊天 / 记忆 / 静默 / 设置 / 定档，记忆按最近 6 轮，攒批 5 秒，主动搭话、复读、补一句全关。\n（切换时保留了最近 6 轮上下文，下一轮接上。）`
+        ? `已切到简洁模式：只保留聊天 / 记忆 / 静默 / 设置 / 定档，记忆按最近 6 轮，攒批 5 秒，主动搭话、复读、补一句全关。\n（${keepSession ? '保留原会话上下文' : '切换时保留了最近 6 轮上下文'}，下一轮接上。）`
         : next === 'sticker'
-          ? `已切到斗图模式：表情发送常驻、不受心情门控，默认每条回复都带一张图，优先按语义接图。\n（切换时保留了最近 15 轮上下文，下一轮接上。）`
-          : `已切回完整模式：功能全开，记忆按最近 15 轮。\n（切换时保留了最近 15 轮上下文，下一轮接上。）`,
+          ? `已切到斗图模式：表情发送常驻、不受心情门控，默认每条回复都带一张图，优先按语义接图。\n（${keepSession ? '保留原会话上下文' : '切换时保留了最近 15 轮上下文'}，下一轮接上。）`
+          : `已切回完整模式：功能全开，记忆按最近 15 轮。\n（${keepSession ? '保留原会话上下文' : '切换时保留了最近 15 轮上下文'}，下一轮接上。）`,
     );
   }
 
-  /**
-   * `模式` 指令：群里只提示私聊；私聊里所有人可看，只有主人能切。
-   *
-   * 为什么看和切分开：切模式会重建会话、收窄能力面，是主人级动作；但「现在是什么模式」
-   * 本身不敏感，访客问一句也应当能答 —— 否则群里有人发现回复变短了，还得去问主人。
-   * @param {object} command - 已解析的指令。
-   */
-  async function modeCommand(command) {
-    if (command.conversation.type !== 'private') {
-      commandReply(command, '模式只在私聊里说。');
+  /** 推理强度：改 bot 自己的运行时设置，不走 settings / 设置页。 */
+  async function reasoningCommand(command) {
+    const raw = String(command.args ?? '').trim().toLowerCase();
+    const alias = { 最大: 'max', 高: 'high', 中: 'low', 低: 'low', 关: 'off', 关闭: 'off', 自动: 'auto' };
+    const value = alias[raw] ?? raw;
+    if (raw.length === 0) {
+      commandReply(command, `当前思考强度：${reasoningEffort}\n可设：auto / off / low / high / max\n例如：推理强度 max`);
       return;
     }
+    if (!command.owner) {
+      commandReply(command, `只有主人能改思考强度；当前是 ${reasoningEffort}。`);
+      return;
+    }
+    if (!['auto', 'off', 'low', 'high', 'max'].includes(value)) {
+      commandReply(command, '只认 auto / off / low / high / max，例如：推理强度 max');
+      return;
+    }
+    reasoningEffort = value;
+    try {
+      await mkdir(dirname(REASONING_FILE), { recursive: true });
+      await writeJsonAtomic(REASONING_FILE, { effort: value, at: Date.now() });
+    } catch (error) {
+      commandReply(command, `没存下来：${errorText(error)}`);
+      return;
+    }
+    const sessionId = sessionIdFor(command.conversation.key, command.conversation.sessionGeneration ?? 0);
+    const live = command.conversation.agent ?? ctx.agents.get(sessionId);
+    if (live !== undefined) {
+      try {
+        if (command.conversation.handle?.agent === live) await command.conversation.handle.dispose();
+        else if (typeof live.scope?.dispose === 'function') await live.scope.dispose();
+      } catch (error) {
+        report('warn', `could not recreate agent for reasoning change: ${errorText(error)}`);
+      }
+    }
+    command.conversation.agent = undefined;
+    command.conversation.handle = undefined;
+    sessionIndex.delete(sessionId);
+    commandReply(command, `思考强度已设为 ${value}，下一条消息生效。`);
+  }
+
+  /** `模式` 指令：群里也能看；只有主人能切。 */
+  async function modeCommand(command) {
     const arg = String(command.args ?? '').trim().toLowerCase();
     if (arg.length === 0) {
       commandReply(
@@ -1702,6 +1790,10 @@ export function apply(ctx, config) {
       commandReply(command, `好，有人提到「${keyword}」我就私聊你。`);
       return;
     }
+    if (name === '推理强度') {
+      await reasoningCommand(command);
+      return;
+    }
     if (name === '模式') {
       await modeCommand(command);
       return;
@@ -1838,11 +1930,15 @@ export function apply(ctx, config) {
   function resolveRoute() {
     const configuredProvider = settings.provider.trim();
     const configuredModel = settings.model.trim();
+    // auto = 跟随默认；简洁模式 auto 下默认关思考。显式值覆盖默认。
+    const configuredEffort = reasoningEffort === 'auto'
+      ? appMode === 'simple' ? 'off' : undefined
+      : reasoningEffort;
     if (configuredProvider.length > 0 && configuredModel.length > 0) {
       Object.assign(route, {
         provider: configuredProvider,
         model: configuredModel,
-        reasoningEffort: undefined,
+        reasoningEffort: configuredEffort,
         source: 'config',
         error: '',
       });
@@ -1861,7 +1957,7 @@ export function apply(ctx, config) {
     Object.assign(route, {
       provider: configuredProvider.length > 0 ? configuredProvider : (selection?.provider ?? ''),
       model: configuredModel.length > 0 ? configuredModel : (selection?.model ?? ''),
-      reasoningEffort: useDefault ? selection?.reasoningEffort : undefined,
+      reasoningEffort: configuredEffort ?? (useDefault ? selection?.reasoningEffort : undefined),
       source: selection === undefined ? 'none' : 'default',
     });
     if (selection === undefined && route.error.length === 0) route.error = 'the default model selection is empty';
@@ -1921,6 +2017,8 @@ export function apply(ctx, config) {
   const repeatStates = new Map();
   /** 消息对象 → 这条消息的媒体解析 Promise（见 `mediaFor`）：环境上下文与表情包复读共用一次下载。 */
   const mediaResolutions = new WeakMap();
+  /** 消息对象 → 这条消息的语音转写 Promise（同一条消息只调一次 fetch_ptt_text）。 */
+  const voiceResolutions = new WeakMap();
   /** `.qq-media/…` 路径 → 画面指纹（见 `sketchOf`）：只在真要比较两条图时才算，算过就留着。 */
   const sketches = new Map();
 
@@ -2189,6 +2287,7 @@ export function apply(ctx, config) {
     findRecent,
     mediaFor,
     resolveForwards,
+    resolveVoice: voiceFor,
     resolveQuote,
     imageAllowed,
     dropPrefix,
@@ -3085,13 +3184,13 @@ export function apply(ctx, config) {
     // 也不再补一句「记忆还是空的」—— 系统提示里已经说清它去哪儿查，而这块每轮都会留在
     // 历史里，重复一次就是一次额外的上下文。
     if (memory.toolsAllowed()) {
-      const recall = memory.recallText(conversation);
+      const recall = memory.recallText(conversation, appMode === 'simple'
+        ? { promptChars: 2500, recallK: 5 }
+        : { promptChars: 4000, recallK: 8 });
       if (recall.length > 0) lines.push('', recall);
     }
-    // 时间与待发提醒的摘要：分钟级变化，同样只能待在这里。
+    // 待发提醒摘要：分钟级变化，只能待在这里；精确时间交给 qq_time，避免每轮换情境。
     if (remindersEnabled && (allowTools.length === 0 || allowTools.includes('qq_remind_create'))) {
-      const nowAt = Date.now();
-      lines.push('', `- 现在是 ${localMinute(nowAt)}（${weekdayLabel(nowAt)}，本地时间）。`);
       const summary = reminders.summaryFor(conversation.key);
       if (summary.count > 0) {
         lines.push(`- 这个会话还有 ${summary.count} 条待发的提醒，最近一条：${describeTask(summary.next)}。`);
@@ -5125,9 +5224,21 @@ export function apply(ctx, config) {
    *   `{ error }`，表情包复读靠它拿内容哈希路径）；这条消息里没有媒体段、或下载功能被
    *   关掉时返回 undefined。
    */
-  async function resolveMessageMedia(message) {
+  // 一条合并转发最多下载前三张图：子消息再多，也不该把整段转发变成图库。
+  const FORWARD_MAX_IMAGES = 3;
+
+  async function resolveMessageMedia(message, { maxImages = Number.POSITIVE_INFINITY } = {}) {
     if (!mediaStore.enabled) return undefined;
-    const items = [...collectMedia(message)];
+    let items = [...collectMedia(message)];
+    let images = 0;
+    if (Number.isFinite(maxImages)) {
+      items = items.filter((item) => {
+        if (item.kind !== 'image' && item.kind !== 'mface') return true;
+        if (images >= maxImages) return false;
+        images += 1;
+        return true;
+      });
+    }
     // 视频**只下封面**（默认开，`videoMaxBytes: 0` 表示不下载整段）：整段视频模型读不了
     // （read_image 只认图片），下它既花带宽又没用；封面是唯一能看见的一帧。
     if (settings.videoCover && Array.isArray(message)) {
@@ -5170,7 +5281,7 @@ export function apply(ctx, config) {
         if (item.kind !== 'video') rendered.set(item.index, mediaPlaceholder(item, '', outcome.error));
       }),
     );
-    return { rendered, fetched, outcomes };
+    return { rendered, fetched, outcomes, images };
   }
 
   /**
@@ -5193,6 +5304,29 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 一条消息里的语音 → 转写文字（段下标 → 正文文本）。
+   * 失败只降级为 undefined，调用方保留 [语音 N 秒] 占位符。
+   */
+  function voiceFor(message, messageId) {
+    if (settings.voiceTranscript === false) return Promise.resolve(undefined);
+    if (typeof message !== 'object' || message === null) return Promise.resolve(undefined);
+    let pending = voiceResolutions.get(message);
+    if (pending === undefined) {
+      pending = resolveVoiceTranscripts(message, {
+        messageId,
+        maxChars: settings.voiceTranscriptMaxChars,
+        call: (action, params) => client.call(action, params, settings.voiceTranscriptTimeoutMs),
+        report,
+      }).catch((error) => {
+        report('warn', `voice: transcript failed: ${errorText(error)}`);
+        return undefined;
+      });
+      voiceResolutions.set(message, pending);
+    }
+    return pending;
+  }
+
+  /**
    * 把一条消息里的合并转发展开成「谁说了什么」。
    *
    * 为什么放在投递链路的异步段（与媒体、引用并列），而不是塞进 `modalities.js`：
@@ -5208,7 +5342,7 @@ export function apply(ctx, config) {
    * @param depth - 当前嵌套层数。
    * @returns `段下标 → 展开文本` 的映射；没有可展开的转发时 undefined。
    */
-  async function forwardReplacements(message, depth = 0) {
+  async function forwardReplacements(message, depth = 0, imageBudget = { left: FORWARD_MAX_IMAGES }) {
     if (settings.forwardRead !== true) return undefined;
     if (!Array.isArray(message)) return undefined;
     // 0 = 整条关掉（`forwardRead` 也可以关，两个都留着是为了单测边界更直白）。
@@ -5232,10 +5366,14 @@ export function apply(ctx, config) {
         // 嵌套块才要结束标记：最外层消息本身就到头了，不加能省一行。
         closing: depth > 0,
         renderNode: async (node) => {
+          // 整个合集共享 3 张图的预算：先按消息里的图片数预留，再下载。
+          const imageCount = [...collectMedia(node.message)].length;
+          const allowed = Math.min(imageBudget.left, imageCount);
+          imageBudget.left -= allowed;
           // 子消息里的图与嵌套转发一起解析：两件事互不依赖，串起来等只是白等。
           const [media, nested] = await Promise.all([
-            resolveMessageMedia(node.message),
-            forwardReplacements(node.message, depth + 1),
+            resolveMessageMedia(node.message, { maxImages: allowed }),
+            forwardReplacements(node.message, depth + 1, imageBudget),
           ]);
           const replacements = new Map(media?.rendered ?? []);
           for (const [nestedIndex, nestedText] of nested ?? []) replacements.set(nestedIndex, nestedText);
@@ -5268,7 +5406,7 @@ export function apply(ctx, config) {
    * @returns 与 {@link forwardReplacements} 同形。
    */
   function resolveForwards(message) {
-    return forwardReplacements(message, 0);
+    return forwardReplacements(message, 0, { left: FORWARD_MAX_IMAGES });
   }
 
   /**
@@ -5355,10 +5493,15 @@ export function apply(ctx, config) {
     }
     const quoted = info?.message ?? info?.raw_message;
     if (quoted === undefined || quoted === null) return undefined;
-    // 被引用的那条自己也可能是一个合并转发：图与转发都取，谁先好都行。
-    const [resolved, forwards] = await Promise.all([resolveMessageMedia(quoted), forwardReplacements(quoted, 0)]);
+    // 被引用的那条自己也可能是一个语音 / 合并转发：图、转发、转写一起取。
+    const [resolved, forwards, voices] = await Promise.all([
+      resolveMessageMedia(quoted),
+      forwardReplacements(quoted, 0),
+      voiceFor(quoted, id),
+    ]);
     const replacements = new Map(resolved?.rendered ?? []);
     for (const [index, text] of forwards ?? []) replacements.set(index, text);
+    for (const [index, text] of voices ?? []) replacements.set(index, text);
     const text = messageToText(quoted, undefined, replacements.size > 0 ? replacements : undefined).replace(/\s+/g, ' ').trim();
     const sender = info?.sender ?? {};
     const name = String(sender.card ?? sender.nickname ?? info?.user_id ?? '某人');

@@ -69,6 +69,7 @@ export function createBatcher(deps) {
     findRecent,
     mediaFor,
     resolveForwards,
+    resolveVoice,
     resolveQuote,
     imageAllowed,
     dropPrefix,
@@ -279,10 +280,11 @@ export function createBatcher(deps) {
         if (held && mark?.action === 'rewrite') continue;
         // 本条自己的图、它在回复的那条（含转发）、以及本条里的合并转发一起取：
         // 三件事互不依赖，串起来等只是白等（转发展开自己还会再等子消息里的图）。
-        const [resolved, quote, forwards] = await Promise.all([
+        const [resolved, quote, forwards, voice] = await Promise.all([
           mediaFor(item.message),
           resolveQuote(item.message),
           resolveForwards(item.message),
+          resolveVoice(item.message, item.messageId),
         ]);
         // 再查一次：撤回可能就发生在这几十毫秒里（我们正在下媒体），而上面那次查是 await
         // 之前 —— 一次不够，正是这段异步窗口逼出了「把 action 记在账上」这个设计。
@@ -291,6 +293,7 @@ export function createBatcher(deps) {
         // 「（引用 kaguya: …）\n[回复]这啥」这种一半有内容、一半是噪音的正文。
         const rendered = new Map(resolved?.rendered ?? []);
         for (const [index, expanded] of forwards ?? []) rendered.set(index, expanded);
+        for (const [index, text] of voice ?? []) rendered.set(index, text);
         if (quote !== undefined) rendered.set(quote.index, '');
         // 活跃对话里接上的那句没有前缀可去：按前缀长度硬切会把「然后呢」切成「后呢」。
         const raw = messageToText(item.message, selfId, rendered.size > 0 ? rendered : undefined).trim();

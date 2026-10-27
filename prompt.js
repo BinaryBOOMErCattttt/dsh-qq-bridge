@@ -253,7 +253,8 @@ export function createPromptKit(deps) {
         // （配置项），所以能留在系统提示里；「这一轮是否已放行」在 channelTurnContext。
         if (emojiMood.enabled()) {
           lines.push(
-            `- 心情：被夸奖 / 被开玩笑（没有攻击性）时，在回复末尾加 \`[[mood:upN]]\`；被指正错误时加 \`[[mood:downN]]\`。N 是 1~${emojiMood.tagCap()} 的整数，插件会删掉 tag，不要解释它。心情到 ${emojiMood.trigger()} 时插件会放行一次表情；不要为了发表情硬刷分。`,
+            `- 心情：按语义判断，不看关键词。被夸奖 / 感谢 / 被需要 / 被安慰 / 对方分享快乐 / 没有攻击性的玩笑 / 你帮上忙后对方满意 → 加 \`[[mood:upN]]\`；被指正错误 / 对方失望或生气 / 被责备 / 你重复犯错 / 对方明确说难受且因你而起 → 加 \`[[mood:downN]]\`。中性问答、命令、普通闲聊不加。`,
+            `- 心情幅度：轻微 5~10，明确 15~25，强情绪 30~40；N 是 1~${emojiMood.tagCap()} 的整数，一次最多一个 tag，插件会删掉它，不要解释。心情到 ${emojiMood.trigger()} 时插件放行一次表情；不要为了发表情硬刷分。`,
             '- 表情的语义判断（用户是不是在要表情、该不该配图）由你判断；插件不读文本猜。用户明确要表情 / 图时，调用 qq_send_image 并把 `user_requested` 设为 true，插件只负责放行一次。',
           );
         }

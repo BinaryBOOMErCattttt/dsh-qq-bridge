@@ -120,6 +120,7 @@
 | `allowGroups` | `[]` | 群白名单；空 = 不限制 |
 | `agentPreset` | `qq` | QQ 会话 Agent 挂载的 Agent 预设 id：默认 `qq`（本 bundle 自带：只读文件 + 检索 + 联网，没有 shell / 子代理）。空 = 用**部署的默认预设**（可能是带 shell 的 `standard`，QQ 消息是不可信输入，别轻易这么配），`none` = 不挂预设（只剩宿主平面的 `qq_*`） |
 | `provider` / `model` | `''` | QQ 会话使用的模型；空 = 用默认 |
+| `modeSwitchSession` | `reset` | 切模式时会话处理：`reset` = 重建并注入最近 6/15 轮（省 token）；`keep` = 保留原 session 历史，只重建 Agent 和工具面（连续性好，输入更大） |
 | `approvalPolicy` | `never` | `never` = 无人值守时一律拒绝需要审批的操作 |
 | `allowTools` | 31 个工具名 | QQ 会话可用的工具白名单：默认 `read` / `read_image` / `glob` / `grep` / `web_search` / `web_fetch` / `skill` + 二十四个 `qq_*` —— **没有 write / edit / bash**。`qq_write` / `qq_edit` / `qq_skill` 是主人专用的受信写盘（执行时按**这一轮发言人**核对主人身份），`qq_quiet` 是静默开关，`qq_settings` 是主人侧 bot 配置，`qq_auto_tool` 是软命令（`modelAutoTool`，默认关），五个 `qq_debug_*` 是调试提权（主人私聊 + `debug` 开关 + 10 分钟 TTL），`qq_time` / `qq_topic` 是精确时间与话题记忆。空 = 不限制（全给它继承到的工具）；写错的名字会被丢掉并记 warn，见[限制 QQ 会话的工具](tools.md#限制-qq-会话的工具allowtools) |
 | `resetCommand` | `/reset` | 新开一轮会话（旧会话留在磁盘上当存档）的指令；空 = 禁用 |
@@ -158,6 +159,9 @@
 | `forwardTimeoutMs` | `5000` | 没有内联内容、需要调 `get_forward_msg` 时的超时（毫秒）：卡住就保留占位符，不拖住投递 |
 | `videoCover` | `true` | 视频消息是否下载封面图（只下封面，不下整段视频）：开着时正文是「[视频 12 秒 · 封面: .qq-media/…]」，模型能 `read_image` 看一帧 |
 | `videoMaxBytes` | `0` | 整段视频的下载上限（字节）：`0` = 不下载整段（默认，只有封面）。非 0 时会先校验大小再下；插件不做转码、模型也读不了视频，一般不需要开 |
+| `voiceTranscript` | `true` | 是否把语音消息转成文字交给模型：调 NapCat 的 `fetch_ptt_text`（QQ 官方语音转文字），正文是 `[语音 3 秒｜这是一条语音消息，语音转文字内容如下：…]`；`false` = 只留 `[语音 N 秒]` 占位符，一次接口都不调 |
+| `voiceTranscriptTimeoutMs` | `8000` | 等语音转写的超时（毫秒）：QQ 那边没结果时保留占位符、照常投递 |
+| `voiceTranscriptMaxChars` | `500` | 一段语音转写最多交给模型多少字（超过截断并补 `…`） |
 | `pokeReply` | `true` | 被戳一戳（双击头像）时是否回应 |
 | `pokeMode` | `random` | 怎么回应戳一戳：`random` = 按 `pokeReplyChance` 在「回戳」与「走一轮模型」之间掷（默认）/ `poke` = 总是回戳 / `text` = 走一轮模型（正文是「X 戳了你一下」，允许 SKIP）/ `ignore` = 不回 |
 | `pokeReplyChance` | `0.7` | `pokeMode: random` 时选择「回戳」的概率（0~1）：其余情况走一轮模型 |

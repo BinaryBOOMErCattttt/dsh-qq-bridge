@@ -208,6 +208,9 @@ export function createSettings(config, defaultCwd) {
   const videoCover = config.videoCover !== false;
   // 0 是**明确的不下载**（默认），非法值也并到 0：视频整段下载本来就不该随手打开。
   const videoMaxBytes = Math.max(0, Math.floor(Number(config.videoMaxBytes) || 0));
+  const voiceTranscript = config.voiceTranscript !== false;
+  const voiceTranscriptTimeoutMs = Math.min(30_000, Math.max(1_000, Math.floor(Number(config.voiceTranscriptTimeoutMs) || 0) || 8_000));
+  const voiceTranscriptMaxChars = Math.min(2_000, Math.max(50, Math.floor(Number(config.voiceTranscriptMaxChars) || 0) || 500));
   const pokeReply = config.pokeReply !== false;
   const pokeReplyChance = Math.min(1, Math.max(0, Number(config.pokeReplyChance)));
   const pokeCooldownMs = msOf(config.pokeCooldownMs, 30000);
@@ -393,6 +396,9 @@ export function createSettings(config, defaultCwd) {
     forwardTimeoutMs,
     videoCover,
     videoMaxBytes,
+    voiceTranscript,
+    voiceTranscriptTimeoutMs,
+    voiceTranscriptMaxChars,
     pokeReply,
     pokeReplyChance,
     pokeCooldownMs,

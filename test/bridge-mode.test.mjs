@@ -81,12 +81,13 @@ async function savedMode(cwd) {
   return JSON.parse(await readFile(join(cwd, 'data', 'mode.json'), 'utf8')).mode;
 }
 
-test('模式：群里只提示私聊（零 token）', async () => {
+test('模式：群里访客能看当前模式（零 token），但不能切', async () => {
   const { onebot, host } = await boot();
   try {
     onebot.push(mention('模式'));
-    const reply = await waitSaid(onebot, 'send_group_msg', '模式只在私聊里说');
-    assert.equal(reply, '模式只在私聊里说。');
+    const reply = await waitSaid(onebot, 'send_group_msg', '当前模式');
+    assert.match(reply, /当前模式：完整/);
+    assert.match(reply, /只有主人能切换模式/);
     assert.equal(host.list.created.length, 0, '这条指令不该建 Agent');
   } finally {
     await onebot.close();
