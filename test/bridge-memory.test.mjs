@@ -494,8 +494,13 @@ test('memory rollover archives the least active rows instead of deleting them', 
     return { files, text: await readFile(join(archiveDir, files[0]), 'utf8') };
   }, 'the archive file to appear');
 
-  const hot = await readMemory(cwd, 'conversations/private-100000002/MEMORY.md');
-  assert.ok(Buffer.byteLength(hot, 'utf8') <= 2048, `热层要滚回阈值以下，实际 ${Buffer.byteLength(hot, 'utf8')}`);
+  // 滚档是「先写 archive、成功才重写热层」的两步，而且 `writeMemoryFile` 之后那次
+  // rolloverMemory 是 fire-and-forget —— archive 文件出现时，热层可能还是一份更早的内容。
+  // 所以这里等热层真的落到阈值以下再断言（后置条件本身没有放宽，只是不再断言中间态）。
+  const hot = await until(async () => {
+    const text = await readMemory(cwd, 'conversations/private-100000002/MEMORY.md');
+    return Buffer.byteLength(text, 'utf8') <= 2048 ? text : undefined;
+  }, 'the hot layer to shrink back under the threshold');
   assert.doesNotMatch(hot, /见 archive|更早的/, '热层里不许写指针行');
   const hotRows = hot.split('\n').filter((line) => /^- /.test(line.trim())).length;
   const archivedRows = archived.text.split('\n').filter((line) => /^- /.test(line.trim())).length;
