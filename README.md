@@ -80,6 +80,10 @@
 `tts.js` 只提供 `registerTtsProvider()` / `synthesize()`，**仓库不内置 Edge-TTS / Azure / 任何在线语音 API**。
 默认 `tts: false`，未注册 provider 时 `语音` 只回「未配置」，不会联网。
 
+**反过来，别人发的语音是能听懂的**：入站的 `record` 段会调协议端的 `fetch_ptt_text`（QQ 自带的语音转文字）
+取回一句话塞给模型 —— **不经过任何第三方识别服务**，不下载也不解码 SILK；转写失败时保留 `[语音 N 秒]`
+占位符，消息照常投递；一条消息里多段语音只转写第一段。实现在 [voice.js](voice.js)，纯函数可单测。
+
 ### 6. 图文攒批
 
 `mediaHoldMs`（默认 1500）把「图 + 配文」攒进同一轮再投给 Agent，避免图先到、文字后到各开一轮。
