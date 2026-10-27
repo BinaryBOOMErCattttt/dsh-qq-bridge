@@ -544,3 +544,4 @@ node scripts/smoke.mjs --json --service # 机读，写交接文档用
 1. 改了源码 → 冒烟之前先 `systemctl --user restart qqbot`（Loader 按 URL 缓存模块，不重启等于没改）。
 2. 交接文档必须带 `git rev-parse HEAD` 与 `package.json` 的版本 —— `smoke.mjs` 两个都报，别只写「最新版」。
 3. `todo` 不是失败。**没验过就写「未验」**，写「通过」是最糟的一种错。
+4. 云端那份是**旧树**（有功能、没合上游）时，先照 [docs/switch-to-merged-branch.md](docs/switch-to-merged-branch.md) 切到 `feat/port-server` 再冒烟：备份 → 切换 → 三类自检（必须变 / 必须在 / 必须保留）→ 重启。
