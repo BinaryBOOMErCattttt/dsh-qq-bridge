@@ -112,7 +112,28 @@ Windows / 本机开发：先把依赖铺进插件目录（`node_modules` 不是�
    `HANDOFF.md`（讲「怎么把 zip 覆盖进仓库」的交接手册）已经删了 —— 对仓库读者没有意义。
 5. **TTS 只有框架**：`tts: true` 之前得先在 `tts.js` 里 `registerTtsProvider()`，否则「语音」只回「未配置」，不会联网。
 
-## 九、以后怎么跟上游
+## 九、维护地图（每个子系统落在哪）
+
+移植时每个子系统都拆成了独立模块，`index.js` 只做装配。改行为先看这里，别去 index.js 里翻：
+
+| 子系统 | 模块 | 装配点 | 测试 |
+| --- | --- | --- | --- |
+| 运行模式 | `mode.js` | `index.js` 的 `appMode` / `switchMode` / `moduleEnabled` / `modeCommand`，`batch.js` 的窗口覆盖，`prompt.js` 的模式段 | `mode.test.mjs` / `bridge-mode.test.mjs` |
+| 心情门控 | `mood.js` | `index.js` 的 `handleEvent` / `turn/end` / `channelTurnContext`，`send.js` 的 `replyPieces`，`tools.js` 的 `user_requested` | `mood.test.mjs` / `bridge-mood.test.mjs` |
+| 调试提权 | `debug.js` | `tools.js` 的 `qq_debug_*`，`index.js` 的 `debugGuard` | `debug.test.mjs` |
+| 话题 / 时间 | `topics.js` | `index.js` 的 `channelTurnContext`，`util.js` 的 `timeBucketLabel`，`tools.js` 的 `qq_topic` / `qq_time` | `topics.test.mjs` |
+| 定档 | `handoff.js` | `index.js` 的 `sleepIntentFor` 与 `定档` 分流 | `handoff.test.mjs` / `bridge-handoff.test.mjs` |
+| 软命令 | —— | `index.js` 的 `runSoftCommand` / `SOFT_BLOCKED` + `tools.js` 的 `qq_auto_tool` | `bridge-debug.test.mjs` |
+
+三条不成文的规矩：
+
+1. **新逻辑先问「能不能单独成模块」**：碰文件系统的归 `filestore.js`，纯计算归自己的新模块，
+   `index.js` 里只留装配与「什么时候调它」。
+2. **每个模块配一个 `test/<模块>.test.mjs`**，端到端行为另开 `test/bridge-<主题>.test.mjs`。
+3. **配置项三处同步**：`config.js`（唯一真相）→ `settings.js`（取值/夹紧）→ `docs/configuration.md`
+   + `client.js` 的 `SECTIONS`（少一处 `check.mjs` 或 `client.test` 会红）。
+
+## 十、以后怎么跟上游
 
 本仓库 `main` = 上游；功能在这条 `feat/port-server` 上。上游更新时：
 
