@@ -97,6 +97,9 @@ owner-settings.js  主人侧配置覆盖层：可写键、与 settings 合并、
 commands.js     指令登记表与解析（第一个空白前的词才是指令）
 mode.js         运行模式纯函数：完整 / 简洁 / 斗图三档、简洁放行的指令 / 模块 / 工具集合
 mood.js         心情门控：mood tag 解析、冷场衰减、表情许可（斗图 / user_requested 直接放行）
+topics.js       话题记忆：high / medium / low / cold 四档、按模式轮数降档、`data/TOPICS.md` 镜像
+debug.js        调试提权：四道闸 + 10 分钟 TTL + `data/debug/<时间>/baseline` 备份 / manifest 回滚 / 审计
+handoff.js      定档（交接）：交接文档、归档旧会话、代次 +1、「睡觉去」12 秒没静默的兜底
 weather.js / balance.js  天气（Open-Meteo）与余额（`/user/balance`）：fetch 注入、可单测
 fun.js / music.js / chat-state.js  零 token 小玩意、点歌（只回链接）、`data/chat-state.json`
 tts.js          TTS 框架（`registerTtsProvider` / `synthesize`），不接在线服务（默认关）
@@ -133,7 +136,7 @@ test/<模块>.test.mjs   纯函数与契约用例（一行一模块）：
   speaking-rules（每例只翻一个字段）、mention（标记边界、名单按会话隔离）、util（写边界、memorySlug、
   本地时间、errorText、key 打码、isVolatileRef/liveConfig）、filestore（不抛错的失败语义）、
   perceptual（畸形输入、解压炸弹）、media（fetchBytes 的 SSRF）、mute、editor、owner-settings、weather、
-  balance、fun、commands、mode、migrate-cognition、napcat、desktop
+  balance、fun、commands、mode、topics、debug、handoff、migrate-cognition、napcat、desktop
 test/persona-template.test.mjs  人设模板/提示词/自检的契约（零解析警告、单底色、长度上限、不失链、退出码）
 test/image-fixtures.mjs  测试共用的图片 fixture（真编码的字节）
 cordis.patch.yml      插件自带 bundle patch：注册 `qq` Agent 预设（含 skill 平面）+ 插件 config
@@ -345,6 +348,9 @@ test/*  ──▶ 直接 import 上述模块（不经过 Harness）；harness.mj
 | 改「给表情改名」 | `cognition.js` 的 `renameStickerRow` + `memory.js` 的 `renameStickerEntry` + `sticker.js` 的 `renameSticker`/`stickerRenameAllowed`（写失败回滚）+ docs/media.md |
 | 改群触发 / 白名单 / 复读 | `index.js` 的 `admit` / `maybeRepeat` 区块 |
 | 改运行模式（完整 / 简洁 / 斗图） | `mode.js`（三档常量与白名单）+ `index.js` 的 `appMode` / `switchMode` / `modeContextText` / `modeCommand` / `moduleEnabled` + `batch.js` 的窗口覆盖 + `prompt.js` 的简洁 / 斗图段 + `Config` 的 `module*` / `*ReplyMaxChars` + `client.js` 的 `mode` 分组 + docs/commands.md、docs/configuration.md + `test/mode.test.mjs` / `test/bridge-mode.test.mjs` |
+| 改软命令 / 调试提权 | `index.js` 的 `runSoftCommand` / `SOFT_BLOCKED` / `commandReply` 的 silent 分支 + `debug.js`（四道闸 / TTL / 回滚 / 审计）+ `tools.js` 的 `qq_auto_tool` 与五个 `qq_debug_*` + `Config.modelAutoTool`/`debug`/`module*Tool` + `mode.js` 的 `COMMAND_MODULES`（debug / overdebug）+ docs/commands.md、docs/tools.md + `test/debug.test.mjs` / `test/bridge-debug.test.mjs` |
+| 改话题记忆 / 时间 | `topics.js`（档位 / 降档窗口 / TOPICS.md）+ `index.js` 的 `topics.decay` 调用点与 `channelTurnContext`（常驻摘要 + 粗时段）+ `util.js` 的 `timeBucketLabel` + `tools.js` 的 `qq_topic`/`qq_time` + `prompt.js` 的能力清单 + `test/topics.test.mjs` |
+| 改定档（交接） | `handoff.js`（文档正文 / 归档 / 兜底定时器 / 模块闸）+ `index.js` 的 `sleepIntentFor` 调用点与 `定档` 指令分支 + `Config.moduleHandoff` + docs/commands.md + `test/handoff.test.mjs` / `test/bridge-handoff.test.mjs` |
 | 改心情门控 / 发表情权限 | `mood.js`（分数 / 衰减 / 放行 / 收尾）+ `index.js` 的 `handleEvent` / `turn/end` / `channelTurnContext` + `send.js` 的 `replyPieces`（只卡收藏目录里的表情）+ `tools.js` 的 `qq_send_image.user_requested` + `Config.mood*` / `moduleEmojiMood` + `client.js` 的 `mode` 分组 + docs/commands.md、docs/configuration.md + `test/mood.test.mjs` / `test/bridge-mood.test.mjs` |
 | 改指令 / 静默 / 受信写盘 | `commands.js`（`parseCommand`，判据是**短句**：第一个空白前的词）+ `mute.js` + `owner-settings.js` + `editor.js` + `index.js` 三处旁路（`admit` 前分流 / `qq_quiet` / `writeAuthority`）+ `Config.commands`/`wake*`/`mute*`/`trustedWrite`/`skillWriteDir`/`writeMaxBytes` + docs/commands.md、docs/tools.md；**部署级字段（provider/model/endpoint/凭据/白名单）只能留在只读那侧** |
 | 改回复的指向（引用 / @） | `send.js` 的 `quoteHead` + `admit` 快照的 `chatter.anchor()` + `Config.replyStyle`；**`continued`/`interject` 在第一行就返回 undefined**；进度读数**含机器人自己发的话**（`noteSelf`，别换 `others()`，也别删 `noteOwnMessage` —— NapCat `reportSelfMessage: false`，自己发的话等不到回灌） |
@@ -388,11 +394,11 @@ Web 表面把 agent 平面的工具搬进了 **Agent 预设**：QQ 会话只有 
 **skill 归预设管**：`dsh-web-app` 把宿主的 `skill-filesystem` / `tool-skill` 停掉了（「presets own local discovery」），
 所以预设里必须自己挂一份，QQ 会话才看得见 `.dsh/skills`；`allowTools` 里也要留着 `skill`，否则模型拿到目录却打不开。
 
-`allowTools` 白名单在 `restrictAgentTools` 里生效。**默认值不是空的**：23 个名字（只读文件 + 检索 + 联网 +
-十六个 `qq_*`），所以 `qq` 预设里带的 `write` / `edit` 默认拿不到；显式写空数组才是「不限制」。名字写错会被丢掉并
-记 warn（白名单只能收窄）。新增的五个 `qq_*`（`qq_quiet` / `qq_settings` / `qq_write` / `qq_edit` / `qq_skill`）
-是**能力面的变化**：它们在 `execute()` 里核对「这一轮是不是主人在说」，所以关它们靠配置（`trustedWrite` /
-`commands`）与主人名单，**不是 `allowTools`**。
+`allowTools` 白名单在 `restrictAgentTools` 里生效。**默认值不是空的**：31 个名字（只读文件 + 检索 + 联网 +
+二十四个 `qq_*`），所以 `qq` 预设里带的 `write` / `edit` 默认拿不到；显式写空数组才是「不限制」。名字写错会被丢掉并
+记 warn（白名单只能收窄）。那批主人侧 `qq_*`（`qq_quiet` / `qq_settings` / `qq_write` / `qq_edit` / `qq_skill` /
+`qq_auto_tool` / `qq_debug_*`）是**能力面的变化**：它们在 `execute()` 里核对「这一轮是不是主人在说」+
+各自的开关（`trustedWrite` / `modelAutoTool` / `debug`），所以关它们靠配置与主人名单，**不是 `allowTools`**。
 
 **渠道提示小节必须可重试地挂**（`attachChannelPrompt` / `detachChannelPrompt`）：`agentCtx.get('systemPrompt')`
 是 **strict** 的 —— 服务所属 fiber 还没 active 就返回 `undefined`，而 Agent 的 resume 可能正好赶在那一小段。

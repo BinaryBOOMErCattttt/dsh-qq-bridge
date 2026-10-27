@@ -95,6 +95,8 @@
 | `blankReply` | `true` | 是否理会「没有正文」的消息：群里单纯 @ 它一下、或私聊发一个空格，都照常交给模型（正文位置写明「@了你一下，没有说别的」），由它看着上下文决定回「？」、发张表情还是接上一句；`false` = 静默丢弃，见[没有正文的消息](speaking.md#没有正文的消息blankreply) |
 | `commands` | `true` | 是否启用「@bot + 空格 + 指令」的指令路由：帮助 / 天气 / 随机表情 / 表情 / 白饭 / 小作文（访客可用）、状态 / 余额 / 设置（主人专用）。关掉后这些词全部当普通聊天交给模型。判据是**短句**：第一个空白前的词命中登记表才算指令，见[指令](commands.md) |
 | `guestCommands` | `true` | 是否允许访客（非主人）用公开指令；`false` = 只有主人能用指令（主人专用指令始终只认主人） |
+| `modelAutoTool` | `false` | 软命令 / model auto tool：用户用自然语言提要求、没命中规范指令时，允许模型自己调用插件指令（「帮我抽个签」→ `抽签`）。只在主人当轮说话时生效；定档 / 语音 / 随机表情 / 接一个 / 存表情 / 设置不开放；还需要 `moduleAutoTool` 没关且不在简洁模式。默认关，见[指令](commands.md) |
+| `debug` | `false` | 调试模式：允许主人在**私聊**里发 `debug` 临时提权，模型获得 `qq_debug_read` / `qq_debug_write` / `qq_debug_list` / `qq_debug_shell`（工作区外读写与命令执行）。10 分钟后或主人发 `overdebug` 自动退出；只对开启它的那个会话生效，每次调用都写 `data/debug-audit.log`。默认关 |
 | `moodMax` | `100` | 心情上限（百分比）：心情分数的天花板。单次涨幅与触发阈值都会被它夹住，调小之后阈值不会超过上限 |
 | `moodTagMaxFull` | `100` | 完整模式单次 `[[mood:upN]]` / `[[mood:downN]]` 的最大涨幅；模型一次最多加/减这么多 |
 | `moodTagMaxSimple` | `50` | 简洁模式单次 mood tag 的最大涨幅（默认 50 = 至少两次夸奖 / 指正才满） |
@@ -107,7 +109,9 @@
 | `moduleLookup` | `true` | 查询模块：天气 / 余额 / 群热度 / 随机表情 |
 | `moduleReminders` | `true` | 提醒模块：`提醒` 指令（定时任务本身仍由 `reminder` 开关控制，关掉这一项不会让已建的任务失效） |
 | `moduleTts` | `true` | 语音模块：`语音` 指令（还需要 `tts` 打开并注册 provider） |
-| `moduleHandoff` | `true` | 定档模块：`定档` 指令 |
+| `moduleAutoTool` | `true` | 软命令模块：模型自己调用插件指令（还要 `modelAutoTool` 打开，且不在简洁模式） |
+| `moduleDebug` | `true` | 调试模块：主人私聊里的 `debug` 提权（还要 `debug` 打开；简洁模式强制关闭） |
+| `moduleHandoff` | `true` | 定档模块：`定档` 指令，以及「主人说了睡但 12 秒内没静默」时自动定档的**兜底**（关掉这一项连兜底也不会发生） |
 | `simpleReplyMaxChars` | `400` | 简洁模式一次回复的硬上限（字符）：超过直接截断，避免啰嗦；`0` = 不截断（协议上限仍是 `maxReplyChars`） |
 | `fullReplyMaxChars` | `800` | 完整模式一次回复的硬上限（字符）：超过直接截断；协议上限仍是 `maxReplyChars`；`0` = 不截断 |
 | `tts` | `false` | 是否启用「语音 <文字>」指令：需要先在 `tts.js` 里注册一个 provider（本地 Kokoro / Piper / 自建服务，或你自己的授权 API）。默认关，未注册时指令只回「未配置」，**不会联网** |
@@ -117,7 +121,7 @@
 | `agentPreset` | `qq` | QQ 会话 Agent 挂载的 Agent 预设 id：默认 `qq`（本 bundle 自带：只读文件 + 检索 + 联网，没有 shell / 子代理）。空 = 用**部署的默认预设**（可能是带 shell 的 `standard`，QQ 消息是不可信输入，别轻易这么配），`none` = 不挂预设（只剩宿主平面的 `qq_*`） |
 | `provider` / `model` | `''` | QQ 会话使用的模型；空 = 用默认 |
 | `approvalPolicy` | `never` | `never` = 无人值守时一律拒绝需要审批的操作 |
-| `allowTools` | 23 个工具名 | QQ 会话可用的工具白名单：默认 `read` / `read_image` / `glob` / `grep` / `web_search` / `web_fetch` / `skill` + 十六个 `qq_*` —— **没有 write / edit / bash**。`qq_write` / `qq_edit` / `qq_skill` 是主人专用的受信写盘（执行时按**这一轮发言人**核对主人身份），`qq_quiet` 是静默开关，`qq_settings` 是主人侧 bot 配置。空 = 不限制（全给它继承到的工具）；写错的名字会被丢掉并记 warn，见[限制 QQ 会话的工具](tools.md#限制-qq-会话的工具allowtools) |
+| `allowTools` | 31 个工具名 | QQ 会话可用的工具白名单：默认 `read` / `read_image` / `glob` / `grep` / `web_search` / `web_fetch` / `skill` + 二十四个 `qq_*` —— **没有 write / edit / bash**。`qq_write` / `qq_edit` / `qq_skill` 是主人专用的受信写盘（执行时按**这一轮发言人**核对主人身份），`qq_quiet` 是静默开关，`qq_settings` 是主人侧 bot 配置，`qq_auto_tool` 是软命令（`modelAutoTool`，默认关），五个 `qq_debug_*` 是调试提权（主人私聊 + `debug` 开关 + 10 分钟 TTL），`qq_time` / `qq_topic` 是精确时间与话题记忆。空 = 不限制（全给它继承到的工具）；写错的名字会被丢掉并记 warn，见[限制 QQ 会话的工具](tools.md#限制-qq-会话的工具allowtools) |
 | `resetCommand` | `/reset` | 新开一轮会话（旧会话留在磁盘上当存档）的指令；空 = 禁用 |
 | `resetUsers` | `[]` | **主人名单**（QQ 号）：能用 `resetCommand` 重置、能用 `qq_quiet` 静默、也是唯一能用受信写盘与 `qq_settings` 的人（与 `allowUsers` 反过来，见[新开一轮会话](sessions.md#新开一轮会话reset)）。**留空 = 走自动认主**（`ownerAutoClaim`，第一个私聊联系人）；自动认主也关掉 = 谁都不能。本仓库的 `cordis.patch.yml` 把这一项接在 `QQBOT_RESET_USERS` 环境变量上（写进 `<启动 cwd>/.env`，逗号分隔）—— 免得把自己的号提交进仓库 |
 | `wakeTriggers` | `['起床','醒醒','醒来','别睡了','重启']` | 主人说这些词时由插件**直接**结束静默（不经过模型、零 token）：睡着之后群消息根本到不了模型，所以起床必须有一条插件侧旁路。只认主人；群里不需要 @。留空 = 只能靠 `qq_quiet` 的 `wake` |

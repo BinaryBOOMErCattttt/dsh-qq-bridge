@@ -57,7 +57,7 @@ test('toolsForMode：基础白名单为空（= 不限制）时展开成简洁模
     assert.equal(SIMPLE_TOOL_SET.has(forbidden), false, forbidden + ' 不该出现在简洁模式');
   }
   // 聊天 / 记忆 / 静默 / 设置必须留着，否则简洁模式连「切回去」和「别说话」都做不到。
-  for (const required of ['read', 'read_image', 'web_search', 'qq_memory', 'qq_transcript', 'qq_quiet', 'qq_settings']) {
+  for (const required of ['read', 'read_image', 'web_search', 'qq_memory', 'qq_transcript', 'qq_quiet', 'qq_settings', 'qq_time', 'qq_topic']) {
     assert.equal(SIMPLE_TOOL_SET.has(required), true, required + ' 必须留在简洁模式');
   }
 });
@@ -82,7 +82,7 @@ test('SIMPLE_MODULES：简洁模式只认定档与心情门控', () => {
 });
 
 test('COMMAND_MODULES：已搬进来的指令都归到一个模块，没有指向不存在的模块', () => {
-  const known = new Set(['fun', 'lookup', 'reminders', 'tts', 'handoff']);
+  const known = new Set(['fun', 'lookup', 'reminders', 'tts', 'handoff', 'debug']);
   assert.equal(COMMAND_MODULES.抽签, 'fun');
   assert.equal(COMMAND_MODULES.天气, 'lookup');
   assert.equal(COMMAND_MODULES.提醒, 'reminders');

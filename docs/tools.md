@@ -22,8 +22,19 @@
 | `qq_write` / `qq_edit` | **主人专用**的受信写盘：工作目录内的 `.md` / `.txt` / `.json` / `.yml`，写前备份到 `.dsh/.history/`；`.qq-memory/` 与 `data/` 拒绝 |
 | `qq_skill` | **主人专用**：`<skill 根>/<名字>/SKILL.md` 的 `list` / `read` / `patch` / `write`（skill 在 cwd 之外，这是改 skill 的唯一通道） |
 | `qq_settings` | **主人专用**：读写 `data/owner-settings.json` 覆盖层（`list` / `get` / `set` / `unset` / `clear`），改完 8 秒后插件自己重启 |
+| `qq_auto_tool` | **主人专用**的软命令：用户用自然语言提要求、消息又不是规范指令时，模型自己执行一条插件指令并转述结果。要 `modelAutoTool: true`（默认关）且 `moduleAutoTool` 没关、且不在简洁模式；定档 / 语音 / 随机表情 / 接一个 / 存表情 / 设置**故意不开放** |
+| `qq_debug_read` / `qq_debug_write` / `qq_debug_list` | **调试提权**：工作区外任意路径的读 / 写 / 列目录。只在 `debug: true` 时注册、只在主人私聊 + 发过 `debug` 后的 10 分钟内生效；透明到 `data/debug-audit.log` |
+| `qq_debug_shell` | **调试提权**：在任意目录跑一条命令（Windows 用 PowerShell，其它平台 bash），默认 30 秒超时、输出截到 32 KB。**它造成的改动无法自动回滚**，只能靠审计 |
+| `qq_debug_log` | **调试提权**：把一轮改动（摘要 +「文件:行号」）追加进本次 debug 的 `CHANGELOG.md`，给下一个 agent 看 |
+| `qq_time` | 取一次精确的本地日期 / 时刻 / 星期。**按需**：被问时间、或要把「明天中午」换算成绝对时间时才调（提示词里只有每天变四次的粗时段） |
+| `qq_topic` | 登记 / 更新一个长期话题（`high` 常驻摘要 / `medium` 按需 / `low` 压缩成一句），状态在 `data/chat-state.json` 的 `topics` 段 + `data/TOPICS.md`。超过模式轮数（简洁 6 / 其它 15）没被提及就自动降一档，最低冷区 |
 
-这十六个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
+这二十四个都是纯宿主平面的全局工具，所有 Agent（包括 Web UI 里的主会话）都能用。
+软命令与调试提权是**两条会扩大能力面的窄通道**，所以默认都关（`modelAutoTool` / `debug`）、
+还有各自的模块开关（`moduleAutoTool` / `moduleDebug`），真正的闸在 `execute()` 里：
+软命令要「这一轮说话的人全是主人」+ 开关全开；调试要「主人私聊 + 就是开启它的那个会话 +
+没过 10 分钟 TTL」。注册了不等于能用 —— 这也是它们能一直留在 `allowTools` 默认值里、
+打开配置后不必改白名单的原因。
 `qq_send_image` / `qq_save_sticker` / `qq_rename_sticker` 见[它也能发表情包](media.md#它也能发表情包)；
 `qq_transcript` / `qq_memory` 见[长期记忆](memory.md#长期记忆聊天记录--摘要--认知)，
 关掉 `memory` 后它们**根本不会注册**；关掉 `reminder`（或任务文件配到 `cwd` 外）后
@@ -111,10 +122,10 @@ allowTools:
 
 - **只影响 QQ 会话**：收窄施加在「由 QQ 消息创建出来的那个 Agent」自己的作用域上
   （DSH 的 `tools.restrict()`），Web UI 主会话等其它 Agent 完全不受影响。
-- **默认就是收窄过的**（23 个：只读文件 + 检索 + 联网 + 十六个 `qq_*`）—— 这样即使
+- **默认就是收窄过的**（31 个：只读文件 + 检索 + 联网 + 二十四个 `qq_*`）—— 这样即使
   `agentPreset: qq` 的预设里带了 `write` / `edit`，QQ 会话也拿不到它们。
 - **显式写空数组 = 不限制**（与 `allowUsers` / `allowGroups` 同一套语义）：把这个 Agent
-  继承到的工具全给它。想放开某一项，就把默认那 23 个抄下来再加减，别直接清空。
+  继承到的工具全给它。想放开某一项，就把默认那 31 个抄下来再加减，别直接清空。
 - 过滤的是**继承来的**工具（宿主平面的全局工具 + 这个 Agent join 的预设里的工具）。
   ⚠️ Agent **自己作用域里注册**的工具不受影响 —— 这是设计使然（它回头作答所依赖的
   机制不能被收走），但也意味着某个预设行可能绕过白名单，典型例子就是 `standard`

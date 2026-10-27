@@ -60,6 +60,8 @@ export const COMMANDS = [
   { name: '纪念日', aliases: ['记纪念日'], level: 'owner', kind: 'plugin', group: '管', args: '<MM-DD> <内容>', summary: '记一个每年提醒的纪念日' },
   { name: '模式', aliases: ['mode', '运行模式'], level: 'guest', kind: 'plugin', group: '管', args: '[完整|简洁]', summary: '看当前运行模式；主人可在私聊里切完整 / 简洁' },
   { name: '定档', aliases: ['交接', '存档重开'], level: 'owner', kind: 'plugin', group: '管', args: '', summary: '把上下文写进交接文档，归档旧会话并新开一轮' },
+  { name: 'debug', aliases: ['调试模式', '提权'], level: 'owner', kind: 'plugin', group: '管', args: '[rollback]', summary: '主人私聊临时提权 10 分钟（工作区外读写 + 命令）；debug rollback 回滚并退出' },
+  { name: 'overdebug', aliases: ['退出调试', '关闭调试'], level: 'owner', kind: 'plugin', group: '管', args: '', summary: '立即退出 debug，恢复正常能力（保留改动）' },
   { name: '纪念日列表', aliases: ['纪念日们'], level: 'owner', kind: 'plugin', group: '管', args: '', summary: '看已记的纪念日' },
   { name: '别复读', aliases: ['关复读', '闭嘴复读'], level: 'owner', kind: 'plugin', group: '管', args: '', summary: '这个群不再自动复读' },
   { name: '可以复读', aliases: ['开复读'], level: 'owner', kind: 'plugin', group: '管', args: '', summary: '恢复这个群的自动复读' },

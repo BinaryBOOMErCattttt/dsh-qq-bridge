@@ -15,11 +15,13 @@
  * @module @qqbot/dsh-plugin-qq/tools
  */
 import { defineTool } from '@deepseek-ai/dsh-tools';
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import { chunkText } from './onebot.js';
 import { imageSegment, loadOutgoingImage } from './image.js';
 import { hasMentionMarker, mentionSegments } from './mention.js';
 import { repeatLabel } from './reminders.js';
-import { localMinute } from './util.js';
+import { localMinute, timeBucketLabel, weekdayLabel } from './util.js';
 
 /**
  * 工具一：qq_send_message —— 主动向某个 QQ 号或群号发文本（超长自动分段）。
@@ -1379,7 +1381,296 @@ function qqSettings(deps) {
  * @param {object} [deps.quiet] - 静默开关（`sleep` / `wake` / `status`）；缺失 = 不注册 `qq_quiet`。
  * @param {object} [deps.settingsAdmin] - 主人侧 bot 配置（`list` / `get` / `set` / `unset` / `clear`）；
  *   缺失 = 不注册 `qq_settings`。
+ * @param {boolean} [deps.modelAutoTool] - 软命令总开关（`modelAutoTool` 且 `moduleAutoTool` 且非简洁模式）。
+ * @param {(exec: object, command: string, args: string) => Promise<string>} [deps.runSoftCommand] -
+ *   执行一条插件指令并把结果文字返回；缺失 = 不注册 `qq_auto_tool`。
+ * @param {(exec: object, args: object) => object} [deps.topicSet] - 登记一个长期话题（话题账本在
+ *   index.js）；缺失 = 不注册 `qq_topic`。
+ * @param {object} [deps.debug] - 调试提权（`guard` / `audit` / `backup` / `log` / `runShell`，由
+ *   debug.js 提供）；缺失 = 不注册那五个 `qq_debug_*`。
  */
+
+/**
+ * 工具：qq_auto_tool —— 软命令。用户用自然语言提要求、没有以规范指令开头时，模型自己
+ * 调一条插件指令（「帮我抽个签」→ 抽签），把结果用自己的口吻转述。
+ *
+ * 三道闸都在这里：`modelAutoTool` / `moduleAutoTool` 开关（由 index.js 折算成
+ * `deps.modelAutoTool`）、这一轮说话的人是不是主人（`writeAuthority`）、以及指令本身
+ * 能不能走软命令（`deps.runSoftCommand` 里那张黑名单）。
+ * @param deps - 见 `registerQqTools` 的说明。
+ */
+function qqAutoTool(deps) {
+  return defineTool({
+    name: 'qq_auto_tool',
+    description:
+      'Run a built-in QQ plugin command when the user asked for it in natural language and no formal command was parsed. Owner only. Do NOT use it for normal chat, and it deliberately refuses 定档 / 语音 / 随机表情 / 接一个 / 存表情 / 设置. The returned text is the command result: say it in your own voice.',
+    parameters: {
+      command: { type: 'string', required: true, description: 'Command name or alias, e.g. 抽签 / 天气 / 点歌.' },
+      args: { type: 'string', description: 'Arguments after the command, e.g. 杭州 for 天气, 稻香 for 点歌.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string', required: true },
+          text: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.text }],
+    },
+    async execute(args, exec) {
+      if (deps.runSoftCommand === undefined) throw new Error('qq_auto_tool is not configured');
+      if (deps.modelAutoTool !== true) throw new Error('model auto tool is off (set modelAutoTool true)');
+      const authority = deps.writeAuthority(exec);
+      if (!authority.allowed) throw new Error('qq_auto_tool refused: ' + authority.reason);
+      const command = String(args.command ?? '').trim();
+      if (command.length === 0) throw new Error('qq_auto_tool needs a command');
+      const text = await deps.runSoftCommand(exec, command, String(args.args ?? ''));
+      return { command, text };
+    },
+  });
+}
+
+/** 调试工具的公共守卫：开关 + 当前会话 + 主人当轮（判据全在 deps.debug.guard）。 */
+function debugAllowed(deps, exec) {
+  if (deps.debug === undefined) throw new Error('debug mode is not configured');
+  const verdict = deps.debug.guard(exec);
+  if (verdict.allowed !== true) throw new Error('debug tool refused: ' + verdict.reason);
+  return verdict;
+}
+
+/** 工具：qq_debug_read —— 读工作区外的任意文本文件（调试模式）。 */
+function qqDebugRead(deps) {
+  return defineTool({
+    name: 'qq_debug_read',
+    description:
+      'Debug mode only: read any text file on the machine, including paths outside the workspace. Owner private chat, 10-minute TTL, audited. Max 256 KB.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'Absolute path, or a path relative to the workspace.' },
+      max_bytes: { type: 'number', description: 'Read at most this many bytes (default 65536, max 262144).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true },
+          text: { type: 'string', required: true },
+          bytes: { type: 'number', required: true },
+          truncated: { type: 'boolean', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.text }],
+    },
+    async execute(args, exec) {
+      debugAllowed(deps, exec);
+      const path = resolve(deps.cwd, String(args.path ?? ''));
+      const info = await stat(path);
+      if (!info.isFile()) throw new Error('not a file: ' + path);
+      const limit = Math.max(1, Math.min(262_144, Math.floor(Number(args.max_bytes ?? 65_536) || 65_536)));
+      const buffer = await readFile(path);
+      const text = buffer.subarray(0, limit).toString('utf8');
+      deps.debug.audit('qq_debug_read', { path, bytes: buffer.length });
+      return { path, text, bytes: buffer.length, truncated: buffer.length > limit };
+    },
+  });
+}
+
+/** 工具：qq_debug_write —— 写任意文本文件（调试模式，覆盖前自动备份）。 */
+function qqDebugWrite(deps) {
+  return defineTool({
+    name: 'qq_debug_write',
+    description:
+      'Debug mode only: write any text file on the machine, creating parent directories. The original is backed up first and debug rollback can restore it. Owner private chat, 10-minute TTL, audited.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'Absolute path, or a path relative to the workspace.' },
+      content: { type: 'string', required: true, description: 'Full text content.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true },
+          bytes: { type: 'number', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: 'wrote ' + value.bytes + ' bytes to ' + value.path }],
+    },
+    async execute(args, exec) {
+      debugAllowed(deps, exec);
+      const path = resolve(deps.cwd, String(args.path ?? ''));
+      const content = String(args.content ?? '');
+      await deps.debug.backup(path);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content, 'utf8');
+      deps.debug.audit('qq_debug_write', { path, bytes: Buffer.byteLength(content) });
+      return { path, bytes: Buffer.byteLength(content) };
+    },
+  });
+}
+
+/** 工具：qq_debug_list —— 列一个目录（调试模式）。 */
+function qqDebugList(deps) {
+  return defineTool({
+    name: 'qq_debug_list',
+    description: 'Debug mode only: list a directory, including ones outside the workspace. Owner private chat, 10-minute TTL, audited.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'Absolute path, or a path relative to the workspace.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true },
+          entries: { type: 'array', items: { type: 'string' }, required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.entries.join('\n') }],
+    },
+    async execute(args, exec) {
+      debugAllowed(deps, exec);
+      const path = resolve(deps.cwd, String(args.path ?? ''));
+      const entries = await readdir(path, { withFileTypes: true });
+      const lines = entries.map((entry) => (entry.isDirectory() ? 'd ' : '- ') + entry.name);
+      deps.debug.audit('qq_debug_list', { path, count: lines.length });
+      return { path, entries: lines };
+    },
+  });
+}
+
+/** 工具：qq_debug_shell —— 在任意目录跑一条命令（执行实现在 debug.js）。 */
+function qqDebugShell(deps) {
+  return defineTool({
+    name: 'qq_debug_shell',
+    description:
+      'Debug mode only: run a shell command (PowerShell on Windows, bash elsewhere) with an arbitrary cwd. Not rollback-able, only audited. Owner private chat, 10-minute TTL, 30-second default timeout, output truncated to 32 KB.',
+    parameters: {
+      command: { type: 'string', required: true, description: 'Command line to run.' },
+      cwd: { type: 'string', description: 'Working directory (defaults to the workspace).' },
+      timeout_ms: { type: 'number', description: 'Timeout in milliseconds (default 30000, max 120000).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          stdout: { type: 'string', required: true },
+          stderr: { type: 'string', required: true },
+          code: { type: 'number', required: true },
+        },
+      },
+      render: (_args, value) => [
+        { type: 'text', text: [value.stdout, value.stderr].filter(Boolean).join('\n') || '(exit ' + value.code + ')' },
+      ],
+    },
+    async execute(args, exec) {
+      debugAllowed(deps, exec);
+      const command = String(args.command ?? '').trim();
+      if (command.length === 0) throw new Error('qq_debug_shell needs a command');
+      const raw = String(args.cwd ?? '').trim();
+      const workdir = raw.length === 0 ? deps.cwd : resolve(deps.cwd, raw);
+      return deps.debug.runShell(command, workdir, args.timeout_ms);
+    },
+  });
+}
+
+/** 工具：qq_debug_log —— 把一轮改动（摘要 / 文件:行号）记进本次 debug 的 CHANGELOG.md。 */
+function qqDebugLog(deps) {
+  return defineTool({
+    name: 'qq_debug_log',
+    description:
+      'Debug mode only: append one change note to the debug CHANGELOG.md. Call it after each round of edits with a short summary and the exact files/line ranges, so the next agent can read what happened.',
+    parameters: {
+      summary: { type: 'string', required: true, description: 'What changed and why.' },
+      files: { type: 'string', required: true, description: 'Files and line ranges, e.g. index.js:120-138, tools.js:900.' },
+      notes: { type: 'string', description: 'Anything not yet verified / next steps.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { ok: { type: 'boolean', required: true } },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.ok ? 'logged' : 'no active debug log' }],
+    },
+    async execute(args, exec) {
+      debugAllowed(deps, exec);
+      const ok = await deps.debug.log(String(args.summary ?? ''), String(args.files ?? ''), String(args.notes ?? ''));
+      return { ok };
+    },
+  });
+}
+
+/**
+ * 工具：qq_time —— 精确本地时间。**按需**：被问时间、或要把「明天中午」换算成绝对时间时
+ * 才调；不参与每轮注入（提示词末尾只有每天 00 / 06 / 12 / 18 变一次的粗时段）。
+ */
+function qqTime() {
+  return defineTool({
+    name: 'qq_time',
+    description:
+      'Get the exact current local date/time and weekday. Use it ONLY when the user asks about the time/date, or when you must turn a relative time (e.g. 明天中午) into an absolute reminder time. Do not call it every turn just to report the time.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          local: { type: 'string', required: true },
+          weekday: { type: 'string', required: true },
+          iso: { type: 'string', required: true },
+          bucket: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.local + '（' + value.weekday + '）' }],
+    },
+    async execute() {
+      const now = Date.now();
+      return {
+        local: localMinute(now),
+        weekday: weekdayLabel(now),
+        iso: new Date(now).toISOString(),
+        bucket: timeBucketLabel(now),
+      };
+    },
+  });
+}
+
+/**
+ * 工具：qq_topic —— 登记 / 更新一个长期话题（high 常驻 / medium 按需 / low 压缩）。
+ * 插件按「模式轮数」自动降档；high 降档后从提示词里消失。
+ */
+function qqTopic(deps) {
+  return defineTool({
+    name: 'qq_topic',
+    description:
+      'Record or update one long-lived topic: high = resident summary in every turn, medium = on demand, low = compressed one-liner. Use it only for recurring/important topics, not every message. The plugin auto-downgrades it after the mode turn window.',
+    parameters: {
+      topic: { type: 'string', required: true, description: 'Short topic name.' },
+      tier: { type: 'string', required: true, enum: ['high', 'medium', 'low'], description: 'high = resident summary, medium = on-demand, low = compressed one-liner.' },
+      summary: { type: 'string', description: 'One short line capturing the current state.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          topic: { type: 'string', required: true },
+          tier: { type: 'string', required: true },
+          label: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.topic + ' → ' + value.label }],
+    },
+    async execute(args, exec) {
+      if (deps.topicSet === undefined) throw new Error('topic memory is disabled');
+      return deps.topicSet(exec, args);
+    },
+  });
+}
 export function registerQqTools(ctx, deps) {
   ctx.tools.register(qqSendMessage(deps));
   ctx.tools.register(qqSendImage(deps));
@@ -1408,4 +1699,20 @@ export function registerQqTools(ctx, deps) {
   if (deps.quiet !== undefined) ctx.tools.register(qqQuiet(deps));
   // 主人侧 bot 配置：同样按发言人鉴权。
   if (deps.settingsAdmin !== undefined) ctx.tools.register(qqSettings(deps));
+  // 精确时间 / 话题：没有权限门槛（它们不改任何东西），永远注册；
+  // qq_topic 要话题账本（deps.topicSet），没有就跳过 —— 不留「一调就报错」的壳。
+  ctx.tools.register(qqTime());
+  if (deps.topicSet !== undefined) ctx.tools.register(qqTopic(deps));
+  // 软命令：**始终注册**，开关（modelAutoTool / moduleAutoTool / 模式）在 execute 里判。
+  // 注册期判会踩两个坑：预设 / allowTools 里写着 qq_auto_tool 却找不到工具（白名单只能
+  // 收窄，写错的名字会被丢掉并记 warn），以及打开配置后还得重启插件才能用。
+  if (deps.runSoftCommand !== undefined) ctx.tools.register(qqAutoTool(deps));
+  // 调试提权：开关 / 会话 / TTL / 主人都在 deps.debug.guard 里；注册不代表能用。
+  if (deps.debug !== undefined) {
+    ctx.tools.register(qqDebugRead(deps));
+    ctx.tools.register(qqDebugWrite(deps));
+    ctx.tools.register(qqDebugList(deps));
+    ctx.tools.register(qqDebugShell(deps));
+    ctx.tools.register(qqDebugLog(deps));
+  }
 }

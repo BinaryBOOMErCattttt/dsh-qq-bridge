@@ -55,6 +55,10 @@
 | `取消关注 <关键词>` / `关注列表` | 管理关注词 |
 | `纪念日 <MM-DD> <内容>` / `纪念日列表` | 每年当天在这个会话提醒一次 |
 | `模式` / `模式 完整` / `模式 简洁` / `模式 斗图` | 私聊里看当前运行模式；主人能切（切模式会重建当前会话，见下）。斗图也认 `sticker` / `表情包` |
+| `定档` / `交接` | 把最近 80 条上下文写进 `data/handoff/*.md`，归档旧会话、代次 +1，再开一轮并让新会话先读那份文档。主人说「睡觉去」但 12 秒内没真的静默时会自动兜底一次（`HANDOFF_FALLBACK_MS`） |
+| `debug` | 主人私聊里临时提权 10 分钟：先把设置与几份关键文件备份到 `data/debug/<时间>/baseline/`，再放开工作区外读写与命令。需要 `debug: true`。群里发无效 |
+| `debug rollback` | 回滚本次 debug 里可追踪的写入与设置，然后退出（`qq_debug_shell` 的副作用回滚不了） |
+| `overdebug` | 立即退出 debug（保留改动），工具与提示词都恢复正常 |
 | `别复读` / `可以复读` | 按群关 / 开自动复读 |
 
 ## 权限与说明
@@ -83,7 +87,17 @@
   许可一起收回）。完整 / 简洁的单次涨幅与阈值分别由 `moodTagMax*` / `moodTrigger*` 控制。
   用户明确要表情时，由模型调用 `qq_send_image` 并传 `user_requested: true`，插件只放行一次。
   表情语义单独放 `.qq-stickers/SEMANTICS.md`（模板 `deploy/SEMANTICS.md`，存新表情时会自动补一行）。
-- 模块开关（`moduleFun` / `moduleLookup` / `moduleReminders` / `moduleTts` / `moduleEmojiMood` / `moduleHandoff`）
-  可以单独关掉一片指令 / 门控；简洁模式忽略这些开关，只认固定的核心集合（`mode.js` 的 `SIMPLE_MODULES`）。
+- 模块开关（`moduleFun` / `moduleLookup` / `moduleReminders` / `moduleTts` / `moduleEmojiMood` / `moduleHandoff` /
+  `moduleAutoTool` / `moduleDebug`）可以单独关掉一片指令 / 门控；简洁模式忽略这些开关，只认固定的核心集合
+  （`mode.js` 的 `SIMPLE_MODULES`）。定档的模块开关对**兜底**那条路同样有效：关掉之后「睡觉去」不会再自动定档。
+- **软命令**（`modelAutoTool`，默认关）：用户用自然语言提要求、消息又不是规范指令时，模型可以调
+  `qq_auto_tool` 执行对应的插件指令（「帮我抽个签」→ `抽签`），再用自己的口吻转述结果。只对主人生效，
+  而且定档 / 语音 / 随机表情 / 接一个 / 存表情 / 设置这几条**故意不开放**（有副作用或会改配置）。
+  简洁模式强制关掉它。
+- **话题记忆**（`qq_topic`）：模型把反复出现 / 明显重要的话题登记成 high / medium / low 三档，状态在
+  `data/chat-state.json` 的 `topics` 段、另有一份人可读的 `data/TOPICS.md`。high 的短摘要每轮进「本轮情境」；
+  超过**模式轮数**（简洁 6 / 其它 15）没再被提到就自动降一档，最低冷区，降档后不再注入。
+- **时间**：提示词末尾只给「日期 + 凌晨 / 早上 / 中午 / 晚上」这一档粗时段（每天 00 / 06 / 12 / 18 各变一次，
+  不把前缀缓存打穿）；要精确到分钟时由模型调用 `qq_time` 取一次。
 - `设置` 的可写范围见 `owner-settings.js`；部署项、`provider` / `model`、访问白名单、凭据、
   整段 `persona` / `instructions` 只读。

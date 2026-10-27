@@ -1148,6 +1148,16 @@ test('the bundled patch declares the narrowed preset the plugin mounts', async (
     'qq_write',
     'qq_edit',
     'qq_skill',
+    // 软命令 / 调试提权 / 精确时间 / 话题记忆：同样是宿主平面的全局工具。白名单里有它们
+    // 不等于预设授予了能力 —— 真正的闸在 execute() 里（配置开关 + 主人名单 + TTL）。
+    'qq_auto_tool',
+    'qq_debug_read',
+    'qq_debug_write',
+    'qq_debug_list',
+    'qq_debug_shell',
+    'qq_debug_log',
+    'qq_time',
+    'qq_topic',
     'skill',
   ]);
   if (bridge.config.memory !== false) for (const name of ['qq_transcript', 'qq_memory']) provided.add(name);

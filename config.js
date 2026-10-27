@@ -49,11 +49,14 @@ export const Config = z.object({
   blankReply: z.boolean().default(true).description('是否理会「没有正文」的消息：群里单纯 @ 它一下、或者私聊发一个空格 —— 这类消息照常交给模型（正文位置写明「@了你一下，没有说别的」/「发来一条空消息」），由它看着这段聊天的上下文决定回一句「？」、发张表情包、还是接上一句；false = 和以前一样静默丢弃（群里被人反复空 @ 时可以一键关掉）'),
   commands: z.boolean().default(true).description('是否启用「@bot + 空格 + 指令」的指令路由：帮助 / 天气 / 随机表情 / 表情 / 白饭 / 小作文（访客可用）、状态 / 余额 / 设置（主人专用）。关掉后这些词全部当普通聊天交给模型'),
   guestCommands: z.boolean().default(true).description('是否允许访客（非主人）使用公开指令：帮助 / 天气 / 随机表情 / 表情 / 白饭 / 小作文；关掉后只有主人能用指令。主人专用指令始终只认主人'),
+  // ---- 软命令与调试提权：两条都会**扩大模型能动的东西**，所以默认都关 ----
+  modelAutoTool: z.boolean().default(false).description('软命令 / model auto tool：用户用自然语言提要求、没命中规范指令时，允许模型自己调用插件指令（例如「帮我抽个签」→ 抽签）。true = 开；只在主人当轮说话时生效，定档 / 语音 / 发图 / 存表情 / 设置这类有副作用的指令不开放（还需要 moduleAutoTool 没关、且不在简洁模式）'),
+  debug: z.boolean().default(false).description('调试模式：允许主人在私聊里发 `debug` 临时提权，模型获得 qq_debug_read / qq_debug_write / qq_debug_list / qq_debug_shell（工作区外读写与命令执行）。10 分钟后或主人发 `overdebug` 自动退出；只在主人私聊、只对当前会话生效，每次调用都写 data/debug-audit.log。默认关'),
   // ---- 运行模式：完整 / 简洁 / 斗图（私聊发「模式」切换，见 docs/commands.md）----
   // 为什么是一组模块开关而不是把功能写死：完整模式要能单独关掉一片（例如不想让它玩骰子），
   // 简洁模式则是**整套**收窄 —— 它只认固定的核心集合，这里的 module* 在简洁模式里不生效
-  // （见 mode.js 的 SIMPLE_MODULES）。只收已经搬进本仓库的模块；调试 / 软命令那几个
-  // 开关等对应分片落地时再加，免得出现「配了却没有任何行为」的死字段。
+  // （见 mode.js 的 SIMPLE_MODULES）。只收已经搬进本仓库的模块（玩 / 查 / 提醒 / 语音 /
+  // 定档 / 心情 / 软命令 / 调试）——配了却没有任何行为的死字段比少一个开关更糟。
   //
   // 心情门控的参数全在这里，而不是写死在 mood.js：部署者会想调「多久算冷场」「夸几次才
   // 能发表情」，而这些是**行为口味**，不是实现细节。数值口径（1..100 的百分比、毫秒）
@@ -70,7 +73,9 @@ export const Config = z.object({
   moduleLookup: z.boolean().default(true).description('查询模块：天气 / 余额 / 群热度 / 随机表情'),
   moduleReminders: z.boolean().default(true).description('提醒模块：`提醒` 指令（定时任务本身仍由 reminder 开关控制，关掉这一项不会让已建的任务失效）'),
   moduleTts: z.boolean().default(true).description('语音模块：`语音` 指令（还需要 tts 打开并注册 provider）'),
-  moduleHandoff: z.boolean().default(true).description('定档模块：`定档` 指令'),
+  moduleHandoff: z.boolean().default(true).description('定档模块：`定档` 指令（以及「主人说了睡但没静默」时自动定档的兜底）'),
+  moduleAutoTool: z.boolean().default(true).description('软命令模块：模型自己调用插件指令（还需要 modelAutoTool 打开、且不在简洁模式）'),
+  moduleDebug: z.boolean().default(true).description('调试模块：主人私聊里的 `debug` 提权（还需要 debug 打开；简洁模式强制关闭）'),
   simpleReplyMaxChars: z.number().default(400).description('简洁模式一次回复的硬上限（字符）：超过直接截断，避免啰嗦；0 = 不截断（协议上限仍是 maxReplyChars）'),
   fullReplyMaxChars: z.number().default(800).description('完整模式一次回复的硬上限（字符）：超过直接截断；协议上限仍是 maxReplyChars；0 = 不截断'),
   // ---- 语音（TTS）：只留框架，仓库不内置任何第三方语音服务 ----
@@ -102,18 +107,29 @@ export const Config = z.object({
       'qq_quiet',
       // 主人侧 bot 配置（只含行为白名单，不含模型路由）。
       'qq_settings',
+      // 软命令：自然语言没命中指令时，模型自己调插件指令（开关 modelAutoTool，默认关）。
+      'qq_auto_tool',
+      // 调试提权（主人私聊 + debug 打开 + 10 分钟 TTL）：工作区外读写 / 命令执行。
+      'qq_debug_read',
+      'qq_debug_write',
+      'qq_debug_list',
+      'qq_debug_shell',
+      'qq_debug_log',
       // 受信写盘（只有 resetUsers 里的人能让它动）：内建 write / edit 仍然不给。
       'qq_write',
       'qq_edit',
       'qq_skill',
       'qq_list_conversations',
+      // 精确时间（按需取一次）与话题记忆（模型登记，插件降档）。
+      'qq_time',
+      'qq_topic',
       'qq_poke',
       'qq_remind_create',
       'qq_remind_list',
       'qq_remind_cancel',
     ])
     .description(
-      'QQ 会话 Agent 可用的工具白名单（工具名）：默认只放开「只读文件 + 检索 + 联网 + 十六个 qq_*」（23 个），没有 write / edit / bash —— QQ 消息是不可信输入；受信写盘是单独的 qq_write / qq_edit / qq_skill，执行时按发言人核对主人。留空表示**不限制**（把这个 Agent 继承到的工具全给它，含预设里的一切）；写错的名字会被丢掉并记 warn（白名单只能收窄，不能凭空给出能力）',
+      'QQ 会话 Agent 可用的工具白名单（工具名）：默认只放开「只读文件 + 检索 + 联网 + 二十四个 qq_*」（31 个），没有 write / edit / bash —— QQ 消息是不可信输入；受信写盘是单独的 qq_write / qq_edit / qq_skill，执行时按发言人核对主人；调试提权是 qq_debug_*（主人私聊 + debug 开关 + 10 分钟 TTL），软命令是 qq_auto_tool（modelAutoTool 开关，默认关）。留空表示**不限制**（把这个 Agent 继承到的工具全给它，含预设里的一切）；写错的名字会被丢掉并记 warn（白名单只能收窄，不能凭空给出能力）',
     ),
   resetCommand: z.string().default('/reset').description('新开一轮会话的指令：在 QQ 里单独发送该指令即生效（旧的会话留在磁盘上当存档，新的一轮从零开始）；留空表示禁用'),
   resetUsers: z.array(z.string()).default([]).description('受信者（通常是主人）的 QQ 号：名单里的人能用 resetCommand 新开一轮、能通过 qq_quiet 让机器人静默、也是唯一能让 Agent 动写盘工具（qq_write / qq_edit / qq_skill）的人。留空 = 走 ownerAutoClaim 自动认主；自动认主也关掉时表示**谁都不能**重置、静默与写盘'),

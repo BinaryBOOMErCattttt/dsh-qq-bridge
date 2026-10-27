@@ -41,7 +41,7 @@ const OWNER = String(PRIVATE_USER_ID);
 /** 简洁模式白名单里真正存在的那几个工具，让假 Host 的 restrict 不因「未知工具」退化。 */
 const SIMPLE_KNOWN_TOOLS = [
   'read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch', 'skill',
-  'qq_memory', 'qq_transcript', 'qq_quiet', 'qq_settings',
+  'qq_memory', 'qq_transcript', 'qq_quiet', 'qq_settings', 'qq_time', 'qq_topic',
   'qq_send_image', 'qq_send_message', 'qq_save_sticker', 'qq_remind_create',
 ];
 

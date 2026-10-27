@@ -152,6 +152,23 @@ export function weekdayLabel(at = Date.now()) {
 }
 
 /**
+ * 粗粒度时段（`YYYY-MM-DD 凌晨|早上|中午|晚上`）：提示词里只给这一档。
+ *
+ * 为什么故意这么粗：提示词每变一个字，DSH 都会把变化后的整段系统提示（含人设 +
+ * 表达契约 + 硬性规则）当成新的 system 消息追加进历史（`systemPromptUpdate: 'in-history'`）。
+ * 「现在是 14:37」这种每分钟都变的写法会把它变成每轮追加一份；按 00 / 06 / 12 / 18
+ * 切成四段之后，一天最多变四次。要精确时刻让模型调 `qq_time`。
+ * @param at - 毫秒时间戳。
+ * @returns 本地日期 + 时段，例如 `2026-10-26 早上`。
+ */
+export function timeBucketLabel(at = Date.now()) {
+  const stamp = Number.isFinite(Number(at)) ? Number(at) : Date.now();
+  const hour = new Date(stamp).getHours();
+  const bucket = hour < 6 ? '凌晨' : hour < 12 ? '早上' : hour < 18 ? '中午' : '晚上';
+  return `${localDate(stamp)} ${bucket}`;
+}
+
+/**
  * 解析模型给的本地时间（`YYYY-MM-DDTHH:MM` 或空格分隔），返回毫秒时间戳。
  *
  * **不用 `Date.parse`**：它对「带不带时区、空格还是 T」的解释在不同实现/不同时区下

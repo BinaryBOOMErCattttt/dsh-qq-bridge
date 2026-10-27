@@ -43,11 +43,14 @@ import { registerQqTools } from './tools.js';
 import { createEditor, defaultSkillRoot, expandHome } from './editor.js';
 import { matchWakeCommand, parseMuteState, serializeMuteState } from './mute.js';
 import { OWNER_SETTING_KEYS, applyOwnerSettings, coerceOwnerSetting, isWritableKey, parseOwnerSettings, settingKind } from './owner-settings.js';
-import { helpText, parseCommand, usageLine } from './commands.js';
+import { findCommand, helpText, parseCommand, usageLine } from './commands.js';
 import { weatherReport } from './weather.js';
 import { fetchBalance, renderBalance } from './balance.js';
 import { createChatState } from './chat-state.js';
 import { createMoodGate } from './mood.js';
+import { createTopicStore } from './topics.js';
+import { createDebugMode } from './debug.js';
+import { createHandoff } from './handoff.js';
 import { dailyFortune, flipCoin, formatFortune, parseDice, pickRandom, rollDice } from './fun.js';
 import { renderSong, searchSong } from './music.js';
 import { synthesize } from './tts.js';
@@ -88,6 +91,7 @@ import {
   localMinute,
   memorySlug,
   sessionIdFor,
+  timeBucketLabel,
   visibleText,
   weekdayLabel,
   withinActiveHours,
@@ -278,6 +282,9 @@ export function apply(ctx, config) {
   // `loader/volatile-update` 监听重启插件来重建。
   const baseSettings = createSettings(liveConfig(config), process.cwd());
   const cwd = baseSettings.cwd;
+  // 插件根：`cordis.patch.yml`、`NapCat.Shell` 这些都在它下面。放在最前面是因为
+  // 调试快照（debug.js）与 NapCat 自检都要用，它不是「后段才需要」的东西。
+  const pluginRoot = dirname(fileURLToPath(import.meta.url));
   // 运行模式：完整 / 简洁 / 斗图。落盘在 data/mode.json；切换时重建当前会话的上下文
   // （见 switchMode）。默认完整模式 —— 没有文件、文件坏了都按最全的那档起，
   // 否则一次写坏的 JSON 会让 bot 悄悄少掉一半能力。
@@ -315,6 +322,16 @@ export function apply(ctx, config) {
     moduleEnabled,
   });
   const { moodFor, decay: decayMood, applyTags: applyMoodTags } = mood;
+  // 话题记忆：模型登记 high/medium/low，插件按「模式轮数」自动降档，状态在
+  // data/chat-state.json 的 topics 段（+ 一份人可读的 data/TOPICS.md 镜像）。
+  // 与心情门控同一套依赖口径：账本与落盘动作由这里递进去，模块自己不读配置、不碰磁盘状态。
+  const topics = createTopicStore({
+    cwd,
+    report,
+    gameData,
+    save: () => chatState.save(),
+    appModeOf: () => appMode,
+  });
   if (ownerSettingsApplied.length > 0) {
     report('info', `owner settings applied: ${ownerSettingsApplied.join(', ')} (from ${baseSettings.ownerSettingsFile})`);
   }
@@ -849,8 +866,18 @@ export function apply(ctx, config) {
     };
   }
 
-  /** 指令回复走和自动回复同一条发送队列（拆条 / 打字延迟都沿用）。 */
+  /**
+   * 指令回复走和自动回复同一条发送队列（拆条 / 打字延迟都沿用）。
+   *
+   * `silent: true` 时不发、只把文字收进 `command.replies`：那是软命令（`qq_auto_tool`）
+   * 借用指令执行器的那条路 —— 结果要**交给模型转述**，插件再发一遍群里就会看到两份
+   * （真实诉求：模型说「抽到中吉」、插件又贴一遍「今日运势：中吉」）。
+   */
   function commandReply(command, text) {
+    if (command.silent === true) {
+      if (Array.isArray(command.replies)) command.replies.push(String(text ?? ''));
+      return;
+    }
     void sendToConversation(command.conversation, text);
   }
 
@@ -1070,172 +1097,6 @@ export function apply(ctx, config) {
     });
   }
 
-  /**
-   * 定档（交接）：把最近上下文与可能未完成的事写进 Markdown，归档旧会话，再新开一轮，
-   * 让新 Agent 的第一件事就是读这份文档。
-   *
-   * 为什么不是简单 `/reset`：上下文清零之后模型会「失忆」，群里正聊到一半它会像换了个人。
-   * 交接文档把「最近说了什么、还有什么没做完、当前静默/提醒状态」留下来，新会话先读它，
-   * 接得上再开口；旧会话目录移到 `data/handoff/archive/`，不再被 resume。
-   */
-  const HANDOFF_FALLBACK_MS = 12_000;
-
-  /** 主人说「睡觉去」这类短句时返回会话；群聊要求 @ / 前缀 / all。 */
-  function sleepIntentFor(event, selfId) {
-    if (event?.post_type !== 'message') return undefined;
-    const type = event.message_type === 'group' ? 'group' : event.message_type === 'private' ? 'private' : undefined;
-    if (type === undefined) return undefined;
-    const userId = String(event.user_id ?? '');
-    if (userId === '' || userId === String(selfId) || !canOperate(userId)) return undefined;
-    const raw = messageToText(event.message ?? event.raw_message, selfId).trim();
-    if (raw.length === 0) return undefined;
-    let text = raw;
-    if (type === 'group') {
-      const prefixed = settings.groupTrigger === 'prefix' && raw.startsWith(settings.prefix);
-      const explicit = settings.groupTrigger === 'all' || mentions(event.message, selfId) || prefixed;
-      if (!explicit) return undefined;
-      if (prefixed) text = dropPrefix(raw);
-    }
-    const compact = text.replace(/[\s\u3000]+/gu, '');
-    if (compact.length > 12) return undefined;
-    if (!/^(睡觉去|去睡吧|睡吧|休眠|静默|该睡了|该睡啦|睡吧你)/u.test(compact)) return undefined;
-    const id = type === 'group' ? String(event.group_id) : userId;
-    const displayName = userDisplayName(event.sender ?? {}, event.user_id);
-    return conversationFor(type, id, {
-      userId,
-      userName: displayName,
-      name: displayName,
-      mentions: type === 'group' ? atMentions(event.message, selfId) : undefined,
-    });
-  }
-
-  /** 记下「主人刚说了睡」：12 秒内没真的静默，就走定档兜底。 */
-  function markSleepIntent(conversation) {
-    conversation.sleepIntentAt = Date.now();
-    if (conversation.sleepTimer !== undefined) clearTimeout(conversation.sleepTimer);
-    const timer = setTimeout(() => {
-      conversation.sleepTimer = undefined;
-      if (conversation.sleepIntentAt === undefined) return;
-      if (isMuted(conversation.key)) {
-        conversation.sleepIntentAt = undefined;
-        return;
-      }
-      conversation.sleepIntentAt = undefined;
-      report('info', `${describeConversation(conversation)} 说了睡但没真的静默，改走定档`);
-      void handoffConversation(conversation, 'sleep-fallback');
-    }, HANDOFF_FALLBACK_MS);
-    timer.unref?.();
-    conversation.sleepTimer = timer;
-  }
-
-  /** 清掉「等它静默」的定时器（静默成功 / 被叫醒 / 已定档时调用）。 */
-  function clearSleepIntent(conversation) {
-    if (conversation === undefined) return;
-    conversation.sleepIntentAt = undefined;
-    if (conversation.sleepTimer !== undefined) {
-      clearTimeout(conversation.sleepTimer);
-      conversation.sleepTimer = undefined;
-    }
-  }
-
-  /** 把最近上下文写成交接文档；返回相对 cwd 的路径。 */
-  async function writeHandoffDoc(conversation, reason) {
-    const lines = await todayTranscript(conversation.key);
-    const tail = lines.slice(-80);
-    const tasks = lines
-      .filter((line) => /提醒|任务|待办|记得|别忘|答应/u.test(String(line.text ?? '')))
-      .slice(-10);
-    const ambientTail = conversation.type === 'group' ? (ambient.get(conversation.id) ?? []).slice(-12) : [];
-    const parts = [
-      '# 交接文档',
-      '',
-      `- 会话：${conversation.key}${conversation.name ? `（${conversation.name}）` : ''}`,
-      `- 时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`,
-      `- 原因：${reason === 'sleep-fallback' ? '主人说睡但静默失败，自动定档' : '主人手动定档'}`,
-      `- 会话轮次：${conversation.sessionGeneration ?? 0}`,
-      `- 静默状态：${isMuted(conversation.key) ? '静默中' : '醒着'}`,
-      '',
-      '## 最近对话（旧 → 新，最多 80 条）',
-      '',
-      ...(tail.length > 0
-        ? tail.map((line) => `- ${line.name ?? line.user ?? '某人'}：${String(line.text ?? '').replace(/\s+/gu, ' ').slice(0, 200)}`)
-        : ['（今天的转录是空的，下面是群聊环境缓冲）', ...ambientTail.map((line) => `- ${line.name}：${line.text}`)]),
-      '',
-      '## 可能未完成的事（关键词命中，供参考）',
-      '',
-      ...(tasks.length > 0
-        ? tasks.map((line) => `- ${line.name ?? line.user ?? '某人'}：${String(line.text ?? '').slice(0, 200)}`)
-        : ['（没有明显命中的任务；以最近对话为准）']),
-      '',
-      '## 备注',
-      '',
-      '- 旧会话已归档到 `data/handoff/archive/`，长期记忆仍在 `.qq-memory/`。',
-      '- 读完这份文档后，先接上当前话题，不要逐条复述。',
-    ];
-    const body = parts.join('\n').slice(0, 12_000);
-    const stamp = new Date().toISOString().replace(/[:.]/gu, '-');
-    const rel = `data/handoff/${memorySlug(conversation.key)}-${stamp}.md`;
-    await mkdir(join(cwd, 'data', 'handoff'), { recursive: true });
-    await writeTextAtomic(join(cwd, rel), `${body}\n`);
-    return rel;
-  }
-
-  /** 把旧会话目录移出 sessions 根目录（保留作归档，不再被 resume）。 */
-  async function archiveSessionDir(sessionId) {
-    const persistence = ctx.get('sessionPersistence');
-    const root = persistence?.root;
-    if (typeof root !== 'string' || root.length === 0) return;
-    try {
-      for (const entry of readdirSync(root, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const source = join(root, entry.name, sessionId);
-        const info = await stat(source).catch(() => undefined);
-        if (info?.isDirectory() !== true) continue;
-        const target = join(cwd, 'data', 'handoff', 'archive', `${sessionId}-${Date.now()}`);
-        await mkdir(dirname(target), { recursive: true });
-        await rename(source, target);
-        report('info', `handoff: archived ${sessionId} → ${target}`);
-        return;
-      }
-    } catch (error) {
-      report('warn', `handoff: could not archive ${sessionId}: ${errorText(error)}`);
-    }
-  }
-
-  /** 定档：写文档 → 归档旧会话 → 新开一轮 → 第一句话读文档。 */
-  async function handoffConversation(conversation, reason) {
-    if (conversation.handoffBusy === true) return;
-    conversation.handoffBusy = true;
-    clearSleepIntent(conversation);
-    try {
-      conversation.pending.length = 0;
-      if (conversation.batchTimer !== undefined) {
-        clearTimeout(conversation.batchTimer);
-        conversation.batchTimer = undefined;
-      }
-      const oldSessionId = sessionIdFor(conversation.key, conversation.sessionGeneration ?? 0);
-      const rel = await writeHandoffDoc(conversation, reason);
-      const ok = await resetConversation(conversation);
-      if (!ok) {
-        void sendToConversation(conversation, '（定档失败：旧会话没能关掉，先别急着重开）');
-        return;
-      }
-      await archiveSessionDir(oldSessionId);
-      void sendToConversation(conversation, `（交接文档写好了：\`${rel}\`，旧会话已归档，正在新开一轮）`);
-      startAgentTurn(
-        conversation,
-        [
-          `（插件转告：你刚接手这个会话。先用 read 读交接文档 \`${rel}\`，`,
-          '里面是上一段对话的最近上下文、可能未完成的事和当前状态。',
-          '读完用一两句话确认你接上了；不要逐条复述，也不要说“交接文档”这四个字。）',
-        ].join('\n'),
-        { intent: 'handoff', command: '定档' },
-      );
-    } finally {
-      conversation.handoffBusy = false;
-    }
-  }
-
 
   function commandPrompt(name, args) {
     if (name === '表情') {
@@ -1351,6 +1212,56 @@ export function apply(ctx, config) {
     } catch (error) {
       commandReply(command, `没改成：${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  /**
+   * 软命令里不开放的指令：有副作用 / 会改配置 / 会直接发媒体，交给模型太不可控。
+   *
+   * 定档会归档会话并换代次、语音会往外发音频、随机表情 / 接一个直接甩图、存表情会写盘、
+   * 设置会改 bot 自己的配置 —— 这些要么不可逆、要么绕过了「主人显式说了要做」这条前提，
+   * 只能由主人发正式指令。
+   */
+  const SOFT_BLOCKED = new Set(['定档', '语音', '随机表情', '接一个', '存表情', '设置']);
+
+  /**
+   * 模型通过 `qq_auto_tool` 执行一条插件指令（软命令）。
+   *
+   * 只接 `kind: plugin` 的指令（创作类本来就该由模型自己写），并且用 `silent` 模式跑：
+   * 指令的结果文字收进 `replies` 交给模型转述，插件一个字都不发。
+   *
+   * 权限：`qq_auto_tool` 的 `execute()` 已经用 `writeAuthority` 判过「这一轮说话的人
+   * 全在主人名单里」，这里再判一次模式与开关 —— 工具注册在 apply 期、开关是运行期，
+   * 两处都要认。
+   *
+   * @param exec - 工具执行上下文（决定是哪个会话）。
+   * @param name - 指令名或别名（`findCommand` 认别名）。
+   * @param args - 指令参数原文。
+   * @returns 指令的输出文字（没有输出时给一句说明，别让模型拿到空串）。
+   */
+  async function runSoftCommand(exec, name, args) {
+    if (appMode === 'simple') throw new Error('简洁模式不开放软命令');
+    if (settings.modelAutoTool !== true) throw new Error('model auto tool 关着（设置 modelAutoTool true 再试）');
+    if (!moduleEnabled('autoTool')) throw new Error('软命令模块关着（设置 moduleAutoTool true 再试）');
+    const conversation = conversationOfExec(exec);
+    if (conversation === undefined) throw new Error('这个工具只能在 QQ 会话里用');
+    const commandDef = findCommand(name);
+    if (commandDef === undefined) throw new Error(`没有「${name}」这个指令`);
+    if (commandDef.kind !== 'plugin') throw new Error(`「${commandDef.name}」需要模型自己处理，不能走软命令`);
+    if (SOFT_BLOCKED.has(commandDef.name)) throw new Error(`「${commandDef.name}」有副作用，软命令不开放`);
+    const command = {
+      command: commandDef,
+      args: String(args ?? ''),
+      conversation,
+      userId: ownerState.ids[0] ?? '',
+      // 软命令只对主人生效：执行器里那些 `level: 'owner'` 的分支要能看到这一点，
+      // 否则「设置」这类指令会被一句「只有主人能用」挡掉（听起来像 bug，其实是权限没传对）。
+      owner: true,
+      silent: true,
+      replies: [],
+    };
+    await runCommand(command);
+    const text = command.replies.join('\n').trim();
+    return text.length > 0 ? text : '（执行了，但没有文字输出）';
   }
 
   /**
@@ -1795,6 +1706,19 @@ export function apply(ctx, config) {
       await modeCommand(command);
       return;
     }
+    if (name === 'debug') {
+      // `debug rollback` 走同一个指令名（判据是参数），不开一次新的提权窗口。
+      if (/^(rollback|回滚)$/iu.test(command.args.trim())) {
+        void debugMode.rollback();
+        return;
+      }
+      void debugMode.start(command.conversation);
+      return;
+    }
+    if (name === 'overdebug') {
+      if (!debugMode.stop('manual')) commandReply(command, '现在不在 debug 模式。');
+      return;
+    }
     if (name === '定档') {
       commandReply(command, '（开始定档：写交接文档 → 归档旧会话 → 新开一轮）');
       void handoffConversation(command.conversation, 'manual');
@@ -2206,6 +2130,52 @@ export function apply(ctx, config) {
     stopAllTyping,
   } = sender;
 
+  // ---- 定档（交接）与调试提权：两个有状态子系统 ----------------------------------
+  //
+  // 两个都搬去了独立模块，这里只装配。放在发送链路**之后**是因为它们要真的发消息：
+  // `sendToConversation` 是上面那个 const，直接把它当参数传会在装配期撞 TDZ（必须包一层
+  // 箭头函数，调用时才取）。其余依赖都是函数声明（提升），位置无所谓。
+  //
+  // 定档有两层开关：指令侧由 `COMMAND_MODULES` 拦（简洁模式也放行这一条），而
+  // 「说了睡但没静默」的兜底不经过指令分流，所以模块里自己也判一次 `moduleHandoff`
+  // —— 关掉定档之后不该还悄悄写文档、换一代会话。
+  const handoffKit = createHandoff({
+    cwd,
+    settings,
+    report,
+    moduleEnabled,
+    canOperate,
+    conversationFor,
+    todayTranscript,
+    // 群聊环境缓冲（今天还没有转录时的兜底）：只在群聊里用，取最近 12 条。
+    ambientTail: (conversation) => ambient.get(conversation.id) ?? [],
+    isMuted,
+    describe: describeConversation,
+    send: (conversation, text) => void sendToConversation(conversation, text),
+    resetConversation,
+    startAgentTurn,
+    // 旧会话目录在 Session 持久化根下面；拿不到（headless / 测试桩）就不归档。
+    sessionRoot: () => {
+      const service = ctx.get('sessionPersistence');
+      return typeof service?.root === 'string' ? service.root : undefined;
+    },
+  });
+  const { sleepIntentFor, markSleepIntent, clearSleepIntent, handoff: handoffConversation } = handoffKit;
+  // 调试提权：四道闸（debug 配置 / moduleDebug / 未过期 / 就是这个私聊会话）+ 主人当轮，
+  // 见 debug.js 文件头。`send` 同样要包一层箭头（TDZ）。
+  const debugMode = createDebugMode({
+    cwd,
+    pluginRoot,
+    settings,
+    report,
+    moduleEnabled,
+    conversationOfExec,
+    writeAuthority,
+    send: (conversation, text) => void sendToConversation(conversation, text),
+    // 回滚会把配置 / 覆盖层恢复成基线：让插件重启一次才真的重新读那些文件。
+    restart: scheduleSettingsRestart,
+  });
+
   // 攒批（窗口 / 积压 / 提交）搬去了 batch.js；这里只装配并解构同名别名。
   const batcher = createBatcher({
     settings,
@@ -2350,6 +2320,11 @@ export function apply(ctx, config) {
       tagCap: () => mood.tagCap(),
       trigger: () => mood.trigger(),
     },
+    // 话题账本永远是「可用」的（没有独立开关，模型不登记就没有内容）；软命令则要三档
+    // 开关全开，折算口径与工具依赖表里那一行完全一致 —— 两边都写反而更容易对不上，
+    // 所以这里读的是同一个表达式。
+    topicEnabled: () => true,
+    modelAutoTool: () => settings.modelAutoTool === true && settings.moduleAutoTool !== false && appMode !== 'simple',
   });
 
   // 设置页的两条 Host 路由（会话列表 / 重置、定时任务看板）搬去了 routes.js；
@@ -3122,12 +3097,29 @@ export function apply(ctx, config) {
         lines.push(`- 这个会话还有 ${summary.count} 条待发的提醒，最近一条：${describeTask(summary.next)}。`);
       }
     }
+    // 时间感：只给**粗时段**（每天 00 / 06 / 12 / 18 各变一次），精确时刻让模型调 qq_time。
+    // 给「14:37」这种写法等于每轮换一次情境；但它**不能排在「一句一条」之后** —— 那一行
+    // 必须离模型开口最近（见 test/bridge-persona.test.mjs 钉住的那条真实回归），所以放它前面。
+    lines.push('', `（时间感：${timeBucketLabel()}；需要精确时间时调用 qq_time，不要猜。）`);
     // 分条：系统提示里那条「能分就分 / 说到气口就发」模型执行得并不稳 —— 2026-10-22 重启后
     // 私聊仍然是「没呢，你怎么也还没睡」这种两句一条。那一轮的情境里还有一句人设的
     // 「别连着轰炸」在反向拉，两者都改掉之后，再在这里补一枪：这一行离模型开口最近。
     // 用**正向**写法、不写条数；reminder 轮的原样发送不走拟人分条，humanize 关掉时也没有。
     if (settings.humanize === true && conversation.pendingIntent !== 'reminder') {
       lines.push('', '- 想说的话一句一条，分几条发（换行 = 分条）。');
+    }
+    // 调试提权：给模型这段「你现在能碰什么」的说明。它只在 10 分钟窗口里出现、
+    // 且只对开启它的那个私聊会话，属于**每轮会变**的东西 —— 不能放系统提示（见
+    // channelPrompt 的注释：那会让 DSH 每次开 / 关 debug 都追加一整份人设）。
+    if (debugMode.activeFor(conversation)) {
+      lines.push(
+        '- 调试模式已开启（主人私聊，10 分钟或 `overdebug` 退出）：你可以用 `qq_debug_read` / `qq_debug_write` / `qq_debug_list` / `qq_debug_shell` 读写工作区外的任意路径、执行命令。像正常 agent 一样先看再改；危险操作先说清楚；所有调用都会写入 `data/debug-audit.log`。每改完一轮，调用 `qq_debug_log` 把摘要和「文件:行号」记进本次 debug 的 `CHANGELOG.md`；主人说 `overdebug` 后这些工具会立即拒绝。',
+      );
+    }
+    // 常驻话题（只取 high）：降档之后它自己从这里消失（topics.js 的 briefLines）。
+    const topicBrief = topics.briefLines(conversation);
+    if (topicBrief.length > 0) {
+      lines.push('', '（长期话题：这些是高频率话题的短摘要，不是本轮聊天记录。）', ...topicBrief);
     }
     const body = lines.join('\n').trim();
     if (body.length === 0) return '';
@@ -5842,6 +5834,12 @@ export function apply(ctx, config) {
       return;
     }
     const { conversation, message, preview, quote } = admitted;
+    // 心情与话题都按「有人真的跟它说话」推进（没 @ 它的群消息在后面就 return 了，不该算轮次）。
+    // 心情衰减在这里补上：`mood.js` 的 decay 只在收到消息时算得出来 —— 群里没人说话时它
+    // 根本不会跑，按次数衰减会漏掉整段安静期（见那个函数的注释）。
+    decayMood(conversation);
+    // 话题降档：超过「模式轮数」没被提及就降一档（简洁 6 / 其它 15，见 topics.js）。
+    topics.decay(conversation);
     // 今天是不是这个会话的纪念日（每个会话一天只提醒一次）。
     checkAnniversaries(conversation);
     const sender = event.sender ?? {};
@@ -6166,6 +6164,24 @@ export function apply(ctx, config) {
     },
     // 主人侧 bot 配置（qq_settings）：白名单键 + 覆盖层 + 重启生效。
     settingsAdmin,
+    // 软命令（qq_auto_tool）：模型自己调插件指令。三档开关在这里折算成一个布尔 ——
+    // `modelAutoTool` 是总闸、`moduleAutoTool` 是模块闸、简洁模式强制关（快照口径）。
+    modelAutoTool: settings.modelAutoTool === true && settings.moduleAutoTool !== false && appMode !== 'simple',
+    runSoftCommand,
+    // 话题记忆：模型登记 high / medium / low，插件按模式轮数降档（topics.js）。
+    topicSet: (exec, args) => {
+      const conversation = conversationOfExec(exec);
+      if (conversation === undefined) throw new Error('qq_topic 只能在 QQ 会话里用');
+      return topics.set(conversation, args);
+    },
+    // 调试提权：guard 判开关 / 会话 / TTL / 主人，audit 写 data/debug-audit.log（debug.js）。
+    debug: {
+      guard: debugMode.guard,
+      audit: (event, detail) => void debugMode.audit(event, detail),
+      backup: debugMode.backup,
+      log: debugMode.log,
+      runShell: debugMode.runShell,
+    },
     // 给已收藏的表情改名：文件与 STICKERS.md 一起搬，别让模型「用新名字再存一遍」
     // 造出一张同画面的重复表情（真实事故，见 renameSticker 的注释）。记忆关掉时
     // 仍可注册：那只是少更新一份目录（与 saveSticker 同一口径）。
@@ -6195,8 +6211,6 @@ export function apply(ctx, config) {
   // 目录怎么找：配了 `napcatDir` 就以它为准；没配就只看少数几个「像 NapCat 装在这里」的
   // 位置 —— 一个插件不该为了找配置把用户的硬盘遍历一遍。找不到时只记 info 而不是 warn：
   // 容器部署里 NapCat 压根不在这个文件系统上，那不是错误。
-  const pluginRoot = dirname(fileURLToPath(import.meta.url));
-
   /** 自动探测时的候选目录（只在没配 `napcatDir` 时用）。 */
   function napcatCandidates() {
     return [

@@ -71,6 +71,10 @@ export function createPromptKit(deps) {
     modeOf = () => 'full',
     // 心情门控的稳定口径。默认「关」：直接构造 prompt kit 的单测不该凭空多出 mood 规则。
     emojiMood = { enabled: () => false, tagCap: () => 1, trigger: () => 1 },
+    // 话题账本与软命令的开关：都是**稳定**的（配置 / 模式变了，会话会重建），所以
+    // 「怎么用它们」可以留在系统提示里；「现在有哪些常驻话题」是动态的，走本轮情境。
+    topicEnabled = () => false,
+    modelAutoTool = () => false,
   } = deps;
 
   /**
@@ -114,6 +118,14 @@ export function createPromptKit(deps) {
     if (recommended.length > 0) {
       lines.push(`- 需要主动给其他人或群发消息、或查询联系人时，使用 ${recommended.join(' / ')} 工具。`);
     }
+    // 精确时间只有 qq_time 一个出口：系统提示里不给「现在几点」（它每分钟都在变，
+    // 会把前缀缓存打穿），只在末尾给一个每天变四次的粗时段（见 channelTurnContext）。
+    const canTellTime = allowTools.length === 0 || allowTools.includes('qq_time');
+    if (canTellTime) {
+      lines.push(
+        '- 用户问现在几点 / 今天几号 / 星期几，或你要把「明天中午」这类相对时间换算成绝对时间时，调用 qq_time 取一次精确的本地时间；不要凭上下文猜，也不要每轮主动报时。',
+      );
+    }
     // 定时提醒：模型必须知道「答应下来的事必须真的落成任务」，而不是只在回复里说
     // 「好的我记住了」—— 它只在这一轮醒着，到点叫醒它的是插件，不是它自己的记忆。
     //
@@ -122,10 +134,27 @@ export function createPromptKit(deps) {
     // 到点才被发现。所以这里要求回复写**绝对日期**，并对凌晨的「明天 / 今天」单独给一条。
     // 「现在几点」与待发提醒的摘要每分钟都在变，放在 `channelTurnContext` 里。
     if (remindersEnabled && (allowTools.length === 0 || allowTools.includes('qq_remind_create'))) {
+      if (canTellTime) {
+        // 时间被理解错一天是真实事故（凌晨「明天中午」被排成次日中午）：换算前先取一次
+        // qq_time，而不是顺着上下文里的「刚才」猜。
+        lines.push('- 要建提醒时，先调用 qq_time 取精确的本地日期、时刻和星期，再换算「明天中午」这类说法；不要猜。');
+      }
       lines.push(
         '- 要提醒谁在某个时刻做什么，必须调用 qq_remind_create；不要只在回复里答应 —— 到点叫醒你的是插件，不是你自己的记忆。',
         '- 建完在回复里**写出绝对日期和时刻**（如「10 月 19 日 周一 12:00」），不要只说「明天中午」「等下」—— 写清日期，对方才能一眼看出「明天」有没有被理解成另一天。没建成要把原因说出来，别假装建好了。提醒的正文会原样发出，不会把图片或 @ 标记解析成真的图 / at 段，把要做什么写清楚。',
         '- 凌晨（大致 00:00–06:00）对方说「明天 / 今天几点」时，**日历上的明天**与**睡醒后的那个白天**都说得通：先问一句「是今天（几月几日）还是明天」；不问就按最近的那个未来时刻排。对方纠正后，用新时间重建一条，并取消旧的那条。',
+      );
+    }
+    // 话题记忆：登记是模型的动作（它才知道哪一段反复出现），插件只负责降档与注入。
+    if (topicEnabled() && (allowTools.length === 0 || allowTools.includes('qq_topic'))) {
+      lines.push(
+        `- 一段话题反复出现、或对之后明显重要时，用 qq_topic 登记：tier=high（常驻摘要）/ medium（按需召回）/ low（压成一句话），summary 一行说清。${modeOf() === 'simple' ? '6' : '15'} 轮没再提会自动降一档，最低冷区；降档后不再注入提示词。只登记真的会再聊到的，别每句都记。`,
+      );
+    }
+    // 软命令：只在配置打开、模块没关、且不是简洁模式时才有意义（index.js 已经折算成一个布尔）。
+    if (modelAutoTool() && (allowTools.length === 0 || allowTools.includes('qq_auto_tool'))) {
+      lines.push(
+        '- 用户（尤其主人）用自然语言让你做插件指令能做的事（例如「帮我抽个签」「今天群里谁话多」「点一首稻香」「掷个骰子」），但消息没有以规范指令开头时，调用 qq_auto_tool 执行对应指令，再用自己的口吻转述结果；不要凭空编运势 / 天气 / 票数 / 点数。它只对主人开放，定档 / 语音 / 随机表情 / 接一个 / 存表情 / 设置这几条走不了软命令。',
       );
     }
     if (memory.toolsAllowed()) {

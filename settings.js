@@ -131,6 +131,15 @@ export function createSettings(config, defaultCwd) {
   const moodZeroIdleMs = clampedInt(config.moodZeroIdleMs, 1000, MAX_TIMER_MS, 1_200_000);
   const moduleEmojiMood = config.moduleEmojiMood !== false;
 
+  // —— 软命令与调试提权 ——
+  // 两个都是**扩大能力面**的开关，所以只有显式 true 才算开（`!== false` 会把缺失 /
+  // 拼错 / 字符串 'false' 都当成开，这两个字段不能这么写）。模块闸是另一层：
+  // 模块关掉 = 整片不可用，与 `moduleFun` 那些同一个口径。
+  const modelAutoTool = config.modelAutoTool === true;
+  const debug = config.debug === true;
+  const moduleAutoTool = config.moduleAutoTool !== false;
+  const moduleDebug = config.moduleDebug !== false;
+
   // —— 自动复读 ——
   const repeatWindowMs = Math.max(0, Math.floor(Number(config.repeatWindowMs) || 0));
   const repeatCount = Math.max(2, Math.floor(Number(config.repeatCount) || 0));
@@ -315,6 +324,10 @@ export function createSettings(config, defaultCwd) {
     moodDecayIdleMs,
     moodZeroIdleMs,
     moduleEmojiMood,
+    modelAutoTool,
+    debug,
+    moduleAutoTool,
+    moduleDebug,
     allowTools,
     resetUsers,
     resetCommand,

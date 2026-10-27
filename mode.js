@@ -39,7 +39,7 @@ export const SIMPLE_MODULES = new Set(['handoff', 'emojiMood']);
 /**
  * 指令 → 所属模块。模块关掉时整条指令直接不可用（在 `runCommand` 里统一拦）。
  *
- * 只收**已经搬进本仓库**的指令；`debug` / `overdebug`（调试分片）等落地后再补。
+ * 只收**已经搬进本仓库**的指令（调试分片落地后 `debug` / `overdebug` 也在这里）。
  * 一条指令只归一个模块：它能被关掉的理由应当只有一个，否则「关了却还能用」很难解释。
  */
 export const COMMAND_MODULES = {
@@ -49,17 +49,23 @@ export const COMMAND_MODULES = {
   存表情: 'fun', 表情: 'fun',
   天气: 'lookup', 余额: 'lookup', 群热度: 'lookup', 随机表情: 'lookup',
   提醒: 'reminders', 语音: 'tts', 定档: 'handoff',
+  // 调试提权（主人私聊）：`moduleDebug` 关掉时两条指令都不可用，与其它模块同一口径。
+  debug: 'debug', overdebug: 'debug',
 };
 
 /**
  * 简洁模式只挂这些工具：聊天 / 记忆 / 静默 / 设置需要的那几格。
  *
  * 与完整模式一样，白名单只能**收窄**：基础白名单为空（= 部署明确说不限制）时才展开
- * 成这一份；非空时取交集。`qq_time` / `qq_topic` 等工具还没搬，等对应分片落地再补。
+ * 成这一份；非空时取交集。
+ *
+ * `qq_time` / `qq_topic` 在简洁模式里**保留**：它们不改任何东西，只是「现在几点」与
+ * 「这段话题记一下」，恰恰是长时间聊天最需要的两格；软命令与调试提权则一律不放行
+ * （前者是能力面扩大，后者是工作区外提权 —— 简洁模式的承诺是「只聊天」）。
  */
 export const SIMPLE_TOOL_SET = new Set([
   'read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch', 'skill',
-  'qq_memory', 'qq_transcript', 'qq_quiet', 'qq_settings',
+  'qq_memory', 'qq_transcript', 'qq_quiet', 'qq_settings', 'qq_time', 'qq_topic',
 ]);
 
 /**
