@@ -262,7 +262,7 @@ test('group replies can quote or mention the message they answer', async () => {
   const quoted = await boot({ replyStyle: 'quote' });
   try {
     quoted.onebot.push(mention('在吗', { messageId: 4242 }));
-    const agent = await until(() => quoted.host.list.created[0], 'the group Agent');
+    const agent = await untilInbox(quoted.host, 1, 'the group Agent');
     completeTurn(quoted.host, agent, '在的');
     const sent = await until(() => sentTexts(quoted.onebot)[0], 'the quoted reply');
     assert.deepEqual(sent, [
